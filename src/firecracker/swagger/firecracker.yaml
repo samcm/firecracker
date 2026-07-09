@@ -1444,6 +1444,23 @@ definitions:
           - None
           - 2M
         description: Which huge pages configuration (if any) should be used to back guest memory.
+      tsc_khz_multiplier:
+        type: number
+        format: double
+        description: >
+          Optional guest TSC frequency multiplier (x86_64 only). When set to a value
+          other than 1.0, Firecracker programs each vCPU with KVM_SET_TSC_KHZ so the
+          guest TSC frequency is floor(host_tsc_khz * multiplier). The guest then
+          observes wall-clock time advancing at `multiplier` times real time (requires
+          guest clocksource=tsc and host hardware TSC scaling / KVM_CAP_TSC_CONTROL).
+          Exactly 1.0 is a no-op. Values other than 1.0 must be finite and in
+          [0.1, 100.0]. NaN and infinities are rejected. Snapshot restore re-applies
+          the saved per-vCPU tsc_khz, so a snapshot of a dilated VM restores dilated
+          without a separate multiplier field in the snapshot format.
+        minimum: 0.1
+        maximum: 100.0
+        exclusiveMinimum: false
+        exclusiveMaximum: false
 
   MemoryBackend:
     type: object

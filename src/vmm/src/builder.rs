@@ -16,7 +16,6 @@ use utils::time::TimestampUs;
 use vm_allocator::AllocPolicy;
 use vm_memory::GuestAddress;
 
-#[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
@@ -50,6 +49,8 @@ use crate::snapshot::Persist;
 use crate::utils::mib_to_bytes;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
+#[cfg(target_arch = "x86_64")]
+use crate::vmm_config::machine_config::compute_guest_tsc_khz;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
 use crate::vstate::kvm::{Kvm, KvmError};
@@ -127,6 +128,18 @@ pub enum StartMicrovmError {
     VcpuFdCloneError(#[from] crate::vstate::vcpu::CopyKvmFdError),
     /// Error with the KvmVm object: {0}
     KvmVm(#[from] VmError),
+    /// Guest TSC frequency dilation requires KVM_CAP_TSC_CONTROL (hardware TSC scaling).
+    #[cfg(target_arch = "x86_64")]
+    TscControlNotSupported,
+    /// Failed to read host TSC frequency for guest TSC dilation: {0}
+    #[cfg(target_arch = "x86_64")]
+    GetTsc(#[from] crate::arch::GetTscError),
+    /// Failed to set guest TSC frequency for dilation: {0}
+    #[cfg(target_arch = "x86_64")]
+    SetTsc(crate::arch::SetTscError),
+    /// Invalid TSC dilation configuration: {0}
+    #[cfg(target_arch = "x86_64")]
+    TscDilationConfig(MachineConfigError),
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -175,6 +188,12 @@ pub fn build_microvm_for_boot(
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm)?;
     let mut vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
+    // Opt-in guest TSC frequency dilation (x86_64). Applied at vCPU creation so
+    // the guest boots with the dilated frequency. Snapshot restore re-applies the
+    // absolute `tsc_khz` saved in vCPU state (see `build_microvm_from_snapshot`
+    // below), so dilated VMs restore dilated without re-reading this field.
+    #[cfg(target_arch = "x86_64")]
+    apply_tsc_khz_multiplier(&vm, &vcpus, vm_resources.machine_config.tsc_khz_multiplier)?;
     vm.register_dram_memory_regions(guest_memory)?;
 
     // Allocate memory as soon as possible to make hotpluggable memory available to all consumers,
@@ -370,6 +389,45 @@ pub fn build_microvm_for_boot(
     Ok(vmm)
 }
 
+/// Applies guest TSC frequency dilation via `KVM_SET_TSC_KHZ` on every vCPU.
+///
+/// When `multiplier` is `None` or exactly `1.0`, this is a no-op. Otherwise requires
+/// `KVM_CAP_TSC_CONTROL` and fails loudly if unsupported. The target frequency is
+/// `floor(host_tsc_khz * multiplier)` (see [`compute_guest_tsc_khz`]).
+#[cfg(target_arch = "x86_64")]
+fn apply_tsc_khz_multiplier(
+    vm: &KvmVm,
+    vcpus: &[Vcpu],
+    multiplier: Option<f64>,
+) -> Result<(), StartMicrovmError> {
+    let Some(multiplier) = multiplier else {
+        return Ok(());
+    };
+    // Exactly 1.0: skip the KVM call (documented no-op).
+    if multiplier == 1.0 {
+        return Ok(());
+    }
+
+    if !vm.kvm().fd.check_extension(kvm_ioctls::Cap::TscControl) {
+        return Err(StartMicrovmError::TscControlNotSupported);
+    }
+
+    let host_tsc_khz = vcpus[0].kvm_vcpu.get_tsc_khz()?;
+    let Some(desired_khz) = compute_guest_tsc_khz(host_tsc_khz, multiplier)
+        .map_err(StartMicrovmError::TscDilationConfig)?
+    else {
+        // `multiplier == 1.0` already returned above; keep this branch defensive.
+        return Ok(());
+    };
+
+    for vcpu in vcpus {
+        vcpu.kvm_vcpu
+            .set_tsc_khz(desired_khz)
+            .map_err(StartMicrovmError::SetTsc)?;
+    }
+    Ok(())
+}
+
 /// Builds and boots a microVM based on the current Firecracker VmResources configuration.
 ///
 /// This is the default build recipe, one could build other microVM flavors by using the
@@ -463,7 +521,10 @@ pub fn build_microvm_from_snapshot(
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Scale TSC to match, extract the TSC freq from the state if specified
+        // Scale TSC to match, extract the TSC freq from the state if specified.
+        // A snapshot of a VM that was booted with `tsc_khz_multiplier` stores the
+        // dilated frequency in each vCPU's `tsc_khz`; restoring that value re-applies
+        // dilation for free (no separate multiplier field in the snapshot format).
         if let Some(state_tsc) = microvm_state.vcpu_states[0].tsc_khz {
             // Scale the TSC frequency for all VCPUs. If a TSC frequency is not specified in the
             // snapshot, by default it uses the host frequency.
