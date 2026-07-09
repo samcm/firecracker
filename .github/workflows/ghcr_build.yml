@@ -1,0 +1,53 @@
+name: ghcr-build
+
+on:
+  push:
+    branches:
+      - "mem-backend-shared-*"
+      - "tsc-*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build firecracker + jailer (devtool, musl release)
+        run: ./tools/devtool -y build --release
+
+      - name: Stage image context
+        run: |
+          mkdir -p out
+          cp build/cargo_target/x86_64-unknown-linux-musl/release/firecracker out/
+          cp build/cargo_target/x86_64-unknown-linux-musl/release/jailer out/
+          cat > out/Dockerfile <<'EOF'
+          FROM scratch
+          COPY firecracker /firecracker
+          COPY jailer /jailer
+          EOF
+
+      - name: Log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        run: |
+          IMG="ghcr.io/${{ github.repository_owner }}/firecracker"
+          BRANCH="${GITHUB_REF_NAME}"
+          SHA7="${GITHUB_SHA::7}"
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${IMG}:${BRANCH}" \
+            -t "${IMG}:${BRANCH}-${SHA7}" \
+            out
+          docker push "${IMG}:${BRANCH}"
+          docker push "${IMG}:${BRANCH}-${SHA7}"
