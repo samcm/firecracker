@@ -13,6 +13,23 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub-hosted x86_64 ubuntu runners expose /dev/kvm (nested virt);
+      # the devctr runs privileged with /dev bind-mounted, so KVM-backed
+      # vmm tests execute for real here.
+      - name: Check KVM availability
+        run: ls -l /dev/kvm
+
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+
+      - name: Run vmm tests (devtool, KVM)
+        run: ./tools/devtool -y sh "RUST_TEST_THREADS=1 cargo test -p vmm --target x86_64-unknown-linux-musl --no-fail-fast"
+
   build-publish:
     runs-on: ubuntu-latest
     steps:
@@ -26,11 +43,22 @@ jobs:
           mkdir -p out
           cp build/cargo_target/x86_64-unknown-linux-musl/release/firecracker out/
           cp build/cargo_target/x86_64-unknown-linux-musl/release/jailer out/
+          # busybox base (not scratch) so consumers can extract the binary
+          # with an initContainer running /bin/cp.
           cat > out/Dockerfile <<'EOF'
-          FROM scratch
+          FROM busybox:stable-musl@sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213
           COPY firecracker /firecracker
           COPY jailer /jailer
           EOF
+
+      - name: Upload raw binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: firecracker-binaries
+          path: |
+            out/firecracker
+            out/jailer
+          if-no-files-found: error
 
       - name: Log in to ghcr
         uses: docker/login-action@v3
