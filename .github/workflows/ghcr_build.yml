@@ -5,6 +5,7 @@ on:
     branches:
       - "mem-backend-shared-*"
       - "tsc-*"
+      - "live-branch-*"
   workflow_dispatch: {}
 
 permissions:
