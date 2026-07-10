@@ -1428,7 +1428,9 @@ mod tests {
             cpu_template: Some(StaticCpuTemplate::V1N1),
             track_dirty_pages: Some(false),
             huge_pages: Some(HugePageConfig::None),
-            tsc_khz_multiplier: None,
+            // `Some(None)` (explicit clear) is what `From<MachineConfig>`
+            // produces, so the round-trip assertions below hold.
+            tsc_khz_multiplier: Some(None),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };

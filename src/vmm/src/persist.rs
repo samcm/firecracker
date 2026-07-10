@@ -570,7 +570,12 @@ fn guest_memory_from_file(
     track_dirty_pages: bool,
     shared: bool,
 ) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
-    let mem_file = File::open(mem_file_path)?;
+    // A shared mapping is mmap'd PROT_READ|PROT_WRITE + MAP_SHARED, which the
+    // kernel only allows on a file descriptor opened for writing.
+    let mem_file = OpenOptions::new()
+        .read(true)
+        .write(shared)
+        .open(mem_file_path)?;
     let guest_mem =
         memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages, shared)?;
     Ok(guest_mem)
