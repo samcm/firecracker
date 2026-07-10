@@ -952,6 +952,16 @@ impl RuntimeApiController {
                     elapsed_time_us
                 );
             }
+            SnapshotType::Msync => {
+                let elapsed_time_us = update_metric_with_elapsed_time(
+                    &METRICS.latencies_us.vmm_msync_create_snapshot,
+                    create_start_us,
+                );
+                info!(
+                    "'create msync snapshot' VMM action took {} us.",
+                    elapsed_time_us
+                );
+            }
         }
         Ok(VmmData::Empty)
     }
@@ -1325,6 +1335,7 @@ mod tests {
                 mem_backend: MemBackendConfig {
                     backend_type: MemBackendType::File,
                     backend_path: PathBuf::new(),
+                    shared: false,
                 },
                 track_dirty_pages: false,
                 resume_vm: false,

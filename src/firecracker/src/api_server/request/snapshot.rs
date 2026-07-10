@@ -168,6 +168,21 @@ mod tests {
             VmmAction::CreateSnapshot(expected_config)
         );
 
+        let body = r#"{
+            "snapshot_type": "Msync",
+            "snapshot_path": "foo",
+            "mem_file_path": "bar"
+        }"#;
+        let expected_config = CreateSnapshotParams {
+            snapshot_type: SnapshotType::Msync,
+            snapshot_path: PathBuf::from("foo"),
+            mem_file_path: PathBuf::from("bar"),
+        };
+        assert_eq!(
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+            VmmAction::CreateSnapshot(expected_config)
+        );
+
         let invalid_body = r#"{
             "invalid_field": "foo",
             "mem_file_path": "bar"

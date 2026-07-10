@@ -34,10 +34,12 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestMemoryExtension, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -157,9 +159,15 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Msync snapshot requires guest memory to be a MAP_SHARED file mapping (restored with mem_backend File and shared=true). Guest memory is MAP_PRIVATE or anonymous (e.g. UFFD / cold boot).
+    NotSharedFileMemory,
 }
 
-/// Snapshot version
+/// Snapshot version.
+///
+/// Msync does **not** change the vmstate on-disk format: it
+/// serializes the same `MicrovmState` as Full/Diff and only skips writing
+/// a separate memory file. No version bump is required.
 pub const SNAPSHOT_VERSION: Version = Version::new(10, 0, 0);
 
 /// Creates a Microvm snapshot.
@@ -168,6 +176,21 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    // Enforce the Msync precondition before any durable side
+    // effects so rejection does not leave a truncated/partial vmstate file.
+    {
+        let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+            CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                "snapshot requires KVM".into(),
+            ))
+        })?;
+        if params.snapshot_type == SnapshotType::Msync
+            && !kvm_vm.guest_memory().is_shared_file_backed()
+        {
+            return Err(CreateSnapshotError::NotSharedFileMemory);
+        }
+    }
+
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
@@ -179,13 +202,26 @@ pub fn create_snapshot(
             "snapshot requires KVM".into(),
         ))
     })?;
-    kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
-    // We need to mark queues as dirty again for all activated devices. The reason we
-    // do it here is that we don't mark pages as dirty during runtime
-    // for queue objects.
-    vmm.device_manager
-        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+    match params.snapshot_type {
+        SnapshotType::Msync => {
+            // The memory "dump" is an msync of the live MAP_SHARED mapping to
+            // its backing file; mem_file_path is not written. Dirty-bitmap
+            // bookkeeping is skipped: dirty tracking is off on this path and
+            // virtio queue writes go through the same mapping, so the msync
+            // captures them.
+            kvm_vm.msync_shared_guest_memory()?;
+        }
+        SnapshotType::Full | SnapshotType::Diff => {
+            kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+
+            // We need to mark queues as dirty again for all activated devices. The reason we
+            // do it here is that we don't mark pages as dirty during runtime
+            // for queue objects.
+            vmm.device_manager
+                .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+        }
+    }
 
     Ok(())
 }

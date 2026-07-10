@@ -76,6 +76,8 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
+    /// Cannot msync guest memory: {0}
+    Msync(std::io::Error),
 }
 
 impl From<vm_memory::VolatileMemoryError> for MemoryError {
@@ -640,6 +642,24 @@ where
     /// Store the dirty bitmap in internal store
     fn store_dirty_bitmap(&self, dirty_bitmap: &DirtyBitmap, page_size: usize);
 
+    /// Returns `true` if every guest memory region is a `MAP_SHARED` file
+    /// mapping (the `File` mem backend with `shared: true`).
+    ///
+    /// This is the precondition for [`crate::vmm_config::snapshot::SnapshotType::Msync`]:
+    /// only then is the backing file a complete current image of guest
+    /// memory at the pause point (after `msync`).
+    ///
+    /// Returns `false` for MAP_PRIVATE file mappings (`shared: false` File
+    /// restore) and anonymous regions (default cold boot, UFFD restore).
+    fn is_shared_file_backed(&self) -> bool;
+
+    /// Synchronizes all guest memory mappings to their backing store via
+    /// `msync(MS_SYNC)`.
+    ///
+    /// Used by Msync snapshots so the shared file is durable
+    /// at the pause point without writing a separate memory dump.
+    fn msync(&self) -> Result<(), MemoryError>;
+
     /// Apply a function to each region in a memory range
     fn try_for_each_region_in_range<F>(
         &self,
@@ -792,6 +812,30 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             });
     }
 
+    fn is_shared_file_backed(&self) -> bool {
+        self.iter().all(|region| {
+            region.file_offset().is_some() && (region.flags() & libc::MAP_SHARED) != 0
+        })
+    }
+
+    fn msync(&self) -> Result<(), MemoryError> {
+        for region in self.iter() {
+            // SAFETY: `as_ptr`/`size` describe the region's live mmap; MS_SYNC
+            // is valid for both shared and private mappings.
+            let ret = unsafe {
+                libc::msync(
+                    region.as_ptr().cast::<libc::c_void>(),
+                    region.size(),
+                    libc::MS_SYNC,
+                )
+            };
+            if ret < 0 {
+                return Err(MemoryError::Msync(std::io::Error::last_os_error()));
+            }
+        }
+        Ok(())
+    }
+
     fn try_for_each_region_in_range<F>(
         &self,
         addr: GuestAddress,
@@ -933,7 +977,7 @@ mod tests {
 
             let regions = vec![(GuestAddress(0), page_size)];
             let guest_regions =
-                snapshot_file(file, regions.into_iter(), dirty_page_tracking).unwrap();
+                snapshot_file(file, regions.into_iter(), dirty_page_tracking, false).unwrap();
             assert_eq!(guest_regions.len(), 1);
             guest_regions.iter().for_each(|region| {
                 assert_eq!(region.bitmap().is_some(), dirty_page_tracking);
@@ -954,7 +998,7 @@ mod tests {
             (GuestAddress(0x10000), page_size),
             (GuestAddress(0x20000), page_size),
         ];
-        let guest_regions = snapshot_file(file, regions.into_iter(), false).unwrap();
+        let guest_regions = snapshot_file(file, regions.into_iter(), false, false).unwrap();
         assert_eq!(guest_regions.len(), 3);
     }
 
@@ -966,8 +1010,70 @@ mod tests {
         file.write_all(&vec![0x42u8; page_size]).unwrap();
 
         let regions = vec![(GuestAddress(0), 2 * page_size)];
-        let result = snapshot_file(file, regions.into_iter(), false);
+        let result = snapshot_file(file, regions.into_iter(), false, false);
         assert!(matches!(result.unwrap_err(), MemoryError::OffsetTooLarge));
+    }
+
+    #[test]
+    fn test_is_shared_file_backed() {
+        let page_size = host_page_size();
+        let regions = [(GuestAddress(0), page_size)];
+
+        // Anonymous (MAP_PRIVATE | MAP_ANONYMOUS) — UFFD-style — is not shared-file.
+        let anonymous_mem =
+            into_region_ext(anonymous(regions.into_iter(), false, HugePageConfig::None).unwrap());
+        assert!(!anonymous_mem.is_shared_file_backed());
+
+        // MAP_PRIVATE file mapping is not shared-file.
+        let mut private_file = TempFile::new().unwrap().into_file();
+        private_file.set_len(page_size as u64).unwrap();
+        private_file.write_all(&vec![0u8; page_size]).unwrap();
+        let private_mem = into_region_ext(
+            snapshot_file(private_file, regions.into_iter(), false, false).unwrap(),
+        );
+        assert!(!private_mem.is_shared_file_backed());
+
+        // MAP_SHARED file mapping (File + shared: true) is accepted.
+        let mut shared_file = TempFile::new().unwrap().into_file();
+        shared_file.set_len(page_size as u64).unwrap();
+        shared_file.write_all(&vec![0u8; page_size]).unwrap();
+        let shared_mem =
+            into_region_ext(snapshot_file(shared_file, regions.into_iter(), false, true).unwrap());
+        assert!(shared_mem.is_shared_file_backed());
+    }
+
+    #[test]
+    fn test_msync_shared_file() {
+        let page_size = host_page_size();
+        let tmp = TempFile::new().unwrap();
+        {
+            let mut file = tmp.as_file().try_clone().unwrap();
+            file.set_len(page_size as u64).unwrap();
+            file.write_all(&vec![0u8; page_size]).unwrap();
+        }
+
+        let guest_memory = into_region_ext(
+            snapshot_file(
+                tmp.as_file().try_clone().unwrap(),
+                std::iter::once((GuestAddress(0), page_size)),
+                false,
+                true,
+            )
+            .unwrap(),
+        );
+
+        // Write a recognizable pattern through the MAP_SHARED mapping.
+        let pattern = vec![0xABu8; page_size];
+        guest_memory.write(&pattern, GuestAddress(0)).unwrap();
+
+        // msync must succeed and make the pattern visible via an independent
+        // read of the backing file (proves MS_SYNC flushed page cache).
+        guest_memory.msync().unwrap();
+
+        let mut from_file = vec![0u8; page_size];
+        let mut reader = std::fs::File::open(tmp.as_path()).unwrap();
+        reader.read_exact(&mut from_file).unwrap();
+        assert_eq!(from_file, pattern);
     }
 
     #[test]
@@ -1156,8 +1262,9 @@ mod tests {
         let mut memory_file = TempFile::new().unwrap().into_file();
         guest_memory.dump(&mut memory_file).unwrap();
 
-        let restored_guest_memory =
-            into_region_ext(snapshot_file(memory_file, memory_state.regions(), false).unwrap());
+        let restored_guest_memory = into_region_ext(
+            snapshot_file(memory_file, memory_state.regions(), false, false).unwrap(),
+        );
 
         // Check that the region contents are the same.
         let mut restored_region = vec![0u8; page_size * 2];
@@ -1222,7 +1329,7 @@ mod tests {
 
         // We can restore from this because this is the first dirty dump.
         let restored_guest_memory =
-            into_region_ext(snapshot_file(file, memory_state.regions(), false).unwrap());
+            into_region_ext(snapshot_file(file, memory_state.regions(), false, false).unwrap());
 
         // Check that the region contents are the same.
         let mut restored_region = vec![0u8; region_size];
@@ -1445,6 +1552,7 @@ mod tests {
             snapshot_file(
                 memory_file,
                 std::iter::once((GuestAddress(0), 2 * page_size)),
+                false,
                 false,
             )
             .unwrap(),

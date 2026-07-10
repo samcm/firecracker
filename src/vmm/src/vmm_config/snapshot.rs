@@ -18,6 +18,11 @@ pub enum SnapshotType {
     /// Full snapshot.
     #[default]
     Full,
+    /// Vmstate-only snapshot for MAP_SHARED file-backed guest memory (`File`
+    /// mem backend restored with `shared: true`): the memory "dump" is an
+    /// `msync` of the live mapping to its backing file. Rejected for any
+    /// other guest memory configuration. The vmstate format is unchanged.
+    Msync,
 }
 
 /// Specifies the method through which guest memory will get populated when
@@ -43,7 +48,9 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory.
+    /// Path to the file that will contain the guest memory. Accepted and
+    /// ignored for [`SnapshotType::Msync`] (the shared backing file, fixed
+    /// at restore time, is the memory image).
     pub mem_file_path: PathBuf,
 }
 
@@ -157,4 +164,24 @@ pub enum VmState {
 pub struct Vm {
     /// The microVM state, which can be `paused` or `resumed`.
     pub state: VmState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snapshot_type_serde_round_trip() {
+        for (snapshot_type, json) in [
+            (SnapshotType::Full, r#""Full""#),
+            (SnapshotType::Diff, r#""Diff""#),
+            (SnapshotType::Msync, r#""Msync""#),
+        ] {
+            assert_eq!(serde_json::to_string(&snapshot_type).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<SnapshotType>(json).unwrap(),
+                snapshot_type
+            );
+        }
+    }
 }

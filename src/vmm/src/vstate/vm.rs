@@ -568,6 +568,9 @@ impl KvmVm {
     /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
     /// file of matching size, then the diff snapshot will be directly merged into the existing
     /// snapshot. Otherwise, existing files are simply overwritten.
+    ///
+    /// [`SnapshotType::Msync`] is not handled here — callers must use
+    /// [`Self::msync_shared_guest_memory`] instead (no memory file is written).
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
@@ -622,12 +625,31 @@ impl KvmVm {
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
+            SnapshotType::Msync => {
+                // Handled exclusively by `msync_shared_guest_memory` (no mem file).
+                unreachable!(
+                    "Msync snapshots must use msync_shared_guest_memory, not \
+                     snapshot_memory_to_file"
+                );
+            }
         };
 
         file.flush()
             .map_err(|err| MemoryBackingFile("flush", err))?;
         file.sync_all()
             .map_err(|err| MemoryBackingFile("sync_all", err))
+    }
+
+    /// Prepares guest memory for a [`SnapshotType::Msync`] snapshot:
+    /// validates the MAP_SHARED file-mapping precondition, then `msync(MS_SYNC)`s
+    /// every region so the shared backing file is complete and durable at the
+    /// pause point. Does not write a separate memory dump file.
+    pub(crate) fn msync_shared_guest_memory(&self) -> Result<(), CreateSnapshotError> {
+        if !self.guest_memory().is_shared_file_backed() {
+            return Err(CreateSnapshotError::NotSharedFileMemory);
+        }
+        self.guest_memory().msync()?;
+        Ok(())
     }
 
     /// Register a device IRQ
@@ -1144,5 +1166,75 @@ pub(crate) mod tests {
             .allocate(1024, 1024, AllocPolicy::FirstMatch)
             .unwrap();
         assert_eq!(range + 1024, range_new.start());
+    }
+
+    #[test]
+    fn test_msync_shared_guest_memory_rejects_anonymous() {
+        // Anonymous MAP_PRIVATE memory (UFFD-style) is not a shared file mapping.
+        let vm = setup_vm_with_memory(0x1000);
+        assert!(matches!(
+            vm.msync_shared_guest_memory(),
+            Err(CreateSnapshotError::NotSharedFileMemory)
+        ));
+    }
+
+    #[test]
+    fn test_msync_shared_guest_memory_accepts_shared_file() {
+        use std::io::Write;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::vstate::memory;
+
+        let mut vm = setup_vm();
+        let page_size = 0x1000;
+        let tmp = TempFile::new().unwrap();
+        {
+            let mut file = tmp.as_file().try_clone().unwrap();
+            file.set_len(page_size as u64).unwrap();
+            file.write_all(&vec![0u8; page_size]).unwrap();
+        }
+        let regions = memory::snapshot_file(
+            tmp.as_file().try_clone().unwrap(),
+            std::iter::once((GuestAddress(0), page_size)),
+            false,
+            true,
+        )
+        .unwrap();
+        vm.register_dram_memory_regions(regions).unwrap();
+
+        // Precondition satisfied; msync must succeed.
+        vm.msync_shared_guest_memory().unwrap();
+    }
+
+    #[test]
+    fn test_msync_shared_guest_memory_rejects_private_file() {
+        use std::io::Write;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::vstate::memory;
+
+        let mut vm = setup_vm();
+        let page_size = 0x1000;
+        let tmp = TempFile::new().unwrap();
+        {
+            let mut file = tmp.as_file().try_clone().unwrap();
+            file.set_len(page_size as u64).unwrap();
+            file.write_all(&vec![0u8; page_size]).unwrap();
+        }
+        let regions = memory::snapshot_file(
+            tmp.as_file().try_clone().unwrap(),
+            std::iter::once((GuestAddress(0), page_size)),
+            false,
+            false,
+        )
+        .unwrap();
+        vm.register_dram_memory_regions(regions).unwrap();
+
+        assert!(matches!(
+            vm.msync_shared_guest_memory(),
+            Err(CreateSnapshotError::NotSharedFileMemory)
+        ));
     }
 }

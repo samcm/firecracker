@@ -311,6 +311,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
+                shared: false,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -342,6 +343,217 @@ fn test_create_and_load_snapshot() {
             }
         }
     }
+}
+
+/// Msync success path: restore with File + shared=true (path-backed
+/// MAP_SHARED), then create a vmstate-only snapshot. `mem_file_path` must be
+/// left untouched; the restore memory file is the durable image after msync.
+///
+/// Default cold boot uses anonymous MAP_PRIVATE (not memfd) and is not a valid
+/// precondition — see `test_msync_rejects_anonymous_cold_boot`.
+#[test]
+fn test_msync_snapshot_skips_memory_file() {
+    // 1) Full snapshot from a normal cold-boot VM (anonymous RAM → memory dump).
+    let (base_snapshot, base_memory) = verify_create_snapshot(false, false, false);
+    let base_mem_len = base_memory.as_file().metadata().unwrap().len();
+    assert!(base_mem_len > 0, "Full snapshot must produce a memory file");
+
+    // 2) Restore with File + shared=true so guest RAM is path-backed MAP_SHARED.
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
+    let mut preboot = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+
+    preboot
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: base_snapshot.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: base_memory.as_path().to_path_buf(),
+                backend_type: MemBackendType::File,
+                shared: true,
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
+        }))
+        .unwrap();
+
+    let vmm = preboot.built_vmm.take().unwrap();
+    let vm_info = VmInfo::from(&*vmm.lock().unwrap());
+    let mut controller = RuntimeApiController::new(vmm.clone());
+
+    // 3) Msync: pass a separate unused path that must stay empty.
+    let mbf_snapshot = TempFile::new().unwrap();
+    let unused_mem_file = TempFile::new().unwrap();
+    let unused_len_before = unused_mem_file.as_file().metadata().unwrap().len();
+    assert_eq!(unused_len_before, 0);
+
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Msync,
+                snapshot_path: mbf_snapshot.as_path().to_path_buf(),
+                mem_file_path: unused_mem_file.as_path().to_path_buf(),
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    // mem_file_path argument is ignored and must not be written.
+    let unused_len_after = unused_mem_file.as_file().metadata().unwrap().len();
+    assert_eq!(
+        unused_len_after, unused_len_before,
+        "Msync must not write mem_file_path"
+    );
+
+    // The shared restore memory file is the durable image; leave it intact.
+    assert_eq!(
+        base_memory.as_file().metadata().unwrap().len(),
+        base_mem_len,
+        "Msync must not rewrite the shared backing memory file"
+    );
+
+    // Vmstate is a normal MicrovmState snapshot (no format change).
+    let restored_microvm_state: MicrovmState =
+        Snapshot::load(&mut mbf_snapshot.as_file()).unwrap().data;
+    assert_eq!(restored_microvm_state.vm_info, vm_info);
+    assert_eq!(restored_microvm_state.vcpu_states.len(), 1);
+}
+
+/// Msync is rejected on default cold boot (anonymous MAP_PRIVATE)
+/// and must not write the vmstate file.
+#[test]
+fn test_msync_rejects_anonymous_cold_boot() {
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+
+    thread::sleep(Duration::from_millis(200));
+
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    let bad_snapshot = TempFile::new().unwrap();
+    let unused_mem = TempFile::new().unwrap();
+    // TempFile creates a zero-length file; rejection must leave it empty
+    // (precondition is checked before any durable side effects).
+    assert_eq!(bad_snapshot.as_file().metadata().unwrap().len(), 0);
+
+    let result = controller.handle_request(
+        VmmAction::CreateSnapshot(CreateSnapshotParams {
+            snapshot_type: SnapshotType::Msync,
+            snapshot_path: bad_snapshot.as_path().to_path_buf(),
+            mem_file_path: unused_mem.as_path().to_path_buf(),
+        }),
+        &mut event_manager,
+    );
+
+    match result {
+        Err(VmmActionError::CreateSnapshot(err)) => {
+            assert!(
+                matches!(&err, vmm::persist::CreateSnapshotError::NotSharedFileMemory)
+                    || err.to_string().contains("Msync")
+                    || err.to_string().contains("MAP_SHARED"),
+                "unexpected error: {err}"
+            );
+        }
+        other => panic!("expected CreateSnapshot rejection, got: {other:?}"),
+    }
+
+    assert_eq!(
+        bad_snapshot.as_file().metadata().unwrap().len(),
+        0,
+        "reject must not leave a partial vmstate file"
+    );
+    assert_eq!(
+        unused_mem.as_file().metadata().unwrap().len(),
+        0,
+        "reject must not write mem_file_path"
+    );
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
+/// Msync is rejected when guest memory is a MAP_PRIVATE file mapping
+/// (restored with shared=false), without writing a partial vmstate file.
+#[test]
+fn test_msync_rejects_private_file_backend() {
+    // Create a normal Full snapshot, then restore with shared=false (MAP_PRIVATE).
+    let (snapshot_file, memory_file) = verify_create_snapshot(false, false, false);
+
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
+    let mut preboot = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+
+    preboot
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: snapshot_file.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: memory_file.as_path().to_path_buf(),
+                backend_type: MemBackendType::File,
+                shared: false,
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
+        }))
+        .unwrap();
+
+    let vmm = preboot.built_vmm.take().unwrap();
+    let mut controller = RuntimeApiController::new(vmm.clone());
+
+    // VM is already paused after load without resume_vm.
+    let bad_snapshot = TempFile::new().unwrap();
+    let unused_mem = TempFile::new().unwrap();
+    assert_eq!(bad_snapshot.as_file().metadata().unwrap().len(), 0);
+
+    let result = controller.handle_request(
+        VmmAction::CreateSnapshot(CreateSnapshotParams {
+            snapshot_type: SnapshotType::Msync,
+            snapshot_path: bad_snapshot.as_path().to_path_buf(),
+            mem_file_path: unused_mem.as_path().to_path_buf(),
+        }),
+        &mut event_manager,
+    );
+
+    match result {
+        Err(VmmActionError::CreateSnapshot(err)) => {
+            assert!(
+                matches!(&err, vmm::persist::CreateSnapshotError::NotSharedFileMemory)
+                    || err.to_string().contains("Msync")
+                    || err.to_string().contains("MAP_SHARED")
+                    || err.to_string().contains("shared"),
+                "unexpected error: {err}"
+            );
+        }
+        other => panic!("expected CreateSnapshot rejection, got: {other:?}"),
+    }
+
+    assert_eq!(
+        bad_snapshot.as_file().metadata().unwrap().len(),
+        0,
+        "reject must not leave a partial vmstate file"
+    );
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
 #[test]
@@ -397,6 +609,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         mem_backend: MemBackendConfig {
             backend_path: memory_file.as_path().to_path_buf(),
             backend_type: MemBackendType::File,
+            shared: false,
         },
         track_dirty_pages: false,
         resume_vm: false,

@@ -1629,7 +1629,11 @@ definitions:
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description: >
+          Path to the file that will contain the guest memory.
+          Ignored when snapshot_type is Msync (that mode does not
+          write a memory file; the shared guest-memory backing file is the
+          memory image).
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
@@ -1638,9 +1642,19 @@ definitions:
         enum:
           - Full
           - Diff
-        description:
+          - Msync
+        description: >
           Type of snapshot to create. It is optional and by default, a full
           snapshot is created.
+
+          Msync serializes only the microVM state file and does
+          not write guest memory. It is valid only when guest memory is a
+          MAP_SHARED file mapping (restored with mem_backend File and
+          shared=true): Firecracker msyncs the mapping so the shared
+          backing file is a complete image at the pause point. Rejected for
+          MAP_PRIVATE and anonymous (default cold boot / UFFD) guest
+          memory. The vmstate format is unchanged; restore uses the usual
+          File/Uffd mem_backend against the external memory file.
 
   NetworkOverride:
     type: object
