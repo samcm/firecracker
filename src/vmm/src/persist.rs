@@ -176,18 +176,31 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    // Enforce the Msync precondition before any durable side
-    // effects so rejection does not leave a truncated/partial vmstate file.
-    {
-        let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
-            CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
-                "snapshot requires KVM".into(),
-            ))
-        })?;
-        if params.snapshot_type == SnapshotType::Msync
-            && !kvm_vm.guest_memory().is_shared_file_backed()
-        {
-            return Err(CreateSnapshotError::NotSharedFileMemory);
+    // Enforce per-type preconditions before any durable side effects so
+    // rejection does not leave a truncated/partial vmstate file. Full/Diff
+    // keep upstream's error ordering for the non-KVM case (checked after
+    // save_state below).
+    match params.snapshot_type {
+        SnapshotType::Msync => {
+            let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+                CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                    "snapshot requires KVM".into(),
+                ))
+            })?;
+            if !kvm_vm.guest_memory().is_shared_file_backed() {
+                return Err(CreateSnapshotError::NotSharedFileMemory);
+            }
+        }
+        SnapshotType::Full | SnapshotType::Diff => {
+            if params.mem_file_path.as_os_str().is_empty() {
+                return Err(CreateSnapshotError::MemoryBackingFile(
+                    "open",
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "mem_file_path is required for Full and Diff snapshots",
+                    ),
+                ));
+            }
         }
     }
 

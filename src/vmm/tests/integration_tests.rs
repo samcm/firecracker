@@ -556,6 +556,51 @@ fn test_msync_rejects_private_file_backend() {
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
+/// `mem_file_path` is `#[serde(default)]` so it can be omitted for Msync;
+/// Full/Diff must reject an empty path before writing anything.
+#[test]
+fn test_full_snapshot_rejects_empty_mem_file_path() {
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+
+    thread::sleep(Duration::from_millis(200));
+
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    let bad_snapshot = TempFile::new().unwrap();
+    assert_eq!(bad_snapshot.as_file().metadata().unwrap().len(), 0);
+
+    let result = controller.handle_request(
+        VmmAction::CreateSnapshot(CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: bad_snapshot.as_path().to_path_buf(),
+            mem_file_path: std::path::PathBuf::new(),
+        }),
+        &mut event_manager,
+    );
+
+    match result {
+        Err(VmmActionError::CreateSnapshot(err)) => {
+            assert!(
+                err.to_string().contains("mem_file_path"),
+                "unexpected error: {err}"
+            );
+        }
+        other => panic!("expected CreateSnapshot rejection, got: {other:?}"),
+    }
+
+    assert_eq!(
+        bad_snapshot.as_file().metadata().unwrap().len(),
+        0,
+        "reject must not leave a partial vmstate file"
+    );
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
 #[test]
 fn test_snapshot_load_sanity_checks() {
     let microvm_state = get_microvm_state_from_snapshot(false);

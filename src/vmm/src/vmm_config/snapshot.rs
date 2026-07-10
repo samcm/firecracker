@@ -48,9 +48,11 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory. Accepted and
-    /// ignored for [`SnapshotType::Msync`] (the shared backing file, fixed
-    /// at restore time, is the memory image).
+    /// Path to the file that will contain the guest memory. Required
+    /// (non-empty) for `Full`/`Diff`. Accepted and ignored for
+    /// [`SnapshotType::Msync`] (the shared backing file, fixed at restore
+    /// time, is the memory image); may be empty or omitted in that case.
+    #[serde(default)]
     pub mem_file_path: PathBuf,
 }
 
@@ -169,6 +171,16 @@ pub struct Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_create_snapshot_params_mem_file_path_optional() {
+        let params: CreateSnapshotParams =
+            serde_json::from_str(r#"{"snapshot_type": "Msync", "snapshot_path": "/tmp/vmstate"}"#)
+                .unwrap();
+        assert_eq!(params.snapshot_type, SnapshotType::Msync);
+        assert_eq!(params.snapshot_path, PathBuf::from("/tmp/vmstate"));
+        assert_eq!(params.mem_file_path, PathBuf::new());
+    }
 
     #[test]
     fn test_snapshot_type_serde_round_trip() {
