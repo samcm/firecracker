@@ -29,6 +29,14 @@ pub enum DriveError {
     RootBlockDeviceAlreadyAdded,
 }
 
+/// Runtime state requested for the virtio-block queue gate.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockGateConfig {
+    /// Whether virtio-block queue processing is gated.
+    pub engaged: bool,
+}
+
 /// Use this structure to set up the Block Device before booting the kernel.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

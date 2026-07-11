@@ -264,6 +264,8 @@ pub struct VirtioBlock {
     pub disk: DiskProperties,
     pub rate_limiter: RateLimiter,
     pub is_io_engine_throttled: bool,
+    queue_gate_engaged: bool,
+    queue_gate_deferred: bool,
     pub metrics: Arc<BlockDeviceMetrics>,
 }
 
@@ -334,6 +336,8 @@ impl VirtioBlock {
             disk: disk_properties,
             rate_limiter,
             is_io_engine_throttled: false,
+            queue_gate_engaged: false,
+            queue_gate_deferred: false,
             metrics: BlockMetricsPerDevice::alloc(config.drive_id),
         })
     }
@@ -362,6 +366,8 @@ impl VirtioBlock {
         if let Err(err) = self.queue_evts[0].read() {
             error!("Failed to get queue event: {:?}", err);
             self.metrics.event_fails.inc();
+        } else if self.queue_gate_engaged {
+            self.queue_gate_deferred = true;
         } else if self.rate_limiter.is_blocked() {
             self.metrics.rate_limiter_throttled_events.inc();
         } else if self.is_io_engine_throttled {
@@ -373,7 +379,12 @@ impl VirtioBlock {
 
     /// Process device virtio queue(s).
     pub fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
-        self.process_queue(0)
+        if self.queue_gate_engaged {
+            self.queue_gate_deferred = true;
+            Ok(())
+        } else {
+            self.process_queue(0)
+        }
     }
 
     pub(crate) fn process_rate_limiter_event(&mut self) {
@@ -381,7 +392,24 @@ impl VirtioBlock {
         // Upon rate limiter event, call the rate limiter handler
         // and restart processing the queue.
         if self.rate_limiter.event_handler().is_ok() {
-            self.process_queue(0).unwrap()
+            self.process_queue_or_defer()
+        }
+    }
+
+    fn process_queue_or_defer(&mut self) {
+        self.process_virtio_queues().unwrap()
+    }
+
+    /// Enables or disables queue processing. Disabling the gate immediately
+    /// replays a queue kick that was consumed while the gate was engaged.
+    pub fn set_queue_gate(&mut self, engaged: bool) {
+        if self.queue_gate_engaged == engaged {
+            return;
+        }
+
+        self.queue_gate_engaged = engaged;
+        if !engaged && std::mem::take(&mut self.queue_gate_deferred) {
+            self.process_queue(0).unwrap();
         }
     }
 
@@ -528,7 +556,7 @@ impl VirtioBlock {
 
             if self.is_io_engine_throttled {
                 self.is_io_engine_throttled = false;
-                self.process_queue(0).unwrap()
+                self.process_queue_or_defer()
             }
         }
     }

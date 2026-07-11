@@ -125,6 +125,7 @@ mod tests {
     use crate::devices::virtio::block::virtio::{VIRTIO_BLK_S_OK, VIRTIO_BLK_T_OUT};
     use crate::devices::virtio::queue::VIRTQ_DESC_F_NEXT;
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
+    use crate::rate_limiter::BucketUpdate;
     use crate::vstate::memory::{Bytes, GuestAddress};
 
     #[test]
@@ -183,5 +184,52 @@ mod tests {
         assert_eq!(vq.used.ring[0].get().id, 0);
         assert_eq!(vq.used.ring[0].get().len, 1);
         assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+    }
+
+    #[test]
+    fn test_queue_gate_defers_and_replays_kick_once() {
+        let mut block = default_block(FileEngineType::Sync);
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        read_blk_req_descriptors(&vq);
+        block
+            .activate(mem.clone(), default_interrupt())
+            .expect("device activation failed");
+
+        let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
+        let data_addr = GuestAddress(vq.dtable[1].addr.get());
+        let status_addr = GuestAddress(vq.dtable[2].addr.get());
+        mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, request_type_addr)
+            .unwrap();
+        vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
+        vq.dtable[1].len.set(512);
+        mem.write_obj::<u64>(123_456_789, data_addr).unwrap();
+
+        // Double engage is idempotent. The queue event is consumed, but the
+        // available descriptor remains untouched while the gate is engaged.
+        // Rate-limiter updates still apply immediately.
+        block.set_queue_gate(true);
+        block.set_queue_gate(true);
+        block.update_rate_limiter(BucketUpdate::Disabled, BucketUpdate::Disabled);
+        assert!(block.rate_limiter.bandwidth().is_none());
+        assert!(block.rate_limiter.ops().is_none());
+        block.queue_evts[0].write(1).unwrap();
+        block.process_queue_event();
+        assert_eq!(block.queues[0].len(), 1);
+        assert_eq!(vq.used.idx.get(), 0);
+        assert_eq!(
+            block.queue_evts[0].read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        // The first disengage replays the deferred kick. A second disengage
+        // does not process the queue again.
+        block.set_queue_gate(false);
+        assert_eq!(block.queues[0].len(), 0);
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+        block.set_queue_gate(false);
+        assert_eq!(vq.used.idx.get(), 1);
     }
 }

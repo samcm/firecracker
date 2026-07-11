@@ -29,7 +29,9 @@ use crate::vmm_config::balloon::{
     BalloonUpdateStatsConfig,
 };
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
-use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
+use crate::vmm_config::drive::{
+    BlockDeviceConfig, BlockDeviceUpdateConfig, BlockGateConfig, DriveError,
+};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
@@ -65,6 +67,8 @@ pub enum VmmAction {
     /// Create a snapshot using as input the `CreateSnapshotParams`. This action can only be called
     /// after the microVM has booted and only when the microVM is in `Paused` state.
     CreateSnapshot(CreateSnapshotParams),
+    /// Enable or disable queue processing for every virtio-block device.
+    SetBlockGate(BlockGateConfig),
     /// Get the balloon device configuration.
     GetBalloonConfig,
     /// Get the ballon device latest statistics.
@@ -501,6 +505,7 @@ impl<'a> PrebootApiController<'a> {
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
+            | SetBlockGate(_)
             | FlushMetrics
             | Pause
             | Resume
@@ -690,6 +695,7 @@ impl<'a> PrebootApiController<'a> {
 #[derive(Debug)]
 pub struct RuntimeApiController {
     vmm: Arc<Mutex<Vmm>>,
+    block_gate_engaged_at_us: Option<u64>,
 }
 
 impl RuntimeApiController {
@@ -703,6 +709,7 @@ impl RuntimeApiController {
         match request {
             // Supported operations allowed post-boot.
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
+            SetBlockGate(config) => self.set_block_gate(config.engaged),
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
                 .vmm
@@ -761,12 +768,7 @@ impl RuntimeApiController {
                     .expect("Poisoned lock"),
                 value,
             ),
-            InsertBlockDevice(config) => self
-                .vmm
-                .lock()
-                .expect("Poisoned lock")
-                .hotplug_device(HotplugDeviceConfig::Block(config), event_manager)
-                .map(|()| VmmData::Empty),
+            InsertBlockDevice(config) => self.hotplug_block_device(config, event_manager),
             InsertPmemDevice(config) => self
                 .vmm
                 .lock()
@@ -863,7 +865,55 @@ impl RuntimeApiController {
 
     /// Creates a new `RuntimeApiController`.
     pub fn new(vmm: Arc<Mutex<Vmm>>) -> Self {
-        Self { vmm }
+        Self {
+            vmm,
+            block_gate_engaged_at_us: None,
+        }
+    }
+
+    fn set_block_gate(&mut self, engaged: bool) -> Result<VmmData, VmmActionError> {
+        if engaged == self.block_gate_engaged_at_us.is_some() {
+            info!("'block gate' VMM action was idempotent (engaged={engaged}).");
+            return Ok(VmmData::Empty);
+        }
+
+        let now_us = get_time_us(ClockType::Monotonic);
+        self.vmm
+            .lock()
+            .expect("Poisoned lock")
+            .set_block_gate(engaged)?;
+
+        if engaged {
+            self.block_gate_engaged_at_us = Some(now_us);
+            info!("'block gate engage' VMM action completed.");
+        } else if let Some(engaged_at_us) = self.block_gate_engaged_at_us.take() {
+            info!(
+                "'block gate disengage' VMM action completed after {} us.",
+                now_us.saturating_sub(engaged_at_us)
+            );
+        }
+
+        Ok(VmmData::Empty)
+    }
+
+    fn hotplug_block_device(
+        &mut self,
+        config: BlockDeviceConfig,
+        event_manager: &mut EventManager,
+    ) -> Result<VmmData, VmmActionError> {
+        let gate_engaged = self.block_gate_engaged_at_us.is_some();
+        if gate_engaged && config.socket.is_some() {
+            return Err(VmmError::BlockGateVhostUser.into());
+        }
+
+        let mut vmm = self.vmm.lock().expect("Poisoned lock");
+        vmm.hotplug_device(HotplugDeviceConfig::Block(config), event_manager)?;
+        if gate_engaged {
+            // The event loop is single-threaded, so the newly attached device
+            // cannot process a queue event before inheriting the active gate.
+            vmm.set_block_gate(true)?;
+        }
+        Ok(VmmData::Empty)
     }
 
     /// Pauses the microVM by pausing the vCPUs.

@@ -127,6 +127,35 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /block-gate:
+    put:
+      summary: Enables or disables virtio-block queue processing. Post-boot only.
+      description:
+        When engaged, queue notifications for every virtio-block device are consumed and
+        remembered without removing requests from the available ring. Completed asynchronous
+        I/O is still returned to the guest. Disengaging immediately processes deferred queues.
+        The gate is transient and is not included in snapshots. Engaging is rejected when a
+        vhost-user-block device is present.
+      operationId: setBlockGate
+      parameters:
+        - name: body
+          in: body
+          description: Requested block queue gate state.
+          required: true
+          schema:
+            $ref: "#/definitions/BlockGate"
+      responses:
+        204:
+          description: Block queue gate state updated
+        400:
+          description: Block queue gate state cannot be updated due to bad input or device support
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /balloon/statistics:
     get:
       summary: Returns the latest balloon device statistics, only if enabled pre-boot.
@@ -899,6 +928,15 @@ paths:
             $ref: "#/definitions/Error"
 
 definitions:
+  BlockGate:
+    type: object
+    required:
+      - engaged
+    properties:
+      engaged:
+        type: boolean
+        description: Whether virtio-block queue processing is gated.
+
   Balloon:
     type: object
     required:

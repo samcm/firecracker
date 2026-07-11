@@ -87,6 +87,13 @@ impl Block {
         }
     }
 
+    /// Enables or disables queue processing for a native virtio-block backend.
+    pub fn set_queue_gate(&mut self, engaged: bool) {
+        if let Self::Virtio(block) = self {
+            block.set_queue_gate(engaged);
+        }
+    }
+
     pub fn root_device(&self) -> bool {
         match self {
             Self::Virtio(b) => b.root_device,

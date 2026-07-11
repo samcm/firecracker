@@ -266,6 +266,8 @@ pub enum VmmError {
     FindDeviceError(#[from] device_manager::FindDeviceError),
     /// Block: {0}
     Block(#[from] BlockError),
+    /// Virtio-block queue gating is not supported with vhost-user-block devices.
+    BlockGateVhostUser,
     /// Balloon: {0}
     Balloon(#[from] BalloonError),
     /// Failed to create memory hotplug device: {0}
@@ -569,6 +571,32 @@ impl Vmm {
             .with_virtio_device(drive_id, |block: &mut Block| {
                 block.update_rate_limiter(rl_bytes, rl_ops)
             })??;
+        Ok(())
+    }
+
+    /// Enables or disables queue processing on all virtio-block devices.
+    pub fn set_block_gate(&mut self, engaged: bool) -> Result<(), VmmError> {
+        let mut block_ids = Vec::new();
+        let mut has_vhost_user = false;
+        self.device_manager
+            .for_each_virtio_device(|device_type, device| {
+                if device_type == VirtioDeviceType::Block
+                    && let Some(block) = device.as_any().downcast_ref::<Block>()
+                {
+                    has_vhost_user |= block.is_vhost_user();
+                    block_ids.push(block.id().to_owned());
+                }
+            });
+
+        // Check every device before changing any of them so engage is atomic.
+        if engaged && has_vhost_user {
+            return Err(VmmError::BlockGateVhostUser);
+        }
+
+        for block_id in block_ids {
+            self.device_manager
+                .with_virtio_device(&block_id, |block: &mut Block| block.set_queue_gate(engaged))?;
+        }
         Ok(())
     }
 

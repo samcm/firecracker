@@ -133,6 +133,8 @@ impl Persist<'_> for VirtioBlock {
             disk: disk_properties,
             rate_limiter,
             is_io_engine_throttled: false,
+            queue_gate_engaged: false,
+            queue_gate_deferred: false,
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
         })
     }
