@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -165,9 +165,9 @@ pub enum CreateSnapshotError {
 
 /// Snapshot version.
 ///
-/// Msync does **not** change the vmstate on-disk format: it
-/// serializes the same `MicrovmState` as Full/Diff and only skips writing
-/// a separate memory file. No version bump is required.
+/// Msync and VmstateOnly do **not** change the vmstate on-disk format: they
+/// serialize the same `MicrovmState` as Full/Diff and only skip writing a
+/// separate memory file. No version bump is required.
 pub const SNAPSHOT_VERSION: Version = Version::new(10, 0, 0);
 
 /// Creates a Microvm snapshot.
@@ -189,6 +189,17 @@ pub fn create_snapshot(
             })?;
             if !kvm_vm.guest_memory().is_shared_file_backed() {
                 return Err(CreateSnapshotError::NotSharedFileMemory);
+            }
+        }
+        SnapshotType::VmstateOnly => {
+            if !params.mem_file_path.as_os_str().is_empty() {
+                return Err(CreateSnapshotError::MemoryBackingFile(
+                    "validate",
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "mem_file_path must be omitted for VmstateOnly snapshots",
+                    ),
+                ));
             }
         }
         SnapshotType::Full | SnapshotType::Diff => {
@@ -225,6 +236,7 @@ pub fn create_snapshot(
             // captures them.
             kvm_vm.msync_shared_guest_memory()?;
         }
+        SnapshotType::VmstateOnly => {}
         SnapshotType::Full | SnapshotType::Diff => {
             kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
@@ -515,6 +527,7 @@ pub fn restore_from_snapshot(
             mem_state,
             track_dirty_pages,
             vm_resources.machine_config.huge_pages,
+            params.mem_backend.write_protect.unwrap_or(false),
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
@@ -601,6 +614,7 @@ fn guest_memory_from_uffd(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    write_protect: bool,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
     let (guest_memory, backend_mappings) =
         create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
@@ -611,7 +625,7 @@ fn guest_memory_from_uffd(
     // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
     // actively change the behavior of UFFD, only passively. Without balloon devices
     // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+    uffd_builder.require_features(uffd_required_features(write_protect));
 
     let uffd = uffd_builder
         .close_on_exec(true)
@@ -620,14 +634,37 @@ fn guest_memory_from_uffd(
         .create()
         .map_err(GuestMemoryFromUffdError::Create)?;
 
+    let register_mode = uffd_register_mode(write_protect);
     for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+        uffd.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size() as _,
+            register_mode,
+        )
+        .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
 
     Ok((guest_memory, Some(uffd)))
+}
+
+fn uffd_required_features(write_protect: bool) -> FeatureFlags {
+    FeatureFlags::EVENT_REMOVE
+        | if write_protect {
+            FeatureFlags::PAGEFAULT_FLAG_WP
+        } else {
+            FeatureFlags::empty()
+        }
+}
+
+fn uffd_register_mode(write_protect: bool) -> RegisterMode {
+    RegisterMode::MISSING
+        | if write_protect {
+            RegisterMode::WRITE_PROTECT
+        } else {
+            RegisterMode::empty()
+        }
 }
 
 fn create_guest_memory(
@@ -846,6 +883,21 @@ mod tests {
         assert_eq!(uffd_regions[0].size, 0x20000);
         assert_eq!(uffd_regions[0].offset, 0);
         assert_eq!(uffd_regions[0].page_size, HugePageConfig::None.page_size());
+    }
+
+    #[test]
+    fn test_uffd_write_protect_configuration() {
+        assert_eq!(uffd_required_features(false), FeatureFlags::EVENT_REMOVE);
+        assert_eq!(uffd_register_mode(false), RegisterMode::MISSING);
+
+        assert_eq!(
+            uffd_required_features(true),
+            FeatureFlags::EVENT_REMOVE | FeatureFlags::PAGEFAULT_FLAG_WP
+        );
+        assert_eq!(
+            uffd_register_mode(true),
+            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT
+        );
     }
 
     #[test]

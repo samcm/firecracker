@@ -23,6 +23,10 @@ pub enum SnapshotType {
     /// `msync` of the live mapping to its backing file. Rejected for any
     /// other guest memory configuration. The vmstate format is unchanged.
     Msync,
+    /// Snapshot containing only microVM state. Guest memory is persisted
+    /// externally and is not written or synchronized by Firecracker. Valid
+    /// for any guest memory backing.
+    VmstateOnly,
 }
 
 /// Specifies the method through which guest memory will get populated when
@@ -51,7 +55,8 @@ pub struct CreateSnapshotParams {
     /// Path to the file that will contain the guest memory. Required
     /// (non-empty) for `Full`/`Diff`. Accepted and ignored for
     /// [`SnapshotType::Msync`] (the shared backing file, fixed at restore
-    /// time, is the memory image); may be empty or omitted in that case.
+    /// time, is the memory image); may be empty or omitted in that case. Must
+    /// be omitted for [`SnapshotType::VmstateOnly`].
     #[serde(default)]
     pub mem_file_path: PathBuf,
 }
@@ -149,6 +154,14 @@ pub struct MemBackendConfig {
     /// `Uffd` backend.
     #[serde(default)]
     pub shared: bool,
+    /// If `true` and `backend_type == Uffd`, register guest memory for
+    /// write-protection faults in addition to missing-page faults.
+    ///
+    /// Defaults to `None` (unchanged behavior). For backends other than
+    /// `Uffd`, `None` and `Some(false)` are ignored while `Some(true)` is
+    /// rejected during request validation.
+    #[serde(default)]
+    pub write_protect: Option<bool>,
 }
 
 /// The microVM state options.
@@ -174,12 +187,18 @@ mod tests {
 
     #[test]
     fn test_create_snapshot_params_mem_file_path_optional() {
-        let params: CreateSnapshotParams =
-            serde_json::from_str(r#"{"snapshot_type": "Msync", "snapshot_path": "/tmp/vmstate"}"#)
-                .unwrap();
-        assert_eq!(params.snapshot_type, SnapshotType::Msync);
-        assert_eq!(params.snapshot_path, PathBuf::from("/tmp/vmstate"));
-        assert_eq!(params.mem_file_path, PathBuf::new());
+        for (snapshot_type, expected_type) in [
+            ("Msync", SnapshotType::Msync),
+            ("VmstateOnly", SnapshotType::VmstateOnly),
+        ] {
+            let params: CreateSnapshotParams = serde_json::from_str(&format!(
+                r#"{{"snapshot_type":"{snapshot_type}","snapshot_path":"/tmp/vmstate"}}"#
+            ))
+            .unwrap();
+            assert_eq!(params.snapshot_type, expected_type);
+            assert_eq!(params.snapshot_path, PathBuf::from("/tmp/vmstate"));
+            assert_eq!(params.mem_file_path, PathBuf::new());
+        }
     }
 
     #[test]
@@ -188,6 +207,7 @@ mod tests {
             (SnapshotType::Full, r#""Full""#),
             (SnapshotType::Diff, r#""Diff""#),
             (SnapshotType::Msync, r#""Msync""#),
+            (SnapshotType::VmstateOnly, r#""VmstateOnly""#),
         ] {
             assert_eq!(serde_json::to_string(&snapshot_type).unwrap(), json);
             assert_eq!(
@@ -195,5 +215,19 @@ mod tests {
                 snapshot_type
             );
         }
+    }
+
+    #[test]
+    fn test_mem_backend_write_protect_serde() {
+        let backend: MemBackendConfig = serde_json::from_str(
+            r#"{"backend_path":"/tmp/uffd.sock","backend_type":"Uffd","write_protect":true}"#,
+        )
+        .unwrap();
+        assert_eq!(backend.write_protect, Some(true));
+
+        let backend: MemBackendConfig =
+            serde_json::from_str(r#"{"backend_path":"/tmp/uffd.sock","backend_type":"Uffd"}"#)
+                .unwrap();
+        assert_eq!(backend.write_protect, None);
     }
 }

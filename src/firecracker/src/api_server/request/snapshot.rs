@@ -6,7 +6,7 @@ use vmm::logger::{IncMetric, METRICS};
 use vmm::rpc_interface::VmmAction;
 use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotConfig, LoadSnapshotParams, MemBackendConfig, MemBackendType,
-    Vm, VmState,
+    SnapshotType, Vm, VmState,
 };
 
 use super::super::parsed_request::{ParsedRequest, RequestError};
@@ -22,6 +22,12 @@ pub const MISSING_FIELD: &str =
 /// Only specifying one of them is allowed.
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
+/// Write protection is only supported by the UFFD memory backend.
+pub const WRITE_PROTECT_REQUIRES_UFFD: &str =
+    "invalid memory backend configuration: `write_protect` is only supported for `Uffd`";
+/// Vmstate-only snapshots never use a memory file.
+pub const VMSTATE_ONLY_WITH_MEMORY_FILE: &str =
+    "invalid snapshot configuration: `mem_file_path` must be omitted for `VmstateOnly`";
 
 pub(crate) fn parse_put_snapshot(
     body: &Body,
@@ -54,6 +60,14 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
+    if snapshot_config.snapshot_type == SnapshotType::VmstateOnly {
+        let snapshot_config_value = serde_json::from_slice::<serde_json::Value>(body.raw())?;
+        if snapshot_config_value.get("mem_file_path").is_some() {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                VMSTATE_ONLY_WITH_MEMORY_FILE,
+            )));
+        }
+    }
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
@@ -99,9 +113,16 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 backend_path: snapshot_config.mem_file_path.unwrap(),
                 backend_type: MemBackendType::File,
                 shared: false,
+                write_protect: None,
             }
         }
     };
+
+    if mem_backend.backend_type == MemBackendType::File && mem_backend.write_protect == Some(true) {
+        return Err(RequestError::SerdeJson(serde_json::Error::custom(
+            WRITE_PROTECT_REQUIRES_UFFD,
+        )));
+    }
 
     let snapshot_params = LoadSnapshotParams {
         snapshot_path: snapshot_config.snapshot_path,
@@ -183,6 +204,33 @@ mod tests {
             VmmAction::CreateSnapshot(expected_config)
         );
 
+        let body = r#"{
+            "snapshot_type": "VmstateOnly",
+            "snapshot_path": "foo"
+        }"#;
+        let expected_config = CreateSnapshotParams {
+            snapshot_type: SnapshotType::VmstateOnly,
+            snapshot_path: PathBuf::from("foo"),
+            mem_file_path: PathBuf::new(),
+        };
+        assert_eq!(
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+            VmmAction::CreateSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_type": "VmstateOnly",
+            "snapshot_path": "foo",
+            "mem_file_path": ""
+        }"#;
+        assert_eq!(
+            parse_put_snapshot(&Body::new(body), Some("create"))
+                .unwrap_err()
+                .to_string(),
+            RequestError::SerdeJson(serde_json::Error::custom(VMSTATE_ONLY_WITH_MEMORY_FILE))
+                .to_string()
+        );
+
         let invalid_body = r#"{
             "invalid_field": "foo",
             "mem_file_path": "bar"
@@ -202,6 +250,7 @@ mod tests {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 shared: false,
+                write_protect: None,
             },
             track_dirty_pages: false,
             resume_vm: false,
@@ -235,6 +284,7 @@ mod tests {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 shared: false,
+                write_protect: None,
             },
             track_dirty_pages: true,
             resume_vm: false,
@@ -258,7 +308,8 @@ mod tests {
             "snapshot_path": "foo",
             "mem_backend": {
                 "backend_path": "bar",
-                "backend_type": "Uffd"
+                "backend_type": "Uffd",
+                "write_protect": true
             },
             "resume_vm": true
         }"#;
@@ -268,6 +319,7 @@ mod tests {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
                 shared: false,
+                write_protect: Some(true),
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -307,6 +359,7 @@ mod tests {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
                 shared: false,
+                write_protect: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -340,6 +393,7 @@ mod tests {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 shared: false,
+                write_protect: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -351,6 +405,22 @@ mod tests {
         assert_eq!(
             depr_action_from_req(parsed_request, Some(LOAD_DEPRECATION_MESSAGE.to_string())),
             VmmAction::LoadSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "File",
+                "write_protect": true
+            }
+        }"#;
+        assert_eq!(
+            parse_put_snapshot(&Body::new(body), Some("load"))
+                .unwrap_err()
+                .to_string(),
+            RequestError::SerdeJson(serde_json::Error::custom(WRITE_PROTECT_REQUIRES_UFFD))
+                .to_string()
         );
 
         let body = r#"{

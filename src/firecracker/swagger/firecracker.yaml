@@ -1624,16 +1624,15 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
         description: >
           Path to the file that will contain the guest memory.
-          Ignored when snapshot_type is Msync (that mode does not
-          write a memory file; the shared guest-memory backing file is the
-          memory image).
+          Required for Full and Diff. Ignored when snapshot_type is Msync
+          (that mode does not write a memory file; the shared guest-memory
+          backing file is the memory image). Must be omitted for VmstateOnly.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
@@ -1643,6 +1642,7 @@ definitions:
           - Full
           - Diff
           - Msync
+          - VmstateOnly
         description: >
           Type of snapshot to create. It is optional and by default, a full
           snapshot is created.
@@ -1655,6 +1655,10 @@ definitions:
           MAP_PRIVATE and anonymous (default cold boot / UFFD) guest
           memory. The vmstate format is unchanged; restore uses the usual
           File/Uffd mem_backend against the external memory file.
+
+          VmstateOnly serializes only the microVM state file and performs no
+          guest-memory write or synchronization. It is valid for any guest
+          memory backing; guest memory must be persisted externally.
 
   NetworkOverride:
     type: object

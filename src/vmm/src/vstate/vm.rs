@@ -569,8 +569,9 @@ impl KvmVm {
     /// file of matching size, then the diff snapshot will be directly merged into the existing
     /// snapshot. Otherwise, existing files are simply overwritten.
     ///
-    /// [`SnapshotType::Msync`] is not handled here — callers must use
-    /// [`Self::msync_shared_guest_memory`] instead (no memory file is written).
+    /// [`SnapshotType::Msync`] and [`SnapshotType::VmstateOnly`] are not handled
+    /// here. Msync callers must use [`Self::msync_shared_guest_memory`] instead;
+    /// VmstateOnly callers do not perform any guest-memory operation.
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
@@ -625,10 +626,10 @@ impl KvmVm {
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
-            SnapshotType::Msync => {
-                // Handled exclusively by `msync_shared_guest_memory` (no mem file).
+            SnapshotType::Msync | SnapshotType::VmstateOnly => {
+                // These snapshot types do not write a memory file.
                 unreachable!(
-                    "Msync snapshots must use msync_shared_guest_memory, not \
+                    "Msync and VmstateOnly snapshots must not use \
                      snapshot_memory_to_file"
                 );
             }

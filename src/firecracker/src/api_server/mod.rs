@@ -163,6 +163,7 @@ impl ApiServer {
                     &METRICS.latencies_us.msync_create_snapshot,
                     "create msync snapshot",
                 )),
+                SnapshotType::VmstateOnly => None,
             },
             VmmAction::LoadSnapshot(_) => {
                 Some((&METRICS.latencies_us.load_snapshot, "load snapshot"))

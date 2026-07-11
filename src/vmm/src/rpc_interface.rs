@@ -962,6 +962,9 @@ impl RuntimeApiController {
                     elapsed_time_us
                 );
             }
+            SnapshotType::VmstateOnly => {
+                info!("'create vmstate-only snapshot' VMM action completed.");
+            }
         }
         Ok(VmmData::Empty)
     }
@@ -1336,6 +1339,7 @@ mod tests {
                     backend_type: MemBackendType::File,
                     backend_path: PathBuf::new(),
                     shared: false,
+                    write_protect: None,
                 },
                 track_dirty_pages: false,
                 resume_vm: false,

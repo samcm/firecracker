@@ -3,6 +3,7 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::tests_outside_test_module)]
 
+use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -30,6 +31,7 @@ use vmm::vmm_config::snapshot::{
 };
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
+use vmm_sys_util::tempdir::TempDir;
 use vmm_sys_util::tempfile::TempFile;
 
 #[allow(unused_mut, unused_variables)]
@@ -312,6 +314,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
                 shared: false,
+                write_protect: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -345,6 +348,52 @@ fn test_create_and_load_snapshot() {
     }
 }
 
+/// VmstateOnly succeeds with the anonymous memory used by a cold-boot VM and
+/// creates exactly one output file: the vmstate snapshot. The equivalent
+/// Msync configuration is rejected by `test_msync_rejects_anonymous_cold_boot`.
+#[test]
+fn test_vmstate_only_snapshot_on_anonymous_memory() {
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+    let vm_info = VmInfo::from(&*vmm.lock().unwrap());
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+
+    thread::sleep(Duration::from_millis(200));
+
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    let output_dir = TempDir::new().unwrap();
+    let snapshot_path = output_dir.as_path().join("vmstate");
+    assert_eq!(std::fs::read_dir(output_dir.as_path()).unwrap().count(), 0);
+
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::VmstateOnly,
+                snapshot_path: snapshot_path.clone(),
+                mem_file_path: std::path::PathBuf::new(),
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    assert_eq!(
+        std::fs::read_dir(output_dir.as_path()).unwrap().count(),
+        1,
+        "VmstateOnly must not create a memory file"
+    );
+    let restored_microvm_state: MicrovmState =
+        Snapshot::load(&mut File::open(snapshot_path).unwrap())
+            .unwrap()
+            .data;
+    assert_eq!(restored_microvm_state.vm_info, vm_info);
+    assert_eq!(restored_microvm_state.vcpu_states.len(), 1);
+}
+
 /// Msync success path: restore with File + shared=true (path-backed
 /// MAP_SHARED), then create a vmstate-only snapshot. `mem_file_path` must be
 /// left untouched; the restore memory file is the durable image after msync.
@@ -376,6 +425,7 @@ fn test_msync_snapshot_skips_memory_file() {
                 backend_path: base_memory.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
                 shared: true,
+                write_protect: None,
             },
             track_dirty_pages: false,
             resume_vm: false,
@@ -508,6 +558,7 @@ fn test_msync_rejects_private_file_backend() {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
                 shared: false,
+                write_protect: None,
             },
             track_dirty_pages: false,
             resume_vm: false,
@@ -655,6 +706,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
             backend_path: memory_file.as_path().to_path_buf(),
             backend_type: MemBackendType::File,
             shared: false,
+            write_protect: None,
         },
         track_dirty_pages: false,
         resume_vm: false,
