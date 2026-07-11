@@ -264,8 +264,8 @@ pub struct VirtioBlock {
     pub disk: DiskProperties,
     pub rate_limiter: RateLimiter,
     pub is_io_engine_throttled: bool,
-    queue_gate_engaged: bool,
-    queue_gate_deferred: bool,
+    pub(crate) queue_gate_engaged: bool,
+    pub(crate) queue_gate_deferred: bool,
     pub metrics: Arc<BlockDeviceMetrics>,
 }
 
