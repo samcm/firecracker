@@ -107,6 +107,18 @@ impl Persist<'_> for VirtioBlock {
             )
             .map_err(VirtioBlockError::Persist)?;
 
+        // The queue eventfd counter is not part of the snapshot, so a kick
+        // that was pending at snapshot time (e.g. a deferred gate replay that
+        // was re-armed but not yet run by the event loop) would otherwise be
+        // lost. Re-arm the eventfd when the avail ring still holds unconsumed
+        // descriptors so the restored VM processes them without relying on
+        // the guest driver to kick again. Queue ring pointers are only
+        // initialized for activated devices, so the check must not run
+        // otherwise.
+        if state.virtio_state.activated && !queues[0].is_empty() {
+            queue_evts[0].write(1).map_err(VirtioBlockError::EventFd)?;
+        }
+
         let avail_features = state.virtio_state.avail_features;
         let acked_features = state.virtio_state.acked_features;
 
@@ -146,8 +158,12 @@ mod tests {
 
     use super::*;
     use crate::devices::virtio::block::virtio::device::VirtioBlockConfig;
+    use crate::devices::virtio::block::virtio::test_utils::{
+        default_block_with_path, read_blk_req_descriptors, set_queue,
+    };
     use crate::devices::virtio::device::VirtioDevice;
-    use crate::devices::virtio::test_utils::{default_interrupt, default_mem};
+    use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
+    use crate::vstate::memory::GuestAddress;
 
     #[test]
     fn test_cache_semantic_ser() {
@@ -229,5 +245,46 @@ mod tests {
 
         // Test that block specific fields are the same.
         assert_eq!(restored_block.disk.file_path, block.disk.file_path);
+    }
+
+    #[test]
+    fn test_restore_rearms_queue_kick_when_avail_ring_pending() {
+        // We create the backing file here so that it exists for the whole lifetime of the test.
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+
+        let mut block = default_block_with_path(
+            f.as_path().to_str().unwrap().to_string(),
+            FileEngineType::Sync,
+        );
+        let mem = default_mem();
+        // Restore validates queue max_size against FIRECRACKER_MAX_QUEUE_SIZE,
+        // so the ring must be full-sized. Place it at 0x4000, past the request
+        // buffers that read_blk_req_descriptors points at 0x1000-0x3fff.
+        let vq = VirtQueue::new(GuestAddress(0x4000), &mem, FIRECRACKER_MAX_QUEUE_SIZE);
+        set_queue(&mut block, 0, vq.create_queue());
+        read_blk_req_descriptors(&vq);
+        block
+            .activate(mem.clone(), default_interrupt())
+            .expect("device activation failed");
+
+        // Kick while gated, then disengage: the owed replay lives only in the
+        // queue eventfd counter, which a snapshot does not capture.
+        block.set_queue_gate(true);
+        block.queue_evts[0].write(1).unwrap();
+        block.process_queue_event();
+        block.set_queue_gate(false);
+        assert_eq!(block.queues[0].len(), 1);
+
+        let block_state = block.save();
+        let serialized_data = bitcode::serialize(&block_state).unwrap();
+        let restored_state = bitcode::deserialize(&serialized_data).unwrap();
+        let restored_block =
+            VirtioBlock::restore(BlockConstructorArgs { mem: mem.clone() }, &restored_state)
+                .unwrap();
+
+        // Restore must re-arm the fresh eventfd so the pending descriptor is
+        // processed without the guest driver kicking again.
+        assert_eq!(restored_block.queue_evts[0].read().unwrap(), 1);
     }
 }

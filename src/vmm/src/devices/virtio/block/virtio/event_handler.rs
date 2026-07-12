@@ -295,6 +295,62 @@ mod tests {
     }
 
     #[test]
+    fn test_queue_gate_reengage_before_replay_turn_redefers_then_replays_once() {
+        let mut event_manager = EventManager::new().unwrap();
+        let mut block = default_block(FileEngineType::Sync);
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        read_blk_req_descriptors(&vq);
+        block
+            .activate(mem.clone(), default_interrupt())
+            .expect("device activation failed");
+        let status_addr = write_request_descriptors(&mem, &vq);
+
+        let block = Arc::new(Mutex::new(block));
+        let _id = event_manager.add_subscriber(block.clone());
+
+        // Kick while gated: the event loop consumes the kick and defers it.
+        block.lock().unwrap().set_queue_gate(true);
+        block.lock().unwrap().queue_evts[0].write(1).unwrap();
+        let ev_count = event_manager.run_with_timeout(100).unwrap();
+        assert_eq!(ev_count, 1);
+
+        // Disengage re-arms the eventfd, then re-engage before the event
+        // loop gets a turn. The replay kick is consumed under the
+        // re-engaged gate and must be deferred again, not dropped.
+        {
+            let mut b = block.lock().unwrap();
+            b.set_queue_gate(false);
+            b.set_queue_gate(true);
+        }
+        let ev_count = event_manager.run_with_timeout(100).unwrap();
+        assert_eq!(ev_count, 1);
+        {
+            let b = block.lock().unwrap();
+            assert_eq!(b.queues[0].len(), 1);
+            assert_eq!(vq.used.idx.get(), 0);
+            assert_eq!(
+                b.queue_evts[0].read().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+
+        // The final disengage replays the surviving deferred kick.
+        block.lock().unwrap().set_queue_gate(false);
+        let ev_count = event_manager.run_with_timeout(100).unwrap();
+        assert_eq!(ev_count, 1);
+        assert_eq!(block.lock().unwrap().queues[0].len(), 0);
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+
+        // Replay happens exactly once: nothing further is pending.
+        let ev_count = event_manager.run_with_timeout(50).unwrap();
+        assert_eq!(ev_count, 0);
+        assert_eq!(vq.used.idx.get(), 1);
+    }
+
+    #[test]
     fn test_queue_gate_multiple_kicks_while_gated_replay_exactly_once() {
         let mut event_manager = EventManager::new().unwrap();
         let mut block = default_block(FileEngineType::Sync);
