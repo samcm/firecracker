@@ -186,17 +186,10 @@ mod tests {
         assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
     }
 
-    #[test]
-    fn test_queue_gate_defers_and_replays_kick_once() {
-        let mut block = default_block(FileEngineType::Sync);
-        let mem = default_mem();
-        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
-        set_queue(&mut block, 0, vq.create_queue());
-        read_blk_req_descriptors(&vq);
-        block
-            .activate(mem.clone(), default_interrupt())
-            .expect("device activation failed");
-
+    fn write_request_descriptors(
+        mem: &crate::vstate::memory::GuestMemoryMmap,
+        vq: &VirtQueue,
+    ) -> GuestAddress {
         let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
         let data_addr = GuestAddress(vq.dtable[1].addr.get());
         let status_addr = GuestAddress(vq.dtable[2].addr.get());
@@ -205,31 +198,133 @@ mod tests {
         vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
         vq.dtable[1].len.set(512);
         mem.write_obj::<u64>(123_456_789, data_addr).unwrap();
+        status_addr
+    }
+
+    #[test]
+    fn test_queue_gate_defers_and_replays_kick_once() {
+        let mut event_manager = EventManager::new().unwrap();
+        let mut block = default_block(FileEngineType::Sync);
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        read_blk_req_descriptors(&vq);
+        block
+            .activate(mem.clone(), default_interrupt())
+            .expect("device activation failed");
+        let status_addr = write_request_descriptors(&mem, &vq);
+
+        let block = Arc::new(Mutex::new(block));
+        let _id = event_manager.add_subscriber(block.clone());
 
         // Double engage is idempotent. The queue event is consumed, but the
         // available descriptor remains untouched while the gate is engaged.
         // Rate-limiter updates still apply immediately.
+        {
+            let mut b = block.lock().unwrap();
+            b.set_queue_gate(true);
+            b.set_queue_gate(true);
+            b.update_rate_limiter(BucketUpdate::Disabled, BucketUpdate::Disabled);
+            assert!(b.rate_limiter.bandwidth().is_none());
+            assert!(b.rate_limiter.ops().is_none());
+            b.queue_evts[0].write(1).unwrap();
+        }
+        let ev_count = event_manager.run_with_timeout(100).unwrap();
+        assert_eq!(ev_count, 1);
+        {
+            let b = block.lock().unwrap();
+            assert_eq!(b.queues[0].len(), 1);
+            assert_eq!(vq.used.idx.get(), 0);
+            assert_eq!(
+                b.queue_evts[0].read().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+
+        // Disengage re-arms the queue eventfd instead of replaying inline;
+        // the next event-loop turn performs the replay.
+        block.lock().unwrap().set_queue_gate(false);
+        assert_eq!(vq.used.idx.get(), 0);
+        let ev_count = event_manager.run_with_timeout(100).unwrap();
+        assert_eq!(ev_count, 1);
+        assert_eq!(block.lock().unwrap().queues[0].len(), 0);
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+
+        // A gate cycle without a deferred kick does not re-arm the eventfd.
+        {
+            let mut b = block.lock().unwrap();
+            b.set_queue_gate(true);
+            b.set_queue_gate(false);
+        }
+        let ev_count = event_manager.run_with_timeout(50).unwrap();
+        assert_eq!(ev_count, 0);
+        assert_eq!(vq.used.idx.get(), 1);
+    }
+
+    #[test]
+    fn test_queue_gate_disengage_rearms_kick_without_touching_guest_memory() {
+        let mut block = default_block(FileEngineType::Sync);
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        read_blk_req_descriptors(&vq);
+        block
+            .activate(mem.clone(), default_interrupt())
+            .expect("device activation failed");
+        let status_addr = write_request_descriptors(&mem, &vq);
+
         block.set_queue_gate(true);
-        block.set_queue_gate(true);
-        block.update_rate_limiter(BucketUpdate::Disabled, BucketUpdate::Disabled);
-        assert!(block.rate_limiter.bandwidth().is_none());
-        assert!(block.rate_limiter.ops().is_none());
         block.queue_evts[0].write(1).unwrap();
         block.process_queue_event();
         assert_eq!(block.queues[0].len(), 1);
-        assert_eq!(vq.used.idx.get(), 0);
-        assert_eq!(
-            block.queue_evts[0].read().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
 
-        // The first disengage replays the deferred kick. A second disengage
-        // does not process the queue again.
+        // Disengage must return with guest memory untouched: no used-ring
+        // write, no status write, and the deferred kick pending on the
+        // queue eventfd for the event loop to pick up.
         block.set_queue_gate(false);
-        assert_eq!(block.queues[0].len(), 0);
+        assert_eq!(block.queues[0].len(), 1);
+        assert_eq!(vq.used.idx.get(), 0);
+        assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), 0);
+        assert_eq!(block.queue_evts[0].read().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_queue_gate_multiple_kicks_while_gated_replay_exactly_once() {
+        let mut event_manager = EventManager::new().unwrap();
+        let mut block = default_block(FileEngineType::Sync);
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        read_blk_req_descriptors(&vq);
+        block
+            .activate(mem.clone(), default_interrupt())
+            .expect("device activation failed");
+        let status_addr = write_request_descriptors(&mem, &vq);
+
+        let block = Arc::new(Mutex::new(block));
+        let _id = event_manager.add_subscriber(block.clone());
+
+        block.lock().unwrap().set_queue_gate(true);
+        for _ in 0..3 {
+            block.lock().unwrap().queue_evts[0].write(1).unwrap();
+            let ev_count = event_manager.run_with_timeout(100).unwrap();
+            assert_eq!(ev_count, 1);
+        }
+        assert_eq!(block.lock().unwrap().queues[0].len(), 1);
+        assert_eq!(vq.used.idx.get(), 0);
+
+        // All gated kicks collapse into a single deferred replay.
+        block.lock().unwrap().set_queue_gate(false);
+        let ev_count = event_manager.run_with_timeout(100).unwrap();
+        assert_eq!(ev_count, 1);
+        assert_eq!(block.lock().unwrap().queues[0].len(), 0);
         assert_eq!(vq.used.idx.get(), 1);
         assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
-        block.set_queue_gate(false);
+
+        // Nothing further is pending on the event loop.
+        let ev_count = event_manager.run_with_timeout(50).unwrap();
+        assert_eq!(ev_count, 0);
         assert_eq!(vq.used.idx.get(), 1);
     }
 }
