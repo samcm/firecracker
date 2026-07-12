@@ -409,18 +409,23 @@ impl VirtioBlock {
     /// memory (used ring, read payloads). Those pages may be write-protected
     /// by an external userfaultfd handler that is itself blocked on this API
     /// call completing, so an inline replay can deadlock the VMM thread.
+    ///
+    /// The deferred flag is only cleared once the eventfd write succeeds, so
+    /// a failed re-arm keeps the replay owed and a later disengage retries it.
     pub fn set_queue_gate(&mut self, engaged: bool) {
         if self.queue_gate_engaged == engaged {
             return;
         }
 
         self.queue_gate_engaged = engaged;
-        if !engaged
-            && std::mem::take(&mut self.queue_gate_deferred)
-            && let Err(err) = self.queue_evts[0].write(1)
-        {
-            error!("Failed to re-arm queue event on gate disengage: {:?}", err);
-            self.metrics.event_fails.inc();
+        if !engaged && self.queue_gate_deferred {
+            match self.queue_evts[0].write(1) {
+                Ok(()) => self.queue_gate_deferred = false,
+                Err(err) => {
+                    error!("Failed to re-arm queue event on gate disengage: {:?}", err);
+                    self.metrics.event_fails.inc();
+                }
+            }
         }
     }
 
