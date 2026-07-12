@@ -400,16 +400,27 @@ impl VirtioBlock {
         self.process_virtio_queues().unwrap()
     }
 
-    /// Enables or disables queue processing. Disabling the gate immediately
-    /// replays a queue kick that was consumed while the gate was engaged.
+    /// Enables or disables queue processing. Disabling the gate re-arms the
+    /// queue eventfd when a kick was consumed while the gate was engaged, so
+    /// the replay runs on the next event-loop turn via `process_queue_event`.
+    ///
+    /// The replay must not run inline: this method executes on the API path
+    /// under the VMM and device locks, and processing the queue writes guest
+    /// memory (used ring, read payloads). Those pages may be write-protected
+    /// by an external userfaultfd handler that is itself blocked on this API
+    /// call completing, so an inline replay can deadlock the VMM thread.
     pub fn set_queue_gate(&mut self, engaged: bool) {
         if self.queue_gate_engaged == engaged {
             return;
         }
 
         self.queue_gate_engaged = engaged;
-        if !engaged && std::mem::take(&mut self.queue_gate_deferred) {
-            self.process_queue(0).unwrap();
+        if !engaged
+            && std::mem::take(&mut self.queue_gate_deferred)
+            && let Err(err) = self.queue_evts[0].write(1)
+        {
+            error!("Failed to re-arm queue event on gate disengage: {:?}", err);
+            self.metrics.event_fails.inc();
         }
     }
 
