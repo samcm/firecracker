@@ -274,6 +274,11 @@ mod tests {
             .expect("device activation failed");
         let status_addr = write_request_descriptors(&mem, &vq);
 
+        // Sentinel: a completed request would overwrite this with
+        // VIRTIO_BLK_S_OK (0), so a surviving sentinel proves no status write.
+        let status_sentinel: u32 = 0xAAAA_AAAA;
+        mem.write_obj::<u32>(status_sentinel, status_addr).unwrap();
+
         block.set_queue_gate(true);
         block.queue_evts[0].write(1).unwrap();
         block.process_queue_event();
@@ -285,7 +290,7 @@ mod tests {
         block.set_queue_gate(false);
         assert_eq!(block.queues[0].len(), 1);
         assert_eq!(vq.used.idx.get(), 0);
-        assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), 0);
+        assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), status_sentinel);
         assert_eq!(block.queue_evts[0].read().unwrap(), 1);
     }
 

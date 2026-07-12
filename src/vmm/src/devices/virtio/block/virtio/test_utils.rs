@@ -8,6 +8,8 @@ use std::thread;
 #[cfg(test)]
 use std::time::Duration;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use vmm_sys_util::tempfile::TempFile;
 
 use super::RequestHeader;
@@ -35,10 +37,16 @@ pub fn default_block(file_engine_type: FileEngineType) -> VirtioBlock {
     default_block_with_path(f.as_path().to_str().unwrap().to_string(), file_engine_type)
 }
 
+/// Block device metrics are process-global, keyed by drive id
+/// (`BlockMetricsPerDevice::alloc`). Tests run in parallel threads, so devices
+/// sharing a drive id would share metrics and break the per-test
+/// `check_metric_after_block!` delta assertions.
+static NEXT_DRIVE_ID: AtomicUsize = AtomicUsize::new(0);
+
 /// Create a default Block instance using file at the specified path to be used in tests.
 pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -> VirtioBlock {
     let config = VirtioBlockConfig {
-        drive_id: "test".to_string(),
+        drive_id: format!("test-{}", NEXT_DRIVE_ID.fetch_add(1, Ordering::Relaxed)),
         path_on_host: path,
         is_root_device: false,
         partuuid: None,
