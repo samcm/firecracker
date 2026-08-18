@@ -10,6 +10,7 @@ use std::convert::From;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::os::linux::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,8 +24,8 @@ use super::io::async_io;
 use super::request::*;
 use super::{BLOCK_QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError, io as block_io};
 use crate::devices::virtio::ActivateError;
-use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::virtio::metrics::{BlockDeviceMetrics, BlockMetricsPerDevice};
+use crate::devices::virtio::block::{CacheType, DiskBacking};
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_blk::{
     VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_ID_BYTES,
@@ -38,7 +39,7 @@ use crate::logger::{IncMetric, error, warn};
 use crate::rate_limiter::{BucketUpdate, RateLimiter};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::RateLimiterConfig;
-use crate::vmm_config::drive::BlockDeviceConfig;
+use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// The engine file type, either Sync or Async (through io_uring).
@@ -54,27 +55,46 @@ pub enum FileEngineType {
 /// Helper object for setting up all `Block` fields derived from its backing file.
 #[derive(Debug)]
 pub struct DiskProperties {
-    pub file_path: String,
+    pub backing: DiskBacking,
     pub file_engine: FileEngine,
     pub nsectors: u64,
     pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
 }
 
 impl DiskProperties {
-    // Helper function that opens the file with the proper access permissions
-    fn open_file(disk_image_path: &str, is_disk_read_only: bool) -> Result<File, VirtioBlockError> {
-        OpenOptions::new()
-            .read(true)
-            .write(!is_disk_read_only)
-            .open(PathBuf::from(&disk_image_path))
-            .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))
+    // Helper function that opens the backing store with the proper access permissions
+    fn open_file(backing: &DiskBacking, is_disk_read_only: bool) -> Result<File, VirtioBlockError> {
+        match backing {
+            DiskBacking::Path(path) => OpenOptions::new()
+                .read(true)
+                .write(!is_disk_read_only)
+                .open(PathBuf::from(path))
+                .map_err(|err| VirtioBlockError::BackingFile(err, path.clone())),
+            DiskBacking::Descriptor(fd) => Self::clone_descriptor(*fd),
+        }
+    }
+
+    // The inherited descriptor outlives every device built from it, so a device owns a duplicate
+    // of it instead of the descriptor itself.
+    fn clone_descriptor(fd: RawFd) -> Result<File, VirtioBlockError> {
+        if fd < 0 {
+            return Err(VirtioBlockError::InvalidDescriptor(fd));
+        }
+
+        // SAFETY: the jailer inherits the descriptor to us and it stays open for the lifetime of
+        // the process, so it is valid for the duration of this borrow.
+        let inherited = unsafe { BorrowedFd::borrow_raw(fd) };
+        inherited
+            .try_clone_to_owned()
+            .map(File::from)
+            .map_err(|err| VirtioBlockError::CloneDescriptor(fd, err))
     }
 
     // Helper function that gets the size of the file
-    fn file_size(disk_image_path: &str, disk_image: &mut File) -> Result<u64, VirtioBlockError> {
+    fn file_size(backing: &DiskBacking, disk_image: &mut File) -> Result<u64, VirtioBlockError> {
         let disk_size = disk_image
             .seek(SeekFrom::End(0))
-            .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))?;
+            .map_err(|err| VirtioBlockError::BackingFile(err, backing.to_string()))?;
 
         // We only support disk size, which uses the first two words of the configuration space.
         // If the image is not a multiple of the sector size, the tail bits are not exposed.
@@ -91,16 +111,21 @@ impl DiskProperties {
 
     /// Create a new file for the block device using a FileEngine
     pub fn new(
-        disk_image_path: String,
+        backing: DiskBacking,
         is_disk_read_only: bool,
         file_engine_type: FileEngineType,
     ) -> Result<Self, VirtioBlockError> {
-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
-        let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
+        let mut disk_image = Self::open_file(&backing, is_disk_read_only)?;
+        let disk_size = Self::file_size(&backing, &mut disk_image)?;
+        if let DiskBacking::Descriptor(fd) = &backing
+            && disk_size == 0
+        {
+            return Err(VirtioBlockError::EmptyDescriptor(*fd));
+        }
         let image_id = Self::build_disk_image_id(&disk_image);
 
         Ok(Self {
-            file_path: disk_image_path,
+            backing,
             file_engine: FileEngine::from_file(disk_image, file_engine_type)
                 .map_err(VirtioBlockError::FileEngine)?,
             nsectors: disk_size >> SECTOR_SHIFT,
@@ -114,15 +139,20 @@ impl DiskProperties {
         disk_image_path: String,
         is_disk_read_only: bool,
     ) -> Result<(), VirtioBlockError> {
-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
-        let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
+        if !matches!(self.backing, DiskBacking::Path(_)) {
+            return Err(VirtioBlockError::DescriptorBackedUpdate);
+        }
+
+        let backing = DiskBacking::Path(disk_image_path);
+        let mut disk_image = Self::open_file(&backing, is_disk_read_only)?;
+        let disk_size = Self::file_size(&backing, &mut disk_image)?;
 
         self.image_id = Self::build_disk_image_id(&disk_image);
         self.file_engine
             .update_file_path(disk_image)
             .map_err(VirtioBlockError::FileEngine)?;
         self.nsectors = disk_size >> SECTOR_SHIFT;
-        self.file_path = disk_image_path;
+        self.backing = backing;
 
         Ok(())
     }
@@ -169,8 +199,7 @@ pub struct ConfigSpace {
 unsafe impl ByteValued for ConfigSpace {}
 
 /// Use this structure to set up the Block Device before booting the kernel.
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct VirtioBlockConfig {
     /// Unique identifier of the drive.
     pub drive_id: String,
@@ -183,58 +212,52 @@ pub struct VirtioBlockConfig {
     pub is_root_device: bool,
     /// If set to true, the drive will ignore flush requests coming from
     /// the guest driver.
-    #[serde(default)]
     pub cache_type: CacheType,
 
     /// If set to true, the drive is opened in read-only mode. Otherwise, the
     /// drive is opened as read-write.
     pub is_read_only: bool,
-    /// Path of the backing file on the host
-    pub path_on_host: String,
+    /// Backing store of the drive.
+    pub backing: DiskBacking,
     /// Rate Limiter for I/O operations.
     pub rate_limiter: Option<RateLimiterConfig>,
     /// The type of IO engine used by the device.
-    #[serde(default)]
-    #[serde(rename = "io_engine")]
     pub file_engine_type: FileEngineType,
 }
 
 impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
-    type Error = VirtioBlockError;
+    type Error = DriveError;
 
     fn try_from(value: &BlockDeviceConfig) -> Result<Self, Self::Error> {
-        if let (Some(path_on_host), None) = (&value.path_on_host, &value.socket) {
-            Ok(Self {
-                drive_id: value.drive_id.clone(),
-                partuuid: value.partuuid.clone(),
-                is_root_device: value.is_root_device,
-                cache_type: value.cache_type,
-
-                is_read_only: value.is_read_only.unwrap_or(false),
-                path_on_host: path_on_host.clone(),
-                rate_limiter: value.rate_limiter,
-                file_engine_type: value.file_engine_type.unwrap_or_default(),
-            })
-        } else {
-            Err(VirtioBlockError::Config)
-        }
+        Ok(Self {
+            drive_id: value.drive_id.clone(),
+            partuuid: value.partuuid.clone(),
+            is_root_device: value.is_root_device,
+            cache_type: value.cache_type,
+            is_read_only: value.is_read_only.unwrap_or(false),
+            backing: value.backing()?,
+            rate_limiter: value.rate_limiter,
+            file_engine_type: value.file_engine_type.unwrap_or_default(),
+        })
     }
 }
 
 impl From<VirtioBlockConfig> for BlockDeviceConfig {
     fn from(value: VirtioBlockConfig) -> Self {
+        let (path_on_host, fd) = match value.backing {
+            DiskBacking::Path(path) => (Some(path), None),
+            DiskBacking::Descriptor(fd) => (None, Some(fd)),
+        };
         Self {
             drive_id: value.drive_id,
             partuuid: value.partuuid,
             is_root_device: value.is_root_device,
             cache_type: value.cache_type,
-
             is_read_only: Some(value.is_read_only),
-            path_on_host: Some(value.path_on_host),
+            path_on_host,
+            fd,
             rate_limiter: value.rate_limiter,
             file_engine_type: Some(value.file_engine_type),
-
-            socket: None,
         }
     }
 }
@@ -284,11 +307,8 @@ impl VirtioBlock {
     ///
     /// The given file must be seekable and sizable.
     pub fn new(config: VirtioBlockConfig) -> Result<VirtioBlock, VirtioBlockError> {
-        let disk_properties = DiskProperties::new(
-            config.path_on_host,
-            config.is_read_only,
-            config.file_engine_type,
-        )?;
+        let disk_properties =
+            DiskProperties::new(config.backing, config.is_read_only, config.file_engine_type)?;
 
         let rate_limiter = config
             .rate_limiter
@@ -343,7 +363,7 @@ impl VirtioBlock {
         let rl: RateLimiterConfig = (&self.rate_limiter).into();
         VirtioBlockConfig {
             drive_id: self.id.clone(),
-            path_on_host: self.disk.file_path.clone(),
+            backing: self.disk.backing.clone(),
             is_root_device: self.root_device,
             partuuid: self.partuuid.clone(),
             is_read_only: self.read_only,
@@ -408,6 +428,7 @@ impl VirtioBlock {
 
                         request.process(
                             &mut self.disk,
+                            self.read_only,
                             head.index,
                             &active_state.mem,
                             &self.metrics,
@@ -695,6 +716,7 @@ impl Drop for VirtioBlock {
 mod tests {
     use std::fs::metadata;
     use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::thread;
     use std::time::Duration;
@@ -705,9 +727,9 @@ mod tests {
     use crate::check_metric_after_block;
     use crate::devices::virtio::block::virtio::IO_URING_NUM_ENTRIES;
     use crate::devices::virtio::block::virtio::test_utils::{
-        default_block, read_blk_req_descriptors, set_queue, set_rate_limiter,
-        simulate_async_completion_event, simulate_queue_and_async_completion_events,
-        simulate_queue_event,
+        default_block, default_block_with_descriptor, read_blk_req_descriptors, set_queue,
+        set_rate_limiter, simulate_async_completion_event,
+        simulate_queue_and_async_completion_events, simulate_queue_event,
     };
     use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
@@ -716,50 +738,29 @@ mod tests {
 
     #[test]
     fn test_from_config() {
-        let block_config = BlockDeviceConfig {
-            drive_id: "".to_string(),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-
+        let path_backed = BlockDeviceConfig {
+            drive_id: "root".to_string(),
             is_read_only: Some(true),
             path_on_host: Some("path".to_string()),
-            rate_limiter: None,
-            file_engine_type: Default::default(),
-
-            socket: None,
+            ..Default::default()
         };
-        VirtioBlockConfig::try_from(&block_config).unwrap();
+        assert_eq!(
+            VirtioBlockConfig::try_from(&path_backed).unwrap().backing,
+            DiskBacking::Path("path".to_string())
+        );
 
-        let block_config = BlockDeviceConfig {
-            drive_id: "".to_string(),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: None,
-            path_on_host: None,
-            rate_limiter: None,
-            file_engine_type: Default::default(),
-
-            socket: Some("sock".to_string()),
-        };
-        VirtioBlockConfig::try_from(&block_config).unwrap_err();
-
-        let block_config = BlockDeviceConfig {
-            drive_id: "".to_string(),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-
+        let descriptor_backed = BlockDeviceConfig {
+            drive_id: "root".to_string(),
             is_read_only: Some(true),
-            path_on_host: Some("path".to_string()),
-            rate_limiter: None,
-            file_engine_type: Default::default(),
-
-            socket: Some("sock".to_string()),
+            fd: Some(4),
+            ..Default::default()
         };
-        VirtioBlockConfig::try_from(&block_config).unwrap_err();
+        assert_eq!(
+            VirtioBlockConfig::try_from(&descriptor_backed)
+                .unwrap()
+                .backing,
+            DiskBacking::Descriptor(4)
+        );
     }
 
     #[test]
@@ -770,22 +771,130 @@ mod tests {
         f.as_file().set_len(size).unwrap();
 
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
-            let disk_properties =
-                DiskProperties::new(String::from(f.as_path().to_str().unwrap()), true, engine)
-                    .unwrap();
+            let path = DiskBacking::Path(String::from(f.as_path().to_str().unwrap()));
+            let disk_properties = DiskProperties::new(path, true, engine).unwrap();
 
             assert_eq!(size, u64::from(SECTOR_SIZE) * num_sectors);
             assert_eq!(disk_properties.nsectors, num_sectors);
             // Testing `backing_file.virtio_block_disk_image_id()` implies
             // duplicating that logic in tests, so skipping it.
 
-            let res = DiskProperties::new("invalid-disk-path".to_string(), true, engine);
+            let res = DiskProperties::new(
+                DiskBacking::Path("invalid-disk-path".to_string()),
+                true,
+                engine,
+            );
             assert!(
                 matches!(res, Err(VirtioBlockError::BackingFile(_, _))),
                 "{:?}",
                 res
             );
         }
+    }
+
+    #[test]
+    fn test_disk_backing_descriptor() {
+        let num_sectors = 2;
+        let f = TempFile::new().unwrap();
+        f.as_file()
+            .set_len(u64::from(SECTOR_SIZE) * num_sectors)
+            .unwrap();
+        let fd = f.as_file().as_raw_fd();
+
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let disk_properties =
+                DiskProperties::new(DiskBacking::Descriptor(fd), true, engine).unwrap();
+            assert_eq!(disk_properties.nsectors, num_sectors);
+
+            // The device owns a duplicate, so the inherited descriptor outlives it.
+            drop(disk_properties);
+            assert_eq!(f.as_file().metadata().unwrap().len(), 1024);
+
+            let empty = TempFile::new().unwrap();
+            assert!(matches!(
+                DiskProperties::new(
+                    DiskBacking::Descriptor(empty.as_file().as_raw_fd()),
+                    true,
+                    engine
+                ),
+                Err(VirtioBlockError::EmptyDescriptor(_))
+            ));
+
+            assert!(matches!(
+                DiskProperties::new(DiskBacking::Descriptor(-1), true, engine),
+                Err(VirtioBlockError::InvalidDescriptor(-1))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_descriptor_backed_device_is_read_only() {
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let mut block = default_block_with_descriptor(f.as_file().as_raw_fd(), engine);
+
+            assert!(block.read_only);
+            assert_ne!(block.avail_features & (1u64 << VIRTIO_BLK_F_RO), 0);
+            assert_eq!(block.avail_features & (1u64 << VIRTIO_BLK_F_FLUSH), 0);
+            assert_eq!(block.config_space.capacity, 0x1000 >> SECTOR_SHIFT);
+
+            assert!(matches!(
+                block.update_disk_image("other-path".to_string()),
+                Err(VirtioBlockError::DescriptorBackedUpdate)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_descriptor_backed_device_rejects_writes() {
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+        f.as_file().write_all(&[0x11; 0x1000]).unwrap();
+
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let mut block = default_block_with_descriptor(f.as_file().as_raw_fd(), engine);
+            let mem = default_mem();
+            let interrupt = default_interrupt();
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+            set_queue(&mut block, 0, vq.create_queue());
+            block.activate(mem.clone(), interrupt).unwrap();
+            read_blk_req_descriptors(&vq);
+
+            let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
+            let data_addr = GuestAddress(vq.dtable[1].addr.get());
+            let status_addr = GuestAddress(vq.dtable[2].addr.get());
+            mem.write_slice(&[0x22; 0x1000], data_addr).unwrap();
+
+            for request_type in [VIRTIO_BLK_T_OUT, VIRTIO_BLK_T_FLUSH] {
+                vq.used.idx.set(0);
+                set_queue(&mut block, 0, vq.create_queue());
+                vq.avail.idx.set(1);
+                // The data of a write request is read by the device.
+                vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
+                mem.write_obj::<RequestHeader>(
+                    RequestHeader::new(request_type, 0),
+                    request_type_addr,
+                )
+                .unwrap();
+
+                simulate_queue_event(&mut block, Some(true));
+
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(vq.used.ring[0].get().len, 1);
+                assert_eq!(
+                    u32::from(mem.read_obj::<u8>(status_addr).unwrap()),
+                    VIRTIO_BLK_S_IOERR
+                );
+            }
+        }
+
+        let mut content = [0u8; 0x1000];
+        let mut file = f.as_file();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut content).unwrap();
+        assert_eq!(content, [0x11; 0x1000]);
     }
 
     #[test]

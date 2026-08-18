@@ -11,20 +11,26 @@ use super::RateLimiterConfig;
 use crate::VmmError;
 use crate::devices::virtio::block::device::Block;
 pub use crate::devices::virtio::block::virtio::device::FileEngineType;
-use crate::devices::virtio::block::{BlockError, CacheType};
+use crate::devices::virtio::block::{BlockError, CacheType, DiskBacking};
 use crate::devices::virtio::device::VirtioDevice;
 
 /// Errors associated with the operations allowed on a drive.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum DriveError {
-    /// Attempt to add block as a root device while the root device defined as a pmem device
-    AddingSecondRootDevice,
     /// Unable to create the virtio block device: {0}
     CreateBlockDevice(BlockError),
     /// Cannot create RateLimiter: {0}
     CreateRateLimiter(io::Error),
     /// Unable to patch the block device: {0} Please verify the request arguments.
     DeviceUpdate(VmmError),
+    /// A drive is backed by either `path_on_host` or `fd`, never both.
+    AmbiguousDriveBacking,
+    /// A drive requires either `path_on_host` or `fd`.
+    MissingDriveBacking,
+    /// A drive backed by `fd` requires `is_read_only` to be true.
+    InvalidRootDescriptor,
+    /// A read-only drive has no write-back cache to flush.
+    ReadOnlyWriteback,
     /// A root block device already exists!
     RootBlockDeviceAlreadyAdded,
 }
@@ -47,24 +53,36 @@ pub struct BlockDeviceConfig {
     #[serde(default)]
     pub cache_type: CacheType,
 
-    // VirtioBlock specific fields
     /// If set to true, the drive is opened in read-only mode. Otherwise, the
     /// drive is opened as read-write.
     pub is_read_only: Option<bool>,
     /// Path of the drive.
     pub path_on_host: Option<String>,
+    /// Descriptor the sealed read-only root image was inherited at. Mutually exclusive with
+    /// `path_on_host`.
+    pub fd: Option<i32>,
     /// Rate Limiter for I/O operations.
     pub rate_limiter: Option<RateLimiterConfig>,
     /// The type of IO engine used by the device.
-    // #[serde(default)]
-    // #[serde(rename = "io_engine")]
-    // pub file_engine_type: FileEngineType,
     #[serde(rename = "io_engine")]
     pub file_engine_type: Option<FileEngineType>,
+}
 
-    // VhostUserBlock specific fields
-    /// Path to the vhost-user socket.
-    pub socket: Option<String>,
+impl BlockDeviceConfig {
+    /// Validates the mutually exclusive `path_on_host`/`fd` pair and resolves it. A descriptor is
+    /// only ever inherited for the sealed read-only root image, so it requires `is_read_only`.
+    pub fn backing(&self) -> Result<DiskBacking, DriveError> {
+        if self.is_read_only == Some(true) && self.cache_type == CacheType::Writeback {
+            return Err(DriveError::ReadOnlyWriteback);
+        }
+        match (&self.path_on_host, self.fd) {
+            (Some(path), None) => Ok(DiskBacking::Path(path.clone())),
+            (None, Some(fd)) if self.is_read_only == Some(true) => Ok(DiskBacking::Descriptor(fd)),
+            (None, Some(_)) => Err(DriveError::InvalidRootDescriptor),
+            (Some(_), Some(_)) => Err(DriveError::AmbiguousDriveBacking),
+            (None, None) => Err(DriveError::MissingDriveBacking),
+        }
+    }
 }
 
 /// Only provided fields will be updated. I.e. if any optional fields
@@ -130,18 +148,10 @@ impl BlockBuilder {
     /// Inserts a `Block` in the block devices list using the specified configuration.
     /// If a block with the same id already exists, it will overwrite it.
     /// Inserting a secondary root block device will fail.
-    pub fn insert(
-        &mut self,
-        config: BlockDeviceConfig,
-        has_pmem_root: bool,
-    ) -> Result<(), DriveError> {
+    pub fn insert(&mut self, config: BlockDeviceConfig) -> Result<(), DriveError> {
         let position = self.get_index_of_drive_id(&config.drive_id);
         let has_root_device = self.has_root_device();
         let configured_as_root = config.is_root_device;
-
-        if configured_as_root && has_pmem_root {
-            return Err(DriveError::AddingSecondRootDevice);
-        }
 
         // Don't allow adding a second root block device.
         // If the new device cfg is root and not an update to the existing root, fail fast.
@@ -149,9 +159,7 @@ impl BlockBuilder {
             return Err(DriveError::RootBlockDeviceAlreadyAdded);
         }
 
-        let block_dev = Arc::new(Mutex::new(
-            Block::new(config).map_err(DriveError::CreateBlockDevice)?,
-        ));
+        let block_dev = Arc::new(Mutex::new(Block::new(config)?));
 
         // If the id of the drive already exists in the list, the operation is update/overwrite.
         match position {
@@ -188,10 +196,13 @@ impl BlockBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
+
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::devices::virtio::block::virtio::VirtioBlockError;
+    use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_RO;
 
     impl PartialEq for DriveError {
         fn eq(&self, other: &DriveError) -> bool {
@@ -209,12 +220,10 @@ mod tests {
                 is_root_device: self.is_root_device,
                 is_read_only: self.is_read_only,
                 cache_type: self.cache_type,
-
                 path_on_host: self.path_on_host.clone(),
+                fd: self.fd,
                 rate_limiter: self.rate_limiter,
                 file_engine_type: self.file_engine_type,
-
-                socket: self.socket.clone(),
             }
         }
     }
@@ -238,16 +247,13 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let mut block_devs = BlockBuilder::new();
-        block_devs
-            .insert(dummy_block_device.clone(), false)
-            .unwrap();
+        block_devs.insert(dummy_block_device.clone()).unwrap();
 
         assert!(!block_devs.has_root_device());
         assert_eq!(block_devs.devices.len(), 1);
@@ -272,16 +278,13 @@ mod tests {
 
             is_read_only: Some(true),
             path_on_host: Some(dummy_path),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let mut block_devs = BlockBuilder::new();
-        block_devs
-            .insert(dummy_block_device.clone(), false)
-            .unwrap();
+        block_devs.insert(dummy_block_device.clone()).unwrap();
 
         assert!(block_devs.has_root_device());
         assert_eq!(block_devs.devices.len(), 1);
@@ -289,36 +292,6 @@ mod tests {
         assert_eq!(block.id(), dummy_block_device.drive_id);
         assert_eq!(block.partuuid(), &dummy_block_device.partuuid);
         assert_eq!(block.read_only(), dummy_block_device.is_read_only.unwrap());
-    }
-
-    #[test]
-    fn test_add_one_root_block_device_with_pmem_already_as_root() {
-        let dummy_file = TempFile::new().unwrap();
-        let dummy_path = dummy_file.as_path().to_str().unwrap().to_string();
-
-        let dummy_block_device = BlockDeviceConfig {
-            drive_id: String::from("1"),
-            partuuid: None,
-            is_root_device: true,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            path_on_host: Some(dummy_path),
-            rate_limiter: None,
-            file_engine_type: None,
-
-            socket: None,
-        };
-
-        let mut block_devs = BlockBuilder::new();
-        assert!(matches!(
-            block_devs
-                .insert(dummy_block_device.clone(), true)
-                .unwrap_err(),
-            DriveError::AddingSecondRootDevice,
-        ));
-        assert!(!block_devs.has_root_device());
-        assert_eq!(block_devs.devices.len(), 0);
     }
 
     #[test]
@@ -333,10 +306,9 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_1),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -349,16 +321,15 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_2),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let mut block_devs = BlockBuilder::new();
-        block_devs.insert(root_block_device_1, false).unwrap();
+        block_devs.insert(root_block_device_1).unwrap();
         assert_eq!(
-            block_devs.insert(root_block_device_2, false).unwrap_err(),
+            block_devs.insert(root_block_device_2).unwrap_err(),
             DriveError::RootBlockDeviceAlreadyAdded
         );
     }
@@ -376,10 +347,9 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_1),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -392,10 +362,9 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_2),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -408,16 +377,15 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_3),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let mut block_devs = BlockBuilder::new();
-        block_devs.insert(dummy_block_dev_2.clone(), false).unwrap();
-        block_devs.insert(dummy_block_dev_3.clone(), false).unwrap();
-        block_devs.insert(root_block_device.clone(), false).unwrap();
+        block_devs.insert(dummy_block_dev_2.clone()).unwrap();
+        block_devs.insert(dummy_block_dev_3.clone()).unwrap();
+        block_devs.insert(root_block_device.clone()).unwrap();
 
         assert_eq!(block_devs.devices.len(), 3);
 
@@ -449,10 +417,9 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_1),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -465,10 +432,9 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_2),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -481,16 +447,15 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_3),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let mut block_devs = BlockBuilder::new();
-        block_devs.insert(dummy_block_dev_2.clone(), false).unwrap();
-        block_devs.insert(dummy_block_dev_3.clone(), false).unwrap();
-        block_devs.insert(root_block_device.clone(), false).unwrap();
+        block_devs.insert(dummy_block_dev_2.clone()).unwrap();
+        block_devs.insert(dummy_block_dev_3.clone()).unwrap();
+        block_devs.insert(root_block_device.clone()).unwrap();
 
         assert_eq!(block_devs.devices.len(), 3);
 
@@ -523,10 +488,9 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_1.clone()),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -539,19 +503,16 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_2.clone()),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let mut block_devs = BlockBuilder::new();
 
         // Add 2 block devices.
-        block_devs.insert(root_block_device, false).unwrap();
-        block_devs
-            .insert(dummy_block_device_2.clone(), false)
-            .unwrap();
+        block_devs.insert(root_block_device).unwrap();
+        block_devs.insert(dummy_block_device_2.clone()).unwrap();
 
         // Get index zero.
         assert_eq!(
@@ -575,9 +536,7 @@ mod tests {
         );
         // Update OK.
         dummy_block_device_2.is_read_only = Some(true);
-        block_devs
-            .insert(dummy_block_device_2.clone(), false)
-            .unwrap();
+        block_devs.insert(dummy_block_device_2.clone()).unwrap();
 
         let index = block_devs
             .get_index_of_drive_id(&dummy_block_device_2.drive_id)
@@ -589,7 +548,7 @@ mod tests {
         let dummy_path_3 = String::from("test_update_3");
         dummy_block_device_2.path_on_host = Some(dummy_path_3);
         assert!(matches!(
-            block_devs.insert(dummy_block_device_2.clone(), false),
+            block_devs.insert(dummy_block_device_2.clone()),
             Err(DriveError::CreateBlockDevice(BlockError::VirtioBackend(
                 VirtioBlockError::BackingFile(_, _)
             )))
@@ -599,7 +558,7 @@ mod tests {
         dummy_block_device_2.path_on_host = Some(dummy_path_2.clone());
         dummy_block_device_2.is_root_device = true;
         assert_eq!(
-            block_devs.insert(dummy_block_device_2, false),
+            block_devs.insert(dummy_block_device_2),
             Err(DriveError::RootBlockDeviceAlreadyAdded)
         );
 
@@ -611,10 +570,9 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_1),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
         // Switch roots and add a PARTUUID for the new one.
         let mut root_block_device_old = root_block_device;
@@ -627,15 +585,14 @@ mod tests {
 
             is_read_only: Some(false),
             path_on_host: Some(dummy_path_2),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
-        block_devs.insert(root_block_device_old, false).unwrap();
+        block_devs.insert(root_block_device_old).unwrap();
         let root_block_id = root_block_device_new.drive_id.clone();
-        block_devs.insert(root_block_device_new, false).unwrap();
+        block_devs.insert(root_block_device_new).unwrap();
         assert!(block_devs.has_root_device());
         // Verify it's been moved to the first position.
         assert_eq!(block_devs.devices[0].lock().unwrap().id(), root_block_id);
@@ -653,16 +610,13 @@ mod tests {
 
             is_read_only: Some(true),
             path_on_host: Some(dummy_file.as_path().to_str().unwrap().to_string()),
+            fd: None,
             rate_limiter: None,
             file_engine_type: Some(FileEngineType::Sync),
-
-            socket: None,
         };
 
         let mut block_devs = BlockBuilder::new();
-        block_devs
-            .insert(dummy_block_device.clone(), false)
-            .unwrap();
+        block_devs.insert(dummy_block_device.clone()).unwrap();
 
         let configs = block_devs.configs();
         assert_eq!(configs.len(), 1);
@@ -683,10 +637,9 @@ mod tests {
 
             is_read_only: Some(true),
             path_on_host: Some(backing_file.as_path().to_str().unwrap().to_string()),
+            fd: None,
             rate_limiter: None,
             file_engine_type: None,
-
-            socket: None,
         };
 
         let block = Block::new(config).unwrap();
@@ -697,5 +650,92 @@ mod tests {
             block_devs.devices.pop_back().unwrap().lock().unwrap().id(),
             block_id
         );
+    }
+
+    #[test]
+    fn test_backing_validation() {
+        let descriptor = BlockDeviceConfig {
+            drive_id: String::from("root"),
+            is_read_only: Some(true),
+            fd: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(descriptor.backing().unwrap(), DiskBacking::Descriptor(4));
+
+        let path = BlockDeviceConfig {
+            drive_id: String::from("data"),
+            path_on_host: Some(String::from("/dev/null")),
+            ..Default::default()
+        };
+        assert_eq!(
+            path.backing().unwrap(),
+            DiskBacking::Path(String::from("/dev/null"))
+        );
+
+        let mut both = descriptor.clone();
+        both.path_on_host = Some(String::from("/dev/null"));
+        assert_eq!(
+            both.backing().unwrap_err(),
+            DriveError::AmbiguousDriveBacking
+        );
+
+        let neither = BlockDeviceConfig {
+            drive_id: String::from("root"),
+            ..Default::default()
+        };
+        assert_eq!(
+            neither.backing().unwrap_err(),
+            DriveError::MissingDriveBacking
+        );
+
+        let mut writable = descriptor.clone();
+        writable.is_read_only = Some(false);
+        assert_eq!(
+            writable.backing().unwrap_err(),
+            DriveError::InvalidRootDescriptor
+        );
+
+        let mut unspecified = descriptor.clone();
+        unspecified.is_read_only = None;
+        assert_eq!(
+            unspecified.backing().unwrap_err(),
+            DriveError::InvalidRootDescriptor
+        );
+
+        let mut writeback = descriptor;
+        writeback.cache_type = CacheType::Writeback;
+        assert_eq!(
+            writeback.backing().unwrap_err(),
+            DriveError::ReadOnlyWriteback
+        );
+    }
+
+    #[test]
+    fn test_insert_descriptor_backed_root_device() {
+        let image = TempFile::new().unwrap();
+        image.as_file().set_len(0x1000).unwrap();
+        let fd = image.as_file().as_raw_fd();
+
+        let mut block_devs = BlockBuilder::new();
+        block_devs
+            .insert(BlockDeviceConfig {
+                drive_id: String::from("root"),
+                is_root_device: true,
+                is_read_only: Some(true),
+                fd: Some(fd),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(block_devs.has_root_device());
+        {
+            let block = block_devs.devices[0].lock().unwrap();
+            assert!(block.read_only());
+            assert_ne!(block.avail_features() & (1u64 << VIRTIO_BLK_F_RO), 0);
+        }
+
+        let configs = block_devs.configs();
+        assert_eq!(configs[0].fd, Some(fd));
+        assert_eq!(configs[0].path_on_host, None);
     }
 }

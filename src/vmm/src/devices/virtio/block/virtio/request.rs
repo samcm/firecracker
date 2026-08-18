@@ -26,6 +26,7 @@ pub enum IoErr {
     GetId(GuestMemoryError),
     PartialTransfer { completed: u32, expected: u32 },
     FileEngine(block_io::BlockIoError),
+    ReadOnlyDevice,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,6 +365,7 @@ impl Request {
     pub(crate) fn process(
         self,
         disk: &mut DiskProperties,
+        read_only: bool,
         desc_idx: u16,
         mem: &GuestMemoryMmap,
         block_metrics: &BlockDeviceMetrics,
@@ -374,6 +376,12 @@ impl Request {
                 let _metric = block_metrics.read_agg.record_latency_metrics();
                 disk.file_engine
                     .read(self.offset(), mem, self.data_addr, self.data_len, pending)
+            }
+            // A read-only device has nothing to write and no write-back cache to flush, and
+            // advertises neither, so the guest asking for either is a protocol violation.
+            RequestType::Out | RequestType::Flush if read_only => {
+                let res = Err(IoErr::ReadOnlyDevice);
+                return ProcessingResult::Executed(pending.finish(mem, res, block_metrics));
             }
             RequestType::Out => {
                 let _metric = block_metrics.write_agg.record_latency_metrics();

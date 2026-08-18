@@ -243,5 +243,30 @@ mod tests {
             }
         }"#;
         parse_put_drive(&Body::new(body), Some("1000")).unwrap();
+
+        // PUT with the root descriptor inherited from the jailer.
+        let body = r#"{
+            "drive_id": "1000",
+            "fd": 4,
+            "is_root_device": true,
+            "is_read_only": true
+        }"#;
+        let VmmAction::InsertBlockDevice(config) =
+            vmm_action_from_request(parse_put_drive(&Body::new(body), Some("1000")).unwrap())
+        else {
+            panic!("Expected an InsertBlockDevice action");
+        };
+        assert_eq!(config.fd, Some(4));
+        assert_eq!(config.path_on_host, None);
+
+        // PUT with an unknown field.
+        let body = r#"{
+            "drive_id": "1000",
+            "fd": 4,
+            "is_root_device": true,
+            "is_read_only": true,
+            "socket": "/socket"
+        }"#;
+        parse_put_drive(&Body::new(body), Some("1000")).unwrap_err();
     }
 }

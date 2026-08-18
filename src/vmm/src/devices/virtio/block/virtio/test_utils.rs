@@ -3,6 +3,7 @@
 
 #![doc(hidden)]
 
+use std::os::fd::RawFd;
 #[cfg(test)]
 use std::thread;
 #[cfg(test)]
@@ -12,6 +13,7 @@ use vmm_sys_util::tempfile::TempFile;
 
 use super::RequestHeader;
 use super::device::VirtioBlockConfig;
+use crate::devices::virtio::block::DiskBacking;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 #[cfg(test)]
 use crate::devices::virtio::block::virtio::io::FileEngine;
@@ -37,12 +39,26 @@ pub fn default_block(file_engine_type: FileEngineType) -> VirtioBlock {
 
 /// Create a default Block instance using file at the specified path to be used in tests.
 pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -> VirtioBlock {
+    // The default block device is read-write and non-root.
+    default_block_with_backing(DiskBacking::Path(path), false, file_engine_type)
+}
+
+/// Create a read-only Block instance backed by an inherited descriptor, to be used in tests.
+pub fn default_block_with_descriptor(fd: RawFd, file_engine_type: FileEngineType) -> VirtioBlock {
+    default_block_with_backing(DiskBacking::Descriptor(fd), true, file_engine_type)
+}
+
+fn default_block_with_backing(
+    backing: DiskBacking,
+    is_read_only: bool,
+    file_engine_type: FileEngineType,
+) -> VirtioBlock {
     let config = VirtioBlockConfig {
         drive_id: "test".to_string(),
-        path_on_host: path,
+        backing,
         is_root_device: false,
         partuuid: None,
-        is_read_only: false,
+        is_read_only,
         cache_type: CacheType::Unsafe,
         // Rate limiting is enabled but with a high operation rate (10 million ops/s).
         rate_limiter: Some(RateLimiterConfig {
@@ -60,7 +76,6 @@ pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -
         file_engine_type,
     };
 
-    // The default block device is read-write and non-root.
     VirtioBlock::new(config).unwrap()
 }
 

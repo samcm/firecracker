@@ -11,6 +11,8 @@ pub mod persist;
 pub mod request;
 pub mod test_utils;
 
+use std::os::fd::RawFd;
+
 use vm_memory::GuestMemoryError;
 
 pub use self::device::VirtioBlock;
@@ -33,8 +35,6 @@ pub const IO_URING_NUM_ENTRIES: u16 = 128;
 /// Errors the block device can trigger.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VirtioBlockError {
-    /// Cannot create config
-    Config,
     /// Guest gave us too few descriptors in a descriptor chain.
     DescriptorChainTooShort,
     /// Guest gave us a descriptor that was too short to use.
@@ -55,6 +55,16 @@ pub enum VirtioBlockError {
     FileEngine(io::BlockIoError),
     /// Error manipulating the backing file: {0} {1}
     BackingFile(std::io::Error, String),
+    /// Drive descriptor {0} is not a valid descriptor.
+    InvalidDescriptor(RawFd),
+    /// Cannot duplicate drive descriptor {0}: {1}
+    CloneDescriptor(RawFd, std::io::Error),
+    /// Drive descriptor {0} is empty.
+    EmptyDescriptor(RawFd),
+    /// Cannot update the backing file of a descriptor-backed drive.
+    DescriptorBackedUpdate,
+    /// Cannot restore drive {0}: only a descriptor-backed drive is restorable.
+    UnrestorableDrive(String),
     /// Error opening eventfd: {0}
     EventFd(std::io::Error),
     /// Error creating an interrupt: {0}

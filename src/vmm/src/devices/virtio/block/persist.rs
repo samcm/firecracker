@@ -1,27 +1,22 @@
 // Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 
-use super::vhost_user::persist::VhostUserBlockState;
 use super::virtio::persist::VirtioBlockState;
-use crate::devices::virtio::transport::VirtioInterrupt;
+use super::{DiskBacking, ROOT_DESCRIPTOR_FILENO};
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// Block device state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BlockState {
     Virtio(VirtioBlockState),
-    VhostUser(VhostUserBlockState),
 }
 
 impl BlockState {
     pub fn is_activated(&self) -> bool {
         match self {
             BlockState::Virtio(virtio_block_state) => virtio_block_state.virtio_state.activated,
-            BlockState::VhostUser(vhost_user_block_state) => false,
         }
     }
 }
@@ -30,4 +25,16 @@ impl BlockState {
 #[derive(Debug)]
 pub struct BlockConstructorArgs {
     pub mem: GuestMemoryMmap,
+    pub backing: DiskBacking,
+}
+
+impl BlockConstructorArgs {
+    /// Arguments for restoring the root drive, which is backed by the descriptor the jailer
+    /// inherited the sealed root image at.
+    pub fn root(mem: GuestMemoryMmap) -> Self {
+        Self {
+            mem,
+            backing: DiskBacking::Descriptor(ROOT_DESCRIPTOR_FILENO),
+        }
+    }
 }
