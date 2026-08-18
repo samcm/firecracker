@@ -47,6 +47,7 @@ impl From<RegModifierMap> for Vec<RegisterModifier> {
     }
 }
 
+#[cfg(test)]
 macro_rules! reg_modifier {
     ($addr:expr, $value:expr) => {
         RegisterModifier {
@@ -68,6 +69,7 @@ macro_rules! reg_modifier {
     };
 }
 
+#[cfg(test)]
 pub(crate) use reg_modifier;
 
 #[cfg(test)]

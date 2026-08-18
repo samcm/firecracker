@@ -35,12 +35,6 @@ cpu_template_test = {
             "m7a.metal-48xl",
         ],
     },
-    "fingerprint": {
-        BkStep.COMMAND: [
-            "tools/devtool -y test --no-build -- -m no_block_pr integration_tests/functional/test_cpu_template_helper.py -k test_guest_cpu_config_change",
-        ],
-        BkStep.LABEL: "fingerprint",
-    },
     "cpuid_wrmsr": {
         "snapshot": {
             BkStep.COMMAND: [

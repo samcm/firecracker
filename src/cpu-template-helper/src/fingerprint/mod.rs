@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use vmm::cpu_config::templates::CustomCpuTemplate;
 
 pub mod compare;
-pub mod dump;
 
 macro_rules! declare_fingerprint_struct_and_enum {
     ($($field_name:ident : $field_type:ty),+) => {
