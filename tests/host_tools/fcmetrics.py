@@ -134,20 +134,6 @@ def validate_fc_metrics(metrics):
             "process_startup_time_us",
             "process_startup_time_cpu_us",
         ],
-        "balloon": [
-            "activate_fails",
-            "inflate_count",
-            "stats_updates_count",
-            "stats_update_fails",
-            "deflate_count",
-            "event_fails",
-            "free_page_report_count",
-            "free_page_report_freed",
-            "free_page_report_fails",
-            "free_page_hint_count",
-            "free_page_hint_freed",
-            "free_page_hint_fails",
-        ],
         "block": block_metrics,
         "deprecated_api": [
             "deprecated_http_api_calls",
@@ -155,9 +141,7 @@ def validate_fc_metrics(metrics):
         "get_api_requests": [
             "instance_info_count",
             "machine_cfg_count",
-            "mmds_count",
             "vmm_version_count",
-            "hotplug_memory_count",
         ],
         "i8042": [
             "error_count",
@@ -185,21 +169,6 @@ def validate_fc_metrics(metrics):
             "missed_log_count",
             "rate_limited_log_count",
         ],
-        "mmds": [
-            "rx_accepted",
-            "rx_accepted_err",
-            "rx_accepted_unusual",
-            "rx_bad_eth",
-            "rx_invalid_token",
-            "rx_no_token",
-            "rx_count",
-            "tx_bytes",
-            "tx_count",
-            "tx_errors",
-            "tx_frames",
-            "connections_created",
-            "connections_destroyed",
-        ],
         "net": net_metrics,
         "patch_api_requests": [
             "drive_count",
@@ -208,12 +177,6 @@ def validate_fc_metrics(metrics):
             "network_fails",
             "machine_cfg_count",
             "machine_cfg_fails",
-            "mmds_count",
-            "mmds_fails",
-            "hotplug_memory_count",
-            "hotplug_memory_fails",
-            "pmem_count",
-            "pmem_fails",
         ],
         "put_api_requests": [
             "actions_count",
@@ -232,16 +195,10 @@ def validate_fc_metrics(metrics):
             "metrics_fails",
             "network_count",
             "network_fails",
-            "mmds_count",
-            "mmds_fails",
             "vsock_count",
             "vsock_fails",
-            "pmem_count",
-            "pmem_fails",
             "serial_count",
             "serial_fails",
-            "hotplug_memory_count",
-            "hotplug_memory_fails",
         ],
         "seccomp": [
             "num_faults",
@@ -311,34 +268,6 @@ def validate_fc_metrics(metrics):
             "rate_limiter_event_count",
         ],
         "interrupts": ["triggers", "config_updates"],
-        "pmem": [
-            "activate_fails",
-            "cfg_fails",
-            "event_fails",
-            "queue_event_count",
-            "rate_limiter_throttled_events",
-            "rate_limiter_event_count",
-        ],
-        "memory_hotplug": [
-            "activate_fails",
-            "queue_event_fails",
-            "queue_event_count",
-            "plug_count",
-            "plug_bytes",
-            "plug_fails",
-            {"plug_agg": latency_agg_metrics_fields},
-            "unplug_count",
-            "unplug_bytes",
-            "unplug_fails",
-            "unplug_discard_fails",
-            {"unplug_agg": latency_agg_metrics_fields},
-            "state_count",
-            "state_fails",
-            {"state_agg": latency_agg_metrics_fields},
-            "unplug_all_count",
-            "unplug_all_fails",
-            {"unplug_all_agg": latency_agg_metrics_fields},
-        ],
     }
 
     # validate timestamp before jsonschema validation which some more time
@@ -357,23 +286,12 @@ def validate_fc_metrics(metrics):
             "missed_read_count",
             "missed_write_count",
         ]
-
-    # add vhost-user metrics to the schema if applicable
-    vhost_user_devices = []
     for metrics_name in metrics.keys():
-        if metrics_name.startswith("vhost_user_"):
-            firecracker_metrics[metrics_name] = [
-                "activate_fails",
-                "cfg_fails",
-                "init_time_us",
-                "activate_time_us",
-                "config_change_time_us",
-            ]
-            vhost_user_devices.append(metrics_name)
         if metrics_name.startswith("block_"):
             firecracker_metrics[metrics_name] = block_metrics
         if metrics_name.startswith("net_"):
             firecracker_metrics[metrics_name] = net_metrics
+
 
     firecracker_metrics_schema = create_metrics_schema_objects(firecracker_metrics)
 
@@ -398,14 +316,6 @@ def validate_fc_metrics(metrics):
                 jsonschema.validate(instance=metrics, schema=firecracker_metrics_schema)
             metrics["rtc"]["error_count"] = temp_pop_metrics
 
-        for vhost_user_dev in vhost_user_devices:
-            temp_pop_metrics = metrics[vhost_user_dev].pop("activate_time_us")
-            with pytest.raises(
-                jsonschema.ValidationError,
-                match="'activate_time_us' is a required property",
-            ):
-                jsonschema.validate(instance=metrics, schema=firecracker_metrics_schema)
-            metrics[vhost_user_dev]["activate_time_us"] = temp_pop_metrics
 
     validate_missing_metrics(metrics)
 

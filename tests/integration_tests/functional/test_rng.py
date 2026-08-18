@@ -8,9 +8,8 @@ from framework.utils import check_entropy
 from host_tools.network import SSHConnection
 
 
-def uvm_with_rng_booted(uvm_plain_any, microvm_factory, rate_limiter):
-    """Return a booted microvm with virtio-rng configured"""
-    # pylint: disable=unused-argument
+def uvm_with_rng_booted(uvm_plain_any, rate_limiter):
+    """Return a booted microvm with virtio-rng configured."""
     uvm = uvm_plain_any
     uvm.spawn(log_level="INFO")
     uvm.basic_config(vcpu_count=2, mem_size_mib=256)
@@ -22,20 +21,6 @@ def uvm_with_rng_booted(uvm_plain_any, microvm_factory, rate_limiter):
     return uvm
 
 
-def uvm_with_rng_restored(uvm_plain_any, microvm_factory, rate_limiter):
-    """Return a restored uvm with virtio-rng configured"""
-    uvm = uvm_with_rng_booted(uvm_plain_any, microvm_factory, rate_limiter)
-    snapshot = uvm.snapshot_full()
-    uvm.kill()
-    uvm2 = microvm_factory.build_from_snapshot(snapshot)
-    uvm2.rng_rate_limiter = uvm.rng_rate_limiter
-    return uvm2
-
-
-@pytest.fixture(params=[uvm_with_rng_booted, uvm_with_rng_restored])
-def uvm_ctor(request):
-    """Fixture to return uvms with different constructors"""
-    return request.param
 
 
 @pytest.fixture(params=[None])
@@ -45,9 +30,9 @@ def rate_limiter(request):
 
 
 @pytest.fixture
-def uvm_any(microvm_factory, uvm_ctor, uvm_plain_any, rate_limiter):
-    """Return booted and restored uvms"""
-    return uvm_ctor(uvm_plain_any, microvm_factory, rate_limiter)
+def uvm_any(uvm_plain_any, rate_limiter):
+    """Return a booted microvm with virtio-rng configured."""
+    return uvm_with_rng_booted(uvm_plain_any, rate_limiter)
 
 
 def list_rng_available(ssh_connection: SSHConnection) -> list[str]:
@@ -217,7 +202,6 @@ def _rate_limiter_id(rate_limiter):
     indirect=True,
     ids=_rate_limiter_id,
 )
-@pytest.mark.parametrize("uvm_ctor", [uvm_with_rng_booted], indirect=True)
 def test_rng_bw_rate_limiter(uvm_any):
     """
     Test that rate limiter without initial burst budget works

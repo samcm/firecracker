@@ -6,12 +6,8 @@
 
 import csv
 import io
-import os
 import platform
 import re
-import shutil
-import sys
-from difflib import unified_diff
 from pathlib import Path
 
 import pytest
@@ -39,12 +35,6 @@ def read_msr_csv(fd):
     return list(csvin)
 
 
-def clean_and_mkdir(dir_path):
-    """
-    Create a clean directory
-    """
-    shutil.rmtree(dir_path, ignore_errors=True)
-    os.makedirs(dir_path)
 
 
 def _check_cpuid_x86(test_microvm, expected_cpu_count, expected_htt):
@@ -76,25 +66,6 @@ def _check_extended_cache_features(vm):
     assert cache_size > 0
 
 
-def skip_test_based_on_artifacts(snapshot_artifacts_dir):
-    """
-    It is possible that some X template is not supported on
-    the instance where the snapshots were created and,
-    snapshot is loaded on an instance where X is supported. This
-    results in error since restore doesn't find the file to load.
-    e.g. let's suppose snapshot is created on Skylake and restored
-    on Cascade Lake. So, the created artifacts could just be:
-    snapshot_artifacts/wrmsr/vmlinux-5.10/T2S
-    but the restore test would fail because the files in
-    snapshot_artifacts/wrmsr/vmlinux-5.10/T2CL won't be available.
-    To avoid this we make an assumption that if template directory
-    does not exist then snapshot was not created for that template
-    and we skip the test.
-    """
-    if not Path.exists(snapshot_artifacts_dir):
-        reason = f"\n Since {snapshot_artifacts_dir} does not exist \
-                we skip the test assuming that snapshot was not"
-        pytest.skip(re.sub(" +", " ", reason))
 
 
 @pytest.mark.parametrize(
@@ -333,106 +304,6 @@ def test_cpu_rdmsr(
     check_msrs_are_equal(baseline_recs, guest_recs)
 
 
-# These names need to be consistent across the two parts of the snapshot-restore test
-# that spans two instances (one that takes a snapshot and one that restores from it)
-# fmt: off
-SNAPSHOT_RESTORE_SHARED_NAMES = {
-    "snapshot_artifacts_root_dir_wrmsr": "snapshot_artifacts/wrmsr",
-    "snapshot_artifacts_root_dir_cpuid": "snapshot_artifacts/cpuid",
-    "msrs_before_fname":                 "msrs_before.txt",
-    "msrs_after_fname":                  "msrs_after.txt",
-    "cpuid_before_fname":                "cpuid_before.txt",
-    "cpuid_after_fname":                 "cpuid_after.txt",
-}
-# fmt: on
-
-
-def dump_msr_state_to_file(msr_reader_bin, dump_fname, ssh_conn):
-    """
-    Read MSR state via SSH and dump it into a file.
-    """
-    ssh_conn.scp_put(msr_reader_bin, "/tmp/msr_reader")
-    _, stdout, stderr = ssh_conn.run("/tmp/msr_reader")
-    assert stderr == ""
-
-    with open(dump_fname, "w", encoding="UTF-8") as file:
-        file.write(stdout)
-
-
-@pytest.mark.skipif(
-    UNSUPPORTED_HOST_KERNEL,
-    reason=f"Supported kernels are {SUPPORTED_HOST_KERNELS}",
-)
-@pytest.mark.timeout(900)
-@pytest.mark.nonci
-def test_cpu_wrmsr_snapshot(
-    msr_reader_bin, microvm_factory, guest_kernel, rootfs, cpu_template_any
-):
-    """
-    This is the first part of the test verifying
-    that MSRs retain their values after restoring from a snapshot.
-
-    This function makes MSR value modifications according to the
-    ./data/msr/wrmsr_list.txt file.
-
-    Before taking a snapshot, MSR values are dumped into a text file.
-    After restoring from the snapshot on another instance, the MSRs are
-    dumped again and their values are compared to previous.
-    Some MSRs are not inherently supposed to retain their values, so they
-    form an MSR exception list.
-
-    This part of the test is responsible for taking a snapshot and publishing
-    its files along with the `before` MSR dump.
-    """
-    cpu_template_name = get_cpu_template_name(cpu_template_any)
-    if cpu_template_name not in MSR_SUPPORTED_TEMPLATES:
-        pytest.skip(f"This test does not support {cpu_template_name} template.")
-
-    shared_names = SNAPSHOT_RESTORE_SHARED_NAMES
-
-    vcpus, guest_mem_mib = 1, 1024
-    vm = microvm_factory.build(guest_kernel, rootfs, monitor_memory=False)
-    vm.spawn()
-    vm.add_net_iface()
-    vm.basic_config(
-        vcpu_count=vcpus,
-        mem_size_mib=guest_mem_mib,
-        track_dirty_pages=True,
-        boot_args="msr.allow_writes=on",
-    )
-    vm.set_cpu_template(cpu_template_any)
-    vm.start()
-
-    # Make MSR modifications
-    msr_writer_host_fname = DATA_FILES / "msr_writer.sh"
-    msr_writer_guest_fname = "/tmp/msr_writer.sh"
-    vm.ssh.scp_put(msr_writer_host_fname, msr_writer_guest_fname)
-
-    wrmsr_input_host_fname = DATA_FILES / "wrmsr_list.txt"
-    wrmsr_input_guest_fname = "/tmp/wrmsr_input.txt"
-    vm.ssh.scp_put(wrmsr_input_host_fname, wrmsr_input_guest_fname)
-
-    _, _, stderr = vm.ssh.run(
-        f"{msr_writer_guest_fname} {wrmsr_input_guest_fname}", timeout=None
-    )
-    assert stderr == ""
-
-    # Dump MSR state to a file that will be published to S3 for the 2nd part of the test
-    snapshot_artifacts_dir = (
-        Path(shared_names["snapshot_artifacts_root_dir_wrmsr"])
-        / guest_kernel.name
-        / get_cpu_template_name(cpu_template_any, with_type=True)
-    )
-    clean_and_mkdir(snapshot_artifacts_dir)
-
-    msrs_before_fname = snapshot_artifacts_dir / shared_names["msrs_before_fname"]
-
-    dump_msr_state_to_file(msr_reader_bin, msrs_before_fname, vm.ssh)
-
-    # Take a snapshot
-    snapshot = vm.snapshot_diff()
-    # Copy snapshot files to be published to S3 for the 2nd part of the test
-    snapshot.save_to(snapshot_artifacts_dir)
 
 
 def check_msrs_are_equal(before_recs, after_recs):
@@ -462,182 +333,17 @@ def check_msrs_are_equal(before_recs, after_recs):
     assert changes == 0
 
 
-@pytest.mark.skipif(
-    UNSUPPORTED_HOST_KERNEL,
-    reason=f"Supported kernels are {SUPPORTED_HOST_KERNELS}",
-)
-@pytest.mark.timeout(900)
-@pytest.mark.nonci
-def test_cpu_wrmsr_restore(
-    msr_reader_bin, microvm_factory, cpu_template_any, guest_kernel
-):
-    """
-    This is the second part of the test verifying
-    that MSRs retain their values after restoring from a snapshot.
-
-    Before taking a snapshot, MSR values are dumped into a text file.
-    After restoring from the snapshot on another instance, the MSRs are
-    dumped again and their values are compared to previous.
-    Some MSRs are not inherently supposed to retain their values, so they
-    form an MSR exception list.
-
-    This part of the test is responsible for restoring from a snapshot and
-    comparing two sets of MSR values.
-    """
-    cpu_template_name = get_cpu_template_name(cpu_template_any)
-    if cpu_template_name not in MSR_SUPPORTED_TEMPLATES:
-        pytest.skip(f"This test does not support {cpu_template_name} template.")
-
-    shared_names = SNAPSHOT_RESTORE_SHARED_NAMES
-    snapshot_artifacts_dir = (
-        Path(shared_names["snapshot_artifacts_root_dir_wrmsr"])
-        / guest_kernel.name
-        / get_cpu_template_name(cpu_template_any, with_type=True)
-    )
-
-    skip_test_based_on_artifacts(snapshot_artifacts_dir)
-
-    vm = microvm_factory.build()
-    vm.spawn()
-    vm.restore_from_path(snapshot_artifacts_dir, resume=True)
-
-    # Dump MSR state to a file for further comparison
-    msrs_after_fname = snapshot_artifacts_dir / shared_names["msrs_after_fname"]
-    dump_msr_state_to_file(msr_reader_bin, msrs_after_fname, vm.ssh)
-    msrs_before_fname = snapshot_artifacts_dir / shared_names["msrs_before_fname"]
-
-    # Compare the two lists of MSR values and assert they are equal
-    before_recs = read_msr_csv(msrs_before_fname.open())
-    after_recs = read_msr_csv(msrs_after_fname.open())
-    check_msrs_are_equal(before_recs, after_recs)
 
 
-def dump_cpuid_to_file(dump_fname, ssh_conn):
-    """
-    Read CPUID via SSH and dump it into a file.
-    """
-    _, stdout, stderr = ssh_conn.run("cpuid --one-cpu")
-    assert stderr == ""
-    dump_fname.write_text(stdout, encoding="UTF-8")
 
 
-@pytest.mark.skipif(
-    UNSUPPORTED_HOST_KERNEL,
-    reason=f"Supported kernels are {SUPPORTED_HOST_KERNELS}",
-)
-@pytest.mark.timeout(900)
-@pytest.mark.nonci
-def test_cpu_cpuid_snapshot(microvm_factory, guest_kernel, rootfs, cpu_template_any):
-    """
-    This is the first part of the test verifying
-    that CPUID remains the same after restoring from a snapshot.
-
-    Before taking a snapshot, CPUID is dumped into a text file.
-    After restoring from the snapshot on another instance, the CPUID is
-    dumped again and its content is compared to previous.
-
-    This part of the test is responsible for taking a snapshot and publishing
-    its files along with the `before` CPUID dump.
-    """
-    cpu_template_name = get_cpu_template_name(cpu_template_any)
-    if cpu_template_name not in MSR_SUPPORTED_TEMPLATES:
-        pytest.skip(f"This test does not support {cpu_template_name} template.")
-
-    shared_names = SNAPSHOT_RESTORE_SHARED_NAMES
-
-    vm = microvm_factory.build(
-        kernel=guest_kernel,
-        rootfs=rootfs,
-    )
-    vm.spawn()
-    vm.add_net_iface()
-    vm.basic_config(
-        vcpu_count=1,
-        mem_size_mib=1024,
-        track_dirty_pages=True,
-    )
-    vm.set_cpu_template(cpu_template_any)
-    vm.start()
-
-    # Dump CPUID to a file that will be published to S3 for the 2nd part of the test
-    snapshot_artifacts_dir = (
-        Path(shared_names["snapshot_artifacts_root_dir_cpuid"])
-        / guest_kernel.name
-        / get_cpu_template_name(cpu_template_any, with_type=True)
-    )
-    clean_and_mkdir(snapshot_artifacts_dir)
-
-    cpuid_before_fname = snapshot_artifacts_dir / shared_names["cpuid_before_fname"]
-
-    dump_cpuid_to_file(cpuid_before_fname, vm.ssh)
-
-    # Take a snapshot
-    snapshot = vm.snapshot_diff()
-    # Copy snapshot files to be published to S3 for the 2nd part of the test
-    snapshot.save_to(snapshot_artifacts_dir)
 
 
-def check_cpuid_is_equal(before_cpuid_fname, after_cpuid_fname):
-    """
-    Checks that CPUID dumps in the files are equal.
-    """
-    with open(before_cpuid_fname, "r", encoding="UTF-8") as file:
-        before = file.readlines()
-    with open(after_cpuid_fname, "r", encoding="UTF-8") as file:
-        after = file.readlines()
-
-    diff = sys.stdout.writelines(unified_diff(before, after))
-
-    assert not diff, f"\n\n{diff}"
 
 
-@pytest.mark.skipif(
-    UNSUPPORTED_HOST_KERNEL,
-    reason=f"Supported kernels are {SUPPORTED_HOST_KERNELS}",
-)
-@pytest.mark.timeout(900)
-@pytest.mark.nonci
-def test_cpu_cpuid_restore(microvm_factory, guest_kernel, cpu_template_any):
-    """
-    This is the second part of the test verifying
-    that CPUID remains the same after restoring from a snapshot.
-
-    Before taking a snapshot, CPUID is dumped into a text file.
-    After restoring from the snapshot on another instance, the CPUID is
-    dumped again and compared to previous.
-
-    This part of the test is responsible for restoring from a snapshot and
-    comparing two CPUIDs.
-    """
-    cpu_template_name = get_cpu_template_name(cpu_template_any)
-    if cpu_template_name not in MSR_SUPPORTED_TEMPLATES:
-        pytest.skip(f"This test does not support {cpu_template_name} template.")
-
-    shared_names = SNAPSHOT_RESTORE_SHARED_NAMES
-    snapshot_artifacts_dir = (
-        Path(shared_names["snapshot_artifacts_root_dir_cpuid"])
-        / guest_kernel.name
-        / get_cpu_template_name(cpu_template_any, with_type=True)
-    )
-
-    skip_test_based_on_artifacts(snapshot_artifacts_dir)
-
-    vm = microvm_factory.build()
-    vm.spawn()
-    vm.restore_from_path(snapshot_artifacts_dir, resume=True)
-
-    # Dump CPUID to a file for further comparison
-    cpuid_after_fname = snapshot_artifacts_dir / shared_names["cpuid_after_fname"]
-    dump_cpuid_to_file(cpuid_after_fname, vm.ssh)
-
-    # Compare the two lists of MSR values and assert they are equal
-    check_cpuid_is_equal(
-        snapshot_artifacts_dir / shared_names["cpuid_before_fname"],
-        snapshot_artifacts_dir / shared_names["cpuid_after_fname"],
-    )
 
 
-def test_cpu_template(uvm_plain_any, cpu_template_any, microvm_factory):
+def test_cpu_template(uvm_plain_any, cpu_template_any):
     """
     Test masked and enabled cpu features against the expected template.
 
@@ -678,14 +384,6 @@ def test_cpu_template(uvm_plain_any, cpu_template_any, microvm_factory):
     check_masked_features(test_microvm, cpu_template_name)
     check_enabled_features(test_microvm, cpu_template_name)
 
-    # Check that cpu features are still correct
-    # after snap/restore cycle.
-    snapshot = test_microvm.snapshot_full()
-    restored_vm = microvm_factory.build()
-    restored_vm.spawn()
-    restored_vm.restore_from_snapshot(snapshot, resume=True)
-    check_masked_features(restored_vm, cpu_template_name)
-    check_enabled_features(restored_vm, cpu_template_name)
 
 
 def check_masked_features(test_microvm, cpu_template):

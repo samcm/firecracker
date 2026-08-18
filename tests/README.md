@@ -600,9 +600,6 @@ uvm.help.tmux_console()
 Just run the test in a loop, and make it drop you into pdb when it fails.
 
 ```sh
-while true; do
-    tools/devtool -y test -- integration_tests/functional/test_balloon.py::test_deflate_on_oom -k False --pdb
-done
 ```
 
 ### How to run tests in parallel with `-n`
@@ -676,7 +673,6 @@ That should drop you in an IPython REPL, where you can interact with a microvm:
 uvm.help.print_log()
 uvm.get_all_metrics()
 uvm.ssh.run("ls")
-snap = uvm.snapshot_full()
 uvm.help.tmux_ssh()
 ```
 

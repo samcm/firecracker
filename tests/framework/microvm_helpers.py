@@ -129,12 +129,10 @@ class MicrovmHelpers:
         if self.vm.boot_args is None:
             self.vm.boot_args = ""
         self.vm.boot_args += "console=ttyS0 reboot=k panic=1 swiotlb=noforce"
-        self.vm.jailer.daemonize = False
-        self.vm.jailer.new_pid_ns = False
 
     def how_to_console(self):
         """Print how to connect to the VM console"""
-        return f"screen -dR {self.vm.screen_session}"
+        return f"tail -f {self.vm.console_log}"
 
     def tmux_console(self):
         """Open a tmux window with the console"""

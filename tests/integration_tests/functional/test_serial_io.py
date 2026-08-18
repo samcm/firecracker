@@ -2,111 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests scenario for the Firecracker serial console."""
 
-import fcntl
-import os
-import platform
-import signal
-import termios
 import time
 from pathlib import Path
 
-import pytest
 
 from framework import utils
 from framework.microvm import Serial
 
-PLATFORM = platform.machine()
 
 
-def test_serial_after_snapshot(uvm_plain, microvm_factory):
-    """
-    Serial I/O after restoring from a snapshot.
-    """
-    microvm = uvm_plain
-    microvm.help.enable_console()
-    microvm.spawn(serial_out_path=None)
-    microvm.basic_config(
-        vcpu_count=2,
-        mem_size_mib=256,
-    )
-    serial = Serial(microvm)
-    serial.open()
-    microvm.start()
-
-    # looking for the # prompt at the end
-    serial.rx(microvm.distro.shell_prompt)
-
-    # Create snapshot.
-    snapshot = microvm.snapshot_full()
-    # Kill base microVM.
-    microvm.kill()
-
-    # Load microVM clone from snapshot.
-    vm = microvm_factory.build()
-    vm.help.enable_console()
-    vm.spawn(serial_out_path=None)
-    vm.restore_from_snapshot(snapshot, resume=True)
-    serial = Serial(vm)
-    serial.open()
-    # After restore, the kernel may emit messages (e.g. crng reseeded on 6.1)
-    # that hold the console lock. Wait for those to finish before sending input.
-    serial.drain_until_idle()
-    serial.tx("")
-    serial.rx(vm.distro.shell_prompt)
-    serial.tx("pwd")
-    res = serial.rx("#")
-    assert "/root" in res
-
-
-# The VM can become unresponsive in the test due to the interrupt storm .
-@pytest.mark.flaky(reruns=2)
-def test_serial_active_tx_snapshot(uvm_plain, microvm_factory):
-    """
-    Snapshot a guest that is actively transmitting on the serial console and
-    test that the transmission continues after snapshot restore.
-    """
-    microvm = uvm_plain
-    microvm.help.enable_console()
-    microvm.spawn(serial_out_path=None)
-    microvm.basic_config(
-        vcpu_count=2,
-        mem_size_mib=256,
-    )
-    serial = Serial(microvm)
-    serial.open()
-    microvm.start()
-
-    # looking for the # prompt at the end
-    serial.rx(microvm.distro.shell_prompt)
-
-    # Start an unbounded serial transmission from inside the guest such that
-    # there will be an active transmission at the point of pausing the VM to
-    # take the snapshot. This will saturate the TX buffer of the UART and it
-    # might make the guest driver enable TX interrupts.
-    serial.tx("cat /dev/zero")
-    # Give the guest time to start the transmission
-    time.sleep(1)
-
-    # Create snapshot.
-    snapshot = microvm.snapshot_full()
-    # Kill base microVM.
-    microvm.kill()
-
-    # Load microVM clone from snapshot.
-    vm = microvm_factory.build()
-    vm.help.enable_console()
-    vm.spawn(serial_out_path=None)
-    vm.restore_from_snapshot(snapshot, resume=True)
-    serial = Serial(vm)
-    serial.open()
-
-    # Send Ctrl-C to the guest to stop the ongoing transmission and regain the shell
-    serial.tx("\x03", end="")
-    # looking for the # prompt at the end
-    serial.rx(vm.distro.shell_prompt)
-    serial.tx("pwd")
-    res = serial.rx("#")
-    assert "/root" in res
 
 
 def test_serial_console_login(uvm_plain_any):
@@ -144,11 +48,11 @@ def get_total_mem_size(pid):
     return float(stdout.strip()[:-1] * 1000)
 
 
-def send_bytes(tty, bytes_count, timeout=60):
-    """Send data to the terminal."""
+def send_bytes(vm, bytes_count, timeout=60):
+    """Send data to the serial console."""
     start = time.time()
     for _ in range(bytes_count):
-        fcntl.ioctl(tty, termios.TIOCSTI, "\n")
+        vm.serial_input("\n")
         current = time.time()
         if current - start > timeout:
             break
@@ -169,13 +73,11 @@ def test_serial_dos(uvm_plain_any):
     microvm.add_net_iface()
     microvm.start()
 
-    # Open an fd for firecracker process terminal.
-    tty_path = f"/proc/{microvm.firecracker_pid}/fd/0"
-    tty_fd = os.open(tty_path, os.O_RDWR)
+    # Send input through the serial console.
 
     # Check if the total memory size changed.
     before_size = get_total_mem_size(microvm.firecracker_pid)
-    send_bytes(tty_fd, 100000000, timeout=1)
+    send_bytes(microvm, 100000000, timeout=1)
     after_size = get_total_mem_size(microvm.firecracker_pid)
     # Give the check a bit of tolerance (1%) since sometimes random unrelated
     # allocations break it.
@@ -205,9 +107,8 @@ def test_serial_block(uvm_plain_any):
     # Get an initial reading of missed writes to the serial.
     fc_metrics = test_microvm.flush_metrics()
     init_count = fc_metrics["uart"]["missed_write_count"]
+    console_size_before = test_microvm.console_log.stat().st_size
 
-    # Stop `screen` process which captures stdout so we stop consuming stdout.
-    os.kill(test_microvm.screen_pid, signal.SIGSTOP)
 
     # Generate a random text file.
     test_microvm.ssh.check_output(
@@ -216,6 +117,7 @@ def test_serial_block(uvm_plain_any):
 
     # Dump output to terminal
     test_microvm.ssh.check_output("cat /tmp/file.txt > /dev/ttyS0")
+    assert test_microvm.console_log.stat().st_size > console_size_before
 
     # Check that the vCPU isn't blocked.
     test_microvm.ssh.check_output("cd /")

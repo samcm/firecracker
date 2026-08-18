@@ -21,15 +21,7 @@ from typing import Dict
 import psutil
 import semver
 from packaging import version
-from tenacity import (
-    Retrying,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_fixed,
-)
 
-FLUSH_CMD = 'screen -S {session} -X colon "logfile flush 0^M"'
 CommandReturn = namedtuple("CommandReturn", "returncode stdout stderr")
 CMDLOG = logging.getLogger("commands")
 
@@ -469,9 +461,8 @@ def dump_proc_state(pid):
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
 
-    # All processes parented to our test session (the subreaper) — reveals
-    # any sibling processes (UFFD handlers, vhost-user backends, leftover FCs)
-    # that might be keeping the stuck FC's resources alive.
+    # All processes parented to our test session (the subreaper) can reveal
+    # sibling processes keeping a stuck Firecracker's resources alive.
     try:
         result = subprocess.run(
             ["ps", "axo", "pid,ppid,pgid,sid,stat,wchan,comm"],
@@ -557,113 +548,6 @@ def supports_hugetlbfs_discard():
     return version.parse(get_kernel_version()) >= version.parse("5.18.0")
 
 
-def generate_mmds_session_token(
-    ssh_connection, ipv4_address, token_ttl, imds_compat=False
-):
-    """Generate session token used for MMDS V2 requests."""
-    cmd = "curl -m 2 -s"
-    cmd += " -X PUT"
-    if imds_compat:
-        cmd += ' -H "X-aws-ec2-metadata-token-ttl-seconds: {}"'.format(token_ttl)
-    else:
-        cmd += ' -H "X-metadata-token-ttl-seconds: {}"'.format(token_ttl)
-    cmd += " http://{}/latest/api/token".format(ipv4_address)
-    _, stdout, _ = ssh_connection.run(cmd)
-    token = stdout
-
-    return token
-
-
-def generate_mmds_get_request(
-    ipv4_address, token=None, app_json=True, imds_compat=False
-):
-    """Build `GET` request to fetch metadata from MMDS."""
-    cmd = "curl -m 2 -s"
-
-    if token is not None:
-        cmd += " -X GET"
-        if imds_compat:
-            cmd += ' -H "X-aws-ec2-metadata-token: {}"'.format(token)
-        else:
-            cmd += ' -H "X-metadata-token: {}"'.format(token)
-
-    if app_json:
-        cmd += ' -H "Accept: application/json"'
-
-    cmd += " http://{}/".format(ipv4_address)
-
-    return cmd
-
-
-def configure_mmds(
-    test_microvm, iface_ids, version=None, ipv4_address=None, imds_compat=False
-):
-    """Configure mmds service."""
-    mmds_config = {"network_interfaces": iface_ids}
-
-    if version is not None:
-        mmds_config["version"] = version
-
-    if ipv4_address:
-        mmds_config["ipv4_address"] = ipv4_address
-
-    if imds_compat is not None:
-        mmds_config["imds_compat"] = imds_compat
-
-    response = test_microvm.api.mmds_config.put(**mmds_config)
-    return response
-
-
-def populate_data_store(test_microvm, data_store):
-    """Populate the MMDS data store of the microvm with the provided data"""
-    response = test_microvm.api.mmds.get()
-    assert response.json() == {}
-
-    test_microvm.api.mmds.put(**data_store)
-    response = test_microvm.api.mmds.get()
-    assert response.json() == data_store
-
-
-def start_screen_process(screen_log, session_name, binary_path, binary_params):
-    """Start binary process into a screen session."""
-    start_cmd = "screen -L -Logfile {logfile} -dmS {session} {binary} {params}"
-    start_cmd = start_cmd.format(
-        logfile=screen_log,
-        session=session_name,
-        binary=binary_path,
-        params=" ".join(binary_params),
-    )
-
-    check_output(start_cmd)
-
-    # Build a regex object to match (number).session_name
-    regex_object = re.compile(r"([0-9]+)\.{}".format(session_name))
-
-    # Run 'screen -ls' in a retry loop, 30 times with a 1s delay between calls.
-    # If the output of 'screen -ls' matches the regex object, it will return the
-    # PID. Otherwise, a RuntimeError will be raised.
-    for attempt in Retrying(
-        retry=retry_if_exception_type(RuntimeError),
-        stop=stop_after_attempt(30),
-        wait=wait_fixed(1),
-        reraise=True,
-    ):
-        with attempt:
-            screen_pid = search_output_from_cmd(
-                cmd="screen -ls", find_regex=regex_object
-            ).group(1)
-
-    # Make sure the screen process launched successfully
-    # As the parent process for the binary.
-    screen_ps = psutil.Process(int(screen_pid))
-    wait_process_running(screen_ps)
-
-    # Configure screen to flush stdout to file.
-    check_output(FLUSH_CMD.format(session=session_name))
-
-    return screen_pid
-
-
 def guest_run_fio_iteration(ssh_connection, iteration):
     """Run FIO workload on a microVM and verify IO completed successfully."""
     fio = (
@@ -699,16 +583,6 @@ def check_network_data_integrity(ssh_connection, size_bytes=64 * 1024):
     assert (
         guest_hash == host_hash
     ), f"Guest hash {guest_hash} does not match host hash {host_hash}"
-
-
-@retry(wait=wait_fixed(0.5), stop=stop_after_attempt(5), reraise=True)
-def wait_process_running(process):
-    """Wait for a process to run.
-
-    Will return successfully if the process is in
-    a running state and will otherwise raise an exception.
-    """
-    assert process.is_running()
 
 
 class Timeout:

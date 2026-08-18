@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for initrd."""
 
+
 import pytest
 
-from framework.microvm import HugePagesConfig, Serial
+from framework.microvm import Serial
+
 
 INITRD_FILESYSTEM = "rootfs"
 
@@ -23,8 +25,7 @@ def uvm_with_initrd(
     yield uvm
 
 
-@pytest.mark.parametrize("huge_pages", HugePagesConfig)
-def test_microvm_initrd_with_serial(uvm_with_initrd, huge_pages):
+def test_microvm_initrd_with_serial(uvm_with_initrd):
     """
     Test that a boot using initrd successfully loads the root filesystem.
     """
@@ -38,7 +39,6 @@ def test_microvm_initrd_with_serial(uvm_with_initrd, huge_pages):
         vcpu_count=1,
         boot_args="console=ttyS0 reboot=k panic=1 swiotlb=noforce",
         use_initrd=True,
-        huge_pages=huge_pages,
     )
 
     vm.start()

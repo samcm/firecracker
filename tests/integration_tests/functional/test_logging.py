@@ -124,16 +124,6 @@ def test_api_requests_logs(uvm_plain):
     )
     microvm.log_file = log_path
 
-    # Check that all requests on /mmds are logged without the body.
-    dummy_json = {"latest": {"meta-data": {"ami-id": "dummy"}}}
-    microvm.api.mmds.put(json=dummy_json)
-    microvm.check_log_message('The API server received a Put request on "/mmds".')
-
-    microvm.api.mmds.patch(json=dummy_json)
-    microvm.check_log_message('The API server received a Patch request on "/mmds".')
-
-    microvm.api.mmds.get()
-    microvm.check_log_message('The API server received a Get request on "/mmds".')
 
     # Check that the fault message return by the client is also logged in the
     # FIFO.

@@ -13,25 +13,18 @@
       "is_read_only": false,
       "path_on_host": "bionic.rootfs.ext4",
       "io_engine": "Sync",
-      "rate_limiter": null,
-      "socket": null
+      "rate_limiter": null
     }
   ],
   "machine-config": {
     "vcpu_count": 2,
     "mem_size_mib": 1024,
-    "smt": false,
-    "track_dirty_pages": false,
-    "huge_pages": "None"
+    "smt": false
   },
   "cpu-config": null,
-  "balloon": null,
   "network-interfaces": [],
   "vsock": null,
   "logger": null,
   "metrics": null,
-  "mmds-config": null,
-  "entropy": null,
-  "pmem": [],
-  "memory-hotplug": null
+  "entropy": null
 }

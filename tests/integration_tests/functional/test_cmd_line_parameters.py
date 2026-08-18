@@ -7,35 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from framework.utils import check_output
 from host_tools.fcmetrics import validate_fc_metrics
 
-
-def test_describe_snapshot(uvm_plain):
-    """
-    Test `--describe-snapshot` correctness for all snapshot versions.
-
-    For each release create a snapshot and verify the data version of the
-    snapshot state file.
-    """
-
-    vm = uvm_plain
-    fc_binary = vm.fc_binary_path
-
-    cmd = [fc_binary, "--snapshot-version"]
-    snap_version_tuple = check_output(cmd).stdout.strip().split("\n")[0].split(".")
-    snap_version = ".".join(str(x) for x in snap_version_tuple)
-
-    vm.spawn()
-    vm.basic_config(track_dirty_pages=True)
-    vm.start()
-    snapshot = vm.snapshot_diff()
-    vm.kill()
-
-    cmd = [fc_binary, "--describe-snapshot", snapshot.vmstate]
-    _, stdout, stderr = check_output(cmd)
-    assert stderr == ""
-    assert snap_version in stdout
 
 
 def test_cli_metrics_path(uvm_plain):
@@ -74,26 +47,6 @@ def test_cli_metrics_path_if_metrics_initialized_twice_fail(uvm_plain):
             metrics_path=microvm.create_jailed_resource(metrics2_path)
         )
 
-
-def test_cli_metrics_if_resume_no_metrics(uvm_plain, microvm_factory):
-    """
-    Check that metrics configuration is not part of the snapshot
-    """
-    # Given: a snapshot of a FC with metrics configured with the CLI option
-    uvm1 = uvm_plain
-    metrics_path = Path(uvm1.path) / "metrics.ndjson"
-    metrics_path.touch()
-    uvm1.spawn(metrics_path=metrics_path)
-    uvm1.basic_config()
-    uvm1.start()
-    snapshot = uvm1.snapshot_full()
-
-    # When: restoring from the snapshot
-    uvm2 = microvm_factory.build_from_snapshot(snapshot)
-
-    # Then: the old metrics configuration does not exist
-    metrics2 = Path(uvm2.jailer.chroot_path()) / metrics_path.name
-    assert not metrics2.exists()
 
 
 def test_cli_no_params(microvm_factory):

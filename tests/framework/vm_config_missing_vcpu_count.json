@@ -13,7 +13,6 @@
   ],
   "machine-config": {
     "mem_size_mib": 1024,
-    "smt": false,
-    "track_dirty_pages": false
+    "smt": false
   }
 }

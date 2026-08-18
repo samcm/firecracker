@@ -7,10 +7,7 @@ import shutil
 import stat
 from pathlib import Path
 
-from tenacity import Retrying, retry_if_exception_type, stop_after_delay
-
-from framework import defs, utils
-from framework.defs import FC_BINARY_NAME
+from framework import defs
 
 # Default name for the socket used for API calls.
 DEFAULT_USOCKET_NAME = "run/firecracker.socket"
@@ -30,14 +27,11 @@ class JailerContext:
     uid = None
     gid = None
     chroot_base = None
-    daemonize = None
-    new_pid_ns = None
     extra_args = None
     api_socket_name = None
-    cgroups = None
+    root_fd = None
+    cgroup_join = None
     resource_limits = None
-    cgroup_ver = None
-    parent_cgroup = None
 
     def __init__(
         self,
@@ -47,12 +41,9 @@ class JailerContext:
         gid=1234,
         chroot_base=DEFAULT_CHROOT_PATH,
         netns=None,
-        daemonize=True,
-        new_pid_ns=False,
-        cgroups=None,
+        root_fd=None,
+        cgroup_join=None,
         resource_limits=None,
-        cgroup_ver=None,
-        parent_cgroup=None,
         **extra_args,
     ):
         """Set up jailer fields.
@@ -60,6 +51,13 @@ class JailerContext:
         This plays the role of a default constructor as it populates
         the jailer's fields with some default values. Each field can be
         further adjusted by each test even with None values.
+
+        `root_fd` is the number of the descriptor holding the sealed root block
+        device image. The process launching the jailer must let the child
+        inherit it, since the jailer renumbers it for the exec'd Firecracker.
+
+        `cgroup_join` is the absolute cgroupfs path of a pre-created leaf
+        cgroup. The jailer only writes its pid there; it creates no cgroup.
         """
         self.jailer_id = jailer_id
         assert jailer_id is not None
@@ -68,14 +66,11 @@ class JailerContext:
         self.gid = gid
         self.chroot_base = Path(chroot_base)
         self.netns = netns
-        self.daemonize = daemonize
-        self.new_pid_ns = new_pid_ns
         self.extra_args = extra_args
         self.api_socket_name = DEFAULT_USOCKET_NAME
-        self.cgroups = cgroups or []
+        self.root_fd = root_fd
+        self.cgroup_join = cgroup_join
         self.resource_limits = resource_limits
-        self.cgroup_ver = cgroup_ver
-        self.parent_cgroup = parent_cgroup
         assert chroot_base is not None
 
     # Disabling 'too-many-branches' warning for this function as it needs to
@@ -100,21 +95,14 @@ class JailerContext:
             jailer_param_list.extend(["--uid", str(self.uid)])
         if self.gid is not None:
             jailer_param_list.extend(["--gid", str(self.gid)])
+        if self.root_fd is not None:
+            jailer_param_list.extend(["--root-fd", str(self.root_fd)])
         if self.chroot_base is not None:
             jailer_param_list.extend(["--chroot-base-dir", str(self.chroot_base)])
         if self.netns is not None:
             jailer_param_list.extend(["--netns", str(self.netns.path)])
-        if self.daemonize:
-            jailer_param_list.append("--daemonize")
-        if self.new_pid_ns:
-            jailer_param_list.append("--new-pid-ns")
-        if self.parent_cgroup:
-            jailer_param_list.extend(["--parent-cgroup", str(self.parent_cgroup)])
-        if self.cgroup_ver:
-            jailer_param_list.extend(["--cgroup-version", str(self.cgroup_ver)])
-        if self.cgroups:
-            for cgroup in self.cgroups:
-                jailer_param_list.extend(["--cgroup", str(cgroup)])
+        if self.cgroup_join is not None:
+            jailer_param_list.extend(["--cgroup-join", str(self.cgroup_join)])
         if self.resource_limits is not None:
             for limit in self.resource_limits:
                 jailer_param_list.extend(["--resource-limit", str(limit)])
@@ -176,71 +164,6 @@ class JailerContext:
     def setup(self):
         """Set up this jailer context."""
         os.makedirs(self.chroot_base, exist_ok=True)
-
-    def cleanup(self):
-        """Clean up this jailer context."""
-
-        # Remove the cgroup folders associated with this microvm.
-        # The base /sys/fs/cgroup/<controller>/firecracker folder will remain,
-        # because we can't remove it unless we're sure there's no other running
-        # microVM.
-
-        if self.cgroups:
-            controllers = set()
-
-            # Extract the controller for every cgroup that needs to be set.
-            for cgroup in self.cgroups:
-                controllers.add(cgroup.split(".")[0])
-
-            for controller in controllers:
-                # Obtain the tasks from each cgroup and wait on them before
-                # removing the microvm's associated cgroup folder.
-                try:
-                    for attempt in Retrying(
-                        retry=retry_if_exception_type(TimeoutError),
-                        stop=stop_after_delay(5),
-                        reraise=True,
-                    ):
-                        with attempt:
-                            self._kill_cgroup_tasks(controller)
-                except TimeoutError:
-                    pass
-
-                # Remove cgroups and sub cgroups.
-                back_cmd = r"-depth -type d -exec rmdir {} \;"
-                cmd = "find /sys/fs/cgroup/{}/{}/{} {}".format(
-                    controller, FC_BINARY_NAME, self.jailer_id, back_cmd
-                )
-                # We do not need to know if it succeeded or not; afterall,
-                # we are trying to clean up resources created by the jailer
-                # itself not the testing system.
-                utils.run_cmd(cmd)
-
-    def _kill_cgroup_tasks(self, controller):
-        """Simulate wait on pid.
-
-        Read the tasks file and stay there until /proc/{pid}
-        disappears. The retry function that calls this code makes
-        sure we do not timeout.
-        """
-        # pylint: disable=subprocess-run-check
-        tasks_file = "/sys/fs/cgroup/{}/{}/{}/tasks".format(
-            controller, FC_BINARY_NAME, self.jailer_id
-        )
-
-        # If tests do not call start on machines, the cgroups will not be
-        # created.
-        if not os.path.exists(tasks_file):
-            return True
-
-        cmd = "cat {}".format(tasks_file)
-        result = utils.check_output(cmd)
-
-        tasks_split = result.stdout.splitlines()
-        for task in tasks_split:
-            if os.path.exists("/proc/{}".format(task)):
-                raise TimeoutError
-        return True
 
     @property
     def pid_file(self):

@@ -18,11 +18,12 @@ import re
 import select
 import shutil
 import signal
+import subprocess
+import threading
 import time
+import tty
 import uuid
 from collections import namedtuple
-from dataclasses import dataclass
-from enum import Enum, auto
 from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import Optional
@@ -30,165 +31,20 @@ from typing import Optional
 import psutil
 from tenacity import Retrying, retry, stop_after_attempt, wait_fixed
 
-import host_tools.cargo_build as build_tools
 import host_tools.network as net_tools
 from framework import utils
-from framework.defs import DEFAULT_BINARY_DIR, MAX_API_CALL_DURATION_MS
+from framework.defs import MAX_API_CALL_DURATION_MS
 from framework.guest import GuestDistro
 from framework.http_api import Api
 from framework.jailer import JailerContext
 from framework.microvm_helpers import MicrovmHelpers
 from framework.properties import global_props
 from framework.utils_cpu_templates import get_cpu_template_name
-from framework.utils_drive import VhostUserBlkBackend, VhostUserBlkBackendType
-from framework.utils_uffd import spawn_pf_handler, uffd_handler
+from host_tools.farplane import ROOT_FILENO, Pagemaster, memfd_from_file
 from host_tools.fcmetrics import FCMetricsMonitor
 from host_tools.memory import MemoryMonitor
 
 LOG = logging.getLogger("microvm")
-
-
-class SnapshotType(Enum):
-    """Supported snapshot types."""
-
-    FULL = auto()
-    DIFF = auto()
-    DIFF_MINCORE = auto()
-
-    def __repr__(self):
-        cls_name = self.__class__.__name__
-        return f"{cls_name}.{self.name}"
-
-    @property
-    def needs_rebase(self) -> bool:
-        """Does this snapshot type need rebasing on top of a base snapshot before restoration?"""
-        return self in [SnapshotType.DIFF, SnapshotType.DIFF_MINCORE]
-
-    @property
-    def needs_dirty_page_tracking(self) -> bool:
-        """Does taking this snapshot type require dirty page tracking to be enabled?"""
-        return self == SnapshotType.DIFF
-
-    @property
-    def api_type(self) -> str:
-        """Converts this `SnapshotType` to the string value expected by the Firecracker API"""
-        match self:
-            case SnapshotType.FULL:
-                return "Full"
-            case SnapshotType.DIFF | SnapshotType.DIFF_MINCORE:
-                return "Diff"
-
-
-def hardlink_or_copy(src, dst):
-    """If src and dst are in the same device, hardlink. Otherwise, copy."""
-    dst.touch(exist_ok=False)
-    if dst.stat().st_dev == src.stat().st_dev:
-        dst.unlink()
-        dst.hardlink_to(src)
-    else:
-        shutil.copyfile(src, dst)
-
-
-@dataclass(frozen=True, repr=True)
-class Snapshot:
-    """A Firecracker snapshot"""
-
-    vmstate: Path
-    mem: Path
-    net_ifaces: list
-    disks: dict
-    ssh_key: Path
-    snapshot_type: SnapshotType
-    meta: dict
-
-    def rebase_snapshot(
-        self, base, use_snapshot_editor=False, binary_dir=DEFAULT_BINARY_DIR
-    ):
-        """Rebases current incremental snapshot onto a specified base layer."""
-        if not self.snapshot_type.needs_rebase:
-            raise ValueError(f"Cannot rebase {self.snapshot_type}")
-        if use_snapshot_editor:
-            build_tools.run_snap_editor_rebase(
-                base.mem, self.mem, binary_dir=binary_dir
-            )
-        else:
-            build_tools.run_rebase_snap_bin(base.mem, self.mem)
-
-        new_args = self.__dict__ | {"mem": base.mem}
-        return Snapshot(**new_args)
-
-    def copy_to_chroot(self, chroot) -> "Snapshot":
-        """
-        Move all the snapshot files into the microvm jail.
-        Use different names so a snapshot doesn't overwrite our original snapshot.
-        """
-        mem_src = chroot / self.mem.with_suffix(".src").name
-        hardlink_or_copy(self.mem, mem_src)
-        vmstate_src = chroot / self.vmstate.with_suffix(".src").name
-        hardlink_or_copy(self.vmstate, vmstate_src)
-
-        return Snapshot(
-            vmstate=vmstate_src,
-            mem=mem_src,
-            net_ifaces=self.net_ifaces,
-            disks=self.disks,
-            ssh_key=self.ssh_key,
-            snapshot_type=self.snapshot_type,
-            meta=self.meta,
-        )
-
-    @classmethod
-    # TBD when Python 3.11: -> Self
-    def load_from(cls, src: Path) -> "Snapshot":
-        """Load a snapshot saved with `save_to`"""
-        snap_json = src / "snapshot.json"
-        obj = json.loads(snap_json.read_text())
-        return cls(
-            vmstate=src / obj["vmstate"],
-            mem=src / obj["mem"],
-            net_ifaces=[net_tools.NetIfaceConfig(**d) for d in obj["net_ifaces"]],
-            disks={dsk: src / p for dsk, p in obj["disks"].items()},
-            ssh_key=src / obj["ssh_key"],
-            snapshot_type=SnapshotType(obj["snapshot_type"]),
-            meta=obj["meta"],
-        )
-
-    def save_to(self, dst: Path):
-        """Serialize snapshot details to `dst`
-
-        Deserialize the snapshot with `load_from`
-        """
-        for path in [self.vmstate, self.mem, self.ssh_key]:
-            new_path = dst / path.name
-            hardlink_or_copy(path, new_path)
-        new_disks = {}
-        for disk_id, path in self.disks.items():
-            new_path = dst / path.name
-            hardlink_or_copy(path, new_path)
-            new_disks[disk_id] = new_path.name
-        obj = {
-            "vmstate": self.vmstate.name,
-            "mem": self.mem.name,
-            "net_ifaces": [x.__dict__ for x in self.net_ifaces],
-            "disks": new_disks,
-            "ssh_key": self.ssh_key.name,
-            "snapshot_type": self.snapshot_type.value,
-            "meta": self.meta,
-        }
-        snap_json = dst / "snapshot.json"
-        snap_json.write_text(json.dumps(obj))
-
-    def delete(self):
-        """Delete the backing files from disk."""
-        self.mem.unlink()
-        self.vmstate.unlink()
-
-
-class HugePagesConfig(str, Enum):
-    """Enum describing the huge pages configurations supported Firecracker"""
-
-    NONE = "None"
-    HUGETLBFS_2MB = "2M"
 
 
 # pylint: disable=R0904
@@ -201,6 +57,8 @@ class Microvm:
     methods, `spawn()` and `kill()` can be used to start/end the microvm
     process.
     """
+
+    MEM_SOCKET_NAME = "farplane.sock"
 
     def __init__(
         self,
@@ -226,7 +84,6 @@ class Microvm:
         self.ssh_key = None
         self.initrd_file = None
         self.boot_args = None
-        self.uffd_handler = None
 
         self.fc_binary_path = Path(fc_binary_path)
         assert fc_binary_path.exists()
@@ -240,7 +97,6 @@ class Microvm:
             jailer_id=self._microvm_id,
             exec_file=self.fc_binary_path,
             netns=netns,
-            new_pid_ns=True,
             **jailer_kwargs,
         )
 
@@ -251,7 +107,11 @@ class Microvm:
         # Copy the /etc/localtime file in the jailer root
         self.jailer.jailed_path("/etc/localtime", subdir="etc")
 
-        self._screen_pid = None
+        self._jailer_proc = None
+        self._console_fd = None
+        self.console_log = None
+        self.pagemaster = None
+        self._root_fd = None
 
         self.time_api_requests = global_props.host_linux_version != "6.1"
         # disable the HTTP API timings as they cause a lot of false positives
@@ -274,7 +134,6 @@ class Microvm:
         # device dictionaries
         self.iface = {}
         self.disks = {}
-        self.disks_vhost_user = {}
         self.vcpus_count = None
         self.mem_size_bytes = None
         self.cpu_template_name = "None"
@@ -287,10 +146,7 @@ class Microvm:
         self._pre_cmd = []
         if numa_node:
             node_str = str(numa_node)
-            self.add_pre_cmd([["numactl", "-N", node_str, "-m", node_str]])
-
-        # MMDS content from file
-        self.metadata_file = None
+            self.add_pre_cmd(["numactl", "-N", node_str, "-m", node_str])
 
         self.help = MicrovmHelpers(self)
 
@@ -312,6 +168,13 @@ class Microvm:
 
     def kill(self, might_be_dead=False):
         """All clean up associated with this microVM should go here."""
+        try:
+            self._kill(might_be_dead)
+        finally:
+            self._release_resources()
+
+    def _kill(self, might_be_dead):
+        """Stop the microVM and assert that nothing survived it."""
         # pylint: disable=subprocess-run-check
         # if it was already killed, return
         if self._killed:
@@ -325,36 +188,34 @@ class Microvm:
         for connection in self._connections:
             connection.close(strict=not might_be_dead)
 
-        # We start with vhost-user backends,
-        # because if we stop Firecracker first, the backend will want
-        # to exit as well and this will cause a race condition.
-        for backend in self.disks_vhost_user.values():
-            backend.kill()
-        self.disks_vhost_user.clear()
-
         assert (
             "Shutting down VM after intercepting signal" not in self.log_data
             or might_be_dead
         ), self.log_data
 
-        # Kill Firecracker and the screen wrapper independently so that one
-        # already being dead (ProcessLookupError) doesn't leak the other.
-        for pid_to_kill in (self.firecracker_pid, self.screen_pid):
-            if not pid_to_kill:
-                continue
+        # Kill Firecracker. The jailer exec'd into it, so the pid in the pid file
+        # is also the pid of our direct child unless a `_pre_cmd` wrapper forked.
+        if self.firecracker_pid:
             try:
-                os.kill(pid_to_kill, signal.SIGKILL)
+                os.kill(self.firecracker_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             except OSError:
                 if not might_be_dead:
-                    msg = (
-                        "Failed to kill Firecracker Process. Did it already die (or did the UFFD handler process die and take it down)?"
-                        if self.uffd_handler
-                        else "Failed to kill Firecracker Process. Did it already die?"
+                    self._dump_debug_information(
+                        "Failed to kill Firecracker Process. Did it already die?"
                     )
-                    self._dump_debug_information(msg)
                     raise
+
+        if self._jailer_proc is not None:
+            if self._jailer_proc.poll() is None:
+                self._jailer_proc.kill()
+            try:
+                self._jailer_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                utils.dump_proc_state(self._jailer_proc.pid)
+                raise
+            self._jailer_proc = None
 
         if self._spawned and self.firecracker_pid:
             try:
@@ -379,7 +240,7 @@ class Microvm:
             offenders = []
             for proc in stdout.splitlines():
                 _, cmd = proc.lower().split(maxsplit=1)
-                if "firecracker" in proc and not cmd.startswith("screen"):
+                if "firecracker" in cmd:
                     offenders.append(proc)
 
             # make sure firecracker was killed
@@ -387,9 +248,6 @@ class Microvm:
                 f"Firecracker reported its pid {self.firecracker_pid}, which was killed, but there still exist processes using the supposedly dead Firecracker's jailer_id: \n"
                 + "\n".join(offenders)
             )
-
-        if self.uffd_handler and self.uffd_handler.is_running():
-            self.uffd_handler.kill()
 
         if self.api:
             self.api.session.close()
@@ -404,15 +262,23 @@ class Microvm:
         if self.memory_monitor:
             self.memory_monitor.check_samples()
 
+    def _release_resources(self):
+        """Stop serving guest memory and drop the descriptors handed to the jail."""
+        if self.pagemaster is not None:
+            self.pagemaster.close()
+            self.pagemaster = None
+        if self._root_fd is not None:
+            os.close(self._root_fd)
+            self._root_fd = None
+        if self._console_fd is not None:
+            os.close(self._console_fd)
+            self._console_fd = None
+
     def _validate_api_response_times(self):
         """
         Parses the firecracker logs for information regarding api server request processing times, and asserts they
         are within acceptable bounds.
         """
-        # Log messages are either
-        # 2023-06-16T07:45:41.767987318 [fc44b23e-ce47-4635-9549-5779a6bd9cee:fc_api] The API server received a Get request on "/mmds".
-        # or
-        # 2023-06-16T07:47:31.204704732 [2f2427c7-e4de-4226-90e6-e3556402be84:fc_api] The API server received a Put request on "/actions" with body "{\"action_type\": \"InstanceStart\"}".
         api_request_regex = re.compile(
             r"\] The API server received a (?P<method>\w+) request on \"(?P<url>(/(\w|-)*)+)\"( with body (?P<body>.*))?\."
         )
@@ -448,7 +314,7 @@ class Microvm:
                         "Got API call duration log entry before request entry"
                     )
 
-                if current_call.url not in ["/snapshot/create", "/snapshot/load"]:
+                if current_call.url != "/snapshot/load":
                     exec_time = float(match.group("execution_time")) / 1000.0
 
                     assert (
@@ -484,6 +350,13 @@ class Microvm:
         return self.log_file.read_text()
 
     @property
+    def console_data(self):
+        """Return everything the microVM wrote to its stdio."""
+        if self.console_log is None:
+            return ""
+        return self.console_log.read_text(errors="replace")
+
+    @property
     def state(self):
         """Get the InstanceInfo property and return the state field."""
         return self.api.describe.get().json()["state"]
@@ -499,13 +372,19 @@ class Microvm:
 
         # Read the PID from Firecracker's pidfile. Retry if
         # file doesn't exist yet, or doesn't yet contain an integer
-        for attempt in Retrying(
-            stop=stop_after_attempt(5),
-            wait=wait_fixed(0.1),
-            reraise=True,
-        ):
-            with attempt:
-                return int(self.jailer.pid_file.read_text(encoding="ascii"))
+        try:
+            for attempt in Retrying(
+                stop=stop_after_attempt(5),
+                wait=wait_fixed(0.1),
+                reraise=True,
+            ):
+                with attempt:
+                    return int(self.jailer.pid_file.read_text(encoding="ascii"))
+        except OSError:
+            if self._jailer_proc is not None and self._jailer_proc.poll() is not None:
+                # The jailer died before it could exec into Firecracker.
+                return None
+            raise
 
     @cached_property
     def ps(self):
@@ -568,26 +447,6 @@ class Microvm:
         """Get the chroot of this microVM."""
         return self.jailer.chroot_path()
 
-    @property
-    def screen_session(self):
-        """The screen session name
-
-        The id of this microVM, which should be unique.
-        """
-        return self.id
-
-    @property
-    def screen_log(self):
-        """Get the screen log file."""
-        return f"/tmp/screen-{self.screen_session}.log"
-
-    @property
-    def screen_pid(self) -> Optional[int]:
-        """Get the screen PID."""
-        if self._screen_pid:
-            return int(self._screen_pid)
-        return None
-
     def pin_vmm(self, cpu_id: int) -> bool:
         """Pin the firecracker process VMM thread to a cpu list."""
         if self.firecracker_pid:
@@ -646,6 +505,43 @@ class Microvm:
         """
         self._pre_cmd = pre_cmd + self._pre_cmd
 
+    def start_pagemaster(self):
+        """Bind the memory channel inside the jail and start serving guest memory."""
+        socket_path = Path(self.chroot()) / self.MEM_SOCKET_NAME
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        pagemaster = Pagemaster(socket_path, markers=False)
+        pagemaster.start()
+        return pagemaster
+
+    def _open_console(self):
+        """Return a pty for the microVM stdio, drained into `console_log`.
+
+        Firecracker's serial console is its stdio unless a `serial_out_path` is
+        configured, so this is what `Serial` and `serial_input` talk to.
+        """
+        self._console_fd, slave = os.openpty()
+        tty.setraw(slave)
+        self.console_log = Path(self.path) / "console.log"
+        threading.Thread(
+            target=self._drain_console,
+            args=(self._console_fd, self.console_log.open("wb", buffering=0)),
+            name=f"console-{self.id}",
+            daemon=True,
+        ).start()
+        return slave
+
+    def _drain_console(self, fd, log):
+        """Copy everything the microVM writes to its pty into `console_log`."""
+        with log:
+            while True:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    return
+                if not data:
+                    return
+                log.write(data)
+
     def spawn(
         self,
         log_file="fc.log",
@@ -657,8 +553,12 @@ class Microvm:
         emit_metrics: bool = False,
         validate_api: bool = True,
     ):
-        """Start a microVM as a daemon or in a screen session."""
-        # pylint: disable=subprocess-run-check
+        """Spawn the microVM.
+
+        The root image reaches Firecracker as a sealed memfd the jailer
+        renumbers to `ROOT_FILENO`, and guest memory is served over the memory
+        channel a `Pagemaster` binds inside the jail.
+        """
         # pylint: disable=too-many-branches
         self.jailer.setup()
         self.api = Api(
@@ -695,17 +595,15 @@ class Microvm:
         else:
             assert not emit_metrics
 
-        if self.metadata_file:
-            if os.path.exists(self.metadata_file):
-                LOG.debug("metadata file exists, adding as a jailed resource")
-                self.create_jailed_resource(self.metadata_file)
-            self.jailer.extra_args.update(
-                {"metadata": os.path.basename(self.metadata_file)}
-            )
-
         if log_level != "Debug":
             # Checking the timings requires DEBUG level log messages
             self.time_api_requests = False
+
+        assert self.rootfs_file is not None, "the jailer requires a root image"
+        self._root_fd = memfd_from_file("rootfs", self.rootfs_file)
+        self.jailer.root_fd = self._root_fd
+        self.pagemaster = self.start_pagemaster()
+        self.jailer.extra_args["farplane-mem-socket"] = f"/{self.MEM_SOCKET_NAME}"
 
         cmd = [
             *self._pre_cmd,
@@ -713,27 +611,18 @@ class Microvm:
             *self.jailer.construct_param_list(),
         ]
 
-        # When the daemonize flag is on, we want to clone-exec into the
-        # jailer rather than executing it via spawning a shell.
-        if self.jailer.daemonize:
-            utils.check_output(cmd, shell=False)
-        else:
-            # Run Firecracker under screen. This is used when we want to access
-            # the serial console. The file will collect the output from
-            # 'screen'ed Firecracker.
-            screen_pid = utils.start_screen_process(
-                self.screen_log,
-                self.screen_session,
-                cmd[0],
-                cmd[1:],
-            )
-            self._screen_pid = screen_pid
-
-        # If `--new-pid-ns` is used, the Firecracker process will detach from
-        # the screen and the screen process will exit. We do not want to
-        # attempt to kill it in that case to avoid a race condition.
-        if self.jailer.new_pid_ns:
-            self._screen_pid = None
+        # The jailer execs into Firecracker, so the root descriptor has to
+        # survive the fork: `pass_fds` keeps exactly that number open, which is
+        # the number `--root-fd` names.
+        console = self._open_console()
+        self._jailer_proc = subprocess.Popen(
+            cmd,
+            stdin=console,
+            stdout=console,
+            stderr=console,
+            pass_fds=(self._root_fd,),
+        )
+        os.close(console)
 
         self._spawned = True
 
@@ -744,9 +633,9 @@ class Microvm:
         # responsiveness / API availability.
         # If we are using a config file and it has a network device specified,
         # use SSH to wait until guest userspace is available. If we are
-        # using the API, wait until the log message indicating the API server
-        # has finished initializing is printed (if logging is enabled), or
-        # until the API socket file has been created.
+        # using the API, wait until the API socket file has been created, and
+        # then until the log message indicating the API server has finished
+        # initializing is printed (if logging is enabled).
         # If none of these apply, do a last ditch effort to make sure the
         # Firecracker process itself at least came up by checking
         # for the startup log message. Otherwise, you're on your own kid.
@@ -754,10 +643,9 @@ class Microvm:
             assert not serial_out_path
             self.wait_for_ssh_up()
         elif "no-api" not in self.jailer.extra_args:
+            self._wait_for_api_socket()
             if self.log_file and log_level in ("Trace", "Debug", "Info"):
                 self.check_log_message("API server started.")
-            else:
-                self._wait_for_api_socket()
 
             if serial_out_path is not None:
                 self.api.serial.put(serial_out_path=serial_out_path)
@@ -768,6 +656,11 @@ class Microvm:
     @retry(wait=wait_fixed(0.2), stop=stop_after_attempt(5), reraise=True)
     def _wait_for_api_socket(self):
         """Wait until the API socket and chroot folder are available."""
+        if self._jailer_proc.poll() is not None:
+            raise ChildProcessError(
+                f"the microVM exited with {self._jailer_proc.returncode} before its "
+                f"API socket appeared:\n{self.console_data}"
+            )
 
         # We expect the jailer to start within 80 ms. However, we wait for
         # 1 sec since we are rechecking the existence of the socket 5 times
@@ -804,9 +697,8 @@ class Microvm:
         )
 
     def serial_input(self, input_string):
-        """Send a string to the Firecracker serial console via screen."""
-        input_cmd = f'screen -S {self.screen_session} -p 0 -X stuff "{input_string}"'
-        return utils.check_output(input_cmd)
+        """Send a string to the Firecracker serial console."""
+        os.write(self._console_fd, input_string.encode())
 
     def basic_config(
         self,
@@ -816,8 +708,6 @@ class Microvm:
         add_root_device: bool = True,
         boot_args: str = None,
         use_initrd: bool = False,
-        track_dirty_pages: bool = False,
-        huge_pages: HugePagesConfig = None,
         rootfs_io_engine=None,
         cpu_template: Optional[str] = None,
         enable_entropy_device=False,
@@ -827,7 +717,7 @@ class Microvm:
         It handles:
         - CPU and memory.
         - Kernel image (will load the one in the microVM allocated path).
-        - Root File System (will use the one in the microVM allocated path).
+        - Root File System (the sealed descriptor the jailer handed over).
         - Does not start the microvm.
 
         The function checks the response status code and asserts that
@@ -842,8 +732,6 @@ class Microvm:
             vcpu_count=vcpu_count,
             smt=smt,
             mem_size_mib=mem_size_mib,
-            track_dirty_pages=track_dirty_pages,
-            huge_pages=huge_pages,
         )
         self.vcpus_count = vcpu_count
         self.mem_size_bytes = mem_size_mib * 2**20
@@ -875,17 +763,17 @@ class Microvm:
 
         self.api.boot.put(**boot_source_args)
 
-        if add_root_device and self.rootfs_file is not None:
-            read_only = self.rootfs_file.suffix == ".squashfs"
-
-            # Add the root file system
-            self.add_drive(
+        if add_root_device:
+            # The root image is the sealed memfd the jailer placed at
+            # `ROOT_FILENO`, which Firecracker only accepts read-only.
+            self.api.drive.put(
                 drive_id="rootfs",
-                path_on_host=self.rootfs_file,
+                fd=ROOT_FILENO,
                 is_root_device=True,
-                is_read_only=read_only,
+                is_read_only=True,
                 io_engine=rootfs_io_engine,
             )
+            self.disks["rootfs"] = self.rootfs_file
 
         if enable_entropy_device:
             self.enable_entropy_device()
@@ -926,41 +814,6 @@ class Microvm:
         )
         self.disks[drive_id] = path_on_host
 
-    def add_vhost_user_drive(
-        self,
-        drive_id,
-        path_on_host,
-        partuuid=None,
-        is_root_device=False,
-        is_read_only=False,
-        cache_type=None,
-        backend_type=VhostUserBlkBackendType.CROSVM,
-    ):
-        """Add a vhost-user block device."""
-
-        # It is possible that the user adds another drive
-        # with the same ID. In that case, we should clean
-        # the previous backend up first.
-        prev = self.disks_vhost_user.pop(drive_id, None)
-        if prev:
-            prev.kill()
-
-        backend = VhostUserBlkBackend.with_backend(
-            backend_type, path_on_host, self.chroot(), drive_id, is_read_only
-        )
-
-        socket = backend.spawn(self.jailer.uid, self.jailer.gid)
-
-        self.api.drive.put(
-            drive_id=drive_id,
-            socket=socket,
-            partuuid=partuuid,
-            is_root_device=is_root_device,
-            cache_type=cache_type,
-        )
-
-        self.disks_vhost_user[drive_id] = backend
-
     def patch_drive(self, drive_id, file=None):
         """Modify/patch an existing block device."""
         if file:
@@ -996,24 +849,6 @@ class Microvm:
 
         return iface
 
-    def add_pmem(
-        self,
-        pmem_id,
-        path_on_host,
-        root_device=False,
-        read_only=False,
-    ):
-        """Add a pmem device."""
-
-        path_on_jail = self.create_jailed_resource(path_on_host)
-        self.api.pmem.put(
-            id=pmem_id,
-            path_on_host=path_on_jail,
-            root_device=root_device,
-            read_only=read_only,
-        )
-        self.disks[pmem_id] = path_on_host
-
     def start(self):
         """Start the microvm.
 
@@ -1023,6 +858,10 @@ class Microvm:
         assert self.state == "Not started"
 
         self.api.actions.put(action_type="InstanceStart")
+
+        # Booting builds guest memory over the memory channel, so surface any
+        # failure the pagemaster hit while serving it.
+        self.pagemaster.wait_ready()
 
         # Check that the VM has started
         assert self.state == "Running"
@@ -1038,155 +877,9 @@ class Microvm:
         """Resume the microVM"""
         self.api.vm.patch(state="Resumed")
 
-    def make_snapshot(
-        self,
-        snapshot_type: SnapshotType,
-        *,
-        mem_path: str = "mem",
-        vmstate_path="vmstate",
-    ):
-        """Create a Snapshot object from a microvm.
-
-        The snapshot's memory and vstate files will be saved at the specified paths
-        relative to the Microvm's chroot.
-
-        It pauses the microvm before taking the snapshot.
-        """
-        self.pause()
-        # Notify monitor that snapshot is being created
-        if self.memory_monitor:
-            self.memory_monitor.set_threshold_for_snapshot()
-        self.api.snapshot_create.put(
-            mem_file_path=str(mem_path),
-            snapshot_path=str(vmstate_path),
-            snapshot_type=snapshot_type.api_type,
-        )
-        root = Path(self.chroot())
-        return Snapshot(
-            vmstate=root / vmstate_path,
-            mem=root / mem_path,
-            disks=self.disks,
-            net_ifaces=[x["iface"] for ifname, x in self.iface.items()],
-            ssh_key=self.ssh_key,
-            snapshot_type=snapshot_type,
-            meta={
-                "kernel_file": str(self.kernel_file),
-                "rootfs_file": str(self.rootfs_file) if self.rootfs_file else None,
-                "vcpus_count": self.vcpus_count,
-            },
-        )
-
-    def snapshot_diff(self, *, mem_path: str = "mem", vmstate_path="vmstate"):
-        """Make a Diff snapshot"""
-        return self.make_snapshot(
-            SnapshotType.DIFF, mem_path=mem_path, vmstate_path=vmstate_path
-        )
-
-    def snapshot_full(self, *, mem_path: str = "mem", vmstate_path="vmstate"):
-        """Make a Full snapshot"""
-        return self.make_snapshot(
-            SnapshotType.FULL, mem_path=mem_path, vmstate_path=vmstate_path
-        )
-
-    def restore_from_snapshot(
-        self,
-        snapshot: Snapshot,
-        resume: bool = False,
-        rename_interfaces: dict = None,
-        vsock_override: str = None,
-        clock_realtime: bool = False,
-        *,
-        uffd_handler_name: str = None,
-    ):
-        """Restore a snapshot"""
-
-        jailed_snapshot = snapshot.copy_to_chroot(Path(self.chroot()))
-
-        if uffd_handler_name:
-            self.uffd_handler = spawn_pf_handler(
-                self,
-                uffd_handler(uffd_handler_name, binary_dir=self.fc_binary_path.parent),
-                jailed_snapshot,
-            )
-
-        jailed_mem = Path("/") / jailed_snapshot.mem.name
-        jailed_vmstate = Path("/") / jailed_snapshot.vmstate.name
-
-        snapshot_disks = [v for k, v in jailed_snapshot.disks.items()]
-        assert len(snapshot_disks) > 0, "Snapshot requires at least one disk."
-        jailed_disks = []
-        for disk in snapshot_disks:
-            jailed_disks.append(self.create_jailed_resource(disk))
-        self.disks = jailed_snapshot.disks
-        self.ssh_key = jailed_snapshot.ssh_key
-
-        # Create network interfaces.
-        for iface in jailed_snapshot.net_ifaces:
-            self.add_net_iface(iface, api=False)
-
-        mem_backend = {"backend_type": "File", "backend_path": str(jailed_mem)}
-        if self.uffd_handler is not None:
-            mem_backend = {
-                "backend_type": "Uffd",
-                "backend_path": str(self.uffd_handler.socket_path),
-            }
-
-        for key, value in jailed_snapshot.meta.items():
-            setattr(self, key, value)
-        # Adjust things just in case
-        self.kernel_file = Path(self.kernel_file)
-        if self.rootfs_file:
-            self.rootfs_file = Path(self.rootfs_file)
-            self.distro = GuestDistro.from_rootfs(self.rootfs_file)
-
-        iface_overrides = []
-        if rename_interfaces is not None:
-            iface_overrides = [
-                {"iface_id": k, "host_dev_name": v}
-                for k, v in rename_interfaces.items()
-            ]
-
-        optional_kwargs = {}
-        if iface_overrides:
-            # For backwards compatibility ab testing we want to avoid adding
-            # new parameters until we have a release baseline with the new
-            # parameter. Once the release baseline has moved, this assignment
-            # can be inline in the snapshot_load command below
-            optional_kwargs["network_overrides"] = iface_overrides
-
-        if vsock_override is not None:
-            optional_kwargs["vsock_override"] = {"uds_path": vsock_override}
-
-        if clock_realtime:
-            optional_kwargs["clock_realtime"] = clock_realtime
-
-        self.api.snapshot_load.put(
-            mem_backend=mem_backend,
-            snapshot_path=str(jailed_vmstate),
-            enable_diff_snapshots=jailed_snapshot.snapshot_type.needs_dirty_page_tracking,
-            resume_vm=resume,
-            **optional_kwargs,
-        )
-
-        if self.memory_monitor:
-            response = self.api.machine_config.get()
-            self.mem_size_bytes = int(response.json()["mem_size_mib"]) * 2**20
-            # Notify monitor that this is a restored VM
-            self.memory_monitor.set_threshold_for_restored_vm()
-            self.memory_monitor.start()
-
-        # This is not a "wait for boot", but rather a "VM still works after restoration"
-        if jailed_snapshot.net_ifaces and resume:
-            self.wait_for_ssh_up()
-        return jailed_snapshot
-
     def enable_entropy_device(self):
         """Enable entropy device for microVM"""
         self.api.entropy.put()
-
-    def restore_from_path(self, snap_dir: Path, **kwargs):
-        """Restore snapshot from a path"""
-        return self.restore_from_snapshot(Snapshot.load_from(snap_dir), **kwargs)
 
     @lru_cache
     def ssh_iface(self, iface_idx=0):
@@ -1233,8 +926,6 @@ class Microvm:
         """
         LOG.error(what)
         LOG.error("Firecracker logs:\n%s", self.log_data)
-        if self.uffd_handler:
-            LOG.error("Uffd logs:\n%s", self.uffd_handler.log_data)
         if not self._killed:
             LOG.error("Thread backtraces:\n%s", self.thread_backtraces)
 
@@ -1248,28 +939,6 @@ class Microvm:
         """Enables GDB debugging"""
         self.gdb_socket = "gdb.socket"
         self.api.machine_config.patch(gdb_socket_path=self.gdb_socket)
-
-    def hotplug_memory(
-        self, requested_size_mib: int, timeout: int = 60, poll: float = 0.1
-    ):
-        """Send a hot(un)plug request and wait up to timeout seconds for completion polling every poll seconds
-
-        Returns: api latency (secs), total latency (secs)
-        """
-        api_start = time.time()
-        self.api.memory_hotplug.patch(requested_size_mib=requested_size_mib)
-        api_end = time.time()
-        # Wait for the hotplug to complete
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if (
-                self.api.memory_hotplug.get().json()["plugged_size_mib"]
-                == requested_size_mib
-            ):
-                plug_end = time.time()
-                return api_end - api_start, plug_end - api_start
-            time.sleep(poll)
-        raise TimeoutError(f"Hotplug did not complete within {timeout} seconds")
 
 
 class MicroVMFactory:
@@ -1312,94 +981,15 @@ class MicroVMFactory:
         if kernel is not None:
             vm.kernel_file = kernel
         if rootfs is not None:
-            ssh_key = rootfs.with_suffix(".id_rsa")
-            # copy only iff not a read-only rootfs
-            rootfs_path = rootfs
-            if rootfs_path.suffix != ".squashfs":
-                rootfs_path = Path(vm.path) / rootfs.name
-                shutil.copyfile(rootfs, rootfs_path)
-            vm.rootfs_file = rootfs_path
-            vm.distro = GuestDistro.from_rootfs(rootfs_path)
-            vm.ssh_key = ssh_key
+            vm.rootfs_file = rootfs
+            vm.distro = GuestDistro.from_rootfs(rootfs)
+            vm.ssh_key = rootfs.with_suffix(".id_rsa")
         return vm
-
-    def build_from_snapshot(
-        self, snapshot: Snapshot, uffd_handler_name=None, clock_realtime=False
-    ):
-        """Build a microvm from a snapshot"""
-        vm = self.build()
-        vm.spawn()
-        vm.restore_from_snapshot(
-            snapshot,
-            resume=True,
-            uffd_handler_name=uffd_handler_name,
-            clock_realtime=clock_realtime,
-        )
-        return vm
-
-    def build_n_from_snapshot(
-        self,
-        current_snapshot,
-        nr_vms,
-        *,
-        uffd_handler_name=None,
-        incremental=False,
-        use_snapshot_editor=True,
-        no_netns_reuse=False,
-    ):
-        """A generator of `n` microvms restored, either all restored from the same given snapshot
-        (incremental=False), or created by taking successive snapshots of restored VMs
-        """
-        last_snapshot = None
-        for _ in range(nr_vms):
-            microvm = self.build(
-                **(
-                    {"netns": net_tools.NetNs(str(uuid.uuid4()))}
-                    if no_netns_reuse
-                    else {}
-                )
-            )
-            microvm.spawn()
-
-            snapshot_copy = microvm.restore_from_snapshot(
-                current_snapshot, resume=True, uffd_handler_name=uffd_handler_name
-            )
-
-            yield microvm
-
-            if incremental:
-                # When doing diff snapshots, we continuously overwrite the same base snapshot file from the first
-                # iteration in-place with successive snapshots, so don't delete it!
-                if (
-                    last_snapshot is not None
-                    and not last_snapshot.snapshot_type.needs_rebase
-                ):
-                    last_snapshot.delete()
-
-                next_snapshot = microvm.make_snapshot(current_snapshot.snapshot_type)
-
-                if current_snapshot.snapshot_type.needs_rebase:
-                    next_snapshot = next_snapshot.rebase_snapshot(
-                        current_snapshot,
-                        use_snapshot_editor,
-                        binary_dir=microvm.fc_binary_path.parent,
-                    )
-
-                last_snapshot = current_snapshot
-                current_snapshot = next_snapshot
-
-            microvm.kill()
-            snapshot_copy.delete()
-
-        if last_snapshot is not None and not last_snapshot.snapshot_type.needs_rebase:
-            last_snapshot.delete()
-        current_snapshot.delete()
 
     def kill(self):
         """Clean up all built VMs"""
         for vm in self.vms:
             vm.kill()
-            vm.jailer.cleanup()
             chroot_base_with_id = vm.jailer.chroot_base_with_id()
             if len(vm.jailer.jailer_id) > 0 and chroot_base_with_id.exists():
                 shutil.rmtree(chroot_base_with_id)
@@ -1420,19 +1010,13 @@ class Serial:
 
     def open(self):
         """Open a serial connection."""
-        # Open the screen log file.
         if self._poller is not None:
             # serial already opened
             return
 
-        attempt = 0
-        while not Path(self._vm.screen_log).exists() and attempt < 5:
-            time.sleep(0.2)
-            attempt += 1
-
-        serial_log_fd = os.open(self._vm.screen_log, os.O_RDONLY)
+        console_log_fd = os.open(self._vm.console_log, os.O_RDONLY)
         self._poller = select.poll()
-        self._poller.register(serial_log_fd, select.POLLIN | select.POLLHUP)
+        self._poller.register(console_log_fd, select.POLLIN | select.POLLHUP)
 
     def tx(self, input_string, end="\n"):
         # pylint: disable=invalid-name

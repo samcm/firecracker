@@ -34,7 +34,7 @@ import host_tools.cargo_build as build_tools
 from framework import defs, utils
 from framework.artifacts import disks, kernel_params
 from framework.defs import ARTIFACT_DIR, DEFAULT_BINARY_DIR
-from framework.microvm import HugePagesConfig, MicroVMFactory, SnapshotType
+from framework.microvm import MicroVMFactory
 from framework.properties import global_props
 from framework.utils_cpu_templates import (
     custom_cpu_templates_params,
@@ -423,18 +423,11 @@ def microvm_factory(request, record_property, results_dir, netns_factory):
             uvm_data.joinpath("host-dmesg.log").write_text(
                 utils.run_cmd(["dmesg", "-dPx"]).stdout
             )
-            if Path(uvm.screen_log).exists():
-                shutil.copy(uvm.screen_log, uvm_data)
+            if uvm.console_log is not None and uvm.console_log.exists():
+                shutil.copy(uvm.console_log, uvm_data)
 
             if not dump_full:
                 continue
-
-            try:
-                uvm.snapshot_full(
-                    mem_path="post_failure.mem", vmstate_path="post_failure.vmstate"
-                )
-            except:  # pylint: disable=bare-except
-                pass
 
             shutil.copy(ARTIFACT_DIR / "id_rsa", uvm_data)
 
@@ -474,14 +467,6 @@ def cpu_template_any(request, record_property):
 @pytest.fixture(params=["Sync", "Async"])
 def io_engine(request):
     """All supported io_engines"""
-    return request.param
-
-
-@pytest.fixture(
-    params=[SnapshotType.DIFF, SnapshotType.DIFF_MINCORE, SnapshotType.FULL]
-)
-def snapshot_type(request):
-    """All possible snapshot types"""
     return request.param
 
 
@@ -655,15 +640,6 @@ def pci_enabled(request):
     yield request.param
 
 
-@pytest.fixture(
-    params=[HugePagesConfig.NONE, HugePagesConfig.HUGETLBFS_2MB],
-    ids=["NO_HUGE_PAGES", "2M_HUGE_PAGES"],
-)
-def huge_pages(request):
-    """Fixture that allows configuring whether a microVM will have huge pages enabled or not"""
-    yield request.param
-
-
 def uvm_booted(
     microvm_factory,
     guest_kernel,
@@ -683,21 +659,7 @@ def uvm_booted(
     return uvm
 
 
-def uvm_restored(
-    microvm_factory, guest_kernel, rootfs, cpu_template, pci_enabled, **kwargs
-):
-    """Return a restored uvm"""
-    uvm = uvm_booted(
-        microvm_factory, guest_kernel, rootfs, cpu_template, pci_enabled, **kwargs
-    )
-    snapshot = uvm.snapshot_full()
-    uvm.kill()
-    uvm2 = microvm_factory.build_from_snapshot(snapshot)
-    uvm2.cpu_template_name = uvm.cpu_template_name
-    return uvm2
-
-
-@pytest.fixture(params=[uvm_booted, uvm_restored])
+@pytest.fixture(params=[uvm_booted])
 def uvm_ctor(request):
     """Fixture to return uvms with different constructors"""
     return request.param
@@ -801,14 +763,3 @@ def uvm_with_fips(microvm_factory, guest_kernel_linux_6_1, rootfs_rw):
     uvm.add_net_iface()
     uvm.start()
     return uvm
-
-
-@pytest.fixture
-def fips_snapshot_pair(uvm_with_fips, microvm_factory):
-    """Boot a FIPS VM, snapshot it, restore two VMs from the same snapshot."""
-    snapshot = uvm_with_fips.snapshot_full()
-    uvm_with_fips.kill()
-
-    uvm_a = microvm_factory.build_from_snapshot(snapshot)
-    uvm_b = microvm_factory.build_from_snapshot(snapshot)
-    yield uvm_a, uvm_b
