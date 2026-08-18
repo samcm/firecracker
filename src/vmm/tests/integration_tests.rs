@@ -9,7 +9,6 @@ use vmm::devices::virtio::block::CacheType;
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{LoadSnapshotError, PrebootApiController, VmmAction, VmmActionError};
 use vmm::seccomp::get_empty_filters;
-use vmm::test_utils::mock_resources::MockVmResources;
 use vmm::vmm_config::boot_source::BootSourceConfig;
 use vmm::vmm_config::drive::BlockDeviceConfig;
 use vmm::vmm_config::instance_info::InstanceInfo;
@@ -21,7 +20,7 @@ use vmm_sys_util::tempfile::TempFile;
 
 #[test]
 fn test_build_and_boot_microvm_without_boot_source() {
-    let resources: VmResources = MockVmResources::new().into();
+    let resources = VmResources::default();
     let mut event_manager = EventManager::new().unwrap();
     let empty_seccomp_filters = get_empty_filters();
 

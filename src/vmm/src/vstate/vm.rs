@@ -453,7 +453,7 @@ impl KvmVm {
             .guest_memory
             .insert_region(Arc::clone(&region))?;
 
-        self.set_user_memory_region((&region.slot()).into())?;
+        self.set_user_memory_region(region.as_ref().into())?;
         self.common.guest_memory = new_guest_memory;
 
         Ok(())
@@ -522,19 +522,17 @@ impl KvmVm {
     }
 
     /// Snapshots the dirty accumulator of every guest region, in ascending guest address order.
-    ///
-    /// Under manual protection `KVM_GET_DIRTY_LOG` neither clears nor re-protects, so the returned
-    /// bits stay set until [`KvmVm::clear_dirty_log`] retires them.
+    /// Under manual protection `KVM_GET_DIRTY_LOG` neither clears nor re-protects, so the bits
+    /// stay set until [`KvmVm::clear_dirty_log`] retires them.
     pub fn snapshot_dirty_log(&self) -> Result<Vec<Vec<u64>>, VmError> {
         let page_size = host_page_size();
         self.guest_memory()
             .iter()
             .map(|region| {
-                let slot = region.slot();
                 let len = u64_to_usize(region.len());
                 let mut words = self
                     .fd()
-                    .get_dirty_log(slot.slot, len)
+                    .get_dirty_log(region.slot, len)
                     .map_err(VmError::GetDirtyLog)?;
                 let pages = len.div_ceil(page_size);
                 if words.len() != pages.div_ceil(64) {
@@ -564,7 +562,7 @@ impl KvmVm {
                 return Err(VmError::DirtyBitmapShape);
             }
             let clear = kvm_clear_dirty_log {
-                slot: region.slot().slot,
+                slot: region.slot,
                 num_pages: u32::try_from(pages).map_err(|_| VmError::DirtyBitmapShape)?,
                 first_page: 0,
                 __bindgen_anon_1: kvm_bindings::kvm_clear_dirty_log__bindgen_ty_1 {

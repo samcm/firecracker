@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use vm_memory::GuestAddress;
 
 use crate::cpu_config::templates::CustomCpuTemplate;
 use crate::logger::LoggerConfig;
@@ -15,7 +14,6 @@ use crate::vmm_config::boot_source::{
 };
 use crate::vmm_config::drive::*;
 use crate::vmm_config::entropy::*;
-use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics};
 use crate::vmm_config::net::*;
@@ -115,12 +113,7 @@ impl VmResources {
     }
 
     /// Configures Vmm resources as described by the `config_json` param.
-    pub fn from_json(
-        config_json: &str,
-        _instance_info: &InstanceInfo,
-        _size_limit: usize,
-        _metadata: Option<&str>,
-    ) -> Result<Self, ResourcesError> {
+    pub fn from_json(config_json: &str) -> Result<Self, ResourcesError> {
         let vmm_config = serde_json::from_str::<VmmConfig>(config_json)?;
 
         if let Some(logger_config) = vmm_config.logger {
@@ -240,31 +233,12 @@ impl VmResources {
         self.entropy.insert(body)
     }
 
-    fn allocate_memory_regions(
-        &self,
-        regions: &[(GuestAddress, usize)],
-    ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-        FarplaneBackend::construct_boot(regions)
-            .map_err(|err| MemoryError::Farplane(err.to_string()))
-    }
-
     /// Allocates guest memory in a configuration most appropriate for these [`VmResources`].
     pub fn allocate_guest_memory(&self) -> Result<Vec<GuestRegionMmap>, MemoryError> {
         let regions =
             crate::arch::arch_memory_regions(mib_to_bytes(self.machine_config.mem_size_mib));
-        self.allocate_memory_regions(&regions)
-    }
-
-    /// Allocates a single guest memory region.
-    pub fn allocate_memory_region(
-        &self,
-        start: GuestAddress,
-        size: usize,
-    ) -> Result<GuestRegionMmap, MemoryError> {
-        Ok(self
-            .allocate_memory_regions(&[(start, size)])?
-            .pop()
-            .unwrap())
+        FarplaneBackend::construct_boot(&regions)
+            .map_err(|err| MemoryError::Farplane(err.to_string()))
     }
 }
 
@@ -296,7 +270,6 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-    use crate::HTTP_MAX_PAYLOAD_SIZE;
     use crate::cpu_config::templates::test_utils::TEST_TEMPLATE_JSON;
     use crate::cpu_config::templates::{CpuTemplateType, StaticCpuTemplate};
     use crate::devices::virtio::block::virtio::VirtioBlockError;
@@ -396,7 +369,6 @@ mod tests {
     fn test_from_json() {
         let kernel_file = TempFile::new().unwrap();
         let rootfs_file = TempFile::new().unwrap();
-        let default_instance_info = InstanceInfo::default();
 
         // We will test different scenarios with invalid resources configuration and
         // check the expected errors. We include configuration for the kernel and rootfs
@@ -404,9 +376,7 @@ mod tests {
         // these resources, it is considered an invalid json and the test will crash.
 
         // Invalid JSON string must yield a `serde_json` error.
-        let error =
-            VmResources::from_json(r#"}"#, &default_instance_info, HTTP_MAX_PAYLOAD_SIZE, None)
-                .unwrap_err();
+        let error = VmResources::from_json(r#"}"#).unwrap_err();
         assert!(
             matches!(error, ResourcesError::InvalidJson(_)),
             "{:?}",
@@ -415,9 +385,7 @@ mod tests {
 
         // Valid JSON string without the configuration for kernel or rootfs
         // result in an invalid JSON error.
-        let error =
-            VmResources::from_json(r#"{}"#, &default_instance_info, HTTP_MAX_PAYLOAD_SIZE, None)
-                .unwrap_err();
+        let error = VmResources::from_json(r#"{}"#).unwrap_err();
         assert!(
             matches!(error, ResourcesError::InvalidJson(_)),
             "{:?}",
@@ -443,13 +411,7 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        let error = VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap_err();
+        let error = VmResources::from_json(json.as_str()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -478,13 +440,7 @@ mod tests {
             kernel_file.as_path().to_str().unwrap()
         );
 
-        let error = VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap_err();
+        let error = VmResources::from_json(json.as_str()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -520,21 +476,9 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
         #[cfg(target_arch = "x86_64")]
-        VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap();
+        VmResources::from_json(json.as_str()).unwrap();
         #[cfg(target_arch = "aarch64")]
-        VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap_err();
+        VmResources::from_json(json.as_str()).unwrap_err();
 
         // Invalid memory size.
         json = format!(
@@ -560,13 +504,7 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        let error = VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap_err();
+        let error = VmResources::from_json(json.as_str()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -599,13 +537,7 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        let error = VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap_err();
+        let error = VmResources::from_json(json.as_str()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -638,13 +570,7 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        let error = VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap_err();
+        let error = VmResources::from_json(json.as_str()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -684,13 +610,7 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        let error = VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap_err();
+        let error = VmResources::from_json(json.as_str()).unwrap_err();
 
         assert!(
             matches!(
@@ -735,13 +655,7 @@ mod tests {
             kernel_file.as_path().to_str().unwrap(),
             rootfs_file.as_path().to_str().unwrap(),
         );
-        VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap();
+        VmResources::from_json(json.as_str()).unwrap();
     }
 
     #[test]
@@ -750,7 +664,6 @@ mod tests {
         // `VmResources::from_json()` should fail with `Error::File`.
         let kernel_file = TempFile::new().unwrap();
         let rootfs_file = TempFile::new().unwrap();
-        let default_instance_info = InstanceInfo::default();
 
         let json = format!(
             r#"{{
@@ -772,13 +685,7 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap(),
         );
 
-        let error = VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap_err();
+        let error = VmResources::from_json(json.as_str()).unwrap_err();
         assert!(matches!(error, ResourcesError::File(_)), "{:?}", error);
     }
 
@@ -787,7 +694,6 @@ mod tests {
         // Include custom cpu template directly inline in config json
         let kernel_file = TempFile::new().unwrap();
         let rootfs_file = TempFile::new().unwrap();
-        let default_instance_info = InstanceInfo::default();
 
         let json = format!(
             r#"{{
@@ -810,13 +716,7 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap(),
         );
 
-        VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap();
+        VmResources::from_json(json.as_str()).unwrap();
     }
 
     #[test]
@@ -825,7 +725,6 @@ mod tests {
         // `VmResources::from_json()` should succeed and it should have a custom CPU template.
         let kernel_file = TempFile::new().unwrap();
         let rootfs_file = TempFile::new().unwrap();
-        let default_instance_info = InstanceInfo::default();
         let cpu_config_file = TempFile::new().unwrap();
         cpu_config_file
             .as_file()
@@ -853,13 +752,7 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap(),
         );
 
-        let vm_resources = VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap();
+        let vm_resources = VmResources::from_json(json.as_str()).unwrap();
         assert_eq!(
             vm_resources.machine_config.cpu_template,
             Some(CpuTemplateType::Custom(CustomCpuTemplate::default()))
@@ -896,13 +789,7 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap(),
         );
 
-        let resources = VmResources::from_json(
-            json.as_str(),
-            &InstanceInfo::default(),
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        )
-        .unwrap();
+        let resources = VmResources::from_json(json.as_str()).unwrap();
 
         let initial_vmm_config = serde_json::from_str::<VmmConfig>(&json).unwrap();
         let vmm_config: VmmConfig = (&resources).into();

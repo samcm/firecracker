@@ -3,13 +3,15 @@
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
 use vmm_sys_util::epoll::EventSet;
 
 use super::backend::{
-    BackendState, MemoryChannel, send_error, set_capture_buffers_armed, validate_buffer_fd,
+    BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, send_error, set_capture_buffers_armed,
+    validate_buffer_fd,
 };
 use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
 use crate::logger::{error, warn};
@@ -26,11 +28,9 @@ struct CaptureBuffers {
     vmstate: File,
 }
 
-/// Serves the capture half of the memory channel on the event loop that owns the microVM.
-///
-/// Running here is what makes a capture epoch airtight: while a command is being served no device
-/// event source is dispatched, so between `quiesced` and `resume` no Firecracker thread writes
-/// guest memory.
+/// Serves the capture half of the memory channel on the event loop that owns the microVM: while a
+/// command is served no device event source is dispatched, so between `quiesced` and `resume` no
+/// Firecracker thread writes guest memory.
 #[derive(Debug)]
 pub struct CaptureService {
     channel: MemoryChannel,
@@ -62,14 +62,14 @@ impl CaptureService {
         if request_id == 0 {
             return Err(ChannelError::Malformed);
         }
-        match incoming.header.msg()? {
+        match incoming.header.msg() {
             MsgType::CaptureBuffers => self.arm_buffers(incoming),
             MsgType::Quiesce => self.quiesce(request_id),
             MsgType::DirtySnapshot => self.dirty_snapshot(request_id),
             MsgType::WriteVmstate => self.write_vmstate(request_id),
             MsgType::DirtyUnion => self.dirty_union(incoming),
             MsgType::Resume => {
-                let run_vcpus = protocol::parse_resume_run_vcpus(&incoming.body)?;
+                let run_vcpus = protocol::parse_u32(&incoming.body)?;
                 self.resume(request_id, run_vcpus)
             }
             _ => Err(ChannelError::Malformed),
@@ -84,16 +84,10 @@ impl CaptureService {
         }
         let [dirty, vmstate] =
             <[_; 2]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
-        if let Err(code) = validate_buffer_fd(
-            std::os::fd::AsRawFd::as_raw_fd(&dirty),
-            self.channel.dirty_bitmap_bytes,
-        ) {
+        if let Err(code) = validate_buffer_fd(dirty.as_raw_fd(), self.channel.dirty_bitmap_bytes) {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
-        if let Err(code) = validate_buffer_fd(
-            std::os::fd::AsRawFd::as_raw_fd(&vmstate),
-            super::backend::VMSTATE_CAPACITY_BYTES,
-        ) {
+        if let Err(code) = validate_buffer_fd(vmstate.as_raw_fd(), VMSTATE_CAPACITY_BYTES) {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
 
@@ -129,14 +123,12 @@ impl CaptureService {
         self.reply(
             request_id,
             MsgType::Quiesced,
-            &protocol::encode_quiesced(u32::from(were_running)),
+            &u32::from(were_running).to_le_bytes(),
         )
     }
 
-    /// Harvests the dirty accumulator into the armed buffer and clears it.
-    ///
-    /// Nothing is cleared before the harvested bits are in the buffer, so a failure at any step
-    /// leaves every bit where it was.
+    /// Harvests the dirty accumulator into the armed buffer and only then clears it, so a failure
+    /// at any step leaves every bit where it was.
     fn dirty_snapshot(&mut self, request_id: u64) -> Result<(), ChannelError> {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::DirtySnapshot);
@@ -162,31 +154,6 @@ impl CaptureService {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::WriteVmstate);
         }
-        if self.buffers.is_none() {
-            return self.reject(
-                request_id,
-                ErrorCode::NoCaptureBuffers,
-                MsgType::WriteVmstate,
-            );
-        }
-
-        let state = match self
-            .vmm
-            .lock()
-            .expect("Poisoned lock")
-            .save_state(&self.vm_info)
-        {
-            Ok(state) => state,
-            Err(err) => {
-                error!("Farplane capture could not save the microVM state: {err}");
-                return self.reject(
-                    request_id,
-                    ErrorCode::VmstateWriteFailed,
-                    MsgType::WriteVmstate,
-                );
-            }
-        };
-
         let Some(mut buffers) = self.buffers.take() else {
             return self.reject(
                 request_id,
@@ -194,14 +161,20 @@ impl CaptureService {
                 MsgType::WriteVmstate,
             );
         };
-        let result = serialize_vmstate(&mut buffers.vmstate, state);
+
+        let saved = self
+            .vmm
+            .lock()
+            .expect("Poisoned lock")
+            .save_state(&self.vm_info)
+            .map_err(|err| {
+                error!("Farplane capture could not save the microVM state: {err}");
+                ErrorCode::VmstateWriteFailed
+            });
+        let result = saved.and_then(|state| serialize_vmstate(&mut buffers.vmstate, state));
         self.buffers = Some(buffers);
         match result {
-            Ok(bytes) => self.reply(
-                request_id,
-                MsgType::VmstateWritten,
-                &protocol::encode_vmstate_written(bytes),
-            ),
+            Ok(bytes) => self.reply(request_id, MsgType::VmstateWritten, &bytes.to_le_bytes()),
             Err(code) => self.reject(request_id, code, MsgType::WriteVmstate),
         }
     }
@@ -214,10 +187,7 @@ impl CaptureService {
         }
         let [bitmap] =
             <[_; 1]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
-        if let Err(code) = validate_buffer_fd(
-            std::os::fd::AsRawFd::as_raw_fd(&bitmap),
-            self.channel.dirty_bitmap_bytes,
-        ) {
+        if let Err(code) = validate_buffer_fd(bitmap.as_raw_fd(), self.channel.dirty_bitmap_bytes) {
             return self.reject(request_id, code, MsgType::DirtyUnion);
         }
 
@@ -268,7 +238,7 @@ impl CaptureService {
         self.reply(
             request_id,
             MsgType::Resumed,
-            &protocol::encode_resumed(u32::from(running)),
+            &u32::from(running).to_le_bytes(),
         )
     }
 
@@ -339,11 +309,8 @@ impl CaptureService {
         Ok(())
     }
 
-    /// Stops serving commands for good.
-    ///
-    /// Nothing else changes: the guest keeps running, faults keep resolving on the retained
-    /// userfaultfd, paused vCPUs stay paused, and the supervisor is the only thing that kills this
-    /// process.
+    /// Stops serving commands for good. Nothing else changes: the guest keeps running, faults keep
+    /// resolving on the retained userfaultfd, and only the supervisor kills this process.
     fn fail(&mut self, ops: &mut EventOps) {
         BackendState::fail();
         if let Err(err) = ops.remove(Events::new(&self.channel.sock, EventSet::IN)) {

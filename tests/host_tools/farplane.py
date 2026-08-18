@@ -159,7 +159,6 @@ _IOC_WRITE = 1
 _IOC_READ = 2
 _UFFDIO = 0xAA
 
-UFFDIO_WAKE = _ioc(_IOC_WRITE, _UFFDIO, 0x02, ctypes.sizeof(_UffdioRange))
 UFFDIO_ZEROPAGE = _ioc(
     _IOC_WRITE | _IOC_READ, _UFFDIO, 0x04, ctypes.sizeof(_UffdioZeropage)
 )
@@ -265,26 +264,6 @@ class DirtyBitmap:
         self.byte_len = sum(self.words_per_region) * 8
         self.data = bytearray(data if data is not None else self.byte_len)
         assert len(self.data) >= self.byte_len
-
-    def bit_index(self, guest_addr):
-        """Bit position of the page holding `guest_addr`."""
-        base_bit = 0
-        for (addr, size), words in zip(self.regions, self.words_per_region):
-            if addr <= guest_addr < addr + size:
-                return base_bit + (guest_addr - addr) // PAGE_SIZE
-            base_bit += words * 64
-        raise KeyError(f"{guest_addr:#x} is outside guest memory")
-
-    def __getitem__(self, guest_addr):
-        bit = self.bit_index(guest_addr)
-        return bool(self.data[bit // 8] & (1 << (bit % 8)))
-
-    def __setitem__(self, guest_addr, value):
-        bit = self.bit_index(guest_addr)
-        if value:
-            self.data[bit // 8] |= 1 << (bit % 8)
-        else:
-            self.data[bit // 8] &= ~(1 << (bit % 8)) & 0xFF
 
     def set_pages(self):
         """Guest addresses of every page marked dirty."""
@@ -607,13 +586,6 @@ class Pagemaster:
         if _libc.ioctl(self.uffd, UFFDIO_CONTINUE, ctypes.byref(arg)) != 0:
             raise _errno_error(f"UFFDIO_CONTINUE at {page:#x}")
 
-    def wake(self, guest_addr, length=PAGE_SIZE):
-        """Wake any thread blocked on this range without filling it."""
-        host = self.host_addr(guest_addr)
-        arg = _UffdioRange(start=host, len=length)
-        if _libc.ioctl(self.uffd, UFFDIO_WAKE, ctypes.byref(arg)) != 0:
-            raise _errno_error(f"UFFDIO_WAKE at {guest_addr:#x}")
-
     def write_protect(self, host_addr, length, *, protect=True):
         """Arm or clear write protection on a host range of the guest mapping."""
         arg = _UffdioWriteprotect(
@@ -626,14 +598,6 @@ class Pagemaster:
     def protect_guest(self, guest_addr, length=PAGE_SIZE):
         """Write protect a guest range."""
         self.write_protect(self.host_addr(guest_addr), length, protect=True)
-
-    def faults_for(self, guest_addr):
-        """Every fault flag word observed for the page holding `guest_addr`."""
-        page = guest_addr & ~(PAGE_SIZE - 1)
-        with self._lock:
-            return [
-                flags for addr, flags in self.faults if addr == self.host_addr(page)
-            ]
 
     def written_pages(self):
         """Guest pages for which a write fault was observed."""
@@ -1059,13 +1023,6 @@ class FarplaneMicrovm:
         if not self.stdio.exists():
             return ""
         return self.stdio.read_text(encoding="utf-8", errors="replace")
-
-    def log_text(self):
-        """The Firecracker log."""
-        log = self.chroot / "fc.log"
-        if not log.exists():
-            return ""
-        return log.read_text(encoding="utf-8", errors="replace")
 
     # -------------------------------------------------------------- configuration
 

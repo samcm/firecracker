@@ -141,6 +141,7 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
+use crate::vstate::farplane::FarplaneState;
 pub use crate::vstate::kvm::Kvm;
 
 #[cfg(target_arch = "aarch64")]
@@ -287,11 +288,11 @@ impl Vmm {
     pub fn instance_info(&self) -> InstanceInfo {
         let mut info = self.instance_info.clone();
         let vcpus = match info.state {
-            crate::vmm_config::instance_info::VmState::NotStarted => "not_started",
-            crate::vmm_config::instance_info::VmState::Running => "running",
-            crate::vmm_config::instance_info::VmState::Paused => "paused",
+            VmState::NotStarted => "not_started",
+            VmState::Running => "running",
+            VmState::Paused => "paused",
         };
-        info.farplane = crate::vstate::farplane::FarplaneState::observe(vcpus);
+        info.farplane = FarplaneState::observe(vcpus);
         info
     }
 
@@ -486,10 +487,8 @@ impl Vmm {
         self.vm.as_kvm()
     }
 
-    /// Stops every host path that writes guest memory outside this event loop.
-    ///
-    /// Device queues are serviced by the loop that calls this, so only asynchronous block IO can
-    /// still land in guest memory; draining it is what makes the capture epoch airtight.
+    /// Stops every host path that writes guest memory outside this event loop: only asynchronous
+    /// block IO can still land in guest memory, so draining it closes the capture epoch.
     pub fn drain_guest_memory_writers(&mut self) {
         let mut drives = Vec::new();
         self.device_manager

@@ -5,7 +5,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::convert::Infallible;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -371,37 +370,6 @@ impl DeviceManager {
                 .lock()
                 .expect("Poisoned lock")
                 .kick();
-        }
-    }
-
-    fn do_mark_virtio_queue_memory_dirty(
-        device: Arc<Mutex<dyn VirtioDevice>>,
-        mem: &GuestMemoryMmap,
-    ) {
-        // SAFETY:
-        // This should never fail as we mark pages only if device has already been activated,
-        // and the address validation was already performed on device activation.
-        let mut locked_device = device.lock().expect("Poisoned lock");
-        if locked_device.is_activated() {
-            locked_device.mark_queue_memory_dirty(mem).unwrap()
-        }
-    }
-
-    /// Mark queue memory dirty for activated VirtIO devices
-    pub fn mark_virtio_queue_memory_dirty(&self, mem: &GuestMemoryMmap) {
-        // Go through MMIO VirtIO devices
-        let _: Result<(), Infallible> =
-            self.mmio_devices
-                .for_each_virtio_mmio_device(|_, _, device| {
-                    let mmio_transport_locked = device.inner.lock().expect("Poisoned locked");
-                    Self::do_mark_virtio_queue_memory_dirty(mmio_transport_locked.device(), mem);
-                    Ok(())
-                });
-
-        // Go through PCI VirtIO devices
-        for device in self.pci_devices.virtio_devices.values() {
-            let virtio_device = device.lock().expect("Poisoned lock").virtio_device();
-            Self::do_mark_virtio_queue_memory_dirty(virtio_device, mem);
         }
     }
 

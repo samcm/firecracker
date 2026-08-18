@@ -5,13 +5,10 @@
 
 use vm_memory::bitmap::NewBitmap;
 use vm_memory::{GuestAddress, GuestRegionCollection};
-use vmm_sys_util::tempdir::TempDir;
 
 use crate::vstate::memory::{
     AtomicBitmap, GuestMemoryMmap, GuestRegionMmap, GuestRegionMmapExt, MmapRegionBuilder,
 };
-
-pub mod mock_resources;
 
 /// Creates a [`GuestMemoryMmap`] with a single region of the given size starting at guest
 /// physical address 0.
@@ -71,49 +68,4 @@ pub fn multi_region_mem_raw(regions: &[(GuestAddress, usize)]) -> Vec<GuestRegio
 /// accordance with the requirements of the architecture on which the tests are being run.
 pub fn arch_mem(mem_size_bytes: usize) -> GuestMemoryMmap {
     multi_region_mem(&crate::arch::arch_memory_regions(mem_size_bytes))
-}
-
-pub fn arch_mem_raw(mem_size_bytes: usize) -> Vec<GuestRegionMmap> {
-    multi_region_mem_raw(&crate::arch::arch_memory_regions(mem_size_bytes))
-}
-
-#[allow(clippy::undocumented_unsafe_blocks)]
-#[allow(clippy::cast_possible_truncation)]
-pub fn create_tmp_socket() -> (TempDir, String) {
-    let tmp_dir = TempDir::new().unwrap();
-    let tmp_dir_path_str = tmp_dir.as_path().to_str().unwrap();
-    let tmp_socket_path = format!("{tmp_dir_path_str}/tmp_socket");
-
-    unsafe {
-        let socketfd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-        if socketfd < 0 {
-            panic!("Cannot create socket");
-        }
-        let mut socket_addr = libc::sockaddr_un {
-            sun_family: libc::AF_UNIX as u16,
-            sun_path: [0; 108],
-        };
-
-        std::ptr::copy(
-            tmp_socket_path.as_ptr().cast(),
-            socket_addr.sun_path.as_mut_ptr(),
-            tmp_socket_path.len(),
-        );
-
-        let bind = libc::bind(
-            socketfd,
-            (&socket_addr as *const libc::sockaddr_un).cast(),
-            std::mem::size_of::<libc::sockaddr_un>() as u32,
-        );
-        if bind < 0 {
-            panic!("Cannot bind socket");
-        }
-
-        let listen = libc::listen(socketfd, 1);
-        if listen < 0 {
-            panic!("Cannot listen on socket");
-        }
-    }
-
-    (tmp_dir, tmp_socket_path)
 }

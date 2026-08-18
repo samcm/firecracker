@@ -200,17 +200,10 @@ pub fn snapshot_state_sanity_check(
 pub enum RestoreFromSnapshotError {
     /// Invalid snapshot state: {0}
     Invalid(#[from] SnapShotStateSanityCheckError),
-    /// Failed to load guest memory: {0}
-    GuestMemory(#[from] RestoreFromSnapshotGuestMemoryError),
+    /// Failed to load guest memory: Farplane restore failed: {0}
+    GuestMemory(String),
     /// Failed to build microVM from snapshot: {0}
     Build(#[from] BuildMicrovmFromSnapshotError),
-}
-
-/// Errors associated with obtaining guest memory for a restore.
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum RestoreFromSnapshotGuestMemoryError {
-    /// Farplane restore failed: {0}
-    Farplane(String),
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
@@ -222,7 +215,7 @@ pub fn restore_from_snapshot(
     vm_resources: &mut VmResources,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
     let (guest_memory, microvm_state) = FarplaneBackend::construct_restore()
-        .map_err(|err| RestoreFromSnapshotGuestMemoryError::Farplane(err.to_string()))?;
+        .map_err(|err| RestoreFromSnapshotError::GuestMemory(err.to_string()))?;
 
     let vcpu_count = microvm_state
         .vcpu_states

@@ -19,8 +19,6 @@ pub const MAX_DATAGRAM: usize = 65_536;
 pub const MAX_EXTENTS: u32 = 65_536;
 /// Largest number of backing descriptors accepted for one plan.
 pub const MAX_PLAN_FDS: u32 = 1_024;
-/// Largest number of descriptors accepted on a single datagram.
-pub const MAX_FDS_PER_FRAME: usize = 64;
 /// Compatibility identity of this protocol, quiesce semantics and vmstate format.
 pub const FEATURE_IDENTITY: &str = "farplane/1";
 /// Size of one extent table record.
@@ -148,36 +146,6 @@ pub enum ErrorCode {
     QuiesceFailed = 21,
 }
 
-impl ErrorCode {
-    /// Returns the error code for `value`, or `None` if it names no code.
-    pub fn from_u32(value: u32) -> Option<Self> {
-        match value {
-            1 => Some(Self::GeometryMismatch),
-            2 => Some(Self::BadExtent),
-            3 => Some(Self::PlanNotCanonical),
-            4 => Some(Self::FdNotMemfd),
-            5 => Some(Self::FdNotSealed),
-            6 => Some(Self::FdWritable),
-            7 => Some(Self::TooManyExtents),
-            8 => Some(Self::TooManyFds),
-            9 => Some(Self::MapFailed),
-            10 => Some(Self::UffdRegisterFailed),
-            11 => Some(Self::MlockFailed),
-            12 => Some(Self::VmstateParseFailed),
-            13 => Some(Self::VmstateWriteFailed),
-            14 => Some(Self::DirtyHarvestFailed),
-            15 => Some(Self::NotQuiesced),
-            16 => Some(Self::AlreadyQuiesced),
-            17 => Some(Self::NoCaptureBuffers),
-            18 => Some(Self::BufferTooSmall),
-            19 => Some(Self::PeercredMismatch),
-            20 => Some(Self::ResumeFailed),
-            21 => Some(Self::QuiesceFailed),
-            _ => None,
-        }
-    }
-}
-
 /// Architecture Firecracker is running on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -268,8 +236,8 @@ impl Header {
     }
 
     /// Returns the message type, which `decode` has already validated.
-    pub fn msg(self) -> Result<MsgType, ChannelError> {
-        MsgType::from_u16(self.msg_type).ok_or(ChannelError::Malformed)
+    pub fn msg(self) -> MsgType {
+        MsgType::from_u16(self.msg_type).expect("decode rejects undefined message types")
     }
 }
 
@@ -401,7 +369,7 @@ pub fn send_frame(
     body: &[u8],
     fds: &[RawFd],
 ) -> Result<(), ChannelError> {
-    if HEADER_LEN + body.len() > MAX_DATAGRAM || fds.len() > MAX_FDS_PER_FRAME {
+    if HEADER_LEN + body.len() > MAX_DATAGRAM {
         return Err(ChannelError::Malformed);
     }
     let header = Header::new(
@@ -418,10 +386,8 @@ pub fn send_frame(
     Ok(())
 }
 
-/// Receives exactly one frame.
-///
-/// A datagram whose payload or control message did not fit is a protocol violation, never a
-/// partially parsed frame.
+/// Receives exactly one frame. A datagram whose payload or control message did not fit is a
+/// protocol violation, never a partially parsed frame.
 pub fn recv_frame(sock: &UnixStream) -> Result<Incoming, ChannelError> {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut control = [0u64; 64];
@@ -553,31 +519,8 @@ pub fn encode_backend_ready(
     body
 }
 
-/// Serializes a `quiesced` body.
-pub fn encode_quiesced(vcpus_were_running: u32) -> Vec<u8> {
-    vcpus_were_running.to_le_bytes().to_vec()
-}
-
-/// Serializes a `vmstate_written` body.
-pub fn encode_vmstate_written(bytes: u64) -> Vec<u8> {
-    bytes.to_le_bytes().to_vec()
-}
-
-/// Serializes a `resumed` body.
-pub fn encode_resumed(vcpus_running: u32) -> Vec<u8> {
-    vcpus_running.to_le_bytes().to_vec()
-}
-
-/// Parses a `plan_fds` body.
-pub fn parse_plan_fds_count(body: &[u8]) -> Result<u32, ChannelError> {
-    if body.len() != 4 {
-        return Err(ChannelError::Malformed);
-    }
-    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
-}
-
-/// Parses a `resume` body.
-pub fn parse_resume_run_vcpus(body: &[u8]) -> Result<u32, ChannelError> {
+/// Parses a body that carries exactly one `u32`, as `plan_fds` and `resume` do.
+pub fn parse_u32(body: &[u8]) -> Result<u32, ChannelError> {
     if body.len() != 4 {
         return Err(ChannelError::Malformed);
     }
@@ -747,12 +690,12 @@ mod tests {
         let mut memfd = memfd(b"farplane-test\0");
         memfd.write_all(b"payload").unwrap();
 
-        let body = encode_quiesced(3);
+        let body = 3u32.to_le_bytes().to_vec();
         send_frame(&tx, MsgType::Quiesced, 7, &body, &[memfd.as_raw_fd()]).unwrap();
 
         let frame = recv_frame(&rx).unwrap();
         assert_eq!(frame.header.request_id, 7);
-        assert_eq!(frame.header.msg().unwrap(), MsgType::Quiesced);
+        assert_eq!(frame.header.msg(), MsgType::Quiesced);
         assert_eq!(frame.body, body);
         assert_eq!(frame.fds.len(), 1);
     }
@@ -845,8 +788,7 @@ mod tests {
     #[test]
     fn error_codes_are_stable() {
         assert_eq!(ErrorCode::GeometryMismatch as u32, 1);
+        assert_eq!(ErrorCode::NoCaptureBuffers as u32, 17);
         assert_eq!(ErrorCode::PeercredMismatch as u32, 19);
-        assert_eq!(ErrorCode::from_u32(17), Some(ErrorCode::NoCaptureBuffers));
-        assert_eq!(ErrorCode::from_u32(0), None);
     }
 }

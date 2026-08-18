@@ -29,8 +29,6 @@ pub type GuestMmapRegion = vm_memory::MmapRegion<Option<AtomicBitmap>>;
 /// Errors associated with guest memory.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MemoryError {
-    /// Error protecting memory slot: {0}
-    Mprotect(std::io::Error),
     /// Restored region ({addr}, {size}) does not match snapshot region ({want_addr}, {want_size})
     RegionMismatch {
         /// Guest address of the region handed over by the memory backend.
@@ -56,26 +54,15 @@ pub struct GuestRegionMmapExt {
     pub slot: u32,
 }
 
-/// A guest memory slot, which is a slice of a guest memory region
-#[derive(Debug)]
-pub struct GuestMemorySlot<'a> {
-    /// KVM memory slot number
-    pub(crate) slot: u32,
-    /// Start guest address of the slot
-    pub(crate) guest_addr: GuestAddress,
-    /// Corresponding slice in host memory
-    pub(crate) slice: VolatileSlice<'a, BS<'a, Option<AtomicBitmap>>>,
-}
-
-impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
-    fn from(mem_slot: &GuestMemorySlot) -> Self {
+impl From<&GuestRegionMmapExt> for kvm_userspace_memory_region {
+    fn from(region: &GuestRegionMmapExt) -> Self {
         kvm_userspace_memory_region {
             // Every region carries a dirty bitmap, so dirty logging is always requested.
             flags: KVM_MEM_LOG_DIRTY_PAGES,
-            slot: mem_slot.slot,
-            guest_phys_addr: mem_slot.guest_addr.raw_value(),
-            memory_size: mem_slot.slice.len() as u64,
-            userspace_addr: mem_slot.slice.ptr_guard().as_ptr() as u64,
+            slot: region.slot,
+            guest_phys_addr: region.start_addr().raw_value(),
+            memory_size: region.len(),
+            userspace_addr: region.as_ptr() as u64,
         }
     }
 }
@@ -103,18 +90,6 @@ impl GuestRegionMmapExt {
         }
 
         Ok(Self::from_mmap_region(region, slot))
-    }
-
-    /// Returns the KVM memory slot backing this region.
-    pub(crate) fn slot(&self) -> GuestMemorySlot<'_> {
-        GuestMemorySlot {
-            slot: self.slot,
-            guest_addr: self.start_addr(),
-            slice: self
-                .inner
-                .get_slice(MemoryRegionAddress(0), u64_to_usize(self.len()))
-                .expect("region range should be valid"),
-        }
     }
 }
 
@@ -406,10 +381,11 @@ mod tests {
             .pop()
             .unwrap();
         let region = GuestRegionMmapExt::from_state(region, &state, 7).unwrap();
-        assert_eq!(region.slot, 7);
-        assert_eq!(region.slot().slot, 7);
-        assert_eq!(region.slot().guest_addr, GuestAddress(0));
-        assert_eq!(region.slot().slice.len(), page_size);
+        let kvm_region = kvm_userspace_memory_region::from(&region);
+        assert_eq!(kvm_region.slot, 7);
+        assert_eq!(kvm_region.guest_phys_addr, 0);
+        assert_eq!(kvm_region.memory_size, page_size as u64);
+        assert_eq!(kvm_region.flags, KVM_MEM_LOG_DIRTY_PAGES);
 
         // A region whose size does not match the snapshot is rejected.
         let region = multi_region_mem_raw(&[(GuestAddress(0), page_size * 2)])

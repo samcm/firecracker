@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -280,10 +280,8 @@ struct MappedExtent {
     host_base: usize,
 }
 
-/// Runs the handshake through to `backend_ready` and publishes the channel.
-///
-/// Every failure before `backend_ready` leaves the guest unable to execute: the caller propagates
-/// it and Firecracker exits.
+/// Runs the handshake through to `backend_ready` and publishes the channel. Every failure before
+/// that point leaves the guest unable to execute: the caller propagates it and Firecracker exits.
 fn handshake(
     mode: Mode,
     arch_regions: &[RegionRecord],
@@ -315,9 +313,9 @@ fn handshake(
     let mut plan_fds: Vec<OwnedFd> = Vec::new();
     loop {
         let incoming = protocol::recv_frame(&sock)?;
-        match incoming.header.msg()? {
+        match incoming.header.msg() {
             MsgType::PlanFds => {
-                let count = protocol::parse_plan_fds_count(&incoming.body)?;
+                let count = protocol::parse_u32(&incoming.body)?;
                 if count as usize != incoming.fds.len() {
                     return Err(BackendError::Channel(ChannelError::FdCountMismatch));
                 }
@@ -463,18 +461,17 @@ fn commit_plan(
     // Pagemaster verifies the reported geometry and probes its read permission, then acknowledges
     // with a bare `resume` before the guest is allowed to execute.
     let ack = protocol::recv_frame(&sock)?;
-    if ack.header.msg()? != MsgType::Resume
+    if ack.header.msg() != MsgType::Resume
         || ack.header.request_id == 0
-        || protocol::parse_resume_run_vcpus(&ack.body)? != 0
+        || protocol::parse_u32(&ack.body)? != 0
     {
         return Err(BackendError::Channel(ChannelError::Malformed));
     }
-    let resumed = protocol::encode_resumed(0);
     protocol::send_frame(
         &sock,
         MsgType::Resumed,
         ack.header.request_id,
-        &resumed,
+        &0u32.to_le_bytes(),
         &[],
     )?;
 
@@ -489,8 +486,8 @@ fn commit_plan(
 
 /// Reports a typed rejection of the command that carried `incoming`.
 fn reject(sock: &UnixStream, incoming: &Incoming, code: ErrorCode) {
-    let op = MsgType::from_u16(incoming.header.msg_type).unwrap_or(MsgType::BackingPlan);
-    send_error(sock, incoming.header.request_id, code, op);
+    let header = incoming.header;
+    send_error(sock, header.request_id, code, header.msg());
 }
 
 /// Sends an `error` frame. A channel that cannot carry the rejection is itself the failure the
@@ -564,14 +561,8 @@ fn set_socket_buffers(sock: &UnixStream) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// Credentials the kernel recorded for the peer when it called `listen`.
-struct PeerCred {
-    pid: libc::pid_t,
-    uid: libc::uid_t,
-}
-
-/// Reads the peer credentials of the channel.
-fn peer_cred(sock: &UnixStream) -> Result<PeerCred, BackendError> {
+/// Reads the credentials the kernel recorded for the peer when it called `listen`.
+fn peer_cred(sock: &UnixStream) -> Result<libc::ucred, BackendError> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -592,10 +583,7 @@ fn peer_cred(sock: &UnixStream) -> Result<PeerCred, BackendError> {
     if ret != 0 {
         return Err(BackendError::Connect(io::Error::last_os_error()));
     }
-    Ok(PeerCred {
-        pid: cred.pid,
-        uid: cred.uid,
-    })
+    Ok(cred)
 }
 
 /// Returns the size of a backing descriptor that satisfies every precondition.
@@ -837,7 +825,8 @@ fn adopt_jailer_uffd() -> Result<Uffd, BackendError> {
         ioctls: 0,
     };
     // SAFETY: fd 3 is the userfaultfd the jailer passed, and `api` outlives the call.
-    let ret = unsafe { ioctl_with_mut_ref(&UffdFd, UFFDIO_API(), &mut api) };
+    let ret =
+        unsafe { ioctl_with_mut_ref(&BorrowedFd::borrow_raw(UFFD_FILENO), UFFDIO_API(), &mut api) };
     if ret != 0 {
         return Err(BackendError::Uffd(io::Error::last_os_error()));
     }
@@ -846,15 +835,6 @@ fn adopt_jailer_uffd() -> Result<Uffd, BackendError> {
     }
     // SAFETY: fd 3 is a userfaultfd whose API handshake just completed, and nothing else owns it.
     Ok(unsafe { Uffd::from_raw_fd(UFFD_FILENO) })
-}
-
-/// The userfaultfd the jailer left at a fixed descriptor number, before Firecracker owns it.
-struct UffdFd;
-
-impl AsRawFd for UffdFd {
-    fn as_raw_fd(&self) -> RawFd {
-        UFFD_FILENO
-    }
 }
 
 /// Registers missing, minor and write-protect faults over every extent mapping.

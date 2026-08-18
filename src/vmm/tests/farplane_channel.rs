@@ -701,7 +701,7 @@ fn a_full_conversation_round_trips_bodies_and_descriptors() {
     )
     .unwrap();
     let got = protocol::recv_frame(&fc).unwrap();
-    assert_eq!(protocol::parse_plan_fds_count(&got.body).unwrap(), 2);
+    assert_eq!(protocol::parse_u32(&got.body).unwrap(), 2);
     assert_eq!(got.fds.len(), 2, "SCM_RIGHTS must deliver both descriptors");
     assert_eq!(first_byte(&got.fds[0]), 0x11);
     assert_eq!(first_byte(&got.fds[1]), 0x22);
@@ -771,7 +771,7 @@ fn a_full_conversation_round_trips_bodies_and_descriptors() {
         (
             MsgType::Quiesce,
             MsgType::Quiesced,
-            protocol::encode_quiesced(2),
+            2u32.to_le_bytes().to_vec(),
         ),
         (
             MsgType::DirtySnapshot,
@@ -781,13 +781,13 @@ fn a_full_conversation_round_trips_bodies_and_descriptors() {
         (
             MsgType::WriteVmstate,
             MsgType::VmstateWritten,
-            protocol::encode_vmstate_written(4096),
+            4096u64.to_le_bytes().to_vec(),
         ),
         (MsgType::DirtyUnion, MsgType::UnionDone, Vec::new()),
         (
             MsgType::Resume,
             MsgType::Resumed,
-            protocol::encode_resumed(2),
+            2u32.to_le_bytes().to_vec(),
         ),
     ];
     for (index, (request, reply, reply_body)) in cycle.into_iter().enumerate() {
@@ -802,7 +802,7 @@ fn a_full_conversation_round_trips_bodies_and_descriptors() {
         assert_eq!(got.header.msg_type, request as u16);
         assert_eq!(got.header.request_id, request_id);
         if request == MsgType::Resume {
-            assert_eq!(protocol::parse_resume_run_vcpus(&got.body).unwrap(), 2);
+            assert_eq!(protocol::parse_u32(&got.body).unwrap(), 2);
         }
 
         protocol::send_frame(&fc, reply, request_id, &reply_body, &[]).unwrap();

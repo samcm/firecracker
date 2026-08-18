@@ -587,8 +587,7 @@ fn build_microvm_from_json(
     pci_enabled: bool,
 ) -> Result<Arc<Mutex<vmm::Vmm>>, BuildFromJsonError> {
     let mut vm_resources =
-        VmResources::from_json(&config_json, &instance_info, HTTP_MAX_PAYLOAD_SIZE, None)
-            .map_err(BuildFromJsonError::ParseFromJson)?;
+        VmResources::from_json(&config_json).map_err(BuildFromJsonError::ParseFromJson)?;
     vm_resources.boot_timer = boot_timer_enabled;
     vm_resources.pci_enabled = pci_enabled;
     let vmm = vmm::builder::build_and_boot_microvm(
