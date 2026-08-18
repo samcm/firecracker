@@ -81,15 +81,11 @@ pub(crate) mod device_manager;
 /// Emulates virtual and hardware devices.
 #[allow(missing_docs)]
 pub mod devices;
-/// minimalist HTTP/TCP/IPv4 stack named DUMBO
-pub mod dumbo;
 /// Support for GDB debugging the guest
 #[cfg(feature = "gdb")]
 pub mod gdb;
 /// Logger
 pub mod logger;
-/// microVM Metadata Service MMDS
-pub mod mmds;
 /// PCI specific emulation code.
 pub mod pci;
 /// Save/restore utilities.
@@ -116,7 +112,6 @@ pub mod vstate;
 /// Module with initrd.
 pub mod initrd;
 
-use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -130,41 +125,28 @@ use vmm_sys_util::terminal::Terminal;
 use vstate::vcpu::{self, VcpuSendEventError};
 
 use crate::cpu_config::templates::CpuConfiguration;
-use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
-use crate::devices::virtio::balloon::{
-    BALLOON_DEV_ID, Balloon, BalloonConfig, BalloonError, BalloonStats,
-};
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
-use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
-use crate::devices::virtio::mem::device::VirtioMem;
-use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemStatus};
+use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::net::Net;
-use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
-use crate::logger::{METRICS, MetricsError, log_dev_preview_warning};
-use crate::mmds::data_store::Mmds;
+use crate::logger::{METRICS, MetricsError};
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
 use crate::resources::VmmConfig;
-use crate::rpc_interface::VmmActionError;
-use crate::vmm_config::HotplugDeviceConfig;
-use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::entropy::EntropyDeviceConfig;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
-use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
-use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
-use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
-pub use crate::vstate::vm::{StartVcpusError, Vm};
+pub use crate::vstate::vm::{KvmVm, StartVcpusError, Vm};
 
 /// Shorthand type for the EventManager flavour used by Firecracker.
 pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber>>>;
@@ -223,8 +205,6 @@ pub enum VmmError {
     DeviceManager(#[from] device_manager::DeviceManagerCreateError),
     /// MMIO Device manager error: {0}
     MmioDeviceManager(device_manager::mmio::MmioError),
-    /// Error getting the KVM dirty bitmap. {0}
-    DirtyBitmap(kvm_ioctls::Error),
     /// I8042 error: {0}
     I8042Error(devices::legacy::I8042DeviceError),
     #[cfg(target_arch = "x86_64")]
@@ -266,18 +246,6 @@ pub enum VmmError {
     FindDeviceError(#[from] device_manager::FindDeviceError),
     /// Block: {0}
     Block(#[from] BlockError),
-    /// Balloon: {0}
-    Balloon(#[from] BalloonError),
-    /// Failed to create memory hotplug device: {0}
-    VirtioMem(#[from] VirtioMemError),
-}
-
-/// Shorthand type for KVM dirty page bitmap.
-pub type DirtyBitmap = HashMap<u32, Vec<u64>>;
-
-/// Returns the size of guest memory, in MiB.
-pub(crate) fn mem_size_mib(guest_memory: &GuestMemoryMmap) -> u64 {
-    guest_memory.iter().map(|region| region.len()).sum::<u64>() >> 20
 }
 
 /// Error type for [`Vmm::dump_cpu_config()`]
@@ -315,25 +283,16 @@ impl Vmm {
         self.instance_info.vmm_version.clone()
     }
 
-    /// Gets Vmm instance info.
+    /// Returns the instance description, sampling the farplane backend state.
     pub fn instance_info(&self) -> InstanceInfo {
-        self.instance_info.clone()
-    }
-
-    /// Gets MMDS reference, if any.
-    pub fn get_mmds(&self) -> Option<Arc<Mutex<Mmds>>> {
-        let mut mmds = None;
-        self.device_manager
-            .for_each_virtio_device(|device_type, device| {
-                if device_type == VirtioDeviceType::Net
-                    && let Some(net) = device.as_any().downcast_ref::<Net>()
-                    && let Some(mmds_ns) = &net.mmds_ns
-                {
-                    mmds = Some(mmds_ns.mmds.clone());
-                }
-            });
-
-        mmds
+        let mut info = self.instance_info.clone();
+        let vcpus = match info.state {
+            crate::vmm_config::instance_info::VmState::NotStarted => "not_started",
+            crate::vmm_config::instance_info::VmState::Running => "running",
+            crate::vmm_config::instance_info::VmState::Paused => "paused",
+        };
+        info.farplane = crate::vstate::farplane::FarplaneState::observe(vcpus);
+        info
     }
 
     /// Provides the Vmm shutdown exit code if there is one.
@@ -345,14 +304,8 @@ impl Vmm {
     pub fn full_config(&self) -> VmmConfig {
         let mut block = Vec::new();
         let mut net = Vec::new();
-        let mut net_with_mmds = Vec::new();
-        let mut pmem = Vec::new();
-        let mut balloon = None;
         let mut vsock = None;
         let mut entropy = None;
-        let mut memory_hotplug = None;
-        let mut mmds_ipv4_address = None;
-        let mut mmds_ref = None;
 
         self.device_manager
             .for_each_virtio_device(|device_type, device| match device_type {
@@ -364,23 +317,6 @@ impl Vmm {
                 VirtioDeviceType::Net => {
                     if let Some(n) = device.as_any().downcast_ref::<Net>() {
                         net.push(NetworkInterfaceConfig::from(n));
-                        if let Some(mmds_ns) = &n.mmds_ns {
-                            net_with_mmds.push(n.id.clone());
-                            if mmds_ref.is_none() {
-                                mmds_ref = Some(mmds_ns.mmds.clone());
-                                mmds_ipv4_address = Some(mmds_ns.ipv4_addr());
-                            }
-                        }
-                    }
-                }
-                VirtioDeviceType::Pmem => {
-                    if let Some(p) = device.as_any().downcast_ref::<Pmem>() {
-                        pmem.push(p.config.clone());
-                    }
-                }
-                VirtioDeviceType::Balloon => {
-                    if let Some(b) = device.as_any().downcast_ref::<Balloon>() {
-                        balloon = Some(BalloonDeviceConfig::from(b.config()));
                     }
                 }
                 VirtioDeviceType::Vsock => {
@@ -393,68 +329,19 @@ impl Vmm {
                         entropy = Some(EntropyDeviceConfig::from(e));
                     }
                 }
-                VirtioDeviceType::Mem => {
-                    if let Some(m) = device.as_any().downcast_ref::<VirtioMem>() {
-                        memory_hotplug = Some(MemoryHotplugConfig::from(m));
-                    }
-                }
             });
 
-        let mmds_config = mmds_ref.map(|mmds| {
-            let mmds = mmds.lock().expect("Poisoned lock");
-            MmdsConfig {
-                version: mmds.version(),
-                ipv4_address: mmds_ipv4_address,
-                network_interfaces: net_with_mmds,
-                imds_compat: mmds.imds_compat(),
-            }
-        });
-
-        // This must match the From<&VmResources> for VmmConfig implementation
-        // in resources.rs which is used to retrieve the config before the VM
-        // is started.
         VmmConfig {
-            balloon,
             drives: block,
             boot_source: self.boot_source_config.clone(),
             cpu_config: None,
             logger: None,
             machine_config: Some(self.machine_config.clone()),
             metrics: None,
-            mmds_config,
             network_interfaces: net,
             vsock,
             entropy,
-            pmem_devices: pmem,
-            // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
-            memory_hotplug,
-        }
-    }
-
-    /// Check if the VM has any devices without snapshot support
-    pub fn check_unsnapshottable_devices(&self) -> Result<(), MicrovmStateError> {
-        let mut tuples = Vec::new();
-        self.device_manager
-            .for_each_virtio_device(|device_type, device| {
-                if let VirtioDeviceType::Block = device_type
-                    && let Some(b) = device.as_any().downcast_ref::<Block>()
-                    && b.is_vhost_user()
-                {
-                    tuples.push(("vhost-user-block", b.id().to_owned()));
-                }
-            });
-        if tuples.is_empty() {
-            Ok(())
-        } else {
-            let msg = tuples
-                .iter()
-                .map(|(t, id)| format!("{t}(id: {id})"))
-                .collect::<Vec<_>>()
-                .join(",");
-            Err(MicrovmStateError::NotAllowed(format!(
-                "Devices without snapshot support are present: {msg}"
-            )))
         }
     }
 
@@ -495,8 +382,6 @@ impl Vmm {
 
     /// Saves the state of a paused Microvm.
     pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
-        self.check_unsnapshottable_devices()?;
-
         // We need to save device state before saving KVM state.
         // Some devices, (at the time of writing this comment block device with async engine)
         // might modify the VirtIO transport and send an interrupt to the guest. If we save KVM
@@ -572,27 +457,6 @@ impl Vmm {
         Ok(())
     }
 
-    /// Updates the rate limiter parameters for block device with `drive_id` id.
-    pub fn update_vhost_user_block_config(&mut self, drive_id: &str) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(drive_id, |block: &mut Block| block.update_config())??;
-        Ok(())
-    }
-
-    /// Updates the rate limiter parameters for pmem device with `pmem_id` id.
-    pub fn update_pmem_rate_limiter(
-        &mut self,
-        pmem_id: &str,
-        rl_bytes: BucketUpdate,
-        rl_ops: BucketUpdate,
-    ) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(pmem_id, |pmem: &mut Pmem| {
-                pmem.update_rate_limiter(rl_bytes, rl_ops)
-            })?;
-        Ok(())
-    }
-
     /// Updates the rate limiter parameters for net device with `net_id` id.
     pub fn update_net_rate_limiters(
         &mut self,
@@ -609,82 +473,6 @@ impl Vmm {
         Ok(())
     }
 
-    /// Returns a reference to the balloon device if present.
-    pub fn balloon_config(&self) -> Result<BalloonConfig, VmmError> {
-        let config = self
-            .device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| dev.config())?;
-        Ok(config)
-    }
-
-    /// Returns the latest balloon statistics if they are enabled.
-    pub fn latest_balloon_stats(&self) -> Result<BalloonStats, VmmError> {
-        let stats = self
-            .device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| dev.latest_stats())??;
-        Ok(stats)
-    }
-
-    /// Updates configuration for the balloon device target size.
-    pub fn update_balloon_config(&mut self, amount_mib: u32) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| {
-                dev.update_size(amount_mib)
-            })??;
-        Ok(())
-    }
-
-    /// Updates configuration for the balloon device as described in `balloon_stats_update`.
-    pub fn update_balloon_stats_config(
-        &mut self,
-        stats_polling_interval_s: u16,
-    ) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| {
-                dev.update_stats_polling_interval(stats_polling_interval_s)
-            })??;
-        Ok(())
-    }
-
-    /// Returns the current state of the memory hotplug device.
-    pub fn memory_hotplug_status(&self) -> Result<VirtioMemStatus, VmmError> {
-        self.device_manager
-            .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| dev.status())
-            .map_err(VmmError::FindDeviceError)
-    }
-
-    /// Returns the current state of the memory hotplug device.
-    pub fn update_memory_hotplug_size(&self, requested_size_mib: usize) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| {
-                dev.update_requested_size(requested_size_mib)
-            })
-            .map_err(VmmError::FindDeviceError)??;
-        Ok(())
-    }
-
-    /// Starts the balloon free page hinting run
-    pub fn start_balloon_hinting(&mut self, cmd: StartHintingCmd) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| dev.start_hinting(cmd))??;
-        Ok(())
-    }
-
-    /// Retrieves the status of the balloon hinting run
-    pub fn get_balloon_hinting_status(&mut self) -> Result<HintingStatus, VmmError> {
-        let status = self
-            .device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| dev.get_hinting_status())??;
-        Ok(status)
-    }
-
-    /// Stops the balloon free page hinting run
-    pub fn stop_balloon_hinting(&mut self) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| dev.stop_hinting())??;
-        Ok(())
-    }
-
     /// Signals Vmm to stop and exit.
     pub fn stop(&mut self, exit_code: FcExitCode) {
         info!("Vmm is stopping.");
@@ -693,44 +481,33 @@ impl Vmm {
         self.shutdown_exit_code = Some(exit_code);
     }
 
-    /// Gets a reference to kvm-ioctls KvmVm
-    #[cfg(feature = "gdb")]
-    pub fn vm(&self) -> &Vm {
-        &self.vm
+    /// Gets the KVM-backed VM of this microVM.
+    pub fn kvm_vm(&self) -> Option<&Arc<KvmVm>> {
+        self.vm.as_kvm()
     }
 
-    /// Attaches a device after VM start
-    #[inline]
-    pub fn hotplug_device(
-        &mut self,
-        config: HotplugDeviceConfig,
-        event_manager: &mut EventManager,
-    ) -> Result<(), VmmActionError> {
-        log_dev_preview_warning("PCI device hotplug", None);
-        let kvm_vm = self
-            .vm
-            .as_kvm()
-            .ok_or_else(|| VmmActionError::NotSupported("Operation requires KVM".to_string()))?
-            .clone();
+    /// Stops every host path that writes guest memory outside this event loop.
+    ///
+    /// Device queues are serviced by the loop that calls this, so only asynchronous block IO can
+    /// still land in guest memory; draining it is what makes the capture epoch airtight.
+    pub fn drain_guest_memory_writers(&mut self) {
+        let mut drives = Vec::new();
         self.device_manager
-            .hotplug_device(kvm_vm, config, event_manager)
-    }
-
-    /// Detaches a device after VM start
-    #[inline]
-    pub fn hot_unplug_device(
-        &mut self,
-        device_id: VirtioDeviceId,
-        event_manager: &mut EventManager,
-    ) -> Result<(), VmmActionError> {
-        log_dev_preview_warning("PCI device hot-unplug", None);
-        let kvm_vm = self
-            .vm
-            .as_kvm()
-            .ok_or_else(|| VmmActionError::NotSupported("Operation requires KVM".to_string()))?
-            .clone();
-        self.device_manager
-            .hot_unplug_device(kvm_vm, device_id, event_manager)
+            .for_each_virtio_device(|device_type, device| {
+                if device_type == VirtioDeviceType::Block
+                    && let Some(block) = device.as_any().downcast_ref::<Block>()
+                {
+                    drives.push(block.id().to_string());
+                }
+            });
+        for drive in drives {
+            if let Err(err) = self
+                .device_manager
+                .with_virtio_device(&drive, |block: &mut Block| block.prepare_save())
+            {
+                error!("Farplane quiesce could not drain drive {drive}: {err}");
+            }
+        }
     }
 }
 

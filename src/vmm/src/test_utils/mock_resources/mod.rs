@@ -97,11 +97,6 @@ impl MockVmConfig {
     pub fn new() -> MockVmConfig {
         MockVmConfig::default()
     }
-
-    pub fn with_dirty_page_tracking(mut self) -> Self {
-        self.0.track_dirty_pages = true;
-        self
-    }
 }
 
 generate_from!(MockBootSourceConfig, BootSourceConfig);

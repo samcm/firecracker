@@ -4,18 +4,9 @@
 //! Defines state structures for saving/restoring a Firecracker microVM.
 
 use std::fmt::Debug;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
-use std::mem::forget;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
-use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
@@ -29,18 +20,15 @@ use crate::device_manager::{DevicePersistError, DevicesState};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
-use crate::snapshot::Snapshot;
 use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
-use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::machine_config::{MachineConfigError, MachineConfigUpdate};
+use crate::vmm_config::snapshot::LoadSnapshotParams;
+use crate::vstate::farplane::FarplaneBackend;
 use crate::vstate::kvm::KvmState;
-use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
-};
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
-use crate::vstate::vm::{VmError, VmState};
+use crate::vstate::vm::VmState;
 use crate::{EventManager, Vmm, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
@@ -54,8 +42,6 @@ pub struct VmInfo {
     pub cpu_template: StaticCpuTemplate,
     /// Boot source information.
     pub boot_source: BootSourceConfig,
-    /// Huge page configuration
-    pub huge_pages: HugePageConfig,
 }
 
 impl From<&VmResources> for VmInfo {
@@ -65,7 +51,6 @@ impl From<&VmResources> for VmInfo {
             smt: value.machine_config.smt,
             cpu_template: StaticCpuTemplate::from(&value.machine_config.cpu_template),
             boot_source: value.boot_source.config.clone(),
-            huge_pages: value.machine_config.huge_pages,
         }
     }
 }
@@ -78,7 +63,6 @@ impl From<&Vmm> for VmInfo {
             smt: machine_config.smt,
             cpu_template: StaticCpuTemplate::from(&machine_config.cpu_template),
             boot_source: value.boot_source_config.clone(),
-            huge_pages: machine_config.huge_pages,
         }
     }
 }
@@ -98,32 +82,6 @@ pub struct MicrovmState {
     pub device_states: DevicesState,
 }
 
-/// This describes the mapping between Firecracker base virtual address and
-/// offset in the buffer or file backend for a guest memory region. It is used
-/// to tell an external process/thread where to populate the guest memory data
-/// for this range.
-///
-/// E.g. Guest memory contents for a region of `size` bytes can be found in the
-/// backend at `offset` bytes from the beginning, and should be copied/populated
-/// into `base_host_address`.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GuestRegionUffdMapping {
-    /// Base host virtual address where the guest memory contents for this
-    /// region should be copied/populated.
-    pub base_host_virt_addr: u64,
-    /// Region size.
-    pub size: usize,
-    /// Offset in the backend file/buffer where the region contents are.
-    pub offset: u64,
-    /// The configured page size for this memory region.
-    pub page_size: usize,
-    /// The configured page size **in bytes** for this memory region. The name is
-    /// wrong but cannot be changed due to being API, so this field is deprecated,
-    /// to be removed in 2.0.
-    #[deprecated]
-    pub page_size_kib: usize,
-}
-
 /// Errors related to saving and restoring Microvm state.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MicrovmStateError {
@@ -139,77 +97,6 @@ pub enum MicrovmStateError {
     SignalVcpu(VcpuSendEventError),
     /// Vcpu is in unexpected state.
     UnexpectedVcpuResponse,
-}
-
-/// Errors associated with creating a snapshot.
-#[rustfmt::skip]
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum CreateSnapshotError {
-    /// Cannot get dirty bitmap: {0}
-    DirtyBitmap(#[from] VmError),
-    /// Cannot write memory file: {0}
-    Memory(#[from] MemoryError),
-    /// Cannot perform {0} on the memory backing file: {1}
-    MemoryBackingFile(&'static str, io::Error),
-    /// Cannot save the microVM state: {0}
-    MicrovmState(MicrovmStateError),
-    /// Cannot serialize the microVM state: {0}
-    SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
-    /// Cannot perform {0} on the snapshot backing file: {1}
-    SnapshotBackingFile(&'static str, io::Error),
-}
-
-/// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(10, 0, 0);
-
-/// Creates a Microvm snapshot.
-pub fn create_snapshot(
-    vmm: &mut Vmm,
-    vm_info: &VmInfo,
-    params: &CreateSnapshotParams,
-) -> Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
-        .save_state(vm_info)
-        .map_err(CreateSnapshotError::MicrovmState)?;
-
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
-
-    let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
-        CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
-            "snapshot requires KVM".into(),
-        ))
-    })?;
-    kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
-
-    // We need to mark queues as dirty again for all activated devices. The reason we
-    // do it here is that we don't mark pages as dirty during runtime
-    // for queue objects.
-    vmm.device_manager
-        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
-
-    Ok(())
-}
-
-fn snapshot_state_to_file(
-    microvm_state: &MicrovmState,
-    snapshot_path: &Path,
-) -> Result<(), CreateSnapshotError> {
-    use self::CreateSnapshotError::*;
-    let mut snapshot_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(snapshot_path)
-        .map_err(|err| SnapshotBackingFile("open", err))?;
-
-    let snapshot = Snapshot::new(microvm_state);
-    snapshot.save(&mut snapshot_file)?;
-    snapshot_file
-        .flush()
-        .map_err(|err| SnapshotBackingFile("flush", err))?;
-    snapshot_file
-        .sync_all()
-        .map_err(|err| SnapshotBackingFile("sync_all", err))
 }
 
 /// Validates that snapshot CPU vendor matches the host CPU vendor.
@@ -286,46 +173,18 @@ pub fn validate_cpu_manufacturer_id(microvm_state: &MicrovmState) {
 pub enum SnapShotStateSanityCheckError {
     /// No memory region defined.
     NoMemory,
-    /// No DRAM memory region defined.
-    NoDramMemory,
-    /// DRAM memory has more than a single slot.
-    DramMemoryTooManySlots,
-    /// DRAM memory is unplugged.
-    DramMemoryUnplugged,
 }
 
 /// Performs sanity checks against the state file and returns specific errors.
 pub fn snapshot_state_sanity_check(
     microvm_state: &MicrovmState,
 ) -> Result<(), SnapShotStateSanityCheckError> {
-    // Check that the snapshot contains at least 1 mem region, that at least one is Dram,
-    // and that Dram region contains a single plugged slot.
-    // Upper bound check will be done when creating guest memory by comparing against
-    // KVM max supported value kvm_context.max_memslots().
+    // Check that the snapshot contains at least one memory region. The upper bound check is
+    // done when creating guest memory by comparing against KVM's max_memslots().
     let regions = &microvm_state.vm_state.memory.regions;
 
     if regions.is_empty() {
         return Err(SnapShotStateSanityCheckError::NoMemory);
-    }
-
-    if !regions
-        .iter()
-        .any(|r| r.region_type == GuestRegionType::Dram)
-    {
-        return Err(SnapShotStateSanityCheckError::NoDramMemory);
-    }
-
-    for dram_region in regions
-        .iter()
-        .filter(|r| r.region_type == GuestRegionType::Dram)
-    {
-        if dram_region.plugged.len() != 1 {
-            return Err(SnapShotStateSanityCheckError::DramMemoryTooManySlots);
-        }
-
-        if !dram_region.plugged[0] {
-            return Err(SnapShotStateSanityCheckError::DramMemoryUnplugged);
-        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -339,8 +198,6 @@ pub fn snapshot_state_sanity_check(
 /// Error type for [`restore_from_snapshot`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum RestoreFromSnapshotError {
-    /// Failed to get snapshot state from file: {0}
-    File(#[from] SnapshotStateFromFileError),
     /// Invalid snapshot state: {0}
     Invalid(#[from] SnapShotStateSanityCheckError),
     /// Failed to load guest memory: {0}
@@ -348,14 +205,12 @@ pub enum RestoreFromSnapshotError {
     /// Failed to build microVM from snapshot: {0}
     Build(#[from] BuildMicrovmFromSnapshotError),
 }
-/// Sub-Error type for [`restore_from_snapshot`] to contain either [`GuestMemoryFromFileError`] or
-/// [`GuestMemoryFromUffdError`] within [`RestoreFromSnapshotError`].
+
+/// Errors associated with obtaining guest memory for a restore.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum RestoreFromSnapshotGuestMemoryError {
-    /// Error creating guest memory from file: {0}
-    File(#[from] GuestMemoryFromFileError),
-    /// Error creating guest memory from uffd: {0}
-    Uffd(#[from] GuestMemoryFromUffdError),
+    /// Farplane restore failed: {0}
+    Farplane(String),
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
@@ -366,53 +221,8 @@ pub fn restore_from_snapshot(
     params: &LoadSnapshotParams,
     vm_resources: &mut VmResources,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
-    let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
-    for entry in &params.network_overrides {
-        microvm_state
-            .device_states
-            .mmio_state
-            .net_devices
-            .iter_mut()
-            .map(|device| &mut device.device_state)
-            .chain(
-                microvm_state
-                    .device_states
-                    .pci_state
-                    .net_devices
-                    .iter_mut()
-                    .map(|device| &mut device.device_state),
-            )
-            .find(|x| x.id == entry.iface_id)
-            .map(|device_state| device_state.tap_if_name.clone_from(&entry.host_dev_name))
-            .ok_or(SnapshotStateFromFileError::UnknownNetworkDevice)?;
-    }
-
-    if let Some(vsock_override) = &params.vsock_override {
-        // There should only ever be at most one vsock device, therefore this
-        // should correctly find it and modify the path if such a device exists.
-        let device_state = microvm_state
-            .device_states
-            .mmio_state
-            .vsock_device
-            .as_mut()
-            .map(|device| &mut device.device_state)
-            .or_else(|| {
-                microvm_state
-                    .device_states
-                    .pci_state
-                    .vsock_device
-                    .as_mut()
-                    .map(|device| &mut device.device_state)
-            })
-            .ok_or(SnapshotStateFromFileError::UnknownVsockDevice)?;
-
-        device_state
-            .backend
-            .uds_path
-            .clone_from(&vsock_override.uds_path);
-    }
-
-    let track_dirty_pages = params.track_dirty_pages;
+    let (guest_memory, microvm_state) = FarplaneBackend::construct_restore()
+        .map_err(|err| RestoreFromSnapshotGuestMemoryError::Farplane(err.to_string()))?;
 
     let vcpu_count = microvm_state
         .vcpu_states
@@ -427,228 +237,26 @@ pub fn restore_from_snapshot(
             mem_size_mib: Some(u64_to_usize(microvm_state.vm_info.mem_size_mib)),
             smt: Some(microvm_state.vm_info.smt),
             cpu_template: Some(microvm_state.vm_info.cpu_template),
-            track_dirty_pages: Some(track_dirty_pages),
-            huge_pages: Some(microvm_state.vm_info.huge_pages),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         })
         .map_err(BuildMicrovmFromSnapshotError::VmUpdateConfig)?;
 
-    // Some sanity checks before building the microvm.
     snapshot_state_sanity_check(&microvm_state)?;
-
-    let mem_backend_path = &params.mem_backend.backend_path;
-    let mem_state = &microvm_state.vm_state.memory;
-
-    let (guest_memory, uffd) = match params.mem_backend.backend_type {
-        MemBackendType::File => {
-            if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
-                return Err(RestoreFromSnapshotGuestMemoryError::File(
-                    GuestMemoryFromFileError::HugetlbfsSnapshot,
-                )
-                .into());
-            }
-            (
-                guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
-                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
-                None,
-            )
-        }
-        MemBackendType::Uffd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
-    };
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
         guest_memory,
-        uffd,
         seccomp_filters,
         vm_resources,
-        params.clock_realtime,
+        params.resume_vm,
     )
     .map_err(RestoreFromSnapshotError::Build)
 }
 
-/// Error type for [`snapshot_state_from_file`]
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum SnapshotStateFromFileError {
-    /// Failed to open snapshot file: {0}
-    Open(#[from] std::io::Error),
-    /// Failed to load snapshot state from file: {0}
-    Load(#[from] crate::snapshot::SnapshotError),
-    /// Unknown Network Device.
-    UnknownNetworkDevice,
-    /// Unknown Vsock Device.
-    UnknownVsockDevice,
-}
-
-fn snapshot_state_from_file(
-    snapshot_path: &Path,
-) -> Result<MicrovmState, SnapshotStateFromFileError> {
-    let mut snapshot_reader = File::open(snapshot_path)?;
-    let snapshot = Snapshot::load(&mut snapshot_reader)?;
-
-    Ok(snapshot.data)
-}
-
-/// Error type for [`guest_memory_from_file`].
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum GuestMemoryFromFileError {
-    /// Failed to load guest memory: {0}
-    File(#[from] std::io::Error),
-    /// Failed to restore guest memory: {0}
-    Restore(#[from] MemoryError),
-    /// Cannot restore hugetlbfs backed snapshot by mapping the memory file. Please use uffd.
-    HugetlbfsSnapshot,
-}
-
-fn guest_memory_from_file(
-    mem_file_path: &Path,
-    mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
-) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
-    let mem_file = File::open(mem_file_path)?;
-    let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages)?;
-    Ok(guest_mem)
-}
-
-/// Error type for [`guest_memory_from_uffd`]
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum GuestMemoryFromUffdError {
-    /// Failed to restore guest memory: {0}
-    Restore(#[from] MemoryError),
-    /// Failed to UFFD object: {0}
-    Create(userfaultfd::Error),
-    /// Failed to register memory address range with the userfaultfd object: {0}
-    Register(userfaultfd::Error),
-    /// Failed to connect to UDS Unix stream: {0}
-    Connect(#[from] std::io::Error),
-    /// Failed to sends file descriptor: {0}
-    Send(#[from] vmm_sys_util::errno::Error),
-}
-
-fn guest_memory_from_uffd(
-    mem_uds_path: &Path,
-    mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
-    huge_pages: HugePageConfig,
-) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
-
-    let mut uffd_builder = UffdBuilder::new();
-
-    // We only make use of this if balloon devices are present, but we can enable it unconditionally
-    // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
-    // actively change the behavior of UFFD, only passively. Without balloon devices
-    // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
-
-    let uffd = uffd_builder
-        .close_on_exec(true)
-        .non_blocking(true)
-        .user_mode_only(false)
-        .create()
-        .map_err(GuestMemoryFromUffdError::Create)?;
-
-    for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
-    }
-
-    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
-
-    Ok((guest_memory, Some(uffd)))
-}
-
-fn create_guest_memory(
-    mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
-    huge_pages: HugePageConfig,
-) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
-    let mut backend_mappings = Vec::with_capacity(guest_memory.len());
-    let mut offset = 0;
-    for mem_region in guest_memory.iter() {
-        #[allow(deprecated)]
-        backend_mappings.push(GuestRegionUffdMapping {
-            base_host_virt_addr: mem_region.as_ptr() as u64,
-            size: mem_region.size(),
-            offset,
-            page_size: huge_pages.page_size(),
-            page_size_kib: huge_pages.page_size(),
-        });
-        offset += mem_region.size() as u64;
-    }
-
-    Ok((guest_memory, backend_mappings))
-}
-
-fn send_uffd_handshake(
-    mem_uds_path: &Path,
-    backend_mappings: &[GuestRegionUffdMapping],
-    uffd: &impl AsRawFd,
-) -> Result<(), GuestMemoryFromUffdError> {
-    // This is safe to unwrap() because we control the contents of the vector
-    // (i.e GuestRegionUffdMapping entries).
-    let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
-
-    let socket = UnixStream::connect(mem_uds_path)?;
-    socket.send_with_fd(
-        backend_mappings.as_bytes(),
-        // In the happy case we can close the fd since the other process has it open and is
-        // using it to serve us pages.
-        //
-        // The problem is that if other process crashes/exits, firecracker guest memory
-        // will simply revert to anon-mem behavior which would lead to silent errors and
-        // undefined behavior.
-        //
-        // To tackle this scenario, the page fault handler can notify Firecracker of any
-        // crashes/exits. There is no need for Firecracker to explicitly send its process ID.
-        // The external process can obtain Firecracker's PID by calling `getsockopt` with
-        // `libc::SO_PEERCRED` option like so:
-        //
-        // let mut val = libc::ucred { pid: 0, gid: 0, uid: 0 };
-        // let mut ucred_size: u32 = mem::size_of::<libc::ucred>() as u32;
-        // libc::getsockopt(
-        //      socket.as_raw_fd(),
-        //      libc::SOL_SOCKET,
-        //      libc::SO_PEERCRED,
-        //      &mut val as *mut _ as *mut _,
-        //      &mut ucred_size as *mut libc::socklen_t,
-        // );
-        //
-        // Per this linux man page: https://man7.org/linux/man-pages/man7/unix.7.html,
-        // `SO_PEERCRED` returns the credentials (PID, UID and GID) of the peer process
-        // connected to this socket. The returned credentials are those that were in effect
-        // at the time of the `connect` call.
-        //
-        // Moreover, Firecracker holds a copy of the UFFD fd as well, so that even if the
-        // page fault handler process does not tear down Firecracker when necessary, the
-        // uffd will still be alive but with no one to serve faults, leading to guest freeze.
-        uffd.as_raw_fd(),
-    )?;
-
-    // We prevent Rust from closing the socket file descriptor to avoid a potential race condition
-    // between the mappings message and the connection shutdown. If the latter arrives at the UFFD
-    // handler first, the handler never sees the mappings.
-    forget(socket);
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixListener;
-
-    use vmm_sys_util::tempfile::TempFile;
-
     use super::*;
     use crate::Vmm;
     #[cfg(target_arch = "x86_64")]
@@ -656,34 +264,37 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmgenid_device;
     use crate::builder::tests::{
-        CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
-        insert_block_devices, insert_net_device, insert_vsock_device,
+        CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_block_devices,
+        insert_net_device, insert_vsock_device,
     };
     #[cfg(target_arch = "aarch64")]
     use crate::construct_kvm_mpidrs;
+    use crate::device_manager::persist::VirtioDeviceState;
     use crate::devices::virtio::block::CacheType;
     use crate::snapshot::Persist;
-    use crate::vmm_config::balloon::BalloonDeviceConfig;
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
-    use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionType};
+    use vmm_sys_util::tempfile::TempFile;
+
+    /// Round-trip equality is checked through the transport state and the MMIO resources;
+    /// per-device state equality is covered by each device's own tests.
+    fn assert_virtio_states_eq<T>(
+        restored: &[VirtioDeviceState<T>],
+        expected: &[VirtioDeviceState<T>],
+    ) {
+        assert_eq!(restored.len(), expected.len());
+        for (restored, expected) in restored.iter().zip(expected) {
+            assert_eq!(restored.device_id, expected.device_id);
+            assert_eq!(restored.transport_state, expected.transport_state);
+            assert_eq!(restored.device_info, expected.device_info);
+        }
+    }
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");
         let mut vmm = default_vmm();
         let mut cmdline = default_kernel_cmdline();
 
-        // Add a balloon device.
-        let balloon_config = BalloonDeviceConfig {
-            amount_mib: 0,
-            deflate_on_oom: false,
-            stats_polling_interval_s: 0,
-            free_page_hinting: false,
-            free_page_reporting: false,
-        };
-        insert_balloon_device(&mut vmm, &mut cmdline, &mut event_manager, balloon_config);
-
-        // Add a block device.
         let drive_id = String::from("root");
         let block_configs = vec![CustomBlockConfig::new(
             drive_id,
@@ -694,7 +305,6 @@ mod tests {
         )];
         insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
 
-        // Add net device.
         let network_interface = NetworkInterfaceConfig {
             iface_id: String::from("netif"),
             host_dev_name: String::from("hostname"),
@@ -710,11 +320,9 @@ mod tests {
             network_interface,
         );
 
-        // Add vsock device.
         let mut tmp_sock_file = TempFile::new().unwrap();
         tmp_sock_file.remove().unwrap();
         let vsock_config = default_config(&tmp_sock_file);
-
         insert_vsock_device(&mut vmm, &mut cmdline, &mut event_manager, vsock_config);
 
         #[cfg(target_arch = "x86_64")]
@@ -729,13 +337,9 @@ mod tests {
     fn test_microvm_state_snapshot() {
         let vmm = default_vmm_with_devices();
         let states = vmm.device_manager.save();
-
-        // Only checking that all devices are saved, actual device state
-        // is tested by that device's tests.
         assert_eq!(states.mmio_state.block_devices.len(), 1);
         assert_eq!(states.mmio_state.net_devices.len(), 1);
         assert!(states.mmio_state.vsock_device.is_some());
-        assert!(states.mmio_state.balloon_device.is_some());
 
         let vcpu_states = vec![VcpuState::default()];
         #[cfg(target_arch = "aarch64")]
@@ -755,75 +359,23 @@ mod tests {
         };
 
         let serialized_data = bitcode::serialize(&microvm_state).unwrap();
-
         let restored_microvm_state: MicrovmState = bitcode::deserialize(&serialized_data).unwrap();
-
         assert_eq!(restored_microvm_state.vm_info, microvm_state.vm_info);
-        assert_eq!(
-            restored_microvm_state.device_states.mmio_state,
-            microvm_state.device_states.mmio_state
-        )
-    }
 
-    #[test]
-    fn test_create_guest_memory() {
-        let mem_state = GuestMemoryState {
-            regions: vec![GuestMemoryRegionState {
-                base_address: 0,
-                size: 0x20000,
-                region_type: GuestRegionType::Dram,
-                plugged: vec![true],
-            }],
-        };
-
-        let (_, uffd_regions) =
-            create_guest_memory(&mem_state, false, HugePageConfig::None).unwrap();
-
-        assert_eq!(uffd_regions.len(), 1);
-        assert_eq!(uffd_regions[0].size, 0x20000);
-        assert_eq!(uffd_regions[0].offset, 0);
-        assert_eq!(uffd_regions[0].page_size, HugePageConfig::None.page_size());
-    }
-
-    #[test]
-    fn test_send_uffd_handshake() {
-        #[allow(deprecated)]
-        let uffd_regions = vec![
-            GuestRegionUffdMapping {
-                base_host_virt_addr: 0,
-                size: 0x100000,
-                offset: 0,
-                page_size: HugePageConfig::None.page_size(),
-                page_size_kib: HugePageConfig::None.page_size(),
-            },
-            GuestRegionUffdMapping {
-                base_host_virt_addr: 0x100000,
-                size: 0x200000,
-                offset: 0,
-                page_size: HugePageConfig::Hugetlbfs2M.page_size(),
-                page_size_kib: HugePageConfig::Hugetlbfs2M.page_size(),
-            },
-        ];
-
-        let uds_path = TempFile::new().unwrap();
-        let uds_path = uds_path.as_path();
-        std::fs::remove_file(uds_path).unwrap();
-
-        let listener = UnixListener::bind(uds_path).expect("Cannot bind to socket path");
-
-        send_uffd_handshake(uds_path, &uffd_regions, &std::io::stdin()).unwrap();
-
-        let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
-
-        let mut message_buf = vec![0u8; 1024];
-        let (bytes_read, _) = stream
-            .recv_with_fd(&mut message_buf[..])
-            .expect("Cannot recv_with_fd");
-        message_buf.resize(bytes_read, 0);
-
-        let deserialized: Vec<GuestRegionUffdMapping> =
-            serde_json::from_slice(&message_buf).unwrap();
-
-        assert_eq!(uffd_regions, deserialized);
+        let restored_mmio_state = &restored_microvm_state.device_states.mmio_state;
+        let mmio_state = &microvm_state.device_states.mmio_state;
+        assert_virtio_states_eq(
+            &restored_mmio_state.block_devices,
+            &mmio_state.block_devices,
+        );
+        assert_virtio_states_eq(&restored_mmio_state.net_devices, &mmio_state.net_devices);
+        assert_virtio_states_eq(
+            restored_mmio_state.vsock_device.as_slice(),
+            mmio_state.vsock_device.as_slice(),
+        );
+        assert_virtio_states_eq(
+            restored_mmio_state.entropy_device.as_slice(),
+            mmio_state.entropy_device.as_slice(),
+        );
     }
 }

@@ -46,10 +46,10 @@ serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
 slab = "0.4.12"
 thiserror = "2.0.18"
-userfaultfd = "0.9.0"
+userfaultfd = { version = "0.9.0", features = ["linux4_14", "linux5_7", "linux5_13"] }
+userfaultfd-sys = "0.6.0"
 utils = { path = "../utils" }
 uuid = "1.23.1"
-vhost = { version = "0.15.0", features = ["vhost-user-frontend"] }
 vm-allocator = { version = "0.1.3", features = ["serde"] }
 vm-memory = { version = "0.17.1", features = [
   "backend-mmap",
@@ -78,10 +78,6 @@ harness = false
 
 [[bench]]
 name = "block_request"
-harness = false
-
-[[bench]]
-name = "memory_access"
 harness = false
 
 [lints]

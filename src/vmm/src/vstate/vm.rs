@@ -6,40 +6,52 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
 use kvm_bindings::{
+    KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2, KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE,
     KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID, KvmIrqRouting,
-    kvm_irq_routing_entry, kvm_userspace_memory_region,
+    kvm_clear_dirty_log, kvm_enable_cap, kvm_irq_routing_entry, kvm_userspace_memory_region,
 };
 use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
-use userfaultfd::Uffd;
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::ioctl::ioctl_with_ref;
 use vmm_sys_util::terminal::Terminal;
 
+use crate::Vcpu;
 use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
 use crate::logger::{debug, info};
-use crate::persist::CreateSnapshotError;
-use crate::vmm_config::snapshot::SnapshotType;
+use crate::utils::u64_to_usize;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
-    GuestRegionMmap, GuestRegionMmapExt, MemoryError,
+    Bitmap, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
-use crate::{DirtyBitmap, Vcpu, mem_size_mib};
+
+mod ioctls {
+    use kvm_bindings::{kvm_clear_dirty_log, kvm_enable_cap};
+    use vmm_sys_util::{ioctl_iow_nr, ioctl_iowr_nr};
+
+    ioctl_iow_nr!(KVM_ENABLE_CAP, kvm_bindings::KVMIO, 0xa3, kvm_enable_cap);
+    ioctl_iowr_nr!(
+        KVM_CLEAR_DIRTY_LOG,
+        kvm_bindings::KVMIO,
+        0xc0,
+        kvm_clear_dirty_log
+    );
+}
+
+use ioctls::{KVM_CLEAR_DIRTY_LOG, KVM_ENABLE_CAP};
 
 /// Error type for [`KvmVm::start_vcpus`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -74,8 +86,6 @@ pub struct VmCommon {
     pub mmio_bus: Arc<Bus>,
     /// The global KVM state (fd + capabilities).
     pub kvm: Kvm,
-    /// Userfaultfd kept open for snapshot restore.
-    pub uffd: Option<Uffd>,
     /// Handles to vCPU threads.
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
@@ -103,8 +113,12 @@ pub enum VmError {
     NotEnoughMemorySlots(u32),
     /// Failed to add a memory region: {0}
     InsertRegion(#[from] vm_memory::GuestRegionCollectionError),
-    /// Error calling mincore: {0}
-    Mincore(vmm_sys_util::errno::Error),
+    /// Failed to clear KVM's dirty log: {0}
+    ClearDirtyLog(vmm_sys_util::errno::Error),
+    /// Failed to enable manual dirty log protection: {0}
+    ManualDirtyLogProtect(kvm_ioctls::Error),
+    /// Harvested bitmap does not match the guest geometry
+    DirtyBitmapShape,
     /// ResourceAllocator error: {0}
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
@@ -174,6 +188,19 @@ impl KvmVm {
             attempt += 1;
         };
 
+        // Manual protection makes a harvest a snapshot-then-clear: reading the log neither clears
+        // nor re-protects, so a capture reports each epoch exactly once.
+        let mut cap = kvm_enable_cap {
+            cap: KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
+            ..Default::default()
+        };
+        cap.args[0] = u64::from(KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE);
+        // SAFETY: the ioctl reads `cap`, which is a fully initialized capability request.
+        let ret = unsafe { ioctl_with_ref(&fd, KVM_ENABLE_CAP(), &cap) };
+        if ret != 0 {
+            return Err(VmError::ManualDirtyLogProtect(errno::Error::last()));
+        }
+
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::EventFd)?;
 
         Ok(VmCommon {
@@ -185,7 +212,6 @@ impl KvmVm {
             resource_allocator: Mutex::new(ResourceAllocator::new()),
             mmio_bus: Arc::new(Bus::new()),
             kvm,
-            uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
         })
@@ -225,11 +251,6 @@ impl KvmVm {
     /// Returns a locked reference to the vCPU handles.
     pub fn vcpus_handles(&self) -> MutexGuard<'_, Vec<VcpuHandle>> {
         self.common.vcpus_handles.lock().expect("Poisoned lock")
-    }
-
-    /// Sets the userfaultfd (used during snapshot restore).
-    pub fn set_uffd(&mut self, uffd: Option<Uffd>) {
-        self.common.uffd = uffd;
     }
 
     /// Starts the microVM vCPUs.
@@ -432,61 +453,31 @@ impl KvmVm {
             .guest_memory
             .insert_region(Arc::clone(&region))?;
 
-        region
-            .slots()
-            .try_for_each(|(ref slot, plugged)| match plugged {
-                // if the slot is plugged, add it to kvm user memory regions
-                true => self.set_user_memory_region(slot.into()),
-                // if the slot is not plugged, protect accesses to it
-                false => slot.protect(true).map_err(VmError::MemoryError),
-            })?;
-
+        self.set_user_memory_region((&region.slot()).into())?;
         self.common.guest_memory = new_guest_memory;
 
         Ok(())
     }
 
     /// Register a list of new memory regions to this [`KvmVm`].
-    pub fn register_dram_memory_regions(
+    pub fn register_memory_regions(
         &mut self,
         regions: Vec<GuestRegionMmap>,
     ) -> Result<(), VmError> {
         for region in regions {
-            let next_slot = self
+            let slot = self
                 .next_kvm_slot(1)
                 .ok_or(VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
 
-            let arcd_region =
-                Arc::new(GuestRegionMmapExt::dram_from_mmap_region(region, next_slot));
-
-            self.register_memory_region(arcd_region)?
+            self.register_memory_region(Arc::new(GuestRegionMmapExt::from_mmap_region(
+                region, slot,
+            )))?;
         }
 
         Ok(())
     }
 
-    /// Register a new hotpluggable region to this [`KvmVm`].
-    pub fn register_hotpluggable_memory_region(
-        &mut self,
-        region: GuestRegionMmap,
-        slot_size: usize,
-    ) -> Result<(), VmError> {
-        // caller should ensure the slot size divides the region length.
-        assert!(region.len().is_multiple_of(slot_size as u64));
-        let slot_cnt = (region.len() / (slot_size as u64))
-            .try_into()
-            .map_err(|_| VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
-        let slot_from = self
-            .next_kvm_slot(slot_cnt)
-            .ok_or(VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
-        let arcd_region = Arc::new(GuestRegionMmapExt::hotpluggable_from_mmap_region(
-            region, slot_from, slot_size,
-        ));
-
-        self.register_memory_region(arcd_region)
-    }
-
-    /// Register a list of new memory regions to this [`KvmVm`].
+    /// Register a list of restored memory regions to this [`KvmVm`].
     ///
     /// Note: regions and state.regions need to be in the same order.
     pub fn restore_memory_regions(
@@ -494,20 +485,19 @@ impl KvmVm {
         regions: Vec<GuestRegionMmap>,
         state: &GuestMemoryState,
     ) -> Result<(), VmError> {
+        if regions.len() != state.regions.len() {
+            return Err(VmError::MemoryError(MemoryError::Farplane(
+                "restored geometry does not match the vmstate".to_string(),
+            )));
+        }
         for (region, state) in regions.into_iter().zip(state.regions.iter()) {
-            let slot_cnt = state
-                .plugged
-                .len()
-                .try_into()
-                .map_err(|_| VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
-
-            let next_slot = self
-                .next_kvm_slot(slot_cnt)
+            let slot = self
+                .next_kvm_slot(1)
                 .ok_or(VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
 
-            let arcd_region = Arc::new(GuestRegionMmapExt::from_state(region, state, next_slot)?);
-
-            self.register_memory_region(arcd_region)?
+            self.register_memory_region(Arc::new(GuestRegionMmapExt::from_state(
+                region, state, slot,
+            )?))?;
         }
 
         Ok(())
@@ -531,103 +521,80 @@ impl KvmVm {
             .expect("Poisoned lock")
     }
 
-    /// Resets the KVM dirty bitmap for each of the guest's memory regions.
-    pub fn reset_dirty_bitmap(&self) {
+    /// Snapshots the dirty accumulator of every guest region, in ascending guest address order.
+    ///
+    /// Under manual protection `KVM_GET_DIRTY_LOG` neither clears nor re-protects, so the returned
+    /// bits stay set until [`KvmVm::clear_dirty_log`] retires them.
+    pub fn snapshot_dirty_log(&self) -> Result<Vec<Vec<u64>>, VmError> {
+        let page_size = host_page_size();
         self.guest_memory()
             .iter()
-            .flat_map(|region| region.plugged_slots())
-            .for_each(|mem_slot| {
-                let _ = self.fd().get_dirty_log(mem_slot.slot, mem_slot.slice.len());
-            });
-    }
-
-    /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
-    pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
-        self.guest_memory()
-            .iter()
-            .flat_map(|region| region.plugged_slots())
-            .map(|mem_slot| {
-                let bitmap = match mem_slot.slice.bitmap() {
-                    Some(_) => self
-                        .fd()
-                        .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
-                        .map_err(VmError::GetDirtyLog)?,
-                    None => mincore_bitmap(
-                        mem_slot.slice.ptr_guard_mut().as_ptr(),
-                        mem_slot.slice.len(),
-                    )?,
-                };
-                Ok((mem_slot.slot, bitmap))
+            .map(|region| {
+                let slot = region.slot();
+                let len = u64_to_usize(region.len());
+                let mut words = self
+                    .fd()
+                    .get_dirty_log(slot.slot, len)
+                    .map_err(VmError::GetDirtyLog)?;
+                let pages = len.div_ceil(page_size);
+                if words.len() != pages.div_ceil(64) {
+                    return Err(VmError::DirtyBitmapShape);
+                }
+                if let Some(host_writes) = region.bitmap() {
+                    for page in 0..pages {
+                        if host_writes.dirty_at(page * page_size) {
+                            words[page / 64] |= 1 << (page % 64);
+                        }
+                    }
+                }
+                Ok(words)
             })
             .collect()
     }
 
-    /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to
-    /// `mem_file_path`.
-    ///
-    /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
-    /// file of matching size, then the diff snapshot will be directly merged into the existing
-    /// snapshot. Otherwise, existing files are simply overwritten.
-    pub(crate) fn snapshot_memory_to_file(
-        &self,
-        mem_file_path: &Path,
-        snapshot_type: SnapshotType,
-    ) -> Result<(), CreateSnapshotError> {
-        use self::CreateSnapshotError::*;
-
-        // Need to check this here, as we create the file in the line below
-        let file_existed = mem_file_path.exists();
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(mem_file_path)
-            .map_err(|err| MemoryBackingFile("open", err))?;
-
-        // Determine what size our total memory area is.
-        let mem_size_mib = mem_size_mib(self.guest_memory());
-        let expected_size = mem_size_mib * 1024 * 1024;
-
-        if file_existed {
-            let file_size = file
-                .metadata()
-                .map_err(|e| MemoryBackingFile("get_metadata", e))?
-                .len();
-
-            // Here we only truncate the file if the size mismatches.
-            // - For full snapshots, the entire file's contents will be overwritten anyway. We have
-            //   to avoid truncating here to deal with the edge case where it represents the
-            //   snapshot file from which this very microVM was loaded (as modifying the memory file
-            //   would be reflected in the mmap of the file, meaning a truncate operation would zero
-            //   out guest memory, and thus corrupt the VM).
-            // - For diff snapshots, we want to merge the diff layer directly into the file.
-            if file_size != expected_size {
-                file.set_len(0)
-                    .map_err(|err| MemoryBackingFile("truncate", err))?;
+    /// Retires the bits of a snapshot: KVM re-protects them and the host accumulator is reset.
+    pub fn clear_dirty_log(&self, snapshot: &[Vec<u64>]) -> Result<(), VmError> {
+        let page_size = host_page_size();
+        if snapshot.len() != self.guest_memory().num_regions() {
+            return Err(VmError::DirtyBitmapShape);
+        }
+        for (region, words) in self.guest_memory().iter().zip(snapshot) {
+            let pages = u64_to_usize(region.len()).div_ceil(page_size);
+            if words.len() != pages.div_ceil(64) {
+                return Err(VmError::DirtyBitmapShape);
+            }
+            let clear = kvm_clear_dirty_log {
+                slot: region.slot().slot,
+                num_pages: u32::try_from(pages).map_err(|_| VmError::DirtyBitmapShape)?,
+                first_page: 0,
+                __bindgen_anon_1: kvm_bindings::kvm_clear_dirty_log__bindgen_ty_1 {
+                    dirty_bitmap: words.as_ptr().cast_mut().cast(),
+                },
+            };
+            // SAFETY: the ioctl reads `clear`, whose bitmap covers exactly this slot's pages.
+            let ret = unsafe { ioctl_with_ref(self.fd(), KVM_CLEAR_DIRTY_LOG(), &clear) };
+            if ret != 0 {
+                return Err(VmError::ClearDirtyLog(errno::Error::last()));
             }
         }
+        self.guest_memory().reset_dirty();
+        Ok(())
+    }
 
-        // Set the length of the file to the full size of the memory area.
-        file.set_len(expected_size)
-            .map_err(|e| MemoryBackingFile("set_length", e))?;
-
-        match snapshot_type {
-            SnapshotType::Diff => {
-                let dirty_bitmap = self.get_dirty_bitmap()?;
-                self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+    /// Returns a previously snapshotted bitmap to the accumulator, so the next snapshot reports it.
+    pub fn union_dirty_log(&self, bits: &[Vec<u64>]) {
+        let page_size = host_page_size();
+        for (region, words) in self.guest_memory().iter().zip(bits) {
+            let Some(host_writes) = region.bitmap() else {
+                continue;
+            };
+            let pages = u64_to_usize(region.len()).div_ceil(page_size);
+            for page in 0..pages {
+                if words[page / 64] & (1 << (page % 64)) != 0 {
+                    host_writes.mark_dirty(page * page_size, 1);
+                }
             }
-            SnapshotType::Full => {
-                self.guest_memory().dump(&mut file)?;
-                self.reset_dirty_bitmap();
-                self.guest_memory().reset_dirty();
-            }
-        };
-
-        file.flush()
-            .map_err(|err| MemoryBackingFile("flush", err))?;
-        file.sync_all()
-            .map_err(|err| MemoryBackingFile("sync_all", err))
+        }
     }
 
     /// Register a device IRQ
@@ -728,41 +695,6 @@ impl KvmVm {
     }
 }
 
-/// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
-/// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
-fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
-    // TODO: Once Host 5.10 goes out of support, we can make this more robust and work on
-    // swap-enabled systems, by doing mlock2(MLOCK_ONFAULT)/munlock() in this function (to
-    // force swapped-out pages to get paged in, so that mincore will consider them incore).
-    // However, on AMD (m6a/m7a) 5.10, doing so introduces a 100%/30ms regression to snapshot
-    // creation, even if swap is disabled, so currently it cannot be done.
-
-    // Mincore always works at PAGE_SIZE granularity, even if the VMA we are dealing with
-    // is a hugetlbfs VMA (e.g. to report a single hugepage as "present", mincore will
-    // give us 512 4k markers with the lowest bit set).
-    let page_size = host_page_size();
-    let mut mincore_bitmap = vec![0u8; len / page_size];
-    let mut bitmap = vec![0u64; (len / page_size).div_ceil(64)];
-
-    // SAFETY: The safety invariants of GuestRegionMmap ensure that region.as_ptr() is a valid
-    // userspace mapping of size region.len() bytes. The bitmap has exactly one byte for each
-    // page in this userspace mapping. Note that mincore does not operate on bitmaps like
-    // KVM_MEM_LOG_DIRTY_PAGES, but rather it uses 8 bits per page (e.g. 1 byte), setting the
-    // least significant bit to 1 if the page corresponding to a byte is in core (available in
-    // the page cache and resolvable via just a minor page fault).
-    let r = unsafe { libc::mincore(addr.cast(), len, mincore_bitmap.as_mut_ptr()) };
-
-    if r != 0 {
-        return Err(VmError::Mincore(vmm_sys_util::errno::Error::last()));
-    }
-
-    for (page_idx, b) in mincore_bitmap.iter().enumerate() {
-        bitmap[page_idx / 64] |= (*b as u64 & 0x1) << (page_idx as u64 % 64);
-    }
-
-    Ok(bitmap)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::atomic::Ordering;
@@ -788,7 +720,7 @@ pub(crate) mod tests {
     pub(crate) fn setup_vm_with_memory(mem_size: usize) -> KvmVm {
         let mut vm = setup_vm();
         let gm = single_region_mem_raw(mem_size);
-        vm.register_dram_memory_regions(gm).unwrap();
+        vm.register_memory_regions(gm).unwrap();
         vm
     }
 
@@ -806,14 +738,14 @@ pub(crate) mod tests {
         // Trying to set a memory region with a size that is not a multiple of GUEST_PAGE_SIZE
         // will result in error.
         let gm = single_region_mem_raw(0x10);
-        let res = vm.register_dram_memory_regions(gm);
+        let res = vm.register_memory_regions(gm);
         assert_eq!(
             res.unwrap_err().to_string(),
             "Cannot set the memory regions: Invalid argument (os error 22)"
         );
 
         let gm = single_region_mem_raw(0x1000);
-        let res = vm.register_dram_memory_regions(gm);
+        let res = vm.register_memory_regions(gm);
         res.unwrap();
     }
 
@@ -848,7 +780,7 @@ pub(crate) mod tests {
 
             let region = GuestRegionMmap::new(region, GuestAddress(i as u64 * 0x1000)).unwrap();
 
-            let res = vm.register_dram_memory_regions(vec![region]);
+            let res = vm.register_memory_regions(vec![region]);
 
             if max_nr_regions <= i {
                 assert!(

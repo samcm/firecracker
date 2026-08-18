@@ -4,6 +4,8 @@ use std::fmt::{self, Display, Formatter};
 
 use serde::{Serialize, ser};
 
+use crate::vstate::farplane::FarplaneState;
+
 /// Enumerates microVM runtime states.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum VmState {
@@ -35,7 +37,7 @@ impl ser::Serialize for VmState {
     }
 }
 
-/// Serializable struct that contains general information about the microVM.
+/// Description of the microVM instance, as reported by the instance information endpoint.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct InstanceInfo {
     /// The ID of the microVM.
@@ -46,4 +48,6 @@ pub struct InstanceInfo {
     pub vmm_version: String,
     /// The name of the application that runs the microVM.
     pub app_name: String,
+    /// Farplane memory-backend observation.
+    pub farplane: FarplaneState,
 }

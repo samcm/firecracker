@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use event_manager::SubscriberOps;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
-use userfaultfd::Uffd;
 use utils::time::TimestampUs;
-use vm_allocator::AllocPolicy;
 use vm_memory::GuestAddress;
 
 #[cfg(target_arch = "aarch64")]
@@ -29,12 +27,9 @@ use crate::device_manager::{
     AttachDeviceError, DeviceManager, DeviceManagerCreateError, DeviceManagerPersistError,
     DeviceRestoreArgs,
 };
-use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDevice;
-use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
-use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 #[cfg(feature = "gdb")]
@@ -43,15 +38,13 @@ use crate::initrd::{InitrdConfig, InitrdError};
 use crate::logger::debug;
 #[cfg(target_arch = "aarch64")]
 use crate::logger::warn;
-use crate::persist::{MicrovmState, MicrovmStateError};
+use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
-use crate::utils::mib_to_bytes;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
-use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
-use crate::vmm_config::pmem::PmemConfig;
+use crate::vstate::farplane::{CaptureService, FarplaneBackend};
 use crate::vstate::kvm::{Kvm, KvmError};
 use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
@@ -75,8 +68,6 @@ pub enum StartMicrovmError {
     CreateGuestConfig(#[from] GuestConfigError),
     /// Cannot create network device: {0}
     CreateNetDevice(crate::devices::virtio::net::NetError),
-    /// Cannot create pmem device: {0}
-    CreatePmemDevice(#[from] crate::devices::virtio::pmem::device::PmemError),
     /// Cannot create RateLimiter: {0}
     CreateRateLimiter(io::Error),
     /// Error creating legacy device: {0}
@@ -105,6 +96,8 @@ pub enum StartMicrovmError {
     MissingKernelConfig,
     /// Cannot start microvm without guest mem_size config.
     MissingMemSizeConfig,
+    /// The pagemaster memory channel was not established.
+    MissingMemoryChannel,
     /// No seccomp filter for thread category: {0}
     MissingSeccompFilters(String),
     /// The net device configuration is missing the tap device.
@@ -175,23 +168,7 @@ pub fn build_microvm_for_boot(
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm)?;
     let mut vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
-    vm.register_dram_memory_regions(guest_memory)?;
-
-    // Allocate memory as soon as possible to make hotpluggable memory available to all consumers,
-    // before they clone the GuestMemoryMmap object
-    let virtio_mem_addr = if let Some(memory_hotplug) = &vm_resources.memory_hotplug {
-        let addr = allocate_virtio_mem_address(&vm, memory_hotplug.total_size_mib)?;
-        let hotplug_memory_region = vm_resources
-            .allocate_memory_region(addr, mib_to_bytes(memory_hotplug.total_size_mib))
-            .map_err(StartMicrovmError::GuestMemory)?;
-        vm.register_hotpluggable_memory_region(
-            hotplug_memory_region,
-            mib_to_bytes(memory_hotplug.slot_size_mib),
-        )?;
-        Some(addr)
-    } else {
-        None
-    };
+    vm.register_memory_regions(guest_memory)?;
 
     let kvm_vm = Arc::new(vm);
     let vm = Vm::Kvm(kvm_vm.clone());
@@ -221,16 +198,6 @@ pub fn build_microvm_for_boot(
         device_manager.attach_boot_timer_device(&kvm_vm, request_ts)?;
     }
 
-    if let Some(balloon) = vm_resources.balloon.get() {
-        attach_balloon_device(
-            &mut device_manager,
-            &vm,
-            &mut boot_cmdline,
-            balloon,
-            event_manager,
-        )?;
-    }
-
     attach_block_devices(
         &mut device_manager,
         &vm,
@@ -243,13 +210,6 @@ pub fn build_microvm_for_boot(
         &vm,
         &mut boot_cmdline,
         vm_resources.net_builder.iter(),
-        event_manager,
-    )?;
-    attach_pmem_devices(
-        &mut device_manager,
-        &vm,
-        &mut boot_cmdline,
-        &vm_resources.pmem.configs,
         event_manager,
     )?;
 
@@ -270,18 +230,6 @@ pub fn build_microvm_for_boot(
             &mut boot_cmdline,
             entropy,
             event_manager,
-        )?;
-    }
-
-    // Attach virtio-mem device if configured
-    if let Some(memory_hotplug) = &vm_resources.memory_hotplug {
-        attach_virtio_mem_device(
-            &mut device_manager,
-            &vm,
-            &mut boot_cmdline,
-            memory_hotplug,
-            event_manager,
-            virtio_mem_addr.expect("address should be allocated"),
         )?;
     }
 
@@ -367,6 +315,14 @@ pub fn build_microvm_for_boot(
 
     event_manager.add_subscriber(vmm.clone());
 
+    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
+    CaptureService::register(
+        channel,
+        vmm.clone(),
+        VmInfo::from(vm_resources),
+        event_manager,
+    );
+
     Ok(vmm)
 }
 
@@ -440,7 +396,6 @@ pub fn build_microvm_from_snapshot(
     event_manager: &mut EventManager,
     microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
-    uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
@@ -500,8 +455,6 @@ pub fn build_microvm_from_snapshot(
     // Restore the boot source config paths.
     vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
 
-    vm.set_uffd(uffd);
-
     let kvm_vm = Arc::new(vm);
     let vm = Vm::Kvm(kvm_vm.clone());
 
@@ -514,7 +467,6 @@ pub fn build_microvm_from_snapshot(
         vm: &kvm_vm,
         event_manager,
         vm_resources,
-        instance_id: &instance_info.id,
         vcpus_exit_evt: kvm_vm.vcpus_exit_evt(),
     };
     #[allow(unused_mut)]
@@ -542,6 +494,14 @@ pub fn build_microvm_from_snapshot(
     let vmm = Arc::new(Mutex::new(vmm));
     vmm.lock().unwrap().instance_info.state = VmState::Paused;
     event_manager.add_subscriber(vmm.clone());
+
+    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
+    CaptureService::register(
+        channel,
+        vmm.clone(),
+        VmInfo::from(&*vm_resources),
+        event_manager,
+    );
 
     // Load seccomp filters for the VMM thread.
     // Keep this as the last step of the building process.
@@ -613,65 +573,7 @@ fn attach_entropy_device(
         .id()
         .to_string();
 
-    device_manager.attach_virtio_device(
-        vm,
-        id,
-        entropy_device.clone(),
-        cmdline,
-        event_manager,
-        false,
-    )
-}
-
-fn allocate_virtio_mem_address(
-    vm: &KvmVm,
-    total_size_mib: usize,
-) -> Result<GuestAddress, StartMicrovmError> {
-    let addr = vm
-        .resource_allocator()
-        .past_mmio64_memory
-        .allocate(
-            mib_to_bytes(total_size_mib) as u64,
-            mib_to_bytes(VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB) as u64,
-            AllocPolicy::FirstMatch,
-        )?
-        .start();
-    Ok(GuestAddress(addr))
-}
-
-fn attach_virtio_mem_device(
-    device_manager: &mut DeviceManager,
-    vm: &Vm,
-    cmdline: &mut LoaderKernelCmdline,
-    config: &MemoryHotplugConfig,
-    event_manager: &mut EventManager,
-    addr: GuestAddress,
-) -> Result<(), StartMicrovmError> {
-    let kvm_vm = vm
-        .as_kvm()
-        .cloned()
-        .ok_or(AttachDeviceError::NotSupported)?;
-    let virtio_mem = Arc::new(Mutex::new(
-        VirtioMem::new(
-            kvm_vm,
-            addr,
-            config.total_size_mib,
-            config.block_size_mib,
-            config.slot_size_mib,
-        )
-        .map_err(|e| StartMicrovmError::Internal(VmmError::VirtioMem(e)))?,
-    ));
-
-    let id = virtio_mem.lock().expect("Poisoned lock").id().to_string();
-    device_manager.attach_virtio_device(
-        vm,
-        id,
-        virtio_mem.clone(),
-        cmdline,
-        event_manager,
-        false,
-    )?;
-    Ok(())
+    device_manager.attach_virtio_device(vm, id, entropy_device.clone(), cmdline, event_manager)
 }
 
 fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
@@ -682,7 +584,7 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
     event_manager: &mut EventManager,
 ) -> Result<(), StartMicrovmError> {
     for block in blocks {
-        let (id, is_vhost_user) = {
+        let id = {
             let locked = block.lock().expect("Poisoned lock");
             if locked.root_device() {
                 match locked.partuuid() {
@@ -694,17 +596,10 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
                     false => cmdline.insert_str("rw")?,
                 }
             }
-            (locked.id().to_string(), locked.is_vhost_user())
+            locked.id().to_string()
         };
         // The device mutex mustn't be locked here otherwise it will deadlock.
-        device_manager.attach_virtio_device(
-            vm,
-            id,
-            block.clone(),
-            cmdline,
-            event_manager,
-            is_vhost_user,
-        )?;
+        device_manager.attach_virtio_device(vm, id, block.clone(), cmdline, event_manager)?;
     }
     Ok(())
 }
@@ -719,39 +614,7 @@ fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Net>>> + Debug>(
     for net_device in net_devices {
         let id = net_device.lock().expect("Poisoned lock").id().to_string();
         // The device mutex mustn't be locked here otherwise it will deadlock.
-        device_manager.attach_virtio_device(
-            vm,
-            id,
-            net_device.clone(),
-            cmdline,
-            event_manager,
-            false,
-        )?;
-    }
-    Ok(())
-}
-
-fn attach_pmem_devices(
-    device_manager: &mut DeviceManager,
-    vm: &Vm,
-    cmdline: &mut LoaderKernelCmdline,
-    configs: &[PmemConfig],
-    event_manager: &mut EventManager,
-) -> Result<(), StartMicrovmError> {
-    let kvm_vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
-    for (i, config) in configs.iter().enumerate() {
-        if config.root_device {
-            cmdline.insert_str(format!("root=/dev/pmem{i}"))?;
-            match config.read_only {
-                true => cmdline.insert_str("ro")?,
-                false => cmdline.insert_str("rw")?,
-            }
-        }
-        let id = config.id.clone();
-        let pmem = Pmem::new(kvm_vm.clone(), config.clone())?;
-        let device = Arc::new(Mutex::new(pmem));
-
-        device_manager.attach_virtio_device(vm, id, device, cmdline, event_manager, false)?;
+        device_manager.attach_virtio_device(vm, id, net_device.clone(), cmdline, event_manager)?;
     }
     Ok(())
 }
@@ -765,20 +628,7 @@ fn attach_unixsock_vsock_device(
 ) -> Result<(), AttachDeviceError> {
     let id = String::from(unix_vsock.lock().expect("Poisoned lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    device_manager.attach_virtio_device(vm, id, unix_vsock.clone(), cmdline, event_manager, false)
-}
-
-fn attach_balloon_device(
-    device_manager: &mut DeviceManager,
-    vm: &Vm,
-    cmdline: &mut LoaderKernelCmdline,
-    balloon: &Arc<Mutex<Balloon>>,
-    event_manager: &mut EventManager,
-) -> Result<(), AttachDeviceError> {
-    let _kvm_vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
-    let id = String::from(balloon.lock().expect("Poisoned lock").id());
-    // The device mutex mustn't be locked here otherwise it will deadlock.
-    device_manager.attach_virtio_device(vm, id, balloon.clone(), cmdline, event_manager, false)
+    device_manager.attach_virtio_device(vm, id, unix_vsock.clone(), cmdline, event_manager)
 }
 
 #[cfg(test)]
@@ -793,16 +643,12 @@ pub(crate) mod tests {
     use crate::devices::virtio::device::VirtioDeviceType;
     use crate::devices::virtio::rng::device::ENTROPY_DEV_ID;
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
-    use crate::mmds::data_store::{Mmds, MmdsVersion};
-    use crate::mmds::ns::MmdsNetworkStack;
     use crate::utils::mib_to_bytes;
-    use crate::vmm_config::balloon::{BALLOON_DEV_ID, BalloonBuilder, BalloonDeviceConfig};
     use crate::vmm_config::boot_source::{BootSourceConfig, DEFAULT_KERNEL_CMDLINE};
     use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig};
     use crate::vmm_config::entropy::{EntropyDeviceBuilder, EntropyDeviceConfig};
     use crate::vmm_config::machine_config::MachineConfig;
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
-    use crate::vmm_config::pmem::{PmemBuilder, PmemConfig};
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vmm_config::vsock::{VsockBuilder, VsockDeviceConfig};
     use crate::vstate::vm::Vm;
@@ -903,15 +749,12 @@ pub(crate) mod tests {
                         .unwrap()
                         .to_string(),
                 ),
+                fd: None,
                 rate_limiter: None,
                 file_engine_type: None,
-
-                socket: None,
             };
 
-            block_dev_configs
-                .insert(block_device_config, false)
-                .unwrap();
+            block_dev_configs.insert(block_device_config).unwrap();
         }
 
         attach_block_devices(
@@ -942,33 +785,6 @@ pub(crate) mod tests {
             event_manager,
         );
         res.unwrap();
-    }
-
-    pub(crate) fn insert_net_device_with_mmds(
-        vmm: &mut Vmm,
-        cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
-        net_config: NetworkInterfaceConfig,
-        mmds_version: MmdsVersion,
-    ) {
-        let mut net_builder = NetBuilder::new();
-        net_builder.build(net_config).unwrap();
-        let net = net_builder.iter().next().unwrap();
-        let mut mmds = Mmds::default();
-        mmds.set_version(mmds_version);
-        net.lock().unwrap().configure_mmds_network_stack(
-            MmdsNetworkStack::default_ipv4_addr(),
-            Arc::new(Mutex::new(mmds)),
-        );
-
-        attach_net_devices(
-            &mut vmm.device_manager,
-            &vmm.vm,
-            cmdline,
-            net_builder.iter(),
-            event_manager,
-        )
-        .unwrap();
     }
 
     pub(crate) fn insert_vsock_device(
@@ -1022,34 +838,6 @@ pub(crate) mod tests {
         );
     }
 
-    pub(crate) fn insert_pmem_devices(
-        vmm: &mut Vmm,
-        cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
-        configs: Vec<PmemConfig>,
-    ) -> Vec<TempFile> {
-        let mut builder = PmemBuilder::default();
-        let mut files = Vec::new();
-        for mut config in configs {
-            let tmp_file = TempFile::new().unwrap();
-            tmp_file.as_file().set_len(0x20_0000).unwrap();
-            let tmp_file_path = tmp_file.as_path().to_str().unwrap().to_string();
-            files.push(tmp_file);
-            config.path_on_host = tmp_file_path;
-            builder.build(config, false).unwrap();
-        }
-
-        attach_pmem_devices(
-            &mut vmm.device_manager,
-            &vmm.vm,
-            cmdline,
-            &builder.configs,
-            event_manager,
-        )
-        .unwrap();
-        files
-    }
-
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn insert_vmgenid_device(vmm: &mut Vmm) {
         vmm.device_manager
@@ -1062,32 +850,6 @@ pub(crate) mod tests {
         vmm.device_manager
             .attach_vmclock_device(vmm.vm.as_kvm().unwrap())
             .unwrap();
-    }
-
-    pub(crate) fn insert_balloon_device(
-        vmm: &mut Vmm,
-        cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
-        balloon_config: BalloonDeviceConfig,
-    ) {
-        let mut builder = BalloonBuilder::new();
-        builder.set(balloon_config).unwrap();
-        let balloon = builder.get().unwrap();
-
-        attach_balloon_device(
-            &mut vmm.device_manager,
-            &vmm.vm,
-            cmdline,
-            balloon,
-            event_manager,
-        )
-        .unwrap();
-
-        assert!(
-            vmm.device_manager
-                .get_virtio_device(VirtioDeviceType::Balloon, BALLOON_DEV_ID)
-                .is_some()
-        );
     }
 
     #[test]
@@ -1305,29 +1067,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_attach_pmem_devices() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
-
-        let id = String::from("root");
-        let configs = vec![PmemConfig {
-            id: id.clone(),
-            path_on_host: "".into(),
-            root_device: true,
-            read_only: true,
-            ..Default::default()
-        }];
-        let mut vmm = default_vmm();
-        let mut cmdline = default_kernel_cmdline();
-        _ = insert_pmem_devices(&mut vmm, &mut cmdline, &mut event_manager, configs);
-        assert!(cmdline_contains(&cmdline, "root=/dev/pmem0 ro"));
-        assert!(
-            vmm.device_manager
-                .get_virtio_device(VirtioDeviceType::Pmem, id.as_str())
-                .is_some()
-        );
-    }
-
-    #[test]
     fn test_attach_boot_timer_device() {
         let mut vmm = default_vmm();
         let request_ts = TimestampUs::default();
@@ -1337,29 +1076,6 @@ pub(crate) mod tests {
             .attach_boot_timer_device(vmm.vm.as_kvm().unwrap(), request_ts);
         res.unwrap();
         assert!(vmm.device_manager.mmio_devices.boot_timer.is_some());
-    }
-
-    #[test]
-    fn test_attach_balloon_device() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
-        let mut vmm = default_vmm();
-
-        let balloon_config = BalloonDeviceConfig {
-            amount_mib: 0,
-            deflate_on_oom: false,
-            stats_polling_interval_s: 0,
-            free_page_hinting: false,
-            free_page_reporting: false,
-        };
-
-        let mut cmdline = default_kernel_cmdline();
-        insert_balloon_device(&mut vmm, &mut cmdline, &mut event_manager, balloon_config);
-        // Check if the vsock device is described in kernel_cmdline.
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        assert!(cmdline_contains(
-            &cmdline,
-            "virtio_mmio.device=4K@0xc0001000:5"
-        ));
     }
 
     #[test]
@@ -1390,45 +1106,6 @@ pub(crate) mod tests {
 
         let mut cmdline = default_kernel_cmdline();
         insert_vsock_device(&mut vmm, &mut cmdline, &mut event_manager, vsock_config);
-        // Check if the vsock device is described in kernel_cmdline.
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        assert!(cmdline_contains(
-            &cmdline,
-            "virtio_mmio.device=4K@0xc0001000:5"
-        ));
-    }
-
-    pub(crate) fn insert_virtio_mem_device(
-        vmm: &mut Vmm,
-        cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
-        config: MemoryHotplugConfig,
-    ) {
-        attach_virtio_mem_device(
-            &mut vmm.device_manager,
-            &vmm.vm,
-            cmdline,
-            &config,
-            event_manager,
-            GuestAddress(512 << 30),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn test_attach_virtio_mem_device() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
-        let mut vmm = default_vmm();
-
-        let config = MemoryHotplugConfig {
-            total_size_mib: 1024,
-            block_size_mib: 2,
-            slot_size_mib: 128,
-        };
-
-        let mut cmdline = default_kernel_cmdline();
-        insert_virtio_mem_device(&mut vmm, &mut cmdline, &mut event_manager, config);
-
         // Check if the vsock device is described in kernel_cmdline.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         assert!(cmdline_contains(

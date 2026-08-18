@@ -264,17 +264,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "chacha20"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
-dependencies = [
- "cfg-if",
- "cpufeatures",
- "rand_core 0.10.0",
-]
-
-[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -320,15 +309,6 @@ checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
 dependencies = [
  "clap_builder",
  "clap_derive",
-]
-
-[[package]]
-name = "clap-num"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "822c4000301ac390e65995c62207501e3ef800a1fc441df913a5e8e4dc374816"
-dependencies = [
- "num-traits",
 ]
 
 [[package]]
@@ -411,15 +391,6 @@ dependencies = [
  "thiserror 2.0.18",
  "vmm",
  "vmm-sys-util",
-]
-
-[[package]]
-name = "cpufeatures"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -590,7 +561,6 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "thiserror 2.0.18",
- "userfaultfd",
  "utils",
  "vmm",
  "vmm-sys-util",
@@ -683,7 +653,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
- "rand_core 0.10.0",
  "wasip2",
  "wasip3",
 ]
@@ -795,7 +764,6 @@ version = "1.16.1"
 dependencies = [
  "libc",
  "log-instrument",
- "regex",
  "thiserror 2.0.18",
  "utils",
  "vmm-sys-util",
@@ -970,7 +938,7 @@ dependencies = [
 [[package]]
 name = "micro_http"
 version = "0.1.0"
-source = "git+https://github.com/firecracker-microvm/micro-http#876f3feccc30e09225f2c77bf95a6b2d46a9259e"
+source = "git+https://github.com/firecracker-microvm/micro-http#7975fe0e59000e8c41cb1d58fbd39ffa102e5b27"
 dependencies = [
  "libc",
  "vmm-sys-util",
@@ -1103,7 +1071,7 @@ checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
 dependencies = [
  "bitflags 2.11.1",
  "num-traits",
- "rand 0.9.4",
+ "rand",
  "rand_chacha",
  "rand_xorshift",
  "regex-syntax",
@@ -1138,18 +1106,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
  "rand_chacha",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc266eb313df6c5c09c1c7b1fbe2510961e5bcd3add930c1e31f7ed9da0feff8"
-dependencies = [
- "chacha20",
- "getrandom 0.4.1",
- "rand_core 0.10.0",
+ "rand_core",
 ]
 
 [[package]]
@@ -1159,7 +1116,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
- "rand_core 0.9.5",
+ "rand_core",
 ]
 
 [[package]]
@@ -1172,30 +1129,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_core"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
-
-[[package]]
 name = "rand_xorshift"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rebase-snap"
-version = "1.16.1"
-dependencies = [
- "displaydoc",
- "libc",
- "log-instrument",
- "thiserror 2.0.18",
- "utils",
- "vmm-sys-util",
+ "rand_core",
 ]
 
 [[package]]
@@ -1357,22 +1296,6 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
-
-[[package]]
-name = "snapshot-editor"
-version = "1.16.1"
-dependencies = [
- "clap",
- "clap-num",
- "displaydoc",
- "libc",
- "log-instrument",
- "semver",
- "thiserror 2.0.18",
- "utils",
- "vmm",
- "vmm-sys-util",
-]
 
 [[package]]
 name = "strsim"
@@ -1565,21 +1488,7 @@ checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
  "getrandom 0.4.1",
  "js-sys",
- "rand 0.10.0",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "vhost"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c76d90ce3c6b37d610a5304c9a445cfff580cf8b4b9fd02fb256aaf68552c28a"
-dependencies = [
- "bitflags 2.11.1",
- "libc",
- "uuid",
- "vm-memory",
- "vmm-sys-util",
 ]
 
 [[package]]
@@ -1652,9 +1561,9 @@ dependencies = [
  "slab",
  "thiserror 2.0.18",
  "userfaultfd",
+ "userfaultfd-sys",
  "utils",
  "uuid",
- "vhost",
  "vm-allocator",
  "vm-fdt",
  "vm-memory",

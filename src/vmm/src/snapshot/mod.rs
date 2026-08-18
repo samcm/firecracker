@@ -21,8 +21,8 @@
 //!  |-----------------------------|
 //!
 //!
-//! The snapshot format uses a version value in the form of `MAJOR.MINOR.PATCH`. The version is
-//! provided by the library clients (it is not tied to this crate).
+//! The snapshot format uses a version value in the form of `MAJOR.MINOR.PATCH`, defined by
+//! [`SNAPSHOT_VERSION`].
 pub mod crc;
 mod persist;
 use std::fmt::Debug;
@@ -33,9 +33,11 @@ use semver::Version;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::persist::SNAPSHOT_VERSION;
 use crate::snapshot::crc::CRC64Writer;
 pub use crate::snapshot::persist::Persist;
+
+/// Version of the snapshot format produced and accepted by this crate.
+pub const SNAPSHOT_VERSION: Version = Version::new(10, 0, 0);
 
 #[cfg(target_arch = "x86_64")]
 const SNAPSHOT_MAGIC_ID: u64 = 0x0710_1984_8664_0000u64;
