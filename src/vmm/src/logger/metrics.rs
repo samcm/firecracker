@@ -72,13 +72,9 @@ use utils::time::{ClockType, get_time_ns, get_time_us};
 
 use super::FcLineWriter;
 use crate::devices::legacy;
-use crate::devices::virtio::balloon::metrics as balloon_metrics;
 use crate::devices::virtio::block::virtio::metrics as block_metrics;
-use crate::devices::virtio::mem::metrics as virtio_mem_metrics;
 use crate::devices::virtio::net::metrics as net_metrics;
-use crate::devices::virtio::pmem::metrics as pmem_metrics;
 use crate::devices::virtio::rng::metrics as entropy_metrics;
-use crate::devices::virtio::vhost_user_metrics;
 use crate::devices::virtio::vsock::metrics as vsock_metrics;
 
 /// Static instance used for handling metrics.
@@ -357,12 +353,8 @@ pub struct GetRequestsMetrics {
     pub instance_info_count: SharedIncMetric,
     /// Number of GETs for getting status on attaching machine configuration.
     pub machine_cfg_count: SharedIncMetric,
-    /// Number of GETs for getting mmds.
-    pub mmds_count: SharedIncMetric,
     /// Number of GETs for getting the VMM version.
     pub vmm_version_count: SharedIncMetric,
-    /// Number of GETs for getting hotpluggable memory status.
-    pub hotplug_memory_count: SharedIncMetric,
 }
 impl GetRequestsMetrics {
     /// Const default construction.
@@ -370,9 +362,7 @@ impl GetRequestsMetrics {
         Self {
             instance_info_count: SharedIncMetric::new(),
             machine_cfg_count: SharedIncMetric::new(),
-            mmds_count: SharedIncMetric::new(),
             vmm_version_count: SharedIncMetric::new(),
-            hotplug_memory_count: SharedIncMetric::new(),
         }
     }
 }
@@ -412,26 +402,14 @@ pub struct PutRequestsMetrics {
     pub network_count: SharedIncMetric,
     /// Number of failures in creating a new network interface.
     pub network_fails: SharedIncMetric,
-    /// Number of PUTs for creating mmds.
-    pub mmds_count: SharedIncMetric,
-    /// Number of failures in creating a new mmds.
-    pub mmds_fails: SharedIncMetric,
     /// Number of PUTs for creating a vsock device.
     pub vsock_count: SharedIncMetric,
     /// Number of failures in creating a vsock device.
     pub vsock_fails: SharedIncMetric,
-    /// Number of PUTs triggering a pmem attach.
-    pub pmem_count: SharedIncMetric,
-    /// Number of failures in attaching a pmem device.
-    pub pmem_fails: SharedIncMetric,
     /// Number of PUTs to /serial
     pub serial_count: SharedIncMetric,
     /// Number of failed PUTs to /serial
     pub serial_fails: SharedIncMetric,
-    /// Number of PUTs to /hotplug/memory
-    pub hotplug_memory_count: SharedIncMetric,
-    /// Number of failed PUTs to /hotplug/memory
-    pub hotplug_memory_fails: SharedIncMetric,
 }
 impl PutRequestsMetrics {
     /// Const default construction.
@@ -453,16 +431,10 @@ impl PutRequestsMetrics {
             metrics_fails: SharedIncMetric::new(),
             network_count: SharedIncMetric::new(),
             network_fails: SharedIncMetric::new(),
-            mmds_count: SharedIncMetric::new(),
-            mmds_fails: SharedIncMetric::new(),
             vsock_count: SharedIncMetric::new(),
             vsock_fails: SharedIncMetric::new(),
-            pmem_count: SharedIncMetric::new(),
-            pmem_fails: SharedIncMetric::new(),
             serial_count: SharedIncMetric::new(),
             serial_fails: SharedIncMetric::new(),
-            hotplug_memory_count: SharedIncMetric::new(),
-            hotplug_memory_fails: SharedIncMetric::new(),
         }
     }
 }
@@ -482,18 +454,6 @@ pub struct PatchRequestsMetrics {
     pub machine_cfg_count: SharedIncMetric,
     /// Number of failures in configuring the machine.
     pub machine_cfg_fails: SharedIncMetric,
-    /// Number of tries to PATCH an mmds.
-    pub mmds_count: SharedIncMetric,
-    /// Number of failures in PATCHing an mmds.
-    pub mmds_fails: SharedIncMetric,
-    /// Number of PATCHes to /hotplug/memory
-    pub hotplug_memory_count: SharedIncMetric,
-    /// Number of failed PATCHes to /hotplug/memory
-    pub hotplug_memory_fails: SharedIncMetric,
-    /// Number of tries to PATCH a pmem device.
-    pub pmem_count: SharedIncMetric,
-    /// Number of failures in PATCHing a pmem device.
-    pub pmem_fails: SharedIncMetric,
 }
 impl PatchRequestsMetrics {
     /// Const default construction.
@@ -505,12 +465,6 @@ impl PatchRequestsMetrics {
             network_fails: SharedIncMetric::new(),
             machine_cfg_count: SharedIncMetric::new(),
             machine_cfg_fails: SharedIncMetric::new(),
-            mmds_count: SharedIncMetric::new(),
-            mmds_fails: SharedIncMetric::new(),
-            hotplug_memory_count: SharedIncMetric::new(),
-            hotplug_memory_fails: SharedIncMetric::new(),
-            pmem_count: SharedIncMetric::new(),
-            pmem_fails: SharedIncMetric::new(),
         }
     }
 }
@@ -550,57 +504,6 @@ impl LoggerSystemMetrics {
             metrics_fails: SharedIncMetric::new(),
             missed_log_count: SharedIncMetric::new(),
             rate_limited_log_count: SharedIncMetric::new(),
-        }
-    }
-}
-
-/// Metrics for the MMDS functionality.
-#[derive(Debug, Default, Serialize)]
-pub struct MmdsMetrics {
-    /// Number of frames rerouted to MMDS.
-    pub rx_accepted: SharedIncMetric,
-    /// Number of errors while handling a frame through MMDS.
-    pub rx_accepted_err: SharedIncMetric,
-    /// Number of uncommon events encountered while processing packets through MMDS.
-    pub rx_accepted_unusual: SharedIncMetric,
-    /// The number of buffers which couldn't be parsed as valid Ethernet frames by the MMDS.
-    pub rx_bad_eth: SharedIncMetric,
-    /// The number of GET requests with invalid tokens.
-    pub rx_invalid_token: SharedIncMetric,
-    /// The number of GET requests with no tokens.
-    pub rx_no_token: SharedIncMetric,
-    /// The total number of successful receive operations by the MMDS.
-    pub rx_count: SharedIncMetric,
-    /// The total number of bytes sent by the MMDS.
-    pub tx_bytes: SharedIncMetric,
-    /// The total number of successful send operations by the MMDS.
-    pub tx_count: SharedIncMetric,
-    /// The number of errors raised by the MMDS while attempting to send frames/packets/segments.
-    pub tx_errors: SharedIncMetric,
-    /// The number of frames sent by the MMDS.
-    pub tx_frames: SharedIncMetric,
-    /// The number of connections successfully accepted by the MMDS TCP handler.
-    pub connections_created: SharedIncMetric,
-    /// The number of connections cleaned up by the MMDS TCP handler.
-    pub connections_destroyed: SharedIncMetric,
-}
-impl MmdsMetrics {
-    /// Const default construction.
-    pub const fn new() -> Self {
-        Self {
-            rx_accepted: SharedIncMetric::new(),
-            rx_accepted_err: SharedIncMetric::new(),
-            rx_accepted_unusual: SharedIncMetric::new(),
-            rx_bad_eth: SharedIncMetric::new(),
-            rx_invalid_token: SharedIncMetric::new(),
-            rx_no_token: SharedIncMetric::new(),
-            rx_count: SharedIncMetric::new(),
-            tx_bytes: SharedIncMetric::new(),
-            tx_count: SharedIncMetric::new(),
-            tx_errors: SharedIncMetric::new(),
-            tx_frames: SharedIncMetric::new(),
-            connections_created: SharedIncMetric::new(),
-            connections_destroyed: SharedIncMetric::new(),
         }
     }
 }
@@ -895,13 +798,9 @@ macro_rules! create_serialize_proxy {
 
 create_serialize_proxy!(BlockMetricsSerializeProxy, block_metrics);
 create_serialize_proxy!(NetMetricsSerializeProxy, net_metrics);
-create_serialize_proxy!(VhostUserMetricsSerializeProxy, vhost_user_metrics);
-create_serialize_proxy!(BalloonMetricsSerializeProxy, balloon_metrics);
 create_serialize_proxy!(EntropyMetricsSerializeProxy, entropy_metrics);
 create_serialize_proxy!(VsockMetricsSerializeProxy, vsock_metrics);
-create_serialize_proxy!(PmemMetricsSerializeProxy, pmem_metrics);
 create_serialize_proxy!(LegacyDevMetricsSerializeProxy, legacy);
-create_serialize_proxy!(MemoryHotplugSerializeProxy, virtio_mem_metrics);
 
 /// Structure storing all metrics while enforcing serialization support on them.
 #[derive(Debug, Default, Serialize)]
@@ -909,9 +808,6 @@ pub struct FirecrackerMetrics {
     utc_timestamp_ms: SerializeToUtcTimestampMs,
     /// API Server related metrics.
     pub api_server: ApiServerMetrics,
-    #[serde(flatten)]
-    /// A balloon device's related metrics.
-    pub balloon_ser: BalloonMetricsSerializeProxy,
     #[serde(flatten)]
     /// A block device's related metrics.
     pub block_ser: BlockMetricsSerializeProxy,
@@ -926,8 +822,6 @@ pub struct FirecrackerMetrics {
     pub latencies_us: PerformanceMetrics,
     /// Logging related metrics.
     pub logger: LoggerSystemMetrics,
-    /// Metrics specific to MMDS functionality.
-    pub mmds: MmdsMetrics,
     #[serde(flatten)]
     /// A network device's related metrics.
     pub net_ser: NetMetricsSerializeProxy,
@@ -949,17 +843,8 @@ pub struct FirecrackerMetrics {
     #[serde(flatten)]
     /// Metrics related to virtio-rng entropy device.
     pub entropy_ser: EntropyMetricsSerializeProxy,
-    #[serde(flatten)]
-    /// Metrics related to virtio-pmem entropy device.
-    pub pmem_ser: PmemMetricsSerializeProxy,
-    #[serde(flatten)]
-    /// Vhost-user device related metrics.
-    pub vhost_user_ser: VhostUserMetricsSerializeProxy,
     /// Interrupt related metrics
     pub interrupts: InterruptMetrics,
-    #[serde(flatten)]
-    /// Virtio-mem device related metrics (memory hotplugging)
-    pub memory_hotplug_ser: MemoryHotplugSerializeProxy,
 }
 impl FirecrackerMetrics {
     /// Const default construction.
@@ -967,14 +852,12 @@ impl FirecrackerMetrics {
         Self {
             utc_timestamp_ms: SerializeToUtcTimestampMs::new(),
             api_server: ApiServerMetrics::new(),
-            balloon_ser: BalloonMetricsSerializeProxy {},
             block_ser: BlockMetricsSerializeProxy {},
             deprecated_api: DeprecatedApiMetrics::new(),
             get_api_requests: GetRequestsMetrics::new(),
             legacy_dev_ser: LegacyDevMetricsSerializeProxy {},
             latencies_us: PerformanceMetrics::new(),
             logger: LoggerSystemMetrics::new(),
-            mmds: MmdsMetrics::new(),
             net_ser: NetMetricsSerializeProxy {},
             patch_api_requests: PatchRequestsMetrics::new(),
             put_api_requests: PutRequestsMetrics::new(),
@@ -984,10 +867,7 @@ impl FirecrackerMetrics {
             signals: SignalMetrics::new(),
             vsock_ser: VsockMetricsSerializeProxy {},
             entropy_ser: EntropyMetricsSerializeProxy {},
-            pmem_ser: PmemMetricsSerializeProxy {},
-            vhost_user_ser: VhostUserMetricsSerializeProxy {},
             interrupts: InterruptMetrics::new(),
-            memory_hotplug_ser: MemoryHotplugSerializeProxy {},
         }
     }
 }

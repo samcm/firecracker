@@ -10,7 +10,6 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use crate::devices::virtio::net::Net;
 #[cfg(test)]
@@ -19,8 +18,6 @@ use crate::devices::virtio::net::generated::net_device_flags;
 use crate::devices::virtio::net::tap::{IfReqBuilder, Tap};
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::test_utils::VirtQueue;
-use crate::mmds::data_store::Mmds;
-use crate::mmds::ns::MmdsNetworkStack;
 use crate::rate_limiter::RateLimiter;
 use crate::utils::net::mac::MacAddr;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
@@ -39,33 +36,9 @@ pub fn default_net() -> Net {
 
     let guest_mac = default_guest_mac();
 
-    let mut net = Net::new(
-        tap_device_id,
-        tap_if_name,
-        Some(guest_mac),
-        RateLimiter::default(),
-        RateLimiter::default(),
-        None,
-    )
-    .unwrap();
-    net.configure_mmds_network_stack(
-        MmdsNetworkStack::default_ipv4_addr(),
-        Arc::new(Mutex::new(Mmds::default())),
-    );
-    enable(&net.tap);
-
-    net
-}
-
-pub fn default_net_no_mmds() -> Net {
-    let next_tap = NEXT_INDEX.fetch_add(1, Ordering::SeqCst);
-    let tap_device_id = format!("net-device{}", next_tap);
-
-    let guest_mac = default_guest_mac();
-
     let net = Net::new(
         tap_device_id,
-        "net-device%d",
+        tap_if_name,
         Some(guest_mac),
         RateLimiter::default(),
         RateLimiter::default(),

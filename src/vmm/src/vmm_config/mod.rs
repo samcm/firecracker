@@ -6,14 +6,8 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use crate::devices::virtio::device::VirtioDeviceType;
 use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenBucket};
-use crate::vmm_config::drive::BlockDeviceConfig;
-use crate::vmm_config::net::NetworkInterfaceConfig;
-use crate::vmm_config::pmem::PmemConfig;
 
-/// Wrapper for configuring the balloon device.
-pub mod balloon;
 /// Wrapper for configuring the microVM boot source.
 pub mod boot_source;
 /// Wrapper for configuring the block devices.
@@ -24,47 +18,16 @@ pub mod entropy;
 pub mod instance_info;
 /// Wrapper for configuring the memory and CPU of the microVM.
 pub mod machine_config;
-/// Wrapper for configuring memory hotplug.
-pub mod memory_hotplug;
 /// Wrapper for configuring the metrics.
 pub mod metrics;
-/// Wrapper for configuring the MMDS.
-pub mod mmds;
 /// Wrapper for configuring the network devices attached to the microVM.
 pub mod net;
-/// Wrapper for configuring the pmem devises attached to the microVM.
-pub mod pmem;
-/// Wrapper for configuring microVM snapshots and the microVM state.
+/// Wrapper for configuring the serial device of the microVM.
 pub mod serial;
+/// Wrapper for configuring microVM snapshots and the microVM state.
 pub mod snapshot;
 /// Wrapper for configuring the vsock devices attached to the microVM.
 pub mod vsock;
-
-#[allow(missing_docs)]
-#[derive(Debug)]
-pub enum HotplugDeviceConfig {
-    Block(BlockDeviceConfig),
-    Pmem(PmemConfig),
-    Net(NetworkInterfaceConfig),
-}
-
-impl HotplugDeviceConfig {
-    pub(crate) fn device_id(&self) -> &str {
-        match self {
-            Self::Block(cfg) => &cfg.drive_id,
-            Self::Pmem(cfg) => &cfg.id,
-            Self::Net(cfg) => &cfg.iface_id,
-        }
-    }
-
-    pub(crate) fn device_type(&self) -> VirtioDeviceType {
-        match self {
-            Self::Block(_) => VirtioDeviceType::Block,
-            Self::Pmem(_) => VirtioDeviceType::Pmem,
-            Self::Net(_) => VirtioDeviceType::Net,
-        }
-    }
-}
 
 /// A public-facing, stateless structure, holding all the data we need to create a TokenBucket
 /// (live) object.

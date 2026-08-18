@@ -212,8 +212,6 @@ pub struct MmioTransportConstructorArgs {
     pub interrupt: Arc<IrqTrigger>,
     /// Device associated with the current MMIO state.
     pub device: Arc<Mutex<dyn VirtioDevice>>,
-    /// Is device backed by vhost-user.
-    pub is_vhost_user: bool,
 }
 
 impl Persist<'_> for MmioTransport {
@@ -240,7 +238,6 @@ impl Persist<'_> for MmioTransport {
             constructor_args.mem,
             constructor_args.interrupt,
             constructor_args.device,
-            constructor_args.is_vhost_user,
         );
         transport.features_select = state.features_select;
         transport.acked_features_select = state.acked_features_select;
@@ -421,7 +418,6 @@ mod tests {
             mem,
             interrupt,
             device,
-            is_vhost_user: false,
         };
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
         let restored_mmio_transport =
@@ -447,8 +443,7 @@ mod tests {
             FileEngineType::default(),
         );
         let block = Arc::new(Mutex::new(block));
-        let mmio_transport =
-            MmioTransport::new(mem.clone(), interrupt.clone(), block.clone(), false);
+        let mmio_transport = MmioTransport::new(mem.clone(), interrupt.clone(), block.clone());
 
         (mmio_transport, interrupt, mem, block)
     }
@@ -462,7 +457,7 @@ mod tests {
         let mem = default_mem();
         let interrupt = Arc::new(IrqTrigger::new());
         let net = Arc::new(Mutex::new(default_net()));
-        let mmio_transport = MmioTransport::new(mem.clone(), interrupt.clone(), net.clone(), false);
+        let mmio_transport = MmioTransport::new(mem.clone(), interrupt.clone(), net.clone());
 
         (mmio_transport, interrupt, mem, net)
     }
@@ -484,8 +479,7 @@ mod tests {
         let backend = VsockUnixBackend::new(guest_cid, uds_path).unwrap();
         let vsock = Vsock::new(guest_cid, backend).unwrap();
         let vsock = Arc::new(Mutex::new(vsock));
-        let mmio_transport =
-            MmioTransport::new(mem.clone(), interrupt.clone(), vsock.clone(), false);
+        let mmio_transport = MmioTransport::new(mem.clone(), interrupt.clone(), vsock.clone());
 
         (mmio_transport, interrupt, mem, vsock)
     }

@@ -74,7 +74,6 @@ pub(crate) fn parse_patch_machine_config(body: &Body) -> Result<ParsedRequest, R
 #[cfg(test)]
 mod tests {
     use vmm::cpu_config::templates::StaticCpuTemplate;
-    use vmm::vmm_config::machine_config::HugePageConfig;
 
     use super::*;
     use crate::api_server::parsed_request::tests::{depr_action_from_req, vmm_action_from_request};
@@ -102,48 +101,15 @@ mod tests {
         }"#;
         parse_put_machine_config(&Body::new(body)).unwrap_err();
 
-        let huge_pages_cases = [
-            ("None", HugePageConfig::None),
-            ("2M", HugePageConfig::Hugetlbfs2M),
-        ];
-
-        for (huge_page, expected) in huge_pages_cases {
-            // 3. Test case for success scenarios for both architectures.
-            let body = format!(
-                r#"{{
-                "vcpu_count": 8,
-                "mem_size_mib": 1024,
-                "huge_pages": "{huge_page}"
-            }}"#
-            );
-            let expected_config = MachineConfigUpdate {
-                vcpu_count: Some(8),
-                mem_size_mib: Some(1024),
-                smt: Some(false),
-                cpu_template: None,
-                track_dirty_pages: Some(false),
-                huge_pages: Some(expected),
-                #[cfg(feature = "gdb")]
-                gdb_socket_path: None,
-            };
-            assert_eq!(
-                vmm_action_from_request(parse_put_machine_config(&Body::new(body)).unwrap()),
-                VmmAction::UpdateMachineConfiguration(expected_config)
-            );
-        }
-
         let body = r#"{
             "vcpu_count": 8,
-            "mem_size_mib": 1024,
-            "cpu_template": "None"
+            "mem_size_mib": 1024
         }"#;
         let expected_config = MachineConfigUpdate {
             vcpu_count: Some(8),
             mem_size_mib: Some(1024),
             smt: Some(false),
-            cpu_template: Some(StaticCpuTemplate::None),
-            track_dirty_pages: Some(false),
-            huge_pages: Some(HugePageConfig::None),
+            cpu_template: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };
@@ -155,16 +121,31 @@ mod tests {
         let body = r#"{
             "vcpu_count": 8,
             "mem_size_mib": 1024,
-            "smt": false,
-            "track_dirty_pages": true
+            "cpu_template": "None"
+        }"#;
+        let expected_config = MachineConfigUpdate {
+            vcpu_count: Some(8),
+            mem_size_mib: Some(1024),
+            smt: Some(false),
+            cpu_template: Some(StaticCpuTemplate::None),
+            #[cfg(feature = "gdb")]
+            gdb_socket_path: None,
+        };
+        assert_eq!(
+            vmm_action_from_request(parse_put_machine_config(&Body::new(body)).unwrap()),
+            VmmAction::UpdateMachineConfiguration(expected_config)
+        );
+
+        let body = r#"{
+            "vcpu_count": 8,
+            "mem_size_mib": 1024,
+            "smt": false
         }"#;
         let expected_config = MachineConfigUpdate {
             vcpu_count: Some(8),
             mem_size_mib: Some(1024),
             smt: Some(false),
             cpu_template: None,
-            track_dirty_pages: Some(true),
-            huge_pages: Some(HugePageConfig::None),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };
@@ -178,8 +159,7 @@ mod tests {
             "vcpu_count": 8,
             "mem_size_mib": 1024,
             "smt": false,
-            "cpu_template": "T2",
-            "track_dirty_pages": true
+            "cpu_template": "T2"
         }"#;
         #[cfg(target_arch = "x86_64")]
         {
@@ -188,8 +168,6 @@ mod tests {
                 mem_size_mib: Some(1024),
                 smt: Some(false),
                 cpu_template: Some(StaticCpuTemplate::T2),
-                track_dirty_pages: Some(true),
-                huge_pages: Some(HugePageConfig::None),
                 #[cfg(feature = "gdb")]
                 gdb_socket_path: None,
             };
@@ -207,16 +185,13 @@ mod tests {
         let body = r#"{
             "vcpu_count": 8,
             "mem_size_mib": 1024,
-            "smt": true,
-            "track_dirty_pages": true
+            "smt": true
         }"#;
         let expected_config = MachineConfigUpdate {
             vcpu_count: Some(8),
             mem_size_mib: Some(1024),
             smt: Some(true),
             cpu_template: None,
-            track_dirty_pages: Some(true),
-            huge_pages: Some(HugePageConfig::None),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };
@@ -225,11 +200,16 @@ mod tests {
             VmmAction::UpdateMachineConfiguration(expected_config)
         );
 
-        // 6. Test nonsense values for huge page size
         let body = r#"{
             "vcpu_count": 8,
             "mem_size_mib": 1024,
-            "huge_pages": "7M"
+            "huge_pages": "None"
+        }"#;
+        parse_put_machine_config(&Body::new(body)).unwrap_err();
+        let body = r#"{
+            "vcpu_count": 8,
+            "mem_size_mib": 1024,
+            "track_dirty_pages": true
         }"#;
         parse_put_machine_config(&Body::new(body)).unwrap_err();
     }
@@ -241,7 +221,7 @@ mod tests {
 
         // 2. Check currently supported fields that can be patched.
         let body = r#"{
-            "track_dirty_pages": true
+            "mem_size_mib": 256
         }"#;
         parse_patch_machine_config(&Body::new(body)).unwrap();
 

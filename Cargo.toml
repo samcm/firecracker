@@ -8,9 +8,7 @@ default-members = [
     "src/clippy-tracing",
     "src/cpu-template-helper",
     "src/firecracker",
-    "src/rebase-snap",
     "src/seccompiler",
-    "src/snapshot-editor",
     "src/acpi-tables",
 ]
 resolver = "2"

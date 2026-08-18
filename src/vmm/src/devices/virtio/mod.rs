@@ -12,22 +12,17 @@ use std::any::Any;
 use self::queue::QueueError;
 use crate::devices::virtio::net::TapError;
 
-pub mod balloon;
 pub mod block;
 pub mod device;
 pub mod generated;
 mod iov_deque;
 pub mod iovec;
-pub mod mem;
 pub mod net;
 pub mod persist;
-pub mod pmem;
 pub mod queue;
 pub mod rng;
 pub mod test_utils;
 pub mod transport;
-pub mod vhost_user;
-pub mod vhost_user_metrics;
 pub mod vsock;
 
 /// When the driver initializes the device, it lets the device know about the
@@ -59,8 +54,6 @@ pub enum ActivateError {
     QueueMismatch { expected: usize, got: usize },
     /// Failed to write to activate eventfd
     EventFd,
-    /// Vhost user: {0}
-    VhostUser(vhost_user::VhostUserError),
     /// Setting tap interface offload flags failed: {0}
     TapSetOffload(TapError),
     /// Error setting pointers in the queue: (0)

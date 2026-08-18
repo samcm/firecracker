@@ -33,9 +33,7 @@ use zerocopy::IntoBytes;
 use crate::logger::warn;
 use crate::utils::{align_up, u64_to_usize, usize_to_u64};
 use crate::vmm_config::machine_config::MachineConfig;
-use crate::vstate::memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestRegionType,
-};
+use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 use crate::vstate::vcpu::KvmVcpuError;
 use crate::vstate::vm::KvmVm;
 use crate::{DeviceManager, Kvm, Vcpu, VcpuConfig, logger};
@@ -236,11 +234,8 @@ pub fn initrd_load_addr(guest_mem: &GuestMemoryMmap, initrd_size: usize) -> Opti
 
 // Auxiliary function to get the address where the device tree blob is loaded.
 fn get_fdt_addr(mem: &GuestMemoryMmap) -> u64 {
-    // Find the first (and only) DRAM region.
-    let dram_region = mem
-        .iter()
-        .find(|region| region.region_type == GuestRegionType::Dram)
-        .unwrap();
+    // Find the first DRAM region.
+    let dram_region = mem.iter().next().unwrap();
 
     // If the memory allocated is smaller than the size allocated for the FDT,
     // we return the start of the DRAM so that

@@ -61,7 +61,6 @@ pub struct MmioTransport {
     pub(crate) config_generation: u32,
     mem: GuestMemoryMmap,
     pub(crate) interrupt: Arc<IrqTrigger>,
-    pub is_vhost_user: bool,
 }
 
 impl MmioTransport {
@@ -70,7 +69,6 @@ impl MmioTransport {
         mem: GuestMemoryMmap,
         interrupt: Arc<IrqTrigger>,
         device: Arc<Mutex<dyn VirtioDevice>>,
-        is_vhost_user: bool,
     ) -> MmioTransport {
         MmioTransport {
             device,
@@ -81,7 +79,6 @@ impl MmioTransport {
             config_generation: 0,
             mem,
             interrupt,
-            is_vhost_user,
         }
     }
 
@@ -255,30 +252,7 @@ impl BusDevice for MmioTransport {
                     }
                     0x34 => self.with_queue(0, |q| u32::from(q.max_size)),
                     0x44 => self.with_queue(0, |q| u32::from(q.ready)),
-                    0x60 => {
-                        // For vhost-user backed devices we need some additional
-                        // logic to differentiate between `VIRTIO_MMIO_INT_VRING`
-                        // and `VIRTIO_MMIO_INT_CONFIG` statuses.
-                        // Because backend cannot propagate any interrupt status
-                        // changes to the FC we always try to serve the `VIRTIO_MMIO_INT_VRING`
-                        // status. But in case when backend changes the configuration and
-                        // user triggers the manual notification, FC needs to send
-                        // `VIRTIO_MMIO_INT_CONFIG`. We know that for vhost-user devices the
-                        // interrupt status can only be 0 (no one set any bits) or
-                        // `VIRTIO_MMIO_INT_CONFIG`. Based on this knowledge we can simply
-                        // check if the current interrupt_status is equal to the
-                        // `VIRTIO_MMIO_INT_CONFIG` or not to understand if we need to send
-                        // `VIRTIO_MMIO_INT_CONFIG` or
-                        // `VIRTIO_MMIO_INT_VRING`.
-                        let is = self.interrupt.irq_status.load(Ordering::SeqCst);
-                        if !self.is_vhost_user {
-                            is
-                        } else if is == VIRTIO_MMIO_INT_CONFIG {
-                            VIRTIO_MMIO_INT_CONFIG
-                        } else {
-                            VIRTIO_MMIO_INT_VRING
-                        }
-                    }
+                    0x60 => self.interrupt.irq_status.load(Ordering::SeqCst),
                     0x70 => self.device_status,
                     0xfc => self.config_generation,
                     _ => {
@@ -615,7 +589,7 @@ pub(crate) mod tests {
         let mut dummy = DummyDevice::new();
         // Validate reset is no-op.
         assert!(dummy.reset().is_none());
-        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(dummy)), false);
+        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(dummy)));
 
         // We just make sure here that the implementation of a mmio device behaves as we expect,
         // given a known virtio device implementation (the dummy device).
@@ -641,12 +615,7 @@ pub(crate) mod tests {
     fn test_bus_device_read() {
         let m = single_region_mem(0x1000);
         let interrupt = Arc::new(IrqTrigger::new());
-        let mut d = MmioTransport::new(
-            m,
-            interrupt,
-            Arc::new(Mutex::new(DummyDevice::new())),
-            false,
-        );
+        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(DummyDevice::new())));
 
         let mut buf = vec![0xff, 0, 0xfe, 0];
         let buf_copy = buf.to_vec();
@@ -699,13 +668,9 @@ pub(crate) mod tests {
         d.interrupt.irq_status.store(111, Ordering::SeqCst);
         d.read(0x0, 0x60, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), 111);
-
-        d.is_vhost_user = true;
         d.interrupt.status().store(0, Ordering::SeqCst);
         d.read(0x0, 0x60, &mut buf[..]);
-        assert_eq!(read_le_u32(&buf[..]), VIRTIO_MMIO_INT_VRING);
-
-        d.is_vhost_user = true;
+        assert_eq!(read_le_u32(&buf[..]), 0);
         d.interrupt
             .irq_status
             .store(VIRTIO_MMIO_INT_CONFIG, Ordering::SeqCst);
@@ -741,7 +706,7 @@ pub(crate) mod tests {
         let m = single_region_mem(0x1000);
         let interrupt = Arc::new(IrqTrigger::new());
         let dummy_dev = Arc::new(Mutex::new(DummyDevice::new()));
-        let mut d = MmioTransport::new(m, interrupt, dummy_dev.clone(), false);
+        let mut d = MmioTransport::new(m, interrupt, dummy_dev.clone());
         let mut buf = vec![0; 5];
         write_le_u32(&mut buf[..4], 1);
 
@@ -903,12 +868,7 @@ pub(crate) mod tests {
     fn test_bus_device_activate() {
         let m = single_region_mem(0x1000);
         let interrupt = Arc::new(IrqTrigger::new());
-        let mut d = MmioTransport::new(
-            m,
-            interrupt,
-            Arc::new(Mutex::new(DummyDevice::new())),
-            false,
-        );
+        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(DummyDevice::new())));
 
         assert!(!d.locked_device().is_activated());
         assert_eq!(d.device_status, device_status::INIT);
@@ -982,7 +942,7 @@ pub(crate) mod tests {
             activate_should_error: true,
             ..DummyDevice::new()
         };
-        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(device)), false);
+        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(device)));
 
         set_device_status(&mut d, device_status::ACKNOWLEDGE);
         set_device_status(&mut d, device_status::ACKNOWLEDGE | device_status::DRIVER);
@@ -1077,12 +1037,7 @@ pub(crate) mod tests {
     fn test_device_status_invalid_transitions() {
         let m = single_region_mem(0x1000);
         let interrupt: Arc<IrqTrigger> = Arc::new(IrqTrigger::new());
-        let mut d = MmioTransport::new(
-            m,
-            interrupt,
-            Arc::new(Mutex::new(DummyDevice::new())),
-            false,
-        );
+        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(DummyDevice::new())));
 
         let mut assert_rejected = |d: &mut MmioTransport, new: u32, expected: u32| {
             set_device_status(d, new);
@@ -1126,12 +1081,7 @@ pub(crate) mod tests {
     fn test_bus_device_reset() {
         let m = single_region_mem(0x1000);
         let interrupt = Arc::new(IrqTrigger::new());
-        let mut d = MmioTransport::new(
-            m,
-            interrupt,
-            Arc::new(Mutex::new(DummyDevice::new())),
-            false,
-        );
+        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(DummyDevice::new())));
         let mut buf = [0; 4];
 
         assert!(!d.locked_device().is_activated());
@@ -1188,12 +1138,7 @@ pub(crate) mod tests {
         // cannot be tested at the integration level via /dev/mem readback.
         let mem = single_region_mem(0x1000);
         let interrupt = Arc::new(IrqTrigger::new());
-        let mut dev = MmioTransport::new(
-            mem,
-            interrupt,
-            Arc::new(Mutex::new(DummyDevice::new())),
-            false,
-        );
+        let mut dev = MmioTransport::new(mem, interrupt, Arc::new(Mutex::new(DummyDevice::new())));
         activate_device(&mut dev);
 
         dev.queue_select = 0;

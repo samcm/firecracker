@@ -45,7 +45,7 @@ use crate::logger::debug;
 use crate::utils::{align_down, u64_to_usize, usize_to_u64};
 use crate::vmm_config::machine_config::MachineConfig;
 use crate::vstate::memory::{
-    Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionType,
+    Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
 };
 use crate::vstate::vcpu::KvmVcpuConfigureError;
 use crate::vstate::vm::KvmVm;
@@ -292,10 +292,7 @@ fn configure_pvh(
         ..Default::default()
     });
 
-    for region in guest_mem
-        .iter()
-        .filter(|region| region.region_type == GuestRegionType::Dram)
-    {
+    for region in guest_mem.iter() {
         // the first 1MB is reserved for the kernel
         let addr = max(himem_start, region.start_addr());
         memmap.push(hvm_memmap_table_entry {
@@ -387,10 +384,7 @@ fn configure_64bit_boot(
         E820_RESERVED,
     )?;
 
-    for region in guest_mem
-        .iter()
-        .filter(|region| region.region_type == GuestRegionType::Dram)
-    {
+    for region in guest_mem.iter() {
         // the first 1MB is reserved for the kernel
         let addr = max(himem_start, region.start_addr());
         add_e820_entry(

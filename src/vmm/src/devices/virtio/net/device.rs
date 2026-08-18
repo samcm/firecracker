@@ -7,10 +7,9 @@
 
 use std::collections::VecDeque;
 use std::mem::{self};
-use std::net::Ipv4Addr;
 use std::num::Wrapping;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use libc::{EAGAIN, iovec};
 use vmm_sys_util::eventfd::EventFd;
@@ -36,18 +35,14 @@ use crate::devices::virtio::net::{
 use crate::devices::virtio::queue::{DescriptorChain, InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::devices::{DeviceError, report_net_event_fail};
-use crate::dumbo::pdu::arp::ETH_IPV4_FRAME_LEN;
-use crate::dumbo::pdu::ethernet::{EthernetFrame, PAYLOAD_OFFSET};
 use crate::impl_device_type;
-use crate::logger::{IncMetric, METRICS, error};
-use crate::mmds::data_store::Mmds;
-use crate::mmds::ns::MmdsNetworkStack;
+use crate::logger::{IncMetric, error};
 use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenType};
 use crate::utils::net::mac::MacAddr;
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
 
-const FRAME_HEADER_MAX_LEN: usize = PAYLOAD_OFFSET + ETH_IPV4_FRAME_LEN;
+const FRAME_HEADER_MAX_LEN: usize = 42;
 
 pub(crate) const fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
@@ -265,9 +260,6 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
     pub(crate) activate_evt: EventFd,
 
-    /// The MMDS stack corresponding to this interface.
-    /// Only if MMDS transport has been associated with it.
-    pub mmds_ns: Option<MmdsNetworkStack>,
     pub(crate) metrics: Arc<NetDeviceMetrics>,
 
     tx_buffer: IoVecBuffer,
@@ -333,7 +325,6 @@ impl Net {
             guest_mac,
             device_state: DeviceState::Inactive,
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(NetError::EventFd)?,
-            mmds_ns: None,
             metrics: NetMetricsPerDevice::alloc(id),
             tx_buffer: Default::default(),
             rx_buffer: RxBuffers::new()?,
@@ -375,26 +366,6 @@ impl Net {
         } else {
             None
         }
-    }
-
-    /// Provides the MmdsNetworkStack of this net device.
-    pub fn mmds_ns(&self) -> Option<&MmdsNetworkStack> {
-        self.mmds_ns.as_ref()
-    }
-
-    /// Configures the `MmdsNetworkStack` to allow device to forward MMDS requests.
-    /// If the device already supports MMDS, updates the IPv4 address.
-    pub fn configure_mmds_network_stack(&mut self, ipv4_addr: Ipv4Addr, mmds: Arc<Mutex<Mmds>>) {
-        if let Some(mmds_ns) = self.mmds_ns.as_mut() {
-            mmds_ns.set_ipv4_addr(ipv4_addr);
-        } else {
-            self.mmds_ns = Some(MmdsNetworkStack::new_with_defaults(Some(ipv4_addr), mmds))
-        }
-    }
-
-    /// Disables the `MmdsNetworkStack` to prevent device to forward MMDS requests.
-    pub fn disable_mmds_network_stack(&mut self) {
-        self.mmds_ns = None
     }
 
     /// Provides a reference to the configured RX rate limiter.
@@ -516,43 +487,13 @@ impl Net {
         Ok(())
     }
 
-    // Tries to detour the frame to MMDS and if MMDS doesn't accept it, sends it on the host TAP.
-    //
-    // Returns whether MMDS consumed the frame.
-    fn write_to_mmds_or_tap(
-        mmds_ns: Option<&mut MmdsNetworkStack>,
-        rate_limiter: &mut RateLimiter,
+    fn write_to_tap(
         headers: &mut [u8],
         frame_iovec: &IoVecBuffer,
         tap: &mut Tap,
         guest_mac: Option<MacAddr>,
         net_metrics: &NetDeviceMetrics,
-    ) -> Result<bool, NetError> {
-        // There is a potential for a TOCTOU race condition here where,
-        // when MMDS is enabled, the guest can rewrite packet headers between
-        // the time that we check that a packet should be detoured to MMDS,
-        // and the time that we forward it to the TAP.
-        //
-        // The implication of this is that a malicious guest can construct a
-        // packet destined for the TAP (i.e., dest_ip != 169.254.169.254), then race
-        // to overwrite the destination IP to 169.254.169.254. the packet will
-        // then be sent over the TAP towards the host's IMDS store.
-        //
-        // We do not plan to fix this for a few reasons:
-        //
-        // 1. Without MMDS enabled, packets with destination IP 169.254.169.254
-        //    will be forwarded to the TAP without filtering. Operators should
-        //    not rely on MMDS for IMDS access control.
-        // 2. Guest originated traffic is treated as untrusted and Firecracker
-        //    does not filter IPv4 packets. Operators deploying Firecracker
-        //    based services should implement host-level firewall rules to
-        //    restrict guest egress traffic.
-        // 3. Preventing this TOCTOU by copying packets to to a host buffer
-        //    before routing decisions would significantly reduce guest-to-host
-        //    TCP throughput, which is not justifiable given the mitigations
-        //    available at host-level.
-
-        // Read the frame headers from the IoVecBuffer
+    ) -> Result<(), NetError> {
         let max_header_len = headers.len();
         let header_len = frame_iovec
             .read_volatile_at(&mut &mut *headers, 0, max_header_len)
@@ -567,34 +508,13 @@ impl Net {
             net_metrics.tx_malformed_frames.inc();
         })?;
 
-        if let Some(ns) = mmds_ns
-            && ns.is_mmds_frame(headers)
+        if let Some(guest_mac) = guest_mac
+            && headers.len() >= 12
         {
-            let mut frame = vec![0u8; frame_iovec.len() as usize - vnet_hdr_len()];
-            // Ok to unwrap here, because we are passing a buffer that has the exact size
-            // of the `IoVecBuffer` minus the VNET headers.
-            frame_iovec
-                .read_exact_volatile_at(&mut frame, vnet_hdr_len())
-                .unwrap();
-            let _ = ns.detour_frame(&frame);
-            METRICS.mmds.rx_accepted.inc();
-
-            // MMDS frames are not accounted by the rate limiter.
-            Self::rate_limiter_replenish_op(rate_limiter, u64::from(frame_iovec.len()));
-
-            // MMDS consumed the frame.
-            return Ok(true);
-        }
-
-        // This frame goes to the TAP.
-
-        // Check for guest MAC spoofing.
-        if let Some(guest_mac) = guest_mac {
-            let _ = EthernetFrame::from_bytes(headers).map(|eth_frame| {
-                if guest_mac != eth_frame.src_mac() {
-                    net_metrics.tx_spoofed_mac_count.inc();
-                }
-            });
+            let src_mac = &headers[6..12];
+            if src_mac != guest_mac.get_bytes() {
+                net_metrics.tx_spoofed_mac_count.inc();
+            }
         }
 
         let _metric = net_metrics.tap_write_agg.record_latency_metrics();
@@ -610,57 +530,22 @@ impl Net {
                 net_metrics.tap_write_fails.inc();
             }
         };
-        Ok(false)
+        Ok(())
     }
 
-    // We currently prioritize packets from the MMDS over regular network packets.
-    fn read_from_mmds_or_tap(&mut self) -> Result<Option<u32>, NetError> {
-        // We only want to read from TAP (or mmds) if we have at least 64K of available capacity as
-        // this is the max size of 1 packet.
-        // SAFETY:
-        // * MAX_BUFFER_SIZE is constant and fits into u32
+    fn read_from_tap(&mut self) -> Result<Option<u32>, NetError> {
         #[allow(clippy::cast_possible_truncation)]
         if self.rx_buffer.capacity() < MAX_BUFFER_SIZE as u32 {
             self.parse_rx_descriptors()?;
 
-            // If after parsing the RX queue we still don't have enough capacity, stop processing RX
-            // frames.
             if self.rx_buffer.capacity() < MAX_BUFFER_SIZE as u32 {
                 return Ok(None);
             }
         }
 
-        if let Some(ns) = self.mmds_ns.as_mut()
-            && let Some(len) =
-                ns.write_next_frame(frame_bytes_from_buf_mut(&mut self.rx_frame_buf)?)
-        {
-            let len = len.get();
-            METRICS.mmds.tx_frames.inc();
-            METRICS.mmds.tx_bytes.add(len as u64);
-            init_vnet_hdr(&mut self.rx_frame_buf);
-            self.rx_buffer
-                .iovec
-                .write_all_volatile_at(&self.rx_frame_buf[..vnet_hdr_len() + len], 0)?;
-            // SAFETY:
-            // * len will never be bigger that u32::MAX because mmds is bound
-            // by the size of `self.rx_frame_buf` which is MAX_BUFFER_SIZE size.
-            let len: u32 = (vnet_hdr_len() + len).try_into().unwrap();
-
-            // SAFETY:
-            // * We checked that `rx_buffer` includes at least one `DescriptorChain`
-            // * `rx_frame_buf` has size of `MAX_BUFFER_SIZE` and all `DescriptorChain` objects are
-            //   at least that big.
-            unsafe {
-                self.rx_buffer.mark_used(len, &mut self.queues[RX_INDEX]);
-            }
-            return Ok(Some(len));
-        }
-
         // SAFETY:
         // * We ensured that `self.rx_buffer` has at least one DescriptorChain parsed in it.
         let len = unsafe { self.read_tap().map_err(NetError::IO) }?;
-        // SAFETY:
-        // * len will never be bigger that u32::MAX
         let len: u32 = len.try_into().unwrap();
 
         // SAFETY:
@@ -676,7 +561,7 @@ impl Net {
     /// Read as many frames as possible.
     fn process_rx(&mut self) -> Result<(), DeviceError> {
         loop {
-            match self.read_from_mmds_or_tap() {
+            match self.read_from_tap() {
                 Ok(None) => {
                     self.metrics.no_rx_avail_buffer.inc();
                     break;
@@ -690,8 +575,6 @@ impl Net {
                     }
                 }
                 Err(NetError::IO(err)) => {
-                    // The tap device is non-blocking, so any error aside from EAGAIN is
-                    // unexpected.
                     match err.raw_os_error() {
                         Some(err) if err == EAGAIN => (),
                         _ => {
@@ -715,27 +598,17 @@ impl Net {
     }
 
     fn resume_rx(&mut self) -> Result<(), DeviceError> {
-        // First try to handle any deferred frame
-        if self.rx_buffer.used_bytes != 0 {
-            // If can't finish sending this frame, re-set it as deferred and return; we can't
-            // process any more frames from the TAP.
-            if !self.rate_limited_rx_single_frame(self.rx_buffer.used_bytes) {
-                return Ok(());
-            }
+        if self.rx_buffer.used_bytes != 0
+            && !self.rate_limited_rx_single_frame(self.rx_buffer.used_bytes)
+        {
+            return Ok(());
         }
 
         self.process_rx()
     }
 
     fn process_tx(&mut self) -> Result<(), DeviceError> {
-        // This is safe since we checked in the event handler that the device is activated.
         let mem = &self.device_state.active_state().unwrap().mem;
-
-        // The MMDS network stack works like a state machine, based on synchronous calls, and
-        // without being added to any event loop. If any frame is accepted by the MMDS, we also
-        // trigger a process_rx() which checks if there are any new frames to be sent, starting
-        // with the MMDS network stack.
-        let mut process_rx_for_mmds = false;
         let mut used_any = false;
         let tx_queue = &mut self.queues[TX_INDEX];
 
@@ -744,17 +617,14 @@ impl Net {
                 .tx_remaining_reqs_count
                 .add(tx_queue.len().into());
             let head_index = head.index;
-            // Parse IoVecBuffer from descriptor head
-            // SAFETY: This descriptor chain is only loaded once
-            // virtio requests are handled sequentially so no two IoVecBuffers
-            // are live at the same time, meaning this has exclusive ownership over the memory
+            // SAFETY: `head` was obtained from `tx_queue`, and `mem` is the active guest memory
+            // mapping that remains valid for the duration of this device operation.
             if unsafe { self.tx_buffer.load_descriptor_chain(mem, head).is_err() } {
                 self.metrics.tx_fails.inc();
                 tx_queue.add_used(head_index, 0)?;
                 continue;
             };
 
-            // We only handle frames that are up to MAX_BUFFER_SIZE
             if self.tx_buffer.len() as usize > MAX_BUFFER_SIZE {
                 error!("net: received too big frame from driver");
                 self.metrics.tx_malformed_frames.inc();
@@ -771,20 +641,13 @@ impl Net {
                 break;
             }
 
-            let frame_consumed_by_mmds = Self::write_to_mmds_or_tap(
-                self.mmds_ns.as_mut(),
-                &mut self.tx_rate_limiter,
+            let _ = Self::write_to_tap(
                 &mut self.tx_frame_headers,
                 &self.tx_buffer,
                 &mut self.tap,
                 self.guest_mac,
                 &self.metrics,
-            )
-            .unwrap_or(false);
-            if frame_consumed_by_mmds && self.rx_buffer.used_bytes == 0 {
-                // MMDS consumed this frame/request, let's also try to process the response.
-                process_rx_for_mmds = true;
-            }
+            );
 
             tx_queue.add_used(head_index, 0)?;
             used_any = true;
@@ -794,16 +657,8 @@ impl Net {
             self.metrics.no_tx_avail_buffer.inc();
         }
 
-        // Cleanup tx_buffer to ensure no two buffers point at the same memory
         self.tx_buffer.clear();
-        self.try_signal_queue(NetQueue::Tx)?;
-
-        // An incoming frame for the MMDS may trigger the transmission of a new message.
-        if process_rx_for_mmds {
-            self.process_rx()
-        } else {
-            Ok(())
-        }
+        self.try_signal_queue(NetQueue::Tx)
     }
 
     /// Builds the offload features we will setup on the TAP device based on the features that the
@@ -1136,9 +991,6 @@ pub mod tests {
     };
     use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::test_utils::VirtQueue;
-    use crate::dumbo::EthernetFrame;
-    use crate::dumbo::pdu::arp::{ETH_IPV4_FRAME_LEN, EthIPv4ArpFrame};
-    use crate::dumbo::pdu::ethernet::ETHERTYPE_ARP;
     use crate::logger::IncMetric;
     use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenBucket, TokenType};
     use crate::test_utils::single_region_mem;
@@ -2001,142 +1853,6 @@ pub mod tests {
         let mut buf = vec![0; 600];
         assert!(tap_traffic_simulator.pop_rx_packet(&mut buf[vnet_hdr_len()..]));
         assert_eq!(&buf[..600], &frame_2[..600]);
-    }
-
-    fn create_arp_request(
-        src_mac: MacAddr,
-        src_ip: Ipv4Addr,
-        dst_mac: MacAddr,
-        dst_ip: Ipv4Addr,
-    ) -> ([u8; MAX_BUFFER_SIZE], usize) {
-        let mut frame_buf = [b'\0'; MAX_BUFFER_SIZE];
-
-        // Create an ethernet frame.
-        let incomplete_frame = EthernetFrame::write_incomplete(
-            frame_bytes_from_buf_mut(&mut frame_buf).unwrap(),
-            dst_mac,
-            src_mac,
-            ETHERTYPE_ARP,
-        )
-        .ok()
-        .unwrap();
-        // Set its length to hold an ARP request.
-        let mut frame = incomplete_frame.with_payload_len_unchecked(ETH_IPV4_FRAME_LEN);
-
-        // Save the total frame length.
-        let frame_len = vnet_hdr_len() + frame.payload_offset() + ETH_IPV4_FRAME_LEN;
-
-        // Create the ARP request.
-        let arp_request =
-            EthIPv4ArpFrame::write_request(frame.payload_mut(), src_mac, src_ip, dst_mac, dst_ip);
-        // Validate success.
-        arp_request.unwrap();
-
-        (frame_buf, frame_len)
-    }
-
-    #[test]
-    fn test_mmds_detour_and_injection() {
-        let mut net = default_net();
-
-        let mem = single_region_mem(2 * MAX_BUFFER_SIZE);
-        let rxq = VirtQueue::new(GuestAddress(0), &mem, 16);
-        net.queues[RX_INDEX] = rxq.create_queue();
-
-        // Inject a fake buffer in the devices buffers, otherwise we won't be able to receive the
-        // MMDS frame. One iovec will be just fine.
-        let mut fake_buffer = vec![0u8; MAX_BUFFER_SIZE];
-        let iov_buffer = IoVecBufferMut::from(fake_buffer.as_mut_slice());
-        net.rx_buffer.iovec = iov_buffer;
-        net.rx_buffer
-            .parsed_descriptors
-            .push_back(ParsedDescriptorChain {
-                head_index: 1,
-                length: 1024,
-                nr_iovecs: 1,
-            });
-
-        let src_mac = MacAddr::from_str("11:11:11:11:11:11").unwrap();
-        let src_ip = Ipv4Addr::new(10, 1, 2, 3);
-        let dst_mac = MacAddr::from_str("22:22:22:22:22:22").unwrap();
-        let dst_ip = Ipv4Addr::new(169, 254, 169, 254);
-
-        let (frame_buf, frame_len) = create_arp_request(src_mac, src_ip, dst_mac, dst_ip);
-        let buffer = IoVecBuffer::from(&frame_buf[..frame_len]);
-
-        let mut headers = vec![0; frame_hdr_len()];
-        buffer.read_exact_volatile_at(&mut headers, 0).unwrap();
-
-        // Call the code which sends the packet to the host or MMDS.
-        // Validate the frame was consumed by MMDS and that the metrics reflect that.
-        check_metric_after_block!(
-            &METRICS.mmds.rx_accepted,
-            1,
-            assert!(
-                Net::write_to_mmds_or_tap(
-                    net.mmds_ns.as_mut(),
-                    &mut net.tx_rate_limiter,
-                    &mut headers,
-                    &buffer,
-                    &mut net.tap,
-                    Some(src_mac),
-                    &net.metrics,
-                )
-                .unwrap()
-            )
-        );
-
-        // Validate that MMDS has a response and we can retrieve it.
-        check_metric_after_block!(
-            &METRICS.mmds.tx_frames,
-            1,
-            net.read_from_mmds_or_tap().unwrap()
-        );
-    }
-
-    #[test]
-    fn test_mac_spoofing_detection() {
-        let mut net = default_net();
-
-        let guest_mac = MacAddr::from_str("11:11:11:11:11:11").unwrap();
-        let not_guest_mac = MacAddr::from_str("33:33:33:33:33:33").unwrap();
-        let guest_ip = Ipv4Addr::new(10, 1, 2, 3);
-        let dst_mac = MacAddr::from_str("22:22:22:22:22:22").unwrap();
-        let dst_ip = Ipv4Addr::new(10, 1, 1, 1);
-
-        let (frame_buf, frame_len) = create_arp_request(guest_mac, guest_ip, dst_mac, dst_ip);
-        let buffer = IoVecBuffer::from(&frame_buf[..frame_len]);
-        let mut headers = vec![0; frame_hdr_len()];
-
-        // Check that a legit MAC doesn't affect the spoofed MAC metric.
-        check_metric_after_block!(
-            net.metrics.tx_spoofed_mac_count,
-            0,
-            Net::write_to_mmds_or_tap(
-                net.mmds_ns.as_mut(),
-                &mut net.tx_rate_limiter,
-                &mut headers,
-                &buffer,
-                &mut net.tap,
-                Some(guest_mac),
-                &net.metrics,
-            )
-        );
-
-        // Check that a spoofed MAC increases our spoofed MAC metric.
-        check_metric_after_block!(
-            net.metrics.tx_spoofed_mac_count,
-            1,
-            Net::write_to_mmds_or_tap(
-                net.mmds_ns.as_mut(),
-                &mut net.tx_rate_limiter,
-                &mut headers,
-                &buffer,
-                &mut net.tap,
-                Some(not_guest_mac),
-                &net.metrics,
-            )
-        );
     }
 
     #[test]

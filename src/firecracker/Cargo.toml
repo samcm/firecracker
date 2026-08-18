@@ -47,24 +47,6 @@ regex = { version = "1.12.3", default-features = false, features = [
   "unicode-perl",
 ] }
 
-# Dev-Dependencies for uffd examples
-serde = { version = "1.0.228", features = ["derive"] }
-userfaultfd = "0.9.0"
-
-[lints]
-workspace = true
-
-[[example]]
-name = "uffd_malicious_handler"
-path = "examples/uffd/malicious_handler.rs"
-
-[[example]]
-name = "uffd_on_demand_handler"
-path = "examples/uffd/on_demand_handler.rs"
-
-[[example]]
-name = "uffd_fault_all_handler"
-path = "examples/uffd/fault_all_handler.rs"
 
 [[example]]
 name = "seccomp_harmless"

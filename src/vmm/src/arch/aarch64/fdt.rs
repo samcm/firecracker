@@ -24,7 +24,7 @@ use crate::device_manager::pci_mngr::PciDevices;
 use crate::devices::acpi::vmclock::{VMCLOCK_SIZE, VmClock};
 use crate::devices::acpi::vmgenid::{VMGENID_MEM_SIZE, VmGenId};
 use crate::initrd::InitrdConfig;
-use crate::vstate::memory::{Address, GuestMemory, GuestMemoryMmap, GuestRegionType};
+use crate::vstate::memory::{Address, GuestMemory, GuestMemoryMmap};
 
 // This is a value for uniquely identifying the FDT node declaring the interrupt controller.
 const GIC_PHANDLE: u32 = 1;
@@ -232,10 +232,7 @@ fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> Resul
     // this memory region out allows Linux kernel modules to remap and thus read this region.
 
     // Pick the first (and only) memory region
-    let dram_region = guest_mem
-        .iter()
-        .find(|region| region.region_type == GuestRegionType::Dram)
-        .unwrap();
+    let dram_region = guest_mem.iter().next().unwrap();
     // Find the start of memory after the system memory region
     let start_addr = dram_region
         .start_addr()

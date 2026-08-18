@@ -16,75 +16,13 @@ pub const MAX_SUPPORTED_VCPUS: u8 = 32;
 #[rustfmt::skip]
 #[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
 pub enum MachineConfigError {
-    /// The memory size (MiB) is smaller than the previously set balloon device target size.
-    IncompatibleBalloonSize,
-    /// The memory size (MiB) is either 0, or not a multiple of the configured page size.
+    /// The memory size (MiB) must be greater than 0.
     InvalidMemorySize,
     /// The number of vCPUs must be greater than 0, less than {MAX_SUPPORTED_VCPUS:} and must be 1 or an even number if SMT is enabled.
     InvalidVcpuCount,
-    /// Could not get the configuration of the previously installed balloon device to validate the memory size.
-    InvalidVmState,
     /// Enabling simultaneous multithreading is not supported on aarch64.
     #[cfg(target_arch = "aarch64")]
     SmtNotSupported,
-    /// Could not determine host kernel version when checking hugetlbfs compatibility
-    KernelVersion,
-}
-
-/// Describes the possible (huge)page configurations for a microVM's memory.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HugePageConfig {
-    /// Do not use hugepages, e.g. back guest memory by 4K
-    #[default]
-    None,
-    /// Back guest memory by 2MB hugetlbfs pages
-    #[serde(rename = "2M")]
-    Hugetlbfs2M,
-}
-
-impl HugePageConfig {
-    /// Checks whether the given memory size (in MiB) is valid for this [`HugePageConfig`], e.g.
-    /// whether it is a multiple of the page size
-    fn is_valid_mem_size(&self, mem_size_mib: usize) -> bool {
-        let divisor = match self {
-            // Any integer memory size expressed in MiB will be a multiple of 4096KiB.
-            HugePageConfig::None => 1,
-            HugePageConfig::Hugetlbfs2M => 2,
-        };
-
-        mem_size_mib.is_multiple_of(divisor)
-    }
-
-    /// Returns the flags required to pass to `mmap`, in addition to `MAP_ANONYMOUS`, to
-    /// create a mapping backed by huge pages as described by this [`HugePageConfig`].
-    pub fn mmap_flags(&self) -> libc::c_int {
-        match self {
-            HugePageConfig::None => 0,
-            HugePageConfig::Hugetlbfs2M => libc::MAP_HUGETLB | libc::MAP_HUGE_2MB,
-        }
-    }
-
-    /// Returns `true` iff this [`HugePageConfig`] describes a hugetlbfs-based configuration.
-    pub fn is_hugetlbfs(&self) -> bool {
-        matches!(self, HugePageConfig::Hugetlbfs2M)
-    }
-
-    /// Gets the page size in bytes of this [`HugePageConfig`].
-    pub fn page_size(&self) -> usize {
-        match self {
-            HugePageConfig::None => 4096,
-            HugePageConfig::Hugetlbfs2M => 2 * 1024 * 1024,
-        }
-    }
-}
-
-impl From<HugePageConfig> for Option<memfd::HugetlbSize> {
-    fn from(value: HugePageConfig) -> Self {
-        match value {
-            HugePageConfig::None => None,
-            HugePageConfig::Hugetlbfs2M => Some(memfd::HugetlbSize::Huge2MB),
-        }
-    }
 }
 
 /// Struct used in PUT `/machine-config` API call.
@@ -107,13 +45,6 @@ pub struct MachineConfig {
         serialize_with = "serialize_static_template"
     )]
     pub cpu_template: Option<CpuTemplateType>,
-    /// Enables or disables dirty page tracking. Enabling allows incremental snapshots.
-    #[serde(default)]
-    pub track_dirty_pages: bool,
-    /// Configures what page size Firecracker should use to back guest memory.
-    #[serde(default)]
-    pub huge_pages: HugePageConfig,
-    /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gdb_socket_path: Option<String>,
@@ -153,8 +84,6 @@ impl Default for MachineConfig {
             mem_size_mib: DEFAULT_MEM_SIZE_MIB,
             smt: false,
             cpu_template: None,
-            track_dirty_pages: false,
-            huge_pages: HugePageConfig::None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         }
@@ -182,13 +111,6 @@ pub struct MachineConfigUpdate {
     /// A CPU template that it is used to filter the CPU features exposed to the guest.
     #[serde(default)]
     pub cpu_template: Option<StaticCpuTemplate>,
-    /// Enables or disables dirty page tracking. Enabling allows incremental snapshots.
-    #[serde(default)]
-    pub track_dirty_pages: Option<bool>,
-    /// Configures what page size Firecracker should use to back guest memory.
-    #[serde(default)]
-    pub huge_pages: Option<HugePageConfig>,
-    /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default)]
     pub gdb_socket_path: Option<String>,
@@ -210,8 +132,6 @@ impl From<MachineConfig> for MachineConfigUpdate {
             mem_size_mib: Some(cfg.mem_size_mib),
             smt: Some(cfg.smt),
             cpu_template: cfg.static_template(),
-            track_dirty_pages: Some(cfg.track_dirty_pages),
-            huge_pages: Some(cfg.huge_pages),
             #[cfg(feature = "gdb")]
             gdb_socket_path: cfg.gdb_socket_path,
         }
@@ -260,9 +180,7 @@ impl MachineConfig {
         }
 
         let mem_size_mib = update.mem_size_mib.unwrap_or(self.mem_size_mib);
-        let page_config = update.huge_pages.unwrap_or(self.huge_pages);
-
-        if mem_size_mib == 0 || !page_config.is_valid_mem_size(mem_size_mib) {
+        if mem_size_mib == 0 {
             return Err(MachineConfigError::InvalidMemorySize);
         }
 
@@ -277,8 +195,6 @@ impl MachineConfig {
             mem_size_mib,
             smt,
             cpu_template,
-            track_dirty_pages: update.track_dirty_pages.unwrap_or(self.track_dirty_pages),
-            huge_pages: page_config,
             #[cfg(feature = "gdb")]
             gdb_socket_path: update.gdb_socket_path.clone(),
         })
