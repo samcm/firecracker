@@ -148,5 +148,3 @@ def test_block_performance(
     for thread_name, values in cpu_util.items():
         for value in values:
             metrics.put_metric(f"cpu_utilization_{thread_name}", value, "Percent")
-
-

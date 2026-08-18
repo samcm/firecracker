@@ -1,10 +1,12 @@
 // Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::os::fd::RawFd;
+
 use serde::{Deserialize, Serialize};
 
+use super::ROOT_DESCRIPTOR_FILENO;
 use super::virtio::persist::VirtioBlockState;
-use super::{DiskBacking, ROOT_DESCRIPTOR_FILENO};
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// Block device state.
@@ -25,7 +27,7 @@ impl BlockState {
 #[derive(Debug)]
 pub struct BlockConstructorArgs {
     pub mem: GuestMemoryMmap,
-    pub backing: DiskBacking,
+    pub descriptor: RawFd,
 }
 
 impl BlockConstructorArgs {
@@ -34,7 +36,7 @@ impl BlockConstructorArgs {
     pub fn root(mem: GuestMemoryMmap) -> Self {
         Self {
             mem,
-            backing: DiskBacking::Descriptor(ROOT_DESCRIPTOR_FILENO),
+            descriptor: ROOT_DESCRIPTOR_FILENO,
         }
     }
 }

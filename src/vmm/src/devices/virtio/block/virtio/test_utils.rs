@@ -3,7 +3,7 @@
 
 #![doc(hidden)]
 
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 #[cfg(test)]
 use std::thread;
 #[cfg(test)]
@@ -13,7 +13,6 @@ use vmm_sys_util::tempfile::TempFile;
 
 use super::RequestHeader;
 use super::device::VirtioBlockConfig;
-use crate::devices::virtio::block::DiskBacking;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 #[cfg(test)]
 use crate::devices::virtio::block::virtio::io::FileEngine;
@@ -28,34 +27,29 @@ use crate::rate_limiter::RateLimiter;
 use crate::vmm_config::{RateLimiterConfig, TokenBucketConfig};
 use crate::vstate::memory::{Bytes, GuestAddress};
 
-/// Create a default Block instance to be used in tests.
+/// Create a default read-write Block instance to be used in tests.
 pub fn default_block(file_engine_type: FileEngineType) -> VirtioBlock {
     // Create backing file.
     let f = TempFile::new().unwrap();
     f.as_file().set_len(0x1000).unwrap();
 
-    default_block_with_path(f.as_path().to_str().unwrap().to_string(), file_engine_type)
-}
-
-/// Create a default Block instance using file at the specified path to be used in tests.
-pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -> VirtioBlock {
     // The default block device is read-write and non-root.
-    default_block_with_backing(DiskBacking::Path(path), false, file_engine_type)
+    default_block_with_backing(f.as_file().as_raw_fd(), false, file_engine_type)
 }
 
 /// Create a read-only Block instance backed by an inherited descriptor, to be used in tests.
 pub fn default_block_with_descriptor(fd: RawFd, file_engine_type: FileEngineType) -> VirtioBlock {
-    default_block_with_backing(DiskBacking::Descriptor(fd), true, file_engine_type)
+    default_block_with_backing(fd, true, file_engine_type)
 }
 
 fn default_block_with_backing(
-    backing: DiskBacking,
+    fd: RawFd,
     is_read_only: bool,
     file_engine_type: FileEngineType,
 ) -> VirtioBlock {
     let config = VirtioBlockConfig {
         drive_id: "test".to_string(),
-        backing,
+        fd,
         is_root_device: false,
         partuuid: None,
         is_read_only,

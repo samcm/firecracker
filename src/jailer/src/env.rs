@@ -34,6 +34,8 @@ const DEV_URANDOM: &CStr = c"/dev/urandom";
 const DEV_URANDOM_MAJOR: u32 = 1;
 const DEV_URANDOM_MINOR: u32 = 9;
 
+const DEV_USERFAULTFD: &CStr = c"/dev/userfaultfd";
+
 const FOLDER_HIERARCHY: [&str; 4] = ["/", "/dev", "/dev/net", "/run"];
 const FOLDER_PERMISSIONS: u32 = 0o700;
 const PID_FILE_EXTENSION: &str = ".pid";
@@ -58,16 +60,17 @@ fn close(fd: RawFd) -> Result<(), JailerError> {
         .map_err(JailerError::Close)
 }
 
-/// Creates the userfaultfd Firecracker takes over. The handler runs in Firecracker, which also
-/// performs the `UFFDIO_API` handshake and the registrations, so no flags are requested here:
-/// notably not `UFFD_USER_MODE_ONLY`, and not `O_CLOEXEC`, so the descriptor survives exec.
-fn create_userfaultfd() -> Result<RawFd, JailerError> {
-    // SAFETY: `userfaultfd` takes no pointer arguments and the return code is checked.
-    let fd = SyscallReturnCode(unsafe { libc::syscall(libc::SYS_userfaultfd, 0) })
-        .into_result()
-        .map_err(JailerError::Userfaultfd)?;
-    // A successful `userfaultfd` returns a descriptor number, which always fits a `RawFd`.
-    Ok(RawFd::try_from(fd).unwrap())
+/// Opens the userfaultfd device Firecracker turns into its own userfaultfd. A userfaultfd is
+/// bound to the memory map of the process that created it, so only the exec'd binary can create
+/// one that its guest mappings can be registered on; access to this device node is the
+/// permission that lets it.
+fn open_userfaultfd_device() -> Result<RawFd, JailerError> {
+    // SAFETY: the path is a static NUL-terminated string and the return code is checked.
+    SyscallReturnCode(unsafe {
+        libc::open(DEV_USERFAULTFD.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
+    })
+    .into_result()
+    .map_err(JailerError::UserfaultfdDevice)
 }
 
 /// Moves `fd` past the descriptor numbers reserved for Firecracker, so that renumbering one of
@@ -85,14 +88,18 @@ fn move_off_reserved_fds(fd: RawFd) -> Result<RawFd, JailerError> {
     Ok(moved)
 }
 
-/// Renumbers `fd` to `target`. `dup2` leaves `target` with `FD_CLOEXEC` clear, so the
-/// descriptor is inherited by the jailed binary.
+/// Renumbers `fd` to `target` and makes sure the jailed binary inherits it: a descriptor that is
+/// already at `target` keeps whatever `FD_CLOEXEC` it was opened with, so the flag is cleared
+/// explicitly rather than relying on `dup2`.
 fn place_fd(fd: RawFd, target: RawFd) -> Result<(), JailerError> {
-    if fd == target {
-        return Ok(());
+    if fd != target {
+        dup2(fd, target)?;
+        close(fd)?;
     }
-    dup2(fd, target)?;
-    close(fd)
+    // SAFETY: `target` is a descriptor this process owns and the return code is checked.
+    SyscallReturnCode(unsafe { libc::fcntl(target, libc::F_SETFD, 0) })
+        .into_empty_result()
+        .map_err(JailerError::Dup2)
 }
 
 #[derive(Debug)]
@@ -373,16 +380,16 @@ impl Env {
         fs::write(&procs, id().to_string()).map_err(|err| JailerError::CgroupJoin(procs, err))
     }
 
-    /// Hands Firecracker the userfaultfd as [`UFFD_FILENO`] and the sealed root image as
+    /// Hands Firecracker the userfaultfd device as [`UFFD_FILENO`] and the sealed root image as
     /// [`ROOT_FILENO`]. The root descriptor is moved clear of both slots first, because the
     /// caller is free to pass it in at either of them.
     fn install_inherited_fds(&self) -> Result<(), JailerError> {
-        let uffd = create_userfaultfd()?;
+        let uffd_device = open_userfaultfd_device()?;
 
         validate_root_fd(self.root_fd)?;
         let root_fd = move_off_reserved_fds(self.root_fd)?;
 
-        place_fd(uffd, UFFD_FILENO)?;
+        place_fd(uffd_device, UFFD_FILENO)?;
         place_fd(root_fd, ROOT_FILENO)
     }
 

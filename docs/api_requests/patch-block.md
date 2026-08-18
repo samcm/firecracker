@@ -107,33 +107,3 @@ microVM quiescence during the update sequence (for example pausing the microVM)
 the guest itself or block device can still become incosistent from in flight I/O
 requests in the guest that will be executed after it is resumed.
 
-## Updating vhost-user block devices after boot
-
-Unlike with Virtio block device, with vhost-user block devices, Firecracker does
-not interact with the underlying block file directly (the vhost-user backend
-does). It means that changes to the file are not automatically seen by
-Firecracker. There is a mechanism in the
-[vhost-user protocol](https://qemu-project.gitlab.io/qemu/interop/vhost-user.html)
-for the backend to notify the frontend about changes in the device config via
-`VHOST_USER_BACKEND_CONFIG_CHANGE_MSG` message. This requires an extra UDS
-socket connection between the frontend and backend used for backend-originated
-messages. This mechanism **is not supported** by Firecracker. Instead,
-Firecracker makes use of the `PATCH /drives` API request to get notified about
-such changes. Such an API request only includes the required property
-(`drive_id`), because optional properties are not relevant to vhost-user.
-
-Example of a `PATCH` request for a vhost-user drive:
-
-```bash
-curl --unix-socket ${socket} -i \
-     -X PATCH "http://localhost/drives/scratch" \
-     -H "accept: application/json" \
-     -H "Content-Type: application/json" \
-     -d "{
-             \"drive_id\": \"scratch\"
-         }"
-```
-
-A `PATCH` request to a vhost-user drive will make Firecracker retrieve the new
-device config from the backend and send a config change notification to the
-guest.

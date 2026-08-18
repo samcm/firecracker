@@ -98,8 +98,6 @@ def run_seccompiler_bin(
     utils.check_output(f"{seccompiler} {seccompiler_args}")
 
 
-
-
 @with_filelock
 def gcc_compile(src_file, output_file, extra_flags="-static -O3"):
     """Build a source file with gcc."""

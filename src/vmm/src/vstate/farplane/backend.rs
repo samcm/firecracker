@@ -27,19 +27,24 @@ use crate::arch::host_page_size;
 use crate::persist::MicrovmState;
 use crate::snapshot::Snapshot;
 use crate::utils::u64_to_usize;
+use crate::vmm_config::instance_info::VmState;
 use crate::vstate::memory::GuestRegionMmap;
 
 mod ioctls {
     use userfaultfd_sys::uffdio_api;
-    use vmm_sys_util::ioctl_iowr_nr;
+    use vmm_sys_util::{ioctl_io_nr, ioctl_iowr_nr};
 
+    ioctl_io_nr!(USERFAULTFD_IOC_NEW, 0xAA, 0x00);
     ioctl_iowr_nr!(UFFDIO_API, 0xAA, 0x3f, uffdio_api);
 }
 
-use ioctls::UFFDIO_API;
+use ioctls::{UFFDIO_API, USERFAULTFD_IOC_NEW};
 
-/// Descriptor the jailer hands the pre-created userfaultfd on.
-const UFFD_FILENO: RawFd = 3;
+/// Descriptor the jailer hands the userfaultfd device on.
+const UFFD_DEVICE_FILENO: RawFd = 3;
+/// A memfd link target always starts with this prefix, regardless of the name it was created
+/// with.
+const MEMFD_LINK_PREFIX: &[u8] = b"/memfd:";
 /// Seals a backing descriptor must carry before it is mapped.
 const REQUIRED_BACKING_SEALS: i32 =
     libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_FUTURE_WRITE;
@@ -129,13 +134,18 @@ pub struct FarplaneState {
 
 impl Default for FarplaneState {
     fn default() -> Self {
-        Self::observe("not_started")
+        Self::observe()
     }
 }
 
 impl FarplaneState {
-    /// Samples the process-wide backend state, reporting `vcpus` as the caller observed it.
-    pub fn observe(vcpus: &str) -> Self {
+    /// Samples the process-wide backend and vCPU state.
+    pub fn observe() -> Self {
+        let vcpus = match VmState::load() {
+            VmState::NotStarted => "not_started",
+            VmState::Paused => "paused",
+            VmState::Running => "running",
+        };
         Self {
             backend_state: BackendState::load().as_str().to_string(),
             vcpus: vcpus.to_string(),
@@ -248,14 +258,25 @@ pub fn dirty_bitmap_len(regions: &[RegionRecord]) -> u64 {
         .sum()
 }
 
-/// Validates a capture buffer descriptor against the requirement reported at `backend_ready`.
+/// Validates a capture buffer descriptor against the requirement reported at `backend_ready`. A
+/// buffer is written during the freeze, so it has to be writable now rather than fail then.
 pub fn validate_buffer_fd(fd: RawFd, min_size: u64) -> Result<(), ErrorCode> {
-    let stat = fstat(fd).ok_or(ErrorCode::FdNotMemfd)?;
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+    if !is_memfd(fd) {
         return Err(ErrorCode::FdNotMemfd);
     }
+    let stat = fstat(fd).ok_or(ErrorCode::FdNotMemfd)?;
+    // SAFETY: `F_GETFL` only reads descriptor flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(ErrorCode::FdNotMemfd);
+    }
+    if flags & libc::O_ACCMODE != libc::O_RDWR {
+        return Err(ErrorCode::FdNotSealed);
+    }
     let seals = seals(fd).ok_or(ErrorCode::FdNotMemfd)?;
-    if seals & REQUIRED_BUFFER_SEALS != REQUIRED_BUFFER_SEALS {
+    if seals & REQUIRED_BUFFER_SEALS != REQUIRED_BUFFER_SEALS
+        || seals & (libc::F_SEAL_WRITE | libc::F_SEAL_FUTURE_WRITE) != 0
+    {
         return Err(ErrorCode::FdNotSealed);
     }
     if stat.st_size.cast_unsigned() < min_size {
@@ -421,7 +442,7 @@ fn commit_plan(
     let mapped = map_plan(&plan.regions, &extents, &plan_fds).inspect_err(|_| {
         reject(&sock, &incoming, ErrorCode::MapFailed);
     })?;
-    let uffd = adopt_jailer_uffd().inspect_err(|_| {
+    let uffd = create_uffd().inspect_err(|_| {
         reject(&sock, &incoming, ErrorCode::UffdRegisterFailed);
     })?;
     register_uffd(&uffd, &mapped).inspect_err(|_| {
@@ -586,8 +607,21 @@ fn peer_cred(sock: &UnixStream) -> Result<libc::ucred, BackendError> {
     Ok(cred)
 }
 
+/// States whether a descriptor refers to a memfd; nothing else has this link target.
+fn is_memfd(fd: RawFd) -> bool {
+    std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok_and(|target| {
+        target
+            .as_os_str()
+            .as_encoded_bytes()
+            .starts_with(MEMFD_LINK_PREFIX)
+    })
+}
+
 /// Returns the size of a backing descriptor that satisfies every precondition.
 fn validate_backing_fd(fd: RawFd) -> Result<u64, ErrorCode> {
+    if !is_memfd(fd) {
+        return Err(ErrorCode::FdNotMemfd);
+    }
     let stat = fstat(fd).ok_or(ErrorCode::FdNotMemfd)?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(ErrorCode::FdNotMemfd);
@@ -668,10 +702,12 @@ fn validate_canonical(
 
     let page = host_page_size() as u64;
     let mut next = 0usize;
+    let mut region_cursor = 0u64;
     for region in &plan.regions {
         if region.size == 0
             || !region.guest_addr.is_multiple_of(page)
             || !region.size.is_multiple_of(page)
+            || region.guest_addr < region_cursor
         {
             return Err(ErrorCode::GeometryMismatch);
         }
@@ -727,6 +763,7 @@ fn validate_canonical(
             cursor = extent_end;
             previous = Some(extent);
         }
+        region_cursor = region_end;
     }
     if next != extents.len() {
         return Err(ErrorCode::PlanNotCanonical);
@@ -817,24 +854,42 @@ fn wrap_guest_memory(mapped: &[MappedRegion]) -> Result<Vec<GuestRegionMmap>, Ba
         .collect()
 }
 
-/// Performs the API handshake on the userfaultfd the jailer created before dropping privilege.
-fn adopt_jailer_uffd() -> Result<Uffd, BackendError> {
+/// Creates this process's userfaultfd from the device the jailer passed, then performs the API
+/// handshake. A userfaultfd belongs to the memory map of the process that created it, so it has
+/// to be created here, after exec, for the guest mappings to be registrable on it.
+fn create_uffd() -> Result<Uffd, BackendError> {
+    // SAFETY: fd 3 is the userfaultfd device the jailer opened; the argument is a flag word.
+    let raw = unsafe {
+        libc::ioctl(
+            UFFD_DEVICE_FILENO,
+            USERFAULTFD_IOC_NEW(),
+            libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if raw < 0 {
+        return Err(BackendError::Uffd(io::Error::last_os_error()));
+    }
+
     let mut api = uffdio_api {
         api: UFFD_API,
         features: REQUIRED_UFFD_FEATURES,
         ioctls: 0,
     };
-    // SAFETY: fd 3 is the userfaultfd the jailer passed, and `api` outlives the call.
-    let ret =
-        unsafe { ioctl_with_mut_ref(&BorrowedFd::borrow_raw(UFFD_FILENO), UFFDIO_API(), &mut api) };
+    // SAFETY: `raw` is the userfaultfd just created, and `api` outlives the call.
+    let ret = unsafe { ioctl_with_mut_ref(&BorrowedFd::borrow_raw(raw), UFFDIO_API(), &mut api) };
     if ret != 0 {
-        return Err(BackendError::Uffd(io::Error::last_os_error()));
+        let err = io::Error::last_os_error();
+        // SAFETY: `raw` is owned here and unused after the failed handshake.
+        unsafe { libc::close(raw) };
+        return Err(BackendError::Uffd(err));
     }
     if api.features & REQUIRED_UFFD_FEATURES != REQUIRED_UFFD_FEATURES {
+        // SAFETY: `raw` is owned here and unused once the features are refused.
+        unsafe { libc::close(raw) };
         return Err(BackendError::UffdFeatures(api.features));
     }
-    // SAFETY: fd 3 is a userfaultfd whose API handshake just completed, and nothing else owns it.
-    Ok(unsafe { Uffd::from_raw_fd(UFFD_FILENO) })
+    // SAFETY: `raw` is a userfaultfd whose API handshake just completed, and nothing else owns it.
+    Ok(unsafe { Uffd::from_raw_fd(raw) })
 }
 
 /// Registers missing, minor and write-protect faults over every extent mapping.

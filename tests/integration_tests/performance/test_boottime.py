@@ -126,7 +126,9 @@ def launch_vm_with_boot_timer(
 
 def test_boot_timer(microvm_factory, guest_kernel_acpi, rootfs, pci_enabled):
     """Tests that the boot timer device works"""
-    launch_vm_with_boot_timer(microvm_factory, guest_kernel_acpi, rootfs, 1, 128, pci_enabled)
+    launch_vm_with_boot_timer(
+        microvm_factory, guest_kernel_acpi, rootfs, 1, 128, pci_enabled
+    )
 
 
 @pytest.mark.parametrize(

@@ -151,8 +151,6 @@ the feature can be combined with guest_memfd support in Firecracker.
 - The API calls exposing the snapshotting functionality have clear
   **Prerequisites** that describe the requirements on when/how they should be
   used.
-- The Firecracker microVM's MMDS config is included in the snapshot. However,
-  the data store is not persisted across snapshots.
 - Configuration information for metrics and logs are not saved to the snapshot.
   These need to be reconfigured on the restored microVM.
 - On x86_64, if a vCPU has MSR_IA32_TSC_DEADLINE set to 0 when a snapshot is
@@ -218,19 +216,9 @@ the base as the first memory file created by a `/snapshot/create` API call and
 the layer as a memory file created by a subsequent `/snapshot/create` API call.
 The order in which the snapshots were created matters and they should be merged
 in the same order in which they were created. To merge a `diff` snapshot memory
-file on top of a base, users should copy its content over the base. This can be
-done using the `rebase-snap` (deprecated) or `snapshot-editor` tools provided
-with the firecracker release:
-
-```bash
-snapshot-editor edit-memory rebase \
-     --memory-path path/to/base \
-     --diff-path path/to/layer
-```
-
-After executing the command above, the base would be a resumable snapshot memory
-file describing the state of the memory at the moment of creation of the layer.
-More layers which were created later can be merged on top of this base.
+file on top of a base, users should copy its content over the base. After doing
+so, the base is a resumable snapshot memory file describing the state of the
+memory at the moment of creation of the layer.
 
 This process needs to be repeated for each layer until the one describing the
 desired memory state is merged on top of the base, which is constantly updated
@@ -326,10 +314,6 @@ to swap to be "in core". This potentially results in bigger memory files
 (although they are still sparse), but avoids the runtime overhead of dirty page
 logging.
 
-> [!NOTE]
->
-> Dirty page tracking negates most of the benefits of
-> [huge pages](../hugepages.md#known-limitations).
 
 **Effects**:
 

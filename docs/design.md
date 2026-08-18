@@ -30,8 +30,6 @@ Firecracker virtual machine manager (VMM).
 1. The number of Firecracker microVMs running simultaneously on a host is
    limited only by the availability of hardware resources.
 1. Each microVM exposes a host-facing API via an in-process HTTP server.
-1. Each microVM provides guest-facing access to host-configured metadata via the
-   `/mmds` API.
 
 ### Specifications
 
@@ -72,8 +70,8 @@ Each Firecracker process encapsulates one and only one microVM. The process runs
 the following threads: API, VMM and vCPU(s). The API thread is responsible for
 Firecracker's API server and associated control plane. It's never in the fast
 path of the virtual machine. The VMM thread exposes the machine model, minimal
-legacy device model, microVM metadata service (MMDS) and VirtIO device emulated
-Net, Block and Vsock devices, complete with I/O rate limiting. In addition to
+legacy device model and VirtIO device emulated Net, Block and Vsock devices,
+complete with I/O rate limiting. In addition to
 them, there are one or more vCPU threads (one per guest CPU core). They are
 created via KVM and run the `KVM_RUN` main loop. They execute synchronous I/O
 and memory-mapped I/O operations on devices models.
@@ -139,15 +137,8 @@ bandwidth. The customer can create and configure rate limiters via the API by
 specifying token bucket configurations for ingress and egress. Each token bucket
 is defined via the bucket size, I/O cost, refill rate, maximum burst, and
 initial value. This enables the customer to define flexible rate limiters that
-support bursts or specific bandwidth/operations limitations. For vhost-user
-devices, customers should implement rate limiting on the side of the vhost-user
-backend that they provide.
+support bursts or specific bandwidth/operations limitations.
 
-### MicroVM Metadata Service
-
-Firecracker microVMs expose access to a minimal MicroVM-Metadata Service (MMDS)
-to the guest through the API endpoint. The metadata stored by the service is
-fully configured by users.
 
 ### Sandboxing
 

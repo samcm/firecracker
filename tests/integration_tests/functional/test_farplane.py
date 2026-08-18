@@ -18,8 +18,13 @@ from framework.properties import global_props
 from host_tools import farplane as fp
 
 pytestmark = pytest.mark.skipif(
-    not Path("/dev/kvm").exists() or global_props.host_linux_version_tpl < (6, 1),
-    reason="farplane needs KVM and a host kernel with shmem minor/write-protect userfaultfd",
+    not Path("/dev/kvm").exists()
+    or not fp.DEV_USERFAULTFD.exists()
+    or global_props.host_linux_version_tpl < (6, 1),
+    reason=(
+        "farplane needs KVM, /dev/userfaultfd and a host kernel with shmem"
+        " minor/write-protect userfaultfd"
+    ),
 )
 
 PAGE = fp.PAGE_SIZE
@@ -136,7 +141,7 @@ def test_multi_extent_regions_boot_and_read_across_every_boundary(farplane_facto
 
 
 def test_missing_minor_and_wp_events_reach_the_pagemaster(farplane_factory):
-    """The jailer-created userfaultfd delivers missing, minor and write-protect faults."""
+    """The userfaultfd Firecracker creates off the device delivers missing, minor and wp faults."""
     vm = farplane_factory()
     pagemaster = boot(vm, splits=2)
 
@@ -698,8 +703,11 @@ def test_jail_hands_over_renumbered_fds_and_a_stripped_process(farplane_factory)
 
     boot(vm)
 
-    assert os.readlink(f"/proc/{vm.pid}/fd/3") == "anon_inode:[userfaultfd]"
-    assert os.readlink(f"/proc/{vm.pid}/fd/4").startswith("/memfd:rootfs")
+    device = f"/proc/{vm.pid}/fd/{fp.UFFD_DEVICE_FILENO}"
+    root = f"/proc/{vm.pid}/fd/{fp.ROOT_FILENO}"
+    assert os.readlink(device) == str(fp.DEV_USERFAULTFD)
+    assert os.stat(device).st_rdev == fp.DEV_USERFAULTFD.stat().st_rdev
+    assert os.readlink(root).startswith("/memfd:rootfs")
 
     status = Path(f"/proc/{vm.pid}/status").read_text(encoding="utf-8")
     caps = dict(

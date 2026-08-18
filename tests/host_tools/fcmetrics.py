@@ -292,7 +292,6 @@ def validate_fc_metrics(metrics):
         if metrics_name.startswith("net_"):
             firecracker_metrics[metrics_name] = net_metrics
 
-
     firecracker_metrics_schema = create_metrics_schema_objects(firecracker_metrics)
 
     jsonschema.validate(instance=metrics, schema=firecracker_metrics_schema)
@@ -315,7 +314,6 @@ def validate_fc_metrics(metrics):
             ):
                 jsonschema.validate(instance=metrics, schema=firecracker_metrics_schema)
             metrics["rtc"]["error_count"] = temp_pop_metrics
-
 
     validate_missing_metrics(metrics)
 

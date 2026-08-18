@@ -86,16 +86,15 @@ mod tests {
 
         // PATCH with invalid types on fields. Adding a drive_id as number instead of string.
         let body = r#"{
-            "drive_id": 1000,
-            "path_on_host": "dummy"
+            "drive_id": 1000
         }"#;
         let res = parse_patch_drive(&Body::new(body), Some("1000"));
         res.unwrap_err();
 
-        // PATCH with invalid types on fields. Adding a path_on_host as bool instead of string.
+        // PATCH naming the backing store, which is no longer a field of the request.
         let body = r#"{
-            "drive_id": 1000,
-            "path_on_host": true
+            "drive_id": "1000",
+            "path_on_host": "dummy"
         }"#;
         let res = parse_patch_drive(&Body::new(body), Some("1000"));
         res.unwrap_err();
@@ -109,15 +108,19 @@ mod tests {
 
         // PATCH with missing drive_id field.
         let body = r#"{
-            "path_on_host": true
+            "rate_limiter": {
+                "ops": {
+                    "size": 500,
+                    "refill_time": 100
+                }
+            }
         }"#;
         let res = parse_patch_drive(&Body::new(body), Some("1000"));
         res.unwrap_err();
 
-        // PATCH that tries to update something else other than path_on_host.
+        // PATCH that tries to update something else other than the rate limiter.
         let body = r#"{
             "drive_id": "dummy_id",
-            "path_on_host": "dummy_host",
             "is_read_only": false
         }"#;
         let res = parse_patch_drive(&Body::new(body), Some("1234"));
@@ -130,12 +133,10 @@ mod tests {
         parse_patch_drive(&Body::new(body), Some("1234")).unwrap_err();
 
         let body = r#"{
-            "drive_id": "foo",
-            "path_on_host": "dummy"
+            "drive_id": "foo"
         }"#;
         let expected_config = BlockDeviceUpdateConfig {
             drive_id: "foo".to_string(),
-            path_on_host: Some("dummy".to_string()),
             rate_limiter: None,
         };
         assert_eq!(
@@ -144,8 +145,7 @@ mod tests {
         );
 
         let body = r#"{
-            "drive_id": "foo",
-            "path_on_host": "dummy"
+            "drive_id": "foo"
         }"#;
         // Must fail since the drive id differs from id_from_path (foo vs bar).
         parse_patch_drive(&Body::new(body), Some("bar")).unwrap_err();
@@ -168,24 +168,6 @@ mod tests {
 
         let body = r#"{
             "drive_id": "foo",
-            "path_on_host": "/there",
-            "rate_limiter": {
-                "bandwidth": {
-                    "size": 5000,
-                    "refill_time": 100
-                },
-                "ops": {
-                    "size": 500,
-                    "refill_time": 100
-                }
-            }
-        }"#;
-        // Validate that updating both path and rate limiter succeds.
-        parse_patch_drive(&Body::new(body), Some("foo")).unwrap();
-
-        let body = r#"{
-            "drive_id": "foo",
-            "path_on_host": "/there",
             "rate_limiter": {
                 "ops": {
                     "size": 100
@@ -208,10 +190,18 @@ mod tests {
         }"#;
         parse_put_drive(&Body::new(body), Some("2")).unwrap_err();
 
+        // PUT without the inherited descriptor.
+        let body = r#"{
+            "drive_id": "1000",
+            "is_root_device": true,
+            "is_read_only": true
+        }"#;
+        parse_put_drive(&Body::new(body), Some("1000")).unwrap_err();
+
         // PUT with missing all optional fields.
         let body = r#"{
             "drive_id": "1000",
-            "path_on_host": "dummy",
+            "fd": 4,
             "is_root_device": true,
             "is_read_only": true
         }"#;
@@ -223,7 +213,7 @@ mod tests {
         // PUT with the complete configuration.
         let body = r#"{
             "drive_id": "1000",
-            "path_on_host": "dummy",
+            "fd": 4,
             "is_root_device": true,
             "partuuid": "string",
             "is_read_only": true,
@@ -256,8 +246,17 @@ mod tests {
         else {
             panic!("Expected an InsertBlockDevice action");
         };
-        assert_eq!(config.fd, Some(4));
-        assert_eq!(config.path_on_host, None);
+        assert_eq!(config.fd, 4);
+
+        // PUT naming the backing store, which is no longer a field of the request.
+        let body = r#"{
+            "drive_id": "1000",
+            "fd": 4,
+            "is_root_device": true,
+            "is_read_only": true,
+            "path_on_host": "/rootfs"
+        }"#;
+        parse_put_drive(&Body::new(body), Some("1000")).unwrap_err();
 
         // PUT with an unknown field.
         let body = r#"{

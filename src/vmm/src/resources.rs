@@ -264,6 +264,7 @@ impl From<&VmResources> for VmmConfig {
 mod tests {
     use std::fs::File;
     use std::io::Write;
+    use std::os::fd::AsRawFd;
     use std::os::linux::fs::MetadataExt;
     use std::str::FromStr;
 
@@ -272,8 +273,7 @@ mod tests {
     use super::*;
     use crate::cpu_config::templates::test_utils::TEST_TEMPLATE_JSON;
     use crate::cpu_config::templates::{CpuTemplateType, StaticCpuTemplate};
-    use crate::devices::virtio::block::virtio::VirtioBlockError;
-    use crate::devices::virtio::block::{BlockError, CacheType};
+    use crate::devices::virtio::block::CacheType;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
     use crate::resources::VmResources;
@@ -313,15 +313,15 @@ mod tests {
 
     fn default_block_cfg() -> (BlockDeviceConfig, TempFile) {
         let tmp_file = TempFile::new().unwrap();
+        tmp_file.as_file().set_len(0x1000).unwrap();
         (
             BlockDeviceConfig {
                 drive_id: "block1".to_string(),
                 partuuid: Some("0eaa91a0-01".to_string()),
                 is_root_device: false,
                 cache_type: CacheType::Unsafe,
-                is_read_only: Some(false),
-                path_on_host: Some(tmp_file.as_path().to_str().unwrap().to_string()),
-                fd: None,
+                is_read_only: Some(true),
+                fd: tmp_file.as_file().as_raw_fd(),
                 rate_limiter: Some(RateLimiterConfig::default()),
                 file_engine_type: None,
             },
@@ -369,6 +369,7 @@ mod tests {
     fn test_from_json() {
         let kernel_file = TempFile::new().unwrap();
         let rootfs_file = TempFile::new().unwrap();
+        rootfs_file.as_file().set_len(0x1000).unwrap();
 
         // We will test different scenarios with invalid resources configuration and
         // check the expected errors. We include configuration for the kernel and rootfs
@@ -402,13 +403,13 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ]
             }}"#,
-            rootfs_file.as_path().to_str().unwrap()
+            rootfs_file.as_file().as_raw_fd()
         );
 
         let error = VmResources::from_json(json.as_str()).unwrap_err();
@@ -421,36 +422,6 @@ mod tests {
             error
         );
 
-        // Invalid rootfs path.
-        json = format!(
-            r#"{{
-                    "boot-source": {{
-                        "kernel_image_path": "{}",
-                        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
-                    }},
-                    "drives": [
-                        {{
-                            "drive_id": "rootfs",
-                            "path_on_host": "/invalid/path",
-                            "is_root_device": true,
-                            "is_read_only": false
-                        }}
-                    ]
-            }}"#,
-            kernel_file.as_path().to_str().unwrap()
-        );
-
-        let error = VmResources::from_json(json.as_str()).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                ResourcesError::BlockDevice(DriveError::CreateBlockDevice(
-                    BlockError::VirtioBackend(VirtioBlockError::BackingFile(_, _)),
-                ))
-            ),
-            "{:?}",
-            error
-        );
         // Valid config for x86 but invalid on aarch64 since it uses cpu_template.
         json = format!(
             r#"{{
@@ -461,9 +432,9 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ],
                     "machine-config": {{
@@ -473,7 +444,7 @@ mod tests {
                     }}
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap()
+            rootfs_file.as_file().as_raw_fd()
         );
         #[cfg(target_arch = "x86_64")]
         VmResources::from_json(json.as_str()).unwrap();
@@ -490,9 +461,9 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ],
                     "machine-config": {{
@@ -501,7 +472,7 @@ mod tests {
                     }}
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap()
+            rootfs_file.as_file().as_raw_fd()
         );
 
         let error = VmResources::from_json(json.as_str()).unwrap_err();
@@ -524,9 +495,9 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ],
                     "logger": {{
@@ -534,7 +505,7 @@ mod tests {
                     }}
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap()
+            rootfs_file.as_file().as_raw_fd()
         );
 
         let error = VmResources::from_json(json.as_str()).unwrap_err();
@@ -557,9 +528,9 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ],
                     "metrics": {{
@@ -567,7 +538,7 @@ mod tests {
                     }}
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap()
+            rootfs_file.as_file().as_raw_fd()
         );
 
         let error = VmResources::from_json(json.as_str()).unwrap_err();
@@ -590,9 +561,9 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ],
                     "network-interfaces": [
@@ -607,7 +578,7 @@ mod tests {
                     ]
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap()
+            rootfs_file.as_file().as_raw_fd()
         );
 
         let error = VmResources::from_json(json.as_str()).unwrap_err();
@@ -635,9 +606,9 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ],
                     "network-interfaces": [
@@ -653,7 +624,7 @@ mod tests {
                     }}
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap(),
+            rootfs_file.as_file().as_raw_fd(),
         );
         VmResources::from_json(json.as_str()).unwrap();
     }
@@ -664,6 +635,7 @@ mod tests {
         // `VmResources::from_json()` should fail with `Error::File`.
         let kernel_file = TempFile::new().unwrap();
         let rootfs_file = TempFile::new().unwrap();
+        rootfs_file.as_file().set_len(0x1000).unwrap();
 
         let json = format!(
             r#"{{
@@ -675,14 +647,14 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ]
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap(),
+            rootfs_file.as_file().as_raw_fd(),
         );
 
         let error = VmResources::from_json(json.as_str()).unwrap_err();
@@ -694,6 +666,7 @@ mod tests {
         // Include custom cpu template directly inline in config json
         let kernel_file = TempFile::new().unwrap();
         let rootfs_file = TempFile::new().unwrap();
+        rootfs_file.as_file().set_len(0x1000).unwrap();
 
         let json = format!(
             r#"{{
@@ -705,15 +678,15 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ]
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
             TEST_TEMPLATE_JSON,
-            rootfs_file.as_path().to_str().unwrap(),
+            rootfs_file.as_file().as_raw_fd(),
         );
 
         VmResources::from_json(json.as_str()).unwrap();
@@ -725,6 +698,7 @@ mod tests {
         // `VmResources::from_json()` should succeed and it should have a custom CPU template.
         let kernel_file = TempFile::new().unwrap();
         let rootfs_file = TempFile::new().unwrap();
+        rootfs_file.as_file().set_len(0x1000).unwrap();
         let cpu_config_file = TempFile::new().unwrap();
         cpu_config_file
             .as_file()
@@ -741,15 +715,15 @@ mod tests {
                     "drives": [
                         {{
                             "drive_id": "rootfs",
-                            "path_on_host": "{}",
+                            "fd": {},
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": true
                         }}
                     ]
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
             cpu_config_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap(),
+            rootfs_file.as_file().as_raw_fd(),
         );
 
         let vm_resources = VmResources::from_json(json.as_str()).unwrap();
@@ -763,6 +737,7 @@ mod tests {
     fn test_cast_to_vmm_config() {
         let kernel_file = TempFile::new().unwrap();
         let rootfs_file = TempFile::new().unwrap();
+        rootfs_file.as_file().set_len(0x1000).unwrap();
         let json = format!(
             r#"{{
                 "boot-source": {{
@@ -772,9 +747,9 @@ mod tests {
                 "drives": [
                     {{
                         "drive_id": "rootfs",
-                        "path_on_host": "{}",
+                        "fd": {},
                         "is_root_device": true,
-                        "is_read_only": false,
+                        "is_read_only": true,
                         "io_engine": "Sync"
                     }}
                 ],
@@ -786,7 +761,7 @@ mod tests {
                 "entropy": {{}}
             }}"#,
             kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap(),
+            rootfs_file.as_file().as_raw_fd(),
         );
 
         let resources = VmResources::from_json(json.as_str()).unwrap();
@@ -943,8 +918,9 @@ mod tests {
         let mut vm_resources = default_vm_resources();
         let (mut new_block_device_cfg, _file) = default_block_cfg();
         let tmp_file = TempFile::new().unwrap();
+        tmp_file.as_file().set_len(0x1000).unwrap();
         new_block_device_cfg.drive_id = "block2".to_string();
-        new_block_device_cfg.path_on_host = Some(tmp_file.as_path().to_str().unwrap().to_string());
+        new_block_device_cfg.fd = tmp_file.as_file().as_raw_fd();
         assert_eq!(vm_resources.block.devices.len(), 1);
         vm_resources.set_block_device(new_block_device_cfg).unwrap();
         assert_eq!(vm_resources.block.devices.len(), 2);

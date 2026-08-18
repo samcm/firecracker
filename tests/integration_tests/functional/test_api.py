@@ -8,14 +8,13 @@ import os
 import platform
 import re
 import resource
-from pathlib import Path
 
 import pytest
 import semver
 
 import host_tools.drive as drive_tools
 import host_tools.network as net_tools
-from framework import utils, utils_cpuid
+from framework import utils
 from framework.utils import get_firecracker_version_from_toml
 from framework.utils_cpu_templates import SUPPORTED_CPU_TEMPLATES
 
@@ -44,7 +43,6 @@ def test_api_happy_start(uvm_plain):
 
     if utils.pvh_supported():
         assert "Kernel loaded using PVH boot protocol" in test_microvm.log_data
-
 
 
 def test_api_put_update_pre_boot(uvm_plain, io_engine):
@@ -80,7 +78,6 @@ def test_api_put_update_pre_boot(uvm_plain, io_engine):
     test_microvm.api.boot.put(
         kernel_image_path=test_microvm.get_jailed_resource(test_microvm.kernel_file)
     )
-
 
     # Updates to `is_root_device` that result in two root block devices are not
     # allowed.
@@ -131,7 +128,6 @@ def test_api_put_update_pre_boot(uvm_plain, io_engine):
         assert response_json["cpu_template"] == cpu_template
 
 
-
 def test_net_api_put_update_pre_boot(uvm_plain):
     """
     Test PUT updates on network configurations before the microvm boots.
@@ -180,8 +176,6 @@ def test_net_api_put_update_pre_boot(uvm_plain):
     )
 
 
-
-
 # pylint: disable=too-many-statements
 def test_api_machine_config(uvm_plain):
     """
@@ -201,7 +195,6 @@ def test_api_machine_config(uvm_plain):
     # Test invalid CPU template.
     with pytest.raises(RuntimeError):
         test_microvm.api.machine_config.put(cpu_template="random_string")
-
 
     # Test missing vcpu_count.
     with pytest.raises(
@@ -370,7 +363,6 @@ def test_api_put_update_post_boot(uvm_plain):
         test_microvm.api.machine_config.put(vcpu_count=4, mem_size_mib=128)
 
 
-
 def test_rate_limiters_api_config(uvm_plain, io_engine):
     """
     Test the IO rate limiter API config.
@@ -479,7 +471,6 @@ def test_rate_limiters_api_config(uvm_plain, io_engine):
     )
 
 
-
 def test_api_patch_pre_boot(uvm_plain, io_engine):
     """
     Test that PATCH updates are not allowed before the microvm boots.
@@ -528,7 +519,6 @@ def test_api_patch_pre_boot(uvm_plain, io_engine):
     # Patching net before boot is not allowed.
     with pytest.raises(RuntimeError, match=NOT_SUPPORTED_BEFORE_START):
         test_microvm.api.network.patch(iface_id=iface_id)
-
 
 
 def test_negative_api_patch_post_boot(uvm_plain, io_engine):
@@ -593,7 +583,6 @@ def test_drive_patch(uvm_plain, io_engine):
         io_engine=io_engine,
     )
 
-
     # Patching drive before boot is not allowed.
     with pytest.raises(RuntimeError, match=NOT_SUPPORTED_BEFORE_START):
         test_microvm.api.drive.patch(drive_id="scratch", path_on_host="foo.bar")
@@ -632,7 +621,6 @@ def _drive_patch(test_microvm, io_engine):
     expected_msg = "Running method expected different backend."
     with pytest.raises(RuntimeError, match=expected_msg):
         test_microvm.api.drive.patch(drive_id="scratch")
-
 
     drive_path = "foo.bar"
 
@@ -811,10 +799,6 @@ def test_api_entropy(uvm_plain):
         test_microvm.api.entropy.put()
 
 
-
-
-
-
 def test_get_full_config(uvm_plain):
     """
     Test the reported configuration of a microVM configured with all resources.
@@ -851,11 +835,9 @@ def test_get_full_config(uvm_plain):
         }
     ]
 
-
     # Add a vsock device.
     response = test_microvm.api.vsock.put(guest_cid=15, uds_path="vsock.sock")
     expected_cfg["vsock"] = {"guest_cid": 15, "uds_path": "vsock.sock"}
-
 
     # Add a net device.
     iface_id = "1"
@@ -883,7 +865,6 @@ def test_get_full_config(uvm_plain):
         }
     ]
 
-
     # We should expect a null entropy device
     expected_cfg["entropy"] = None
 
@@ -897,6 +878,3 @@ def test_get_full_config(uvm_plain):
     # Validate full vm configuration post-boot as well.
     response = test_microvm.api.vm_config.get()
     assert response.json() == expected_cfg
-
-
-

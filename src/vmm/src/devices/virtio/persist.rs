@@ -259,7 +259,7 @@ mod tests {
     use super::*;
     use crate::devices::virtio::block::virtio::VirtioBlock;
     use crate::devices::virtio::block::virtio::device::FileEngineType;
-    use crate::devices::virtio::block::virtio::test_utils::default_block_with_path;
+    use crate::devices::virtio::block::virtio::test_utils::default_block;
     use crate::devices::virtio::net::Net;
     use crate::devices::virtio::net::test_utils::default_net;
     use crate::devices::virtio::test_utils::default_mem;
@@ -435,13 +435,7 @@ mod tests {
         let mem = default_mem();
         let interrupt = Arc::new(IrqTrigger::new());
 
-        // Create backing file.
-        let f = TempFile::new().unwrap();
-        f.as_file().set_len(0x1000).unwrap();
-        let block = default_block_with_path(
-            f.as_path().to_str().unwrap().to_string(),
-            FileEngineType::default(),
-        );
+        let block = default_block(FileEngineType::default());
         let block = Arc::new(Mutex::new(block));
         let mmio_transport = MmioTransport::new(mem.clone(), interrupt.clone(), block.clone());
 

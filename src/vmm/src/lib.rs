@@ -141,7 +141,6 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
-use crate::vstate::farplane::FarplaneState;
 pub use crate::vstate::kvm::Kvm;
 
 #[cfg(target_arch = "aarch64")]
@@ -247,6 +246,8 @@ pub enum VmmError {
     FindDeviceError(#[from] device_manager::FindDeviceError),
     /// Block: {0}
     Block(#[from] BlockError),
+    /// Cannot drain a block device before a capture: {0}
+    DrainWrites(#[from] crate::devices::virtio::block::virtio::VirtioBlockError),
 }
 
 /// Error type for [`Vmm::dump_cpu_config()`]
@@ -282,18 +283,6 @@ impl Vmm {
     /// Gets Vmm version.
     pub fn version(&self) -> String {
         self.instance_info.vmm_version.clone()
-    }
-
-    /// Returns the instance description, sampling the farplane backend state.
-    pub fn instance_info(&self) -> InstanceInfo {
-        let mut info = self.instance_info.clone();
-        let vcpus = match info.state {
-            VmState::NotStarted => "not_started",
-            VmState::Running => "running",
-            VmState::Paused => "paused",
-        };
-        info.farplane = FarplaneState::observe(vcpus);
-        info
     }
 
     /// Provides the Vmm shutdown exit code if there is one.
@@ -354,7 +343,7 @@ impl Vmm {
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
         self.device_manager.kick_virtio_devices();
         kvm_vm.resume_vcpus()?;
-        self.instance_info.state = VmState::Running;
+        self.set_vm_state(VmState::Running);
         Ok(())
     }
 
@@ -365,7 +354,7 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
         kvm_vm.pause_vcpus()?;
-        self.instance_info.state = VmState::Paused;
+        self.set_vm_state(VmState::Paused);
         Ok(())
     }
 
@@ -430,20 +419,6 @@ impl Vmm {
         kvm_vm.dump_cpu_config_states()
     }
 
-    /// Updates the path of the host file backing the emulated block device with id `drive_id`.
-    /// We update the disk image on the device and its virtio configuration.
-    pub fn update_block_device_path(
-        &mut self,
-        drive_id: &str,
-        path_on_host: String,
-    ) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(drive_id, |block: &mut Block| {
-                block.update_disk_image(path_on_host)
-            })??;
-        Ok(())
-    }
-
     /// Updates the rate limiter parameters for block device with `drive_id` id.
     pub fn update_block_rate_limiter(
         &mut self,
@@ -482,6 +457,12 @@ impl Vmm {
         self.shutdown_exit_code = Some(exit_code);
     }
 
+    /// Records the vCPU state, publishing it for readers that hold no microVM.
+    pub fn set_vm_state(&mut self, state: VmState) {
+        self.instance_info.state = state;
+        state.publish();
+    }
+
     /// Gets the KVM-backed VM of this microVM.
     pub fn kvm_vm(&self) -> Option<&Arc<KvmVm>> {
         self.vm.as_kvm()
@@ -489,7 +470,7 @@ impl Vmm {
 
     /// Stops every host path that writes guest memory outside this event loop: only asynchronous
     /// block IO can still land in guest memory, so draining it closes the capture epoch.
-    pub fn drain_guest_memory_writers(&mut self) {
+    pub fn drain_guest_memory_writers(&mut self) -> Result<(), VmmError> {
         let mut drives = Vec::new();
         self.device_manager
             .for_each_virtio_device(|device_type, device| {
@@ -500,13 +481,10 @@ impl Vmm {
                 }
             });
         for drive in drives {
-            if let Err(err) = self
-                .device_manager
-                .with_virtio_device(&drive, |block: &mut Block| block.prepare_save())
-            {
-                error!("Farplane quiesce could not drain drive {drive}: {err}");
-            }
+            self.device_manager
+                .with_virtio_device(&drive, |block: &mut Block| block.drain_writes())??;
         }
+        Ok(())
     }
 }
 

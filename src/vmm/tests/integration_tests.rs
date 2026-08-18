@@ -3,6 +3,8 @@
 
 #![allow(clippy::tests_outside_test_module)]
 
+use std::os::fd::AsRawFd;
+
 use vmm::EventManager;
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
@@ -63,10 +65,11 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
 #[test]
 fn test_preboot_load_snap_disallowed_after_boot_resources() {
     let tmp_file = TempFile::new().unwrap();
-    let tmp_file = tmp_file.as_path().to_str().unwrap().to_string();
+    tmp_file.as_file().set_len(0x1000).unwrap();
+    let kernel_image_path = tmp_file.as_path().to_str().unwrap().to_string();
     // Verify LoadSnapshot not allowed after configuring various boot-specific resources.
     let req = VmmAction::ConfigureBootSource(BootSourceConfig {
-        kernel_image_path: tmp_file.clone(),
+        kernel_image_path,
         ..Default::default()
     });
     verify_load_snap_disallowed_after_boot_resources(req, "ConfigureBootSource");
@@ -76,9 +79,8 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         partuuid: None,
         is_root_device: false,
         cache_type: CacheType::Unsafe,
-        is_read_only: Some(false),
-        path_on_host: Some(tmp_file),
-        fd: None,
+        is_read_only: Some(true),
+        fd: tmp_file.as_file().as_raw_fd(),
         rate_limiter: None,
         file_engine_type: None,
     };

@@ -29,6 +29,8 @@ use crate::api_server::request::serial::parse_put_serial;
 #[derive(Debug)]
 pub(crate) enum RequestAction {
     Sync(Box<VmmAction>),
+    /// Data the API thread already has, answered without the microVM.
+    Immediate(Box<VmmData>),
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -126,6 +128,11 @@ impl ParsedRequest {
             action,
             parsing_info: Default::default(),
         }
+    }
+
+    /// Wraps data the API thread already has, so the request needs no microVM.
+    pub(crate) fn new_immediate(data: VmmData) -> Self {
+        Self::new(RequestAction::Immediate(Box::new(data)))
     }
 
     pub(crate) fn into_parts(self) -> (RequestAction, ParsingInfo) {
@@ -321,6 +328,7 @@ pub mod tests {
                 (RequestAction::Sync(sync_req), RequestAction::Sync(other_sync_req)) => {
                     sync_req == other_sync_req
                 }
+                _ => false,
             }
         }
     }
@@ -328,6 +336,7 @@ pub mod tests {
     pub(crate) fn vmm_action_from_request(req: ParsedRequest) -> VmmAction {
         match req.action {
             RequestAction::Sync(vmm_action) => *vmm_action,
+            RequestAction::Immediate(data) => panic!("Not a VMM action: {data:?}"),
         }
     }
 
@@ -340,6 +349,7 @@ pub mod tests {
                 assert_eq!(req_msg, msg);
                 *vmm_action
             }
+            RequestAction::Immediate(data) => panic!("Not a VMM action: {data:?}"),
         }
     }
 
@@ -571,6 +581,8 @@ pub mod tests {
 
     #[test]
     fn test_try_from_get_info() {
+        // The description is answered from the API thread, so it has to be published first.
+        InstanceInfo::default().publish();
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         let mut connection = HttpConnection::new(receiver);
         sender
@@ -650,8 +662,8 @@ pub mod tests {
     fn test_try_from_put_drives() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         let mut connection = HttpConnection::new(receiver);
-        let body = "{ \"drive_id\": \"string\", \"path_on_host\": \"string\", \"is_root_device\": \
-                    true, \"partuuid\": \"string\", \"is_read_only\": true, \"cache_type\": \
+        let body = "{ \"drive_id\": \"string\", \"fd\": 4, \"is_root_device\": true, \
+                    \"partuuid\": \"string\", \"is_read_only\": true, \"cache_type\": \
                     \"Unsafe\", \"io_engine\": \"Sync\", \"rate_limiter\": { \"bandwidth\": { \
                     \"size\": 0, \"one_time_burst\": 0, \"refill_time\": 0 }, \"ops\": { \
                     \"size\": 0, \"one_time_burst\": 0, \"refill_time\": 0 } } }";
@@ -787,7 +799,7 @@ pub mod tests {
     fn test_try_from_patch_drives() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         let mut connection = HttpConnection::new(receiver);
-        let body = "{ \"drive_id\": \"string\", \"path_on_host\": \"string\" }";
+        let body = "{ \"drive_id\": \"string\" }";
         sender
             .write_all(http_request("PATCH", "/drives/string", Some(body)).as_bytes())
             .unwrap();

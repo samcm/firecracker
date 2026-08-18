@@ -129,6 +129,9 @@ impl ApiServer {
                     RequestAction::Sync(vmm_action) => {
                         self.serve_vmm_action_request(vmm_action, request_processing_start_us)
                     }
+                    RequestAction::Immediate(data) => {
+                        ParsedRequest::convert_to_response(&Ok(*data))
+                    }
                 };
                 if let Some(message) = parsing_info.take_deprecation_message() {
                     warn_unrestricted!("{}", message);

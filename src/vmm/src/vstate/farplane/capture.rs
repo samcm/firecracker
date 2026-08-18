@@ -56,13 +56,28 @@ impl CaptureService {
     }
 
     /// Serves exactly one command.
+    ///
+    /// A command whose body length or descriptor count differs from its wire definition is a
+    /// protocol violation, rejected before any state changes.
     fn serve_one(&mut self) -> Result<(), ChannelError> {
         let incoming = protocol::recv_frame(&self.channel.sock)?;
         let request_id = incoming.header.request_id;
         if request_id == 0 {
             return Err(ChannelError::Malformed);
         }
-        match incoming.header.msg() {
+        let msg = incoming.header.msg();
+        let (body_len, fd_count) = match msg {
+            MsgType::CaptureBuffers => (0, 2),
+            MsgType::Quiesce | MsgType::DirtySnapshot | MsgType::WriteVmstate => (0, 0),
+            MsgType::DirtyUnion => (0, 1),
+            MsgType::Resume => (4, 0),
+            _ => return Err(ChannelError::Malformed),
+        };
+        if incoming.body.len() != body_len || incoming.fds.len() != fd_count {
+            return Err(ChannelError::Malformed);
+        }
+
+        match msg {
             MsgType::CaptureBuffers => self.arm_buffers(incoming),
             MsgType::Quiesce => self.quiesce(request_id),
             MsgType::DirtySnapshot => self.dirty_snapshot(request_id),
@@ -116,7 +131,11 @@ impl CaptureService {
             drop(vmm);
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
-        vmm.drain_guest_memory_writers();
+        if let Err(err) = vmm.drain_guest_memory_writers() {
+            error!("Farplane quiesce could not stop every guest-memory writer: {err}");
+            drop(vmm);
+            return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
+        }
         drop(vmm);
 
         BackendState::Quiesced.store();
@@ -213,11 +232,12 @@ impl CaptureService {
         }
     }
 
-    /// Leaves the capture epoch, restarting the vCPUs when pagemaster asks for it.
+    /// Leaves the capture epoch, restarting the vCPUs when pagemaster asks for it. The initial
+    /// boot and restore acknowledgement is answered by the handshake itself, so on this channel
+    /// the command is only ever a capture exit.
     fn resume(&mut self, request_id: u64, run_vcpus: u32) -> Result<(), ChannelError> {
-        match BackendState::load() {
-            BackendState::Ready | BackendState::Quiesced => {}
-            _ => return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Resume),
+        if BackendState::load() != BackendState::Quiesced {
+            return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Resume);
         }
 
         let mut vmm = self.vmm.lock().expect("Poisoned lock");

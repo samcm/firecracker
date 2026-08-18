@@ -42,5 +42,3 @@ def test_pvtime_steal_time_increases(uvm_plain):
     assert (
         steal_after > steal_before
     ), f"Steal time did not increase as expected. Before: {steal_before}, After: {steal_after}"
-
-

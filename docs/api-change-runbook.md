@@ -186,8 +186,7 @@ When doing a major release, the API can have breaking changes. This is the _only
 time_ where we can safely remove deprecated elements of the API. To remove a
 deprecated element of the API:
 
-- Remove the associated functionality from the codebase (usually in `vmm` or
-  `mmds`);
+- Remove the associated functionality from the codebase;
 - Remove the parsing logic in `api_server`;
 - Remove any unit and integration tests associated with this element.
 

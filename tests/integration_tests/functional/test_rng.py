@@ -21,8 +21,6 @@ def uvm_with_rng_booted(uvm_plain_any, rate_limiter):
     return uvm
 
 
-
-
 @pytest.fixture(params=[None])
 def rate_limiter(request):
     """Fixture to return different rate limiters"""

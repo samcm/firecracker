@@ -7,7 +7,6 @@ import pytest
 
 from framework.microvm import Serial
 
-
 INITRD_FILESYSTEM = "rootfs"
 
 

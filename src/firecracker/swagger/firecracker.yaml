@@ -669,6 +669,7 @@ definitions:
     required:
       - drive_id
       - is_root_device
+      - fd
     properties:
       drive_id:
         type: string
@@ -691,19 +692,13 @@ definitions:
         type: boolean
         description:
           Is block read only. This field is required for virtio-block config.
-      path_on_host:
-        type: string
-        description:
-          Host level path for the guest drive.
-          Mutually exclusive with fd.
       fd:
         type: integer
         format: int32
         minimum: 0
         description:
           Number of an inherited descriptor for the sealed, read-only memfd backing
-          this drive. Mutually exclusive with path_on_host, and requires is_read_only
-          to be true.
+          this drive. Requires is_read_only to be true.
       rate_limiter:
         $ref: "#/definitions/RateLimiter"
       io_engine:
@@ -938,10 +933,6 @@ definitions:
     properties:
       drive_id:
         type: string
-      path_on_host:
-        type: string
-        description:
-          This field is optional for virtio-block config.
       rate_limiter:
         $ref: "#/definitions/RateLimiter"
 

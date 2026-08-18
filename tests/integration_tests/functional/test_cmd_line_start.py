@@ -14,7 +14,6 @@ from framework import utils
 from framework.utils_cpu_templates import SUPPORTED_CPU_TEMPLATES
 
 
-
 def _configure_vm_from_json(test_microvm, vm_config_file):
     """
     Configure a microvm using a file sent as command line parameter.
@@ -38,8 +37,6 @@ def _configure_vm_from_json(test_microvm, vm_config_file):
     return obj
 
 
-
-
 def _configure_network_interface(test_microvm):
     """
     Create tap interface before spawning the microVM.
@@ -52,8 +49,6 @@ def _configure_network_interface(test_microvm):
     # Create tap device, and avoid creating it in the guest since it is already
     # specified in the JSON
     test_microvm.add_net_iface(api=False)
-
-
 
 
 @pytest.mark.parametrize("vm_config_file", ["framework/vm_config.json"])
@@ -182,5 +177,3 @@ def test_config_machine_config_params(uvm_plain, test_config):
         test_microvm.check_log_message(
             "Successfully started microvm that was configured from one single json"
         )
-
-

@@ -51,8 +51,6 @@ pub enum VmmAction {
     GetFullVmConfig,
     /// Get the machine configuration of the microVM.
     GetVmMachineConfig,
-    /// Get microVM instance information.
-    GetVmInstanceInfo,
     /// Get microVM version.
     GetVmmVersion,
     /// Flush the metrics. This action can only be called after the logger has been configured.
@@ -87,7 +85,7 @@ pub enum VmmAction {
     /// driver is listening on the guest end, this can be used to shut down the microVM gracefully.
     #[cfg(target_arch = "x86_64")]
     SendCtrlAltDel,
-    /// Update existing block device properties such as `path_on_host` or `rate_limiter`.
+    /// Update existing block device properties such as `rate_limiter`.
     UpdateBlockDevice(BlockDeviceUpdateConfig),
     /// Update a network interface, after microVM start. Currently, the only updatable properties
     /// are the RX and TX rate limiters.
@@ -199,6 +197,8 @@ pub type ApiResponse = Box<Result<VmmData, VmmActionError>>;
 /// Error type for `PrebootApiController::build_microvm_from_requests`.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum BuildMicrovmFromRequestsError {
+    /// Booting the microVM failed.
+    Boot,
     /// Loading snapshot failed.
     Restore,
     /// Resuming MicroVM after loading snapshot failed.
@@ -329,7 +329,6 @@ impl<'a> PrebootApiController<'a> {
             GetVmMachineConfig => Ok(VmmData::MachineConfiguration(
                 self.vm_resources.machine_config.clone(),
             )),
-            GetVmInstanceInfo => Ok(VmmData::InstanceInformation(self.instance_info.clone())),
             GetVmmVersion => Ok(VmmData::VmmVersion(self.instance_info.vmm_version.clone())),
             InsertBlockDevice(config) => self.insert_block_device(config),
             InsertNetworkDevice(config) => self.insert_net_device(config),
@@ -425,7 +424,12 @@ impl<'a> PrebootApiController<'a> {
             self.built_vmm = Some(vmm);
             VmmData::Empty
         })
-        .map_err(VmmActionError::StartMicrovm)
+        .map_err(|err| {
+            // A failed boot leaves the guest mappings and the memory channel half established, so
+            // the process exits instead of serving another request.
+            self.fatal_error = Some(BuildMicrovmFromRequestsError::Boot);
+            VmmActionError::StartMicrovm(err)
+        })
     }
 
     // On success, this command will end the pre-boot stage and this controller
@@ -497,9 +501,6 @@ impl RuntimeApiController {
                     .expect("Poisoned lock")
                     .machine_config
                     .clone(),
-            )),
-            GetVmInstanceInfo => Ok(VmmData::InstanceInformation(
-                self.vmm.lock().expect("Poisoned lock").instance_info(),
             )),
             GetVmmVersion => Ok(VmmData::VmmVersion(
                 self.vmm.lock().expect("Poisoned lock").version(),
@@ -583,8 +584,6 @@ impl RuntimeApiController {
     }
 
     /// Updates block device properties:
-    ///  - path of the host file backing the emulated block device, update the disk image on the
-    ///    device and its virtio configuration
     ///  - rate limiter configuration.
     fn update_block_device(
         &mut self,
@@ -592,11 +591,6 @@ impl RuntimeApiController {
     ) -> Result<VmmData, VmmActionError> {
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
 
-        // virtio-block updates
-        if let Some(new_path) = new_cfg.path_on_host {
-            vmm.update_block_device_path(&new_cfg.drive_id, new_path)
-                .map_err(DriveError::DeviceUpdate)?;
-        }
         if new_cfg.rate_limiter.is_some() {
             vmm.update_block_rate_limiter(
                 &new_cfg.drive_id,

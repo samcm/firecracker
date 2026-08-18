@@ -10,7 +10,6 @@ import pytest
 from host_tools.fcmetrics import validate_fc_metrics
 
 
-
 def test_cli_metrics_path(uvm_plain):
     """
     Test --metrics-path parameter
@@ -46,7 +45,6 @@ def test_cli_metrics_path_if_metrics_initialized_twice_fail(uvm_plain):
         microvm.api.metrics.put(
             metrics_path=microvm.create_jailed_resource(metrics2_path)
         )
-
 
 
 def test_cli_no_params(microvm_factory):

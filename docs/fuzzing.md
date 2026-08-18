@@ -15,8 +15,6 @@ more amenable to fuzz testing:
 
 - TCP Initial Sequence Numbers use a deterministic hardcoded value instead of
   the usual random ones, so network behavior is reproducible across runs.
-- The balloon device processes the stats queue inline rather than relying on the
-  timer-driven path, which is not available during fuzzing.
 
 ## Building
 

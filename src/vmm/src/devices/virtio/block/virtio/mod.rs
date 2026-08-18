@@ -53,18 +53,14 @@ pub enum VirtioBlockError {
     UnexpectedWriteOnlyDescriptor,
     /// Error coming from the IO engine: {0}
     FileEngine(io::BlockIoError),
-    /// Error manipulating the backing file: {0} {1}
-    BackingFile(std::io::Error, String),
+    /// Error manipulating drive descriptor {1}: {0}
+    BackingFile(std::io::Error, RawFd),
     /// Drive descriptor {0} is not a valid descriptor.
     InvalidDescriptor(RawFd),
     /// Cannot duplicate drive descriptor {0}: {1}
     CloneDescriptor(RawFd, std::io::Error),
     /// Drive descriptor {0} is empty.
     EmptyDescriptor(RawFd),
-    /// Cannot update the backing file of a descriptor-backed drive.
-    DescriptorBackedUpdate,
-    /// Cannot restore drive {0}: only a descriptor-backed drive is restorable.
-    UnrestorableDrive(String),
     /// Error opening eventfd: {0}
     EventFd(std::io::Error),
     /// Error creating an interrupt: {0}

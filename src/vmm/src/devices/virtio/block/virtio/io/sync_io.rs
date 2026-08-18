@@ -38,11 +38,6 @@ impl SyncFileEngine {
         &self.file
     }
 
-    /// Update the backing file of the engine
-    pub fn update_file(&mut self, file: File) {
-        self.file = file
-    }
-
     pub fn read(
         &mut self,
         offset: u64,

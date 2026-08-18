@@ -63,5 +63,3 @@ def test_vmclock_read_fields(vm_with_vmclock, use_mmap):
     assert vmclock["VMCLOCK_COUNTER_ID"] == "255"
     assert vmclock["VMCLOCK_DISRUPTION_MARKER"] == "0"
     assert vmclock["VMCLOCK_VM_GENERATION_COUNTER"] == "0"
-
-

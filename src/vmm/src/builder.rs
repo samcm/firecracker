@@ -293,7 +293,7 @@ pub fn build_microvm_for_boot(
                 .clone(),
         )
         .map_err(VmmError::VcpuStart)?;
-    vmm.lock().unwrap().instance_info.state = VmState::Paused;
+    vmm.lock().unwrap().set_vm_state(VmState::Paused);
 
     #[cfg(feature = "gdb")]
     if let Some(gdb_socket_path) = &vm_resources.machine_config.gdb_socket_path {
@@ -493,7 +493,7 @@ pub fn build_microvm_from_snapshot(
     )?;
 
     let vmm = Arc::new(Mutex::new(vmm));
-    vmm.lock().unwrap().instance_info.state = VmState::Paused;
+    vmm.lock().unwrap().set_vm_state(VmState::Paused);
     event_manager.add_subscriber(vmm.clone());
 
     let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
@@ -635,18 +635,22 @@ fn attach_unixsock_vsock_device(
 #[cfg(test)]
 pub(crate) mod tests {
 
+    use std::os::fd::AsRawFd;
+
     use linux_loader::cmdline::Cmdline;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::device_manager::tests::default_device_manager;
     use crate::devices::virtio::block::CacheType;
+    use crate::devices::virtio::block::virtio::VirtioBlock;
+    use crate::devices::virtio::block::virtio::device::{FileEngineType, VirtioBlockConfig};
     use crate::devices::virtio::device::VirtioDeviceType;
     use crate::devices::virtio::rng::device::ENTROPY_DEV_ID;
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
     use crate::utils::mib_to_bytes;
     use crate::vmm_config::boot_source::{BootSourceConfig, DEFAULT_KERNEL_CMDLINE};
-    use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig};
+    use crate::vmm_config::drive::BlockBuilder;
     use crate::vmm_config::entropy::{EntropyDeviceBuilder, EntropyDeviceConfig};
     use crate::vmm_config::machine_config::MachineConfig;
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
@@ -732,30 +736,24 @@ pub(crate) mod tests {
         let mut block_dev_configs = BlockBuilder::new();
         let mut block_files = Vec::new();
         for custom_block_cfg in custom_block_cfgs {
-            block_files.push(TempFile::new().unwrap());
+            let image = TempFile::new().unwrap();
+            image.as_file().set_len(0x1000).unwrap();
+            block_files.push(image);
 
-            let block_device_config = BlockDeviceConfig {
+            let block = VirtioBlock::new(VirtioBlockConfig {
                 drive_id: String::from(&custom_block_cfg.drive_id),
                 partuuid: custom_block_cfg.partuuid,
                 is_root_device: custom_block_cfg.is_root_device,
                 cache_type: custom_block_cfg.cache_type,
 
-                is_read_only: Some(custom_block_cfg.is_read_only),
-                path_on_host: Some(
-                    block_files
-                        .last()
-                        .unwrap()
-                        .as_path()
-                        .to_str()
-                        .unwrap()
-                        .to_string(),
-                ),
-                fd: None,
+                is_read_only: custom_block_cfg.is_read_only,
+                fd: block_files.last().unwrap().as_file().as_raw_fd(),
                 rate_limiter: None,
-                file_engine_type: None,
-            };
+                file_engine_type: FileEngineType::default(),
+            })
+            .unwrap();
 
-            block_dev_configs.insert(block_device_config).unwrap();
+            block_dev_configs.add_virtio_device(Arc::new(Mutex::new(Block::Virtio(block))));
         }
 
         attach_block_devices(

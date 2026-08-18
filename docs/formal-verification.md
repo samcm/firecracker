@@ -22,8 +22,7 @@ official [Kani book](https://model-checking.github.io/kani/) or try out this
 [tutorial](https://model-checking.github.io/kani/kani-tutorial.html).
 
 We aim to have Kani harnesses for components that directly interact with data
-from the guest, such as the TCP/IP stack powering our microVM Metadata Service
-(MMDS) integration, or which are difficult to test traditionally, such as our
+from the guest or which are difficult to test traditionally, such as our
 I/O Rate Limiter. Our Kani harnesses live in `verification` modules that are
 tagged with `#[cfg(kani)]`, similar to how unit tests in Rust are usually
 structured.

@@ -9,6 +9,8 @@ the capture cycle. `FarplaneMicrovm` launches the jailer with the inherited root
 talk to a real Firecracker over that channel.
 """
 
+# pylint: disable=too-many-lines
+
 import ctypes
 import fcntl
 import os
@@ -43,9 +45,8 @@ READY_TAIL = struct.Struct("<IQQQ")
 BACKING_PLAN = struct.Struct("<IIII")
 ERROR_BODY = struct.Struct("<IHH128s")
 
-HEADER_LEN = HEADER.size
-
-UFFD_FILENO = 3
+DEV_USERFAULTFD = Path("/dev/userfaultfd")
+UFFD_DEVICE_FILENO = 3
 ROOT_FILENO = 4
 
 ARCH_X86_64 = 1
@@ -121,6 +122,7 @@ UFFD_PAGEFAULT_FLAG_MINOR = 1 << 2
 UFFDIO_WRITEPROTECT_MODE_WP = 1 << 0
 
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+MFD_ALLOW_SEALING = 0x0002
 
 
 class _UffdioRange(ctypes.Structure):
@@ -204,11 +206,19 @@ class ChannelViolation(Exception):
 Reply = namedtuple("Reply", ["msg", "body", "fds", "error"])
 
 
+def _memfd_create(name):
+    """Create a sealable memfd."""
+    fd = _libc.memfd_create(name.encode(), MFD_ALLOW_SEALING)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "memfd_create")
+    return fd
+
+
 def sealed_memfd(
     name, size, *, content=None, offset=0, seals=BACKING_SEALS, read_only=True
 ):
     """Create a memfd of `size` bytes, optionally seeded, sealed and reopened read-only."""
-    fd = os.memfd_create(name, os.MFD_ALLOW_SEALING)
+    fd = _memfd_create(name)
     os.ftruncate(fd, size)
     if content:
         os.pwrite(fd, content, offset)
@@ -224,7 +234,7 @@ def sealed_memfd(
 def memfd_from_file(name, path, *, seals=ROOT_SEALS, read_only=True):
     """Copy `path` into a sealed memfd, reopened read-only by default."""
     size = os.path.getsize(path)
-    fd = os.memfd_create(name, os.MFD_ALLOW_SEALING)
+    fd = _memfd_create(name)
     os.ftruncate(fd, size)
     with open(path, "rb") as src:
         written = 0
@@ -806,14 +816,14 @@ class Pagemaster:
         for level, kind, data in ancillary:
             if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
                 fds.frombytes(data[: len(data) - (len(data) % fds.itemsize)])
-        if len(payload) < HEADER_LEN:
+        if len(payload) < HEADER.size:
             raise ChannelViolation(f"datagram of {len(payload)} bytes is not a frame")
         magic, version, msg_type, request_id, body_len, fd_count, reserved = (
             HEADER.unpack_from(payload)
         )
         if magic != MAGIC or version != VERSION or reserved != 0:
-            raise ChannelViolation(f"bad header {payload[:HEADER_LEN]!r}")
-        if len(payload) != HEADER_LEN + body_len:
+            raise ChannelViolation(f"bad header {payload[: HEADER.size]!r}")
+        if len(payload) != HEADER.size + body_len:
             raise ChannelViolation("body_len disagrees with the datagram")
         if fd_count != len(fds):
             raise ChannelViolation(f"fd_count {fd_count} but {len(fds)} descriptors")
@@ -823,7 +833,7 @@ class Pagemaster:
             "body_len": body_len,
             "fd_count": fd_count,
         }
-        return header, payload[HEADER_LEN:], list(fds)
+        return header, payload[HEADER.size :], list(fds)
 
 
 class FarplaneMicrovm:

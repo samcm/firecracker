@@ -77,6 +77,8 @@ enum MainError {
     ResizeFdtable(ResizeFdTableError),
     /// Failed to arm parent-death signal: {0}
     ParentDeath(io::Error),
+    /// Failed to lock the working set: {0}
+    LockWorkingSet(io::Error),
     /// Missing required --farplane-mem-socket
     MissingFarplaneSocket,
     /// RunWithApiError error: {0}
@@ -344,6 +346,7 @@ fn main_exec() -> Result<(), MainError> {
 
     register_signal_handlers().map_err(MainError::RegisterSignalHandlers)?;
     arm_parent_death_signal()?;
+    lock_working_set()?;
 
     #[cfg(target_arch = "aarch64")]
     enable_ssbd_mitigation();
@@ -373,6 +376,7 @@ fn main_exec() -> Result<(), MainError> {
         app_name: "Firecracker".to_string(),
         farplane: vmm::vstate::farplane::FarplaneState::default(),
     };
+    instance_info.publish();
 
     if let Some(metrics_path) = arguments.single_value("metrics-path") {
         let metrics_config = MetricsConfig {
@@ -502,6 +506,16 @@ fn resize_fdtable() -> Result<(), ResizeFdTableError> {
         }
     }
 
+    Ok(())
+}
+
+/// Keeps this process's own pages resident, so reclaim cannot fault them back in during a freeze.
+fn lock_working_set() -> Result<(), MainError> {
+    // SAFETY: `mlockall` only changes this process's own memory policy.
+    let ret = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) };
+    if ret != 0 {
+        return Err(MainError::LockWorkingSet(io::Error::last_os_error()));
+    }
     Ok(())
 }
 

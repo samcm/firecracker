@@ -60,7 +60,6 @@ The configuration items that may be relevant for Firecracker are:
 - serial console - `CONFIG_SERIAL_8250_CONSOLE`, `CONFIG_PRINTK`
 - initrd support - `CONFIG_BLK_DEV_INITRD`
 - virtio devices - `CONFIG_VIRTIO_MMIO`
-  - balloon - `CONFIG_MEMORY_BALLOON`, `CONFIG_VIRTIO_BALLOON`
   - block - `CONFIG_VIRTIO_BLK`
     - partuuid support - `CONFIG_MSDOS_PARTITION`
   - network - `CONFIG_VIRTIO_NET`

@@ -124,7 +124,6 @@ def test_api_requests_logs(uvm_plain):
     )
     microvm.log_file = log_path
 
-
     # Check that the fault message return by the client is also logged in the
     # FIFO.
     fault_msg = "Boot source error: The kernel file cannot be opened: No such file or directory (os error 2)"

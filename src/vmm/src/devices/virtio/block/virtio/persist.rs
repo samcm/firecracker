@@ -9,7 +9,6 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::device::DiskProperties;
 use super::*;
-use crate::devices::virtio::block::DiskBacking;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::devices::virtio::block::virtio::metrics::BlockMetricsPerDevice;
@@ -57,7 +56,6 @@ pub struct VirtioBlockState {
     partuuid: Option<String>,
     cache_type: CacheType,
     root_device: bool,
-    descriptor_backed: bool,
     pub virtio_state: VirtioDeviceState,
     rate_limiter_state: RateLimiterState,
     file_engine_type: FileEngineTypeState,
@@ -75,7 +73,6 @@ impl Persist<'_> for VirtioBlock {
             partuuid: self.partuuid.clone(),
             cache_type: self.cache_type,
             root_device: self.root_device,
-            descriptor_backed: matches!(self.disk.backing, DiskBacking::Descriptor(_)),
             virtio_state: VirtioDeviceState::from_device(self),
             rate_limiter_state: self.rate_limiter.save(),
             file_engine_type: FileEngineTypeState::from(self.file_engine_type()),
@@ -86,19 +83,12 @@ impl Persist<'_> for VirtioBlock {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        if !state.descriptor_backed {
-            return Err(VirtioBlockError::UnrestorableDrive(state.id.clone()));
-        }
-
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
         let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
             .map_err(VirtioBlockError::RateLimiter)?;
 
-        let disk_properties = DiskProperties::new(
-            constructor_args.backing,
-            is_read_only,
-            state.file_engine_type.into(),
-        )?;
+        let disk_properties =
+            DiskProperties::new(constructor_args.descriptor, state.file_engine_type.into())?;
 
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
 
@@ -162,7 +152,7 @@ mod tests {
 
         let config = VirtioBlockConfig {
             drive_id: "test".to_string(),
-            backing: DiskBacking::Path(f.as_path().to_str().unwrap().to_string()),
+            fd: f.as_file().as_raw_fd(),
             is_root_device: false,
             partuuid: None,
             is_read_only: false,
@@ -203,7 +193,7 @@ mod tests {
 
         let config = VirtioBlockConfig {
             drive_id: "test".to_string(),
-            backing: DiskBacking::Descriptor(f.as_file().as_raw_fd()),
+            fd: f.as_file().as_raw_fd(),
             is_root_device: true,
             partuuid: None,
             is_read_only: true,
@@ -224,7 +214,7 @@ mod tests {
         let restored_block = VirtioBlock::restore(
             BlockConstructorArgs {
                 mem: guest_mem,
-                backing: DiskBacking::Descriptor(f.as_file().as_raw_fd()),
+                descriptor: f.as_file().as_raw_fd(),
             },
             &restored_state,
         )
@@ -239,36 +229,7 @@ mod tests {
         assert!(!restored_block.is_activated());
 
         // Test that block specific fields are the same.
-        assert_eq!(restored_block.disk.backing, block.disk.backing);
+        assert_eq!(restored_block.disk.descriptor, block.disk.descriptor);
         assert!(restored_block.read_only);
-    }
-
-    #[test]
-    fn test_path_backed_drive_is_not_restorable() {
-        let f = TempFile::new().unwrap();
-        f.as_file().set_len(0x1000).unwrap();
-
-        let config = VirtioBlockConfig {
-            drive_id: "test".to_string(),
-            backing: DiskBacking::Path(f.as_path().to_str().unwrap().to_string()),
-            is_root_device: false,
-            partuuid: None,
-            is_read_only: false,
-            cache_type: CacheType::Unsafe,
-            rate_limiter: None,
-            file_engine_type: FileEngineType::default(),
-        };
-
-        let block_state = VirtioBlock::new(config).unwrap().save();
-        let err = VirtioBlock::restore(
-            BlockConstructorArgs {
-                mem: default_mem(),
-                backing: DiskBacking::Descriptor(f.as_file().as_raw_fd()),
-            },
-            &block_state,
-        )
-        .unwrap_err();
-
-        assert!(matches!(err, VirtioBlockError::UnrestorableDrive(id) if id == "test"));
     }
 }

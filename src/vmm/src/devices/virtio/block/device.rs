@@ -8,6 +8,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::BlockError;
 use super::persist::{BlockConstructorArgs, BlockState};
+use super::virtio::VirtioBlockError;
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
@@ -32,17 +33,17 @@ impl Block {
             .map_err(|err| DriveError::CreateBlockDevice(BlockError::VirtioBackend(err)))
     }
 
-    pub fn config(&self) -> BlockDeviceConfig {
+    /// Drains every in-flight request so nothing this device started can write guest memory
+    /// after the call returns.
+    pub fn drain_writes(&mut self) -> Result<(), VirtioBlockError> {
         match self {
-            Self::Virtio(b) => b.config().into(),
+            Self::Virtio(b) => b.drain_writes(),
         }
     }
 
-    pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), BlockError> {
+    pub fn config(&self) -> BlockDeviceConfig {
         match self {
-            Self::Virtio(b) => b
-                .update_disk_image(disk_image_path)
-                .map_err(BlockError::VirtioBackend),
+            Self::Virtio(b) => b.config().into(),
         }
     }
 
@@ -160,12 +161,6 @@ impl VirtioDevice for Block {
     fn is_activated(&self) -> bool {
         match self {
             Self::Virtio(b) => b.device_state.is_activated(),
-        }
-    }
-
-    fn prepare_save(&mut self) {
-        match self {
-            Self::Virtio(b) => b.prepare_save(),
         }
     }
 }

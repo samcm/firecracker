@@ -91,8 +91,8 @@ Firecracker and the page fault handler.
 ![](../images/uffd_flow3.png)
 
 - Firecracker passes the userfault file descriptor and the guest memory layout
-  (e.g. dimensions of each memory region, and their [page size](../hugepages.md)
-  in KiB) to the page fault handler process through the socket.
+  (e.g. dimensions of each memory region and their page size in KiB) to the page
+  fault handler process through the socket.
 
 ![](../images/uffd_flow4.png)
 
@@ -111,30 +111,6 @@ After Firecracker sends the payload (i.e. mem mappings and file descriptor), no
 other communication happens on the UDS socket (or otherwise) between Firecracker
 and the page fault handler process.
 
-### Userfaultfd interaction with balloon
-
-The balloon device allows the host to reclaim memory from a microVM. For more
-details on balloon, please refer to [this doc](../ballooning.md).
-
-When the balloon device asks for removal of a memory range, Firecracker calls
-`madvise` with the `MADV_DONTNEED` flag in order to let the kernel know that it
-can free up memory found in that specific area. On such a system call, the
-userfaultfd interface sends `UFFD_EVENT_REMOVE`.
-
-When implementing the logic for the page fault handler, users must identify
-events of type `UFFD_EVENT_REMOVE` and handle them by zeroing out those pages.
-This is because the memory is removed, but the area still remains monitored by
-userfaultfd. After a cycle of inflation and deflation, page faults might happen
-again for memory ranges that have been removed by balloon (and subsequently
-zeroed out by the page fault handler). In such a case, the page fault handler
-process must zero out the faulted page (instead of bringing it from file), as
-recommended by
-[the userfaultfd documentation](https://www.kernel.org/doc/html/latest/admin-guide/mm/userfaultfd.html#non-cooperative-userfaultfd).
-
-In case of a compromised balloon driver, the page fault handler can get flooded
-with `UFFD_EVENT_REMOVE`. We recommend using the jailer's built-in cgroup
-functionality as defense in depth, in order to limit resource usage of the
-Firecracker process.
 
 ### Caveats
 

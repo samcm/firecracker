@@ -307,5 +307,3 @@ def test_firecracker_kill_by_pid(uvm_plain):
     microvm.start()
 
     microvm.kill()
-
-

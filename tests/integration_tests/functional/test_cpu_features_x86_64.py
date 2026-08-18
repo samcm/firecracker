@@ -35,8 +35,6 @@ def read_msr_csv(fd):
     return list(csvin)
 
 
-
-
 def _check_cpuid_x86(test_microvm, expected_cpu_count, expected_htt):
     expected_cpu_features = {
         "maximum IDs for CPUs in pkg": f"{expected_cpu_count:#x} ({expected_cpu_count})",
@@ -64,8 +62,6 @@ def _check_extended_cache_features(vm):
     assert lines_per_tag == 0x1  # This is hardcoded in the AMD spec
     assert assoc == 0x9  # This is hardcoded in the AMD spec
     assert cache_size > 0
-
-
 
 
 @pytest.mark.parametrize(
@@ -304,8 +300,6 @@ def test_cpu_rdmsr(
     check_msrs_are_equal(baseline_recs, guest_recs)
 
 
-
-
 def check_msrs_are_equal(before_recs, after_recs):
     """
     Checks that reported MSRs and their values in the files are equal.
@@ -331,16 +325,6 @@ def check_msrs_are_equal(before_recs, after_recs):
             print(f"MSR changed {msr} before={before[msr]} after={after[msr]}")
             changes += 1
     assert changes == 0
-
-
-
-
-
-
-
-
-
-
 
 
 def test_cpu_template(uvm_plain_any, cpu_template_any):
@@ -383,7 +367,6 @@ def test_cpu_template(uvm_plain_any, cpu_template_any):
 
     check_masked_features(test_microvm, cpu_template_name)
     check_enabled_features(test_microvm, cpu_template_name)
-
 
 
 def check_masked_features(test_microvm, cpu_template):

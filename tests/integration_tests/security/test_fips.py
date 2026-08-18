@@ -14,5 +14,3 @@ def test_fips_enabled(uvm_with_fips):
     """Test that FIPS mode is enabled in the guest kernel."""
     _, dmesg, _ = uvm_with_fips.ssh.run("dmesg | grep -i fips")
     assert "fips mode: enabled" in dmesg.lower()
-
-

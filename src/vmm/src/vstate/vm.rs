@@ -551,6 +551,10 @@ impl KvmVm {
     }
 
     /// Retires the bits of a snapshot: KVM re-protects them and the host accumulator is reset.
+    ///
+    /// KVM drops a slot's bits as it clears them, so the accumulator takes the whole snapshot over
+    /// first and is only reset once every slot cleared: a failure part way through leaves every
+    /// reported bit for the next harvest.
     pub fn clear_dirty_log(&self, snapshot: &[Vec<u64>]) -> Result<(), VmError> {
         let page_size = host_page_size();
         if snapshot.len() != self.guest_memory().num_regions() {
@@ -561,6 +565,11 @@ impl KvmVm {
             if words.len() != pages.div_ceil(64) {
                 return Err(VmError::DirtyBitmapShape);
             }
+        }
+
+        self.union_dirty_log(snapshot);
+        for (region, words) in self.guest_memory().iter().zip(snapshot) {
+            let pages = u64_to_usize(region.len()).div_ceil(page_size);
             let clear = kvm_clear_dirty_log {
                 slot: region.slot,
                 num_pages: u32::try_from(pages).map_err(|_| VmError::DirtyBitmapShape)?,
@@ -745,6 +754,42 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(0x1000);
         let res = vm.register_memory_regions(gm);
         res.unwrap();
+    }
+
+    /// A clear that fails part way through must leave every reported bit for the next harvest.
+    #[test]
+    fn test_failed_clear_preserves_every_reported_bit() {
+        let page_size = host_page_size();
+        let mut vm = setup_vm();
+        vm.register_memory_regions(crate::test_utils::multi_region_mem_raw(&[
+            (GuestAddress(0), page_size),
+            (GuestAddress(0x1_0000), page_size),
+        ]))
+        .unwrap();
+
+        vm.guest_memory().mark_dirty(GuestAddress(0), page_size);
+        vm.guest_memory()
+            .mark_dirty(GuestAddress(0x1_0000), page_size);
+        let snapshot = vm.snapshot_dirty_log().unwrap();
+        assert!(snapshot.iter().all(|words| words[0] & 1 == 1));
+
+        // Emptying the accumulator leaves the snapshot as the only record of those bits, so the
+        // assertion below holds exactly when the clear took them over before touching KVM.
+        vm.guest_memory().reset_dirty();
+
+        // Dropping dirty logging on the second slot makes its clear fail while the first succeeds.
+        let second: &GuestRegionMmapExt = vm.guest_memory().iter().nth(1).unwrap();
+        let mut region = kvm_userspace_memory_region::from(second);
+        region.flags = 0;
+        vm.set_user_memory_region(region).unwrap();
+
+        assert!(matches!(
+            vm.clear_dirty_log(&snapshot),
+            Err(VmError::ClearDirtyLog(_))
+        ));
+        for region in vm.guest_memory().iter() {
+            assert!(region.bitmap().unwrap().dirty_at(0));
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 import os
 import shutil
+import subprocess
 from concurrent.futures import ProcessPoolExecutor
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from framework import utils
 from framework.jailer import DEFAULT_CHROOT_PATH, JailerContext
 from framework.properties import global_props
+from host_tools.farplane import PAGE_SIZE, ROOT_SEALS, sealed_memfd
 
 
 def setup_bind_mounts(tmp_path, n):
@@ -31,6 +33,21 @@ def clean_up_mounts(tmp_path):
     mounts_paths = tmp_path / "mounts"
     for d in os.listdir(mounts_paths):
         utils.check_output(f"umount {mounts_paths}/{d}")
+
+
+def time_jailer(argv):
+    """Run one jailer with the root memfd it renumbers, returning the timestamps it printed."""
+    root_fd = sealed_memfd("rootfs", PAGE_SIZE, seals=ROOT_SEALS)
+    try:
+        return subprocess.run(
+            [*argv, "--root-fd", str(root_fd)],
+            capture_output=True,
+            check=True,
+            pass_fds=(root_fd,),
+            text=True,
+        ).stdout
+    finally:
+        os.close(root_fd)
 
 
 @pytest.mark.nonci
@@ -64,8 +81,6 @@ def test_jailer_startup(
         jailer = JailerContext(
             jailer_id=f"fakefc{i}",
             exec_file=jailer_time_bin,
-            # Don't deamonize to get the stdout
-            daemonize=False,
         )
         jailer.setup()
 
@@ -73,12 +88,8 @@ def test_jailer_startup(
         cmds.append(cmd)
 
     with ProcessPoolExecutor(max_workers=parallel) as executor:
-        # Submit all commands and get results
-        results = executor.map(utils.check_output, cmds)
-
-        # Get results as they complete
-        for result in results:
-            end_time, start_time = result.stdout.split()
+        for stdout in executor.map(time_jailer, cmds):
+            end_time, start_time = stdout.split()
             metrics.put_metric(
                 "startup",
                 int(end_time) - int(start_time),

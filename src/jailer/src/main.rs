@@ -19,7 +19,7 @@ mod resource_limits;
 
 const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Descriptor Firecracker reads the pre-created userfaultfd from.
+/// Descriptor Firecracker creates its userfaultfd from.
 pub(crate) const UFFD_FILENO: libc::c_int = 3;
 /// Descriptor Firecracker reads the sealed root block device image from.
 pub(crate) const ROOT_FILENO: libc::c_int = 4;
@@ -118,8 +118,8 @@ pub enum JailerError {
     UmountOldRoot(io::Error),
     #[error("Failed to unshare into new mount namespace: {0}")]
     UnshareNewNs(io::Error),
-    #[error("Failed to create userfaultfd: {0}")]
-    Userfaultfd(io::Error),
+    #[error("Failed to open the userfaultfd device: {0}")]
+    UserfaultfdDevice(io::Error),
     #[error("{}", format!("Failed to write to {:?}: {}", .0, .1).replace('\"', ""))]
     Write(PathBuf, io::Error),
 }

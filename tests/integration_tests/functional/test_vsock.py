@@ -25,11 +25,11 @@ from framework.utils_vsock import (
     check_host_connections,
     check_vsock_device,
     make_blob,
+    start_guest_echo_server,
 )
 from host_tools.fcmetrics import validate_fc_metrics
 
 NEGATIVE_TEST_CONNECTION_COUNT = 100
-
 
 
 @pytest.fixture
@@ -118,15 +118,3 @@ def test_vsock_epipe(vsock_uvm_any, bin_vsock_path, test_fc_session_root_path):
     negative_test_host_connections(vm, blob_path, blob_hash)
     metrics = vm.flush_metrics()
     validate_fc_metrics(metrics)
-
-
-
-
-
-
-
-
-
-
-
-

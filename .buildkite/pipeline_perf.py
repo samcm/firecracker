@@ -26,12 +26,6 @@ perf_test = {
         "tests": "integration_tests/performance/test_block.py::test_block_performance -k Async",
         "devtool_opts": "-c 1-10 -m 0",
     },
-    "vhost-user-block": {
-        "label": "vhost-user-block",
-        "tests": "integration_tests/performance/test_block.py::test_block_vhost_user_performance",
-        "devtool_opts": "-c 1-10 -m 0",
-        "ab_opts": "--noise-threshold 0.1",
-    },
     "network": {
         "label": "network",
         "tests": "integration_tests/performance/test_network.py",
@@ -70,21 +64,6 @@ perf_test = {
     "jailer": {
         "label": "jailer",
         "tests": "integration_tests/performance/test_jailer.py",
-        "devtool_opts": "-c 1-10 -m 0",
-    },
-    "pmem": {
-        "label": "pmem",
-        "tests": "integration_tests/performance/test_pmem.py",
-        "devtool_opts": "-c 1-10 -m 0",
-    },
-    "mmds": {
-        "label": "mmds",
-        "tests": "integration_tests/performance/test_mmds.py",
-        "devtool_opts": "-c 1-10 -m 0",
-    },
-    "memory-hotplug": {
-        "label": "memory-hotplug",
-        "tests": "integration_tests/performance/test_hotplug_memory.py",
         "devtool_opts": "-c 1-10 -m 0",
     },
 }

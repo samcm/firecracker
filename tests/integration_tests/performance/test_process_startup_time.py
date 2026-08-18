@@ -13,31 +13,6 @@ ITERATIONS = 100
 
 
 @pytest.mark.nonci
-def test_startup_time_new_pid_ns(
-    microvm_factory, guest_kernel_default, rootfs, metrics
-):
-    """
-    Check startup time when jailer is spawned in a new PID namespace.
-    """
-    for _ in range(ITERATIONS):
-        microvm = microvm_factory.build(guest_kernel_default, rootfs)
-        microvm.jailer.new_pid_ns = True
-        _test_startup_time(microvm, metrics, "new_pid_ns")
-        microvm.kill()
-
-
-@pytest.mark.nonci
-def test_startup_time_daemonize(microvm_factory, guest_kernel_default, rootfs, metrics):
-    """
-    Check startup time when jailer detaches Firecracker from the controlling terminal.
-    """
-    for _ in range(ITERATIONS):
-        microvm = microvm_factory.build(guest_kernel_default, rootfs)
-        _test_startup_time(microvm, metrics, "daemonize")
-        microvm.kill()
-
-
-@pytest.mark.nonci
 def test_startup_time_custom_seccomp(
     microvm_factory, guest_kernel_default, rootfs, metrics
 ):
