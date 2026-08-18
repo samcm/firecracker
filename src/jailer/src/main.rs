@@ -4,62 +4,44 @@
 use std::ffi::{CString, NulError, OsString};
 use std::fmt::{Debug, Display};
 use std::path::{Path, PathBuf};
-use std::{env as p_env, fs, io};
+use std::{fs, io};
 
-use env::PROC_MOUNTS;
-use utils::arg_parser::{ArgParser, Argument, UtilsArgParserError as ParsingError};
+use utils::arg_parser::{ArgParser, Argument, UtilsArgParserError};
 use utils::time::{ClockType, get_time_us};
 use utils::validators;
 use vmm_sys_util::syscall::SyscallReturnCode;
 
 use crate::env::Env;
 
-mod cgroup;
 mod chroot;
 mod env;
 mod resource_limits;
 
 const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Descriptor Firecracker reads the pre-created userfaultfd from.
+pub(crate) const UFFD_FILENO: libc::c_int = 3;
+/// Descriptor Firecracker reads the sealed root block device image from.
+pub(crate) const ROOT_FILENO: libc::c_int = 4;
+
 #[derive(Debug, thiserror::Error)]
 pub enum JailerError {
     #[error("Failed to parse arguments: {0}")]
-    ArgumentParsing(ParsingError),
+    ArgumentParsing(UtilsArgParserError),
     #[error("{}", format!("Failed to canonicalize path {:?}: {}", .0, .1).replace('\"', ""))]
     Canonicalize(PathBuf, io::Error),
-    #[error("{}", format!("Failed to inherit cgroups configurations from file {} in path {:?}", .1, .0).replace('\"', ""))]
-    CgroupInheritFromParent(PathBuf, String),
-    #[error("{1} configurations not found in {0}")]
-    CgroupLineNotFound(String, String),
-    #[error("Cgroup invalid file: {0}")]
-    CgroupInvalidFile(String),
-    #[error("Invalid format for cgroups: {0}")]
-    CgroupFormat(String),
-    #[error("Hierarchy not found: {0}")]
-    CgroupHierarchyMissing(String),
-    #[error("Controller {0} is unavailable")]
-    CgroupControllerUnavailable(String),
-    #[error("{0} is an invalid cgroup version specifier")]
-    CgroupInvalidVersion(String),
-    #[error("Parent cgroup path is invalid. Path should not be absolute or contain '..' or '.'")]
-    CgroupInvalidParentPath(),
-    #[error(
-        "Failed to move process to cgroup ({0}): {1}.\nHint: If you intended to create a child \
-         cgroup under {0}, pass any --cgroup parameters."
-    )]
-    CgroupMove(PathBuf, io::Error),
+    #[error("Failed to join cgroup {0}: {1}")]
+    CgroupJoin(PathBuf, io::Error),
+    #[error("--cgroup-join path must be absolute")]
+    CgroupJoinNotAbsolute,
     #[error("Failed to change owner for {0}: {1}")]
     ChangeFileOwner(PathBuf, io::Error),
     #[error("Failed to chdir into chroot directory: {0}")]
     ChdirNewRoot(io::Error),
     #[error("Failed to change permissions on {0}: {1}")]
     Chmod(PathBuf, io::Error),
-    #[error("Failed cloning into a new child process: {0}")]
-    Clone(io::Error),
-    #[error("Failed to close netns fd: {0}")]
-    CloseNetNsFd(io::Error),
-    #[error("Failed to close /dev/null fd: {0}")]
-    CloseDevNullFd(io::Error),
+    #[error("Failed to close fd: {0}")]
+    Close(io::Error),
     #[error("Failed to call close range syscall: {0}")]
     CloseRange(io::Error),
     #[error("{}", format!("Failed to copy {:?} to {:?}: {}", .0, .1, .2).replace('\"', ""))]
@@ -68,10 +50,6 @@ pub enum JailerError {
     CreateDir(PathBuf, io::Error),
     #[error("Encountered interior \\0 while parsing a string")]
     CStringParsing(NulError),
-    #[error("Failed to daemonize: {0}")]
-    Daemonize(io::Error),
-    #[error("Failed to open directory {0}: {1}")]
-    DirOpen(String, String),
     #[error("Failed to duplicate fd: {0}")]
     Dup2(io::Error),
     #[error("Failed to exec into Firecracker: {0}")]
@@ -80,14 +58,6 @@ pub enum JailerError {
     ExtractFileName(PathBuf),
     #[error("{}", format!("Failed to open file {:?}: {}", .0, .1).replace('\"', ""))]
     FileOpen(PathBuf, io::Error),
-    #[error("Failed to decode string from byte array: {0}")]
-    FromBytesWithNul(std::ffi::FromBytesWithNulError),
-    #[error("Failed to get flags from fd: {0}")]
-    GetOldFdFlags(io::Error),
-    #[error("Failed to get PID (getpid): {0}")]
-    GetPid(io::Error),
-    #[error("Failed to get SID (getsid): {0}")]
-    GetSid(io::Error),
     #[error("Invalid gid: {0}")]
     Gid(String),
     #[error("Detected hard link at: {0}")]
@@ -96,8 +66,6 @@ pub enum JailerError {
     InvalidInstanceId(validators::ValidatorError),
     #[error("Cannot get metadata for a file: {0}: {1}")]
     Metadata(PathBuf, io::Error),
-    #[error("{}", format!("File {:?} doesn't have a parent", .0).replace('\"', ""))]
-    MissingParent(PathBuf),
     #[error("Failed to create the jail root directory before pivoting root: {0}")]
     MkdirOldRoot(io::Error),
     #[error("Failed to create {1} via mknod inside the jail: {0}")]
@@ -116,12 +84,8 @@ pub enum JailerError {
     OsStringParsing(PathBuf, OsString),
     #[error("Failed to pivot root: {0}")]
     PivotRoot(io::Error),
-    #[error("{}", format!("Failed to read line from {:?}: {}", .0, .1).replace('\"', ""))]
-    ReadLine(PathBuf, io::Error),
     #[error("{}", format!("Failed to read file {:?} into a string: {}", .0, .1).replace('\"', ""))]
     ReadToString(PathBuf, io::Error),
-    #[error("Regex failed: {0}")]
-    RegEx(regex::Error),
     #[error("Invalid resource argument: {0}")]
     ResLimitArgument(String),
     #[error("Invalid format for resources limits: {0}")]
@@ -130,26 +94,32 @@ pub enum JailerError {
     ResLimitValue(String, String),
     #[error("Failed to remove old jail root directory: {0}")]
     RmOldRootDir(io::Error),
+    #[error("--root-fd is not a descriptor number: {0}")]
+    RootFdArgument(String),
+    #[error("--root-fd must have a nonzero size")]
+    RootFdEmpty,
+    #[error("Failed to inspect --root-fd: {0}")]
+    RootFdInspect(io::Error),
+    #[error("--root-fd is not a memfd")]
+    RootFdNotMemfd,
+    #[error("--root-fd must be opened O_RDONLY")]
+    RootFdNotReadOnly,
+    #[error("--root-fd is missing the write, grow, shrink or seal memfd seal")]
+    RootFdNotSealed,
     #[error("Failed to change current directory: {0}")]
     SetCurrentDir(io::Error),
     #[error("Failed to join network namespace: netns: {0}")]
     SetNetNs(io::Error),
     #[error("Failed to set limit for resource: {0}")]
     Setrlimit(String),
-    #[error("Failed to daemonize: setsid: {0}")]
-    SetSid(io::Error),
     #[error("Invalid uid: {0}")]
     Uid(String),
     #[error("Failed to unmount the old jail root: {0}")]
     UmountOldRoot(io::Error),
-    #[error("Unexpected value for the socket listener fd: {0}")]
-    UnexpectedListenerFd(i32),
     #[error("Failed to unshare into new mount namespace: {0}")]
     UnshareNewNs(io::Error),
-    #[error("Failed to unset the O_CLOEXEC flag on the socket fd: {0}")]
-    UnsetCloexec(io::Error),
-    #[error("Slice contains invalid UTF-8 data : {0}")]
-    UTF8Parsing(std::str::Utf8Error),
+    #[error("Failed to create userfaultfd: {0}")]
+    Userfaultfd(io::Error),
     #[error("{}", format!("Failed to write to {:?}: {}", .0, .1).replace('\"', ""))]
     Write(PathBuf, io::Error),
 }
@@ -183,6 +153,15 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .help("The group identifier the jailer switches to after exec."),
         )
         .arg(
+            Argument::new("root-fd")
+                .required(true)
+                .takes_value(true)
+                .help(
+                    "Inherited descriptor of the sealed read-only root block device image. It is \
+                     validated and handed to Firecracker as fd 4.",
+                ),
+        )
+        .arg(
             Argument::new("chroot-base-dir")
                 .takes_value(true)
                 .default_value("/srv/jailer")
@@ -193,19 +172,9 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .takes_value(true)
                 .help("Path to the network namespace this microVM should join."),
         )
-        .arg(Argument::new("daemonize").takes_value(false).help(
-            "Daemonize the jailer before exec, by invoking setsid(), and redirecting the standard \
-             I/O file descriptors to /dev/null.",
-        ))
-        .arg(
-            Argument::new("new-pid-ns")
-                .takes_value(false)
-                .help("Exec into a new PID namespace."),
-        )
-        .arg(Argument::new("cgroup").allow_multiple(true).help(
-            "Cgroup and value to be set by the jailer. It must follow this format: \
-             <cgroup_file>=<value> (e.g cpu.shares=10). This argument can be used multiple times \
-             to add multiple cgroups.",
+        .arg(Argument::new("cgroup-join").takes_value(true).help(
+            "Absolute cgroupfs path of a pre-created leaf cgroup. The Firecracker process \
+                     is moved into it before privileges are dropped.",
         ))
         .arg(Argument::new("resource-limit").allow_multiple(true).help(
             "Resource limit values to be set by the jailer. It must follow this format: \
@@ -213,19 +182,9 @@ pub fn build_arg_parser() -> ArgParser<'static> {
              add multiple resource limits. Current available resource values are:\n\t\tfsize: The \
              maximum size in bytes for files created by the process.\n\t\tno-file: Specifies a \
              value one greater than the maximum file descriptor number that can be opened by this \
-             process.",
+             process.\n\t\tmemlock: The maximum size in bytes of memory that may be locked into \
+             RAM.",
         ))
-        .arg(
-            Argument::new("cgroup-version")
-                .takes_value(true)
-                .default_value("1")
-                .help("Select the cgroup version used by the jailer."),
-        )
-        .arg(
-            Argument::new("parent-cgroup")
-                .takes_value(true)
-                .help("Parent cgroup in which the cgroup of this microvm will be placed."),
-        )
         .arg(
             Argument::new("version")
                 .takes_value(false)
@@ -233,8 +192,6 @@ pub fn build_arg_parser() -> ArgParser<'static> {
         )
 }
 
-// It's called writeln_special because we have to use this rather convoluted way of writing
-// to special cgroup files, to avoid getting errors. It would be nice to know why that happens :-s
 pub fn writeln_special<T, V>(file_path: &T, value: V) -> Result<(), JailerError>
 where
     T: AsRef<Path> + Debug,
@@ -254,13 +211,15 @@ pub fn readln_special<T: AsRef<Path> + Debug>(file_path: &T) -> Result<String, J
     Ok(line)
 }
 
-fn close_fds_by_close_range() -> Result<(), JailerError> {
-    // First try using the close_range syscall to close all open FDs in the range of 3..UINT_MAX
-    // SAFETY: if the syscall is not available then ENOSYS will be returned
+/// Closes every inherited descriptor above the ones the jailed binary needs: the standard
+/// streams, [`UFFD_FILENO`] and [`ROOT_FILENO`], which are the highest reserved number.
+pub(crate) fn close_inherited_fds() -> Result<(), JailerError> {
+    // SAFETY: closing a range which holds no open descriptors is a no-op, and the return code
+    // of the syscall is checked.
     SyscallReturnCode(unsafe {
         libc::syscall(
             libc::SYS_close_range,
-            3,
+            ROOT_FILENO + 1,
             libc::c_uint::MAX,
             libc::CLOSE_RANGE_UNSHARE,
         )
@@ -269,38 +228,18 @@ fn close_fds_by_close_range() -> Result<(), JailerError> {
     .map_err(JailerError::CloseRange)
 }
 
-// Closes all FDs other than 0 (STDIN), 1 (STDOUT) and 2 (STDERR)
-fn close_inherited_fds() -> Result<(), JailerError> {
-    // We use the close_range syscall which is available on kernels > 5.9.
-    close_fds_by_close_range()?;
-    Ok(())
-}
-
-fn sanitize_process() -> Result<(), JailerError> {
-    // First thing to do is make sure we don't keep any inherited FDs
-    // other that IN, OUT and ERR.
-    close_inherited_fds()?;
-
-    // Cleanup environment variables.
-    clean_env_vars();
-    Ok(())
-}
-
 fn clean_env_vars() {
-    // Remove environment variables received from
-    // the parent process so there are no leaks
-    // inside the jailer environment
-    for (key, _) in p_env::vars() {
+    // Remove environment variables received from the parent process so there are no leaks inside
+    // the jailer environment.
+    for (key, _) in std::env::vars() {
         // SAFETY: the function is safe to call in a single-threaded program
         unsafe {
-            p_env::remove_var(key);
+            std::env::remove_var(key);
         }
     }
 }
 
 /// Turns an [`AsRef<Path>`] into a [`CString`] (c style string).
-/// The expect should not fail, since Linux paths only contain valid Unicode chars (do they?),
-/// and do not contain null bytes (do they?).
 pub fn to_cstring<T: AsRef<Path> + Debug>(path: T) -> Result<CString, JailerError> {
     let path_str = path
         .as_ref()
@@ -323,8 +262,7 @@ fn main() -> Result<(), JailerError> {
 }
 
 fn main_exec() -> Result<(), JailerError> {
-    sanitize_process()
-        .unwrap_or_else(|err| panic!("Failed to sanitize the Jailer process: {}", err));
+    clean_env_vars();
 
     let mut arg_parser = build_arg_parser();
     arg_parser
@@ -348,7 +286,6 @@ fn main_exec() -> Result<(), JailerError> {
         arguments,
         get_time_us(ClockType::Monotonic),
         get_time_us(ClockType::ProcessCpu),
-        PROC_MOUNTS,
     )
     .and_then(|env| {
         fs::create_dir_all(env.chroot_dir())
@@ -360,99 +297,29 @@ fn main_exec() -> Result<(), JailerError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::undocumented_unsafe_blocks)]
-
-    use std::env;
-    use std::ffi::CStr;
-    use std::fs::File;
-    use std::os::unix::io::IntoRawFd;
-
-    use vmm_sys_util::rand;
-
     use super::*;
 
-    fn run_close_fds_test(test_fn: fn() -> Result<(), JailerError>) {
-        let n = 100;
-
-        let tmp_dir_path = format!(
-            "/tmp/jailer/tests/close_fds/_{}",
-            rand::rand_alphanumerics(4).into_string().unwrap()
-        );
-        fs::create_dir_all(&tmp_dir_path).unwrap();
-
-        let mut fds = Vec::new();
-        for i in 0..n {
-            let maybe_file = File::create(format!("{}/{}", &tmp_dir_path, i));
-            fds.push(maybe_file.unwrap().into_raw_fd());
-        }
-
-        test_fn().unwrap();
-
-        for fd in fds {
-            let is_fd_opened = unsafe { libc::fcntl(fd, libc::F_GETFD) } == 0;
-            assert!(!is_fd_opened);
-        }
-
-        fs::remove_dir_all(tmp_dir_path).unwrap();
-    }
-
     #[test]
-    fn test_fds_close_range() {
-        // SAFETY: Always safe
-        let mut n = unsafe { std::mem::zeroed() };
-        // SAFETY: We check if the uname call succeeded
-        assert_eq!(unsafe { libc::uname(&mut n) }, 0);
-        // SAFETY: Always safe
-        let release = unsafe { CStr::from_ptr(n.release.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        // Parse the major and minor version of the kernel
-        let mut r = release.split('.');
-        let major: i32 = str::parse(r.next().unwrap()).unwrap();
-        let minor: i32 = str::parse(r.next().unwrap()).unwrap();
-
-        // Skip this test if we're running on a too old kernel
-        if major > 5 || (major == 5 && minor >= 9) {
-            run_close_fds_test(close_fds_by_close_range);
-        }
-    }
-
-    #[test]
-    fn test_sanitize_process() {
-        run_close_fds_test(sanitize_process);
+    fn test_to_cstring() {
+        let path = PathBuf::from("/tmp");
+        assert_eq!(to_cstring(&path).unwrap(), CString::new("/tmp").unwrap());
     }
 
     #[test]
     fn test_clean_env_vars() {
         let env_vars: [&str; 5] = ["VAR1", "VAR2", "VAR3", "VAR4", "VAR5"];
 
-        // Set environment variables
         for env_var in env_vars.iter() {
             // SAFETY: the function is safe to call in a single-threaded program
             unsafe {
-                env::set_var(env_var, "0");
+                std::env::set_var(env_var, "0");
             }
         }
 
-        // Cleanup the environment
         clean_env_vars();
 
-        // Assert that the variables set beforehand
-        // do not exist anymore
         for env_var in env_vars.iter() {
-            assert_eq!(env::var_os(env_var), None);
+            assert_eq!(std::env::var_os(env_var), None);
         }
-    }
-
-    #[test]
-    fn test_to_cstring() {
-        let path = Path::new("some_path");
-        let cstring_path = to_cstring(path).unwrap();
-        assert_eq!(cstring_path, CString::new("some_path").unwrap());
-        let path_with_nul = Path::new("some_path\0");
-        assert_eq!(
-            format!("{}", to_cstring(path_with_nul).unwrap_err()),
-            "Encountered interior \\0 while parsing a string"
-        );
     }
 }
