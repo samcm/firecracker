@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use event_manager::SubscriberOps;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
 use utils::time::TimestampUs;
+#[cfg(target_arch = "aarch64")]
 use vm_memory::GuestAddress;
 
 #[cfg(target_arch = "aarch64")]

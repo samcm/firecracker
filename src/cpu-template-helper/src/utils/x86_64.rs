@@ -133,6 +133,7 @@ impl From<MsrModifierMap> for Vec<RegisterModifier> {
     }
 }
 
+#[cfg(test)]
 macro_rules! cpuid_reg_modifier {
     ($register:expr, $value:expr) => {
         CpuidRegisterModifier {
@@ -154,6 +155,7 @@ macro_rules! cpuid_reg_modifier {
     };
 }
 
+#[cfg(test)]
 macro_rules! cpuid_leaf_modifier {
     ($leaf:expr, $subleaf:expr, $flags:expr, $reg_modifiers:expr) => {
         CpuidLeafModifier {
@@ -165,6 +167,7 @@ macro_rules! cpuid_leaf_modifier {
     };
 }
 
+#[cfg(test)]
 macro_rules! msr_modifier {
     ($addr:expr, $value:expr) => {
         RegisterModifier {
@@ -186,8 +189,11 @@ macro_rules! msr_modifier {
     };
 }
 
+#[cfg(test)]
 pub(crate) use cpuid_leaf_modifier;
+#[cfg(test)]
 pub(crate) use cpuid_reg_modifier;
+#[cfg(test)]
 pub(crate) use msr_modifier;
 
 #[cfg(test)]
