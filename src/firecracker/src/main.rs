@@ -33,10 +33,10 @@ use vmm::logger::{
     LOGGER, LoggerConfig, METRICS, ProcessTimeReporter, StoreMetric, debug, error_unrestricted,
     info_unrestricted,
 };
-use vmm::persist::SNAPSHOT_VERSION;
 use vmm::resources::VmResources;
 use vmm::seccomp::BpfThreadMap;
 use vmm::signal_handler::register_signal_handlers;
+use vmm::snapshot::SNAPSHOT_VERSION;
 use vmm::snapshot::{SnapshotError, get_format_version};
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics};
@@ -54,7 +54,6 @@ const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
 } else {
     env!("CARGO_PKG_VERSION")
 };
-const MMDS_CONTENT_ARG: &str = "metadata";
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 enum MainError {
@@ -76,6 +75,10 @@ enum MainError {
     SeccompFilter(FilterError),
     /// Failed to resize fd table: {0}
     ResizeFdtable(ResizeFdTableError),
+    /// Failed to arm parent-death signal: {0}
+    ParentDeath(io::Error),
+    /// Missing required --farplane-mem-socket
+    MissingFarplaneSocket,
     /// RunWithApiError error: {0}
     RunWithApi(ApiServerError),
     /// RunWithoutApiError error: {0}
@@ -203,11 +206,6 @@ fn main_exec() -> Result<(), MainError> {
                     .help("Path to a file that contains the microVM configuration in JSON format."),
             )
             .arg(
-                Argument::new(MMDS_CONTENT_ARG).takes_value(true).help(
-                    "Path to a file that contains metadata in JSON format to add to the mmds.",
-                ),
-            )
-            .arg(
                 Argument::new("no-api")
                     .takes_value(false)
                     .requires("config-file")
@@ -270,14 +268,14 @@ fn main_exec() -> Result<(), MainError> {
                     .help("Http API request payload max size, in bytes."),
             )
             .arg(
-                Argument::new("mmds-size-limit")
-                    .takes_value(true)
-                    .help("Mmds data store limit, in bytes."),
-            )
-            .arg(
                 Argument::new("enable-pci")
                     .takes_value(false)
                     .help("Enables PCIe support."),
+            )
+            .arg(
+                Argument::new("farplane-mem-socket")
+                    .takes_value(true)
+                    .help("Path to the pagemaster SEQPACKET memory channel."),
             );
 
     arg_parser.parse_from_cmdline()?;
@@ -291,6 +289,7 @@ fn main_exec() -> Result<(), MainError> {
 
     if arguments.flag_present("version") {
         println!("Firecracker v{}\n", FIRECRACKER_VERSION);
+        println!("{}", vmm::vstate::farplane::FEATURE_IDENTITY);
         return Ok(());
     }
 
@@ -303,6 +302,11 @@ fn main_exec() -> Result<(), MainError> {
         print_snapshot_data_format(snapshot_path)?;
         return Ok(());
     }
+
+    let farplane_socket = arguments
+        .single_value("farplane-mem-socket")
+        .ok_or(MainError::MissingFarplaneSocket)?;
+    vmm::vstate::farplane::FarplaneBackend::set_socket_path(PathBuf::from(farplane_socket));
 
     // It's safe to unwrap here because the field's been provided with a default value.
     let instance_id = arguments.single_value("id").unwrap();
@@ -339,6 +343,7 @@ fn main_exec() -> Result<(), MainError> {
     );
 
     register_signal_handlers().map_err(MainError::RegisterSignalHandlers)?;
+    arm_parent_death_signal()?;
 
     #[cfg(target_arch = "aarch64")]
     enable_ssbd_mitigation();
@@ -366,6 +371,7 @@ fn main_exec() -> Result<(), MainError> {
         state: VmState::NotStarted,
         vmm_version: FIRECRACKER_VERSION.to_string(),
         app_name: "Firecracker".to_string(),
+        farplane: vmm::vstate::farplane::FarplaneState::default(),
     };
 
     if let Some(metrics_path) = arguments.single_value("metrics-path") {
@@ -387,11 +393,6 @@ fn main_exec() -> Result<(), MainError> {
         .map(fs::read_to_string)
         .map(|x| x.expect("Unable to open or read from the configuration file"));
 
-    let metadata_json = arguments
-        .single_value(MMDS_CONTENT_ARG)
-        .map(fs::read_to_string)
-        .map(|x| x.expect("Unable to open or read from the mmds content file"));
-
     let boot_timer_enabled = arguments.flag_present("boot-timer");
     let pci_enabled = arguments.flag_present("enable-pci");
     let api_enabled = !arguments.flag_present("no-api");
@@ -404,17 +405,6 @@ fn main_exec() -> Result<(), MainError> {
         })
         // Safe to unwrap as we provide a default value.
         .unwrap();
-
-    // If the mmds size limit is not explicitly configured, default to using the
-    // `http-api-max-payload-size` value.
-    let mmds_size_limit = arg_parser
-        .arguments()
-        .single_value("mmds-size-limit")
-        .map(|lim| {
-            lim.parse::<usize>()
-                .expect("'mmds-size-limit' parameter expected to be of 'usize' type.")
-        })
-        .unwrap_or_else(|| api_payload_limit);
 
     if api_enabled {
         let bind_path = arguments
@@ -449,8 +439,6 @@ fn main_exec() -> Result<(), MainError> {
             boot_timer_enabled,
             pci_enabled,
             api_payload_limit,
-            mmds_size_limit,
-            metadata_json.as_deref(),
         )
         .map_err(MainError::RunWithApi)
     } else {
@@ -464,8 +452,6 @@ fn main_exec() -> Result<(), MainError> {
             instance_info,
             boot_timer_enabled,
             pci_enabled,
-            mmds_size_limit,
-            metadata_json.as_deref(),
         )
         .map_err(MainError::RunWithoutApiError)
     }
@@ -516,6 +502,17 @@ fn resize_fdtable() -> Result<(), ResizeFdTableError> {
         }
     }
 
+    Ok(())
+}
+
+fn arm_parent_death_signal() -> Result<(), MainError> {
+    let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+    if ret != 0 {
+        return Err(MainError::ParentDeath(io::Error::last_os_error()));
+    }
+    if unsafe { libc::getppid() } == 1 {
+        unsafe { libc::raise(libc::SIGKILL) };
+    }
     Ok(())
 }
 
@@ -581,7 +578,6 @@ pub enum BuildFromJsonError {
 }
 
 // Configure and start a microVM as described by the command-line JSON.
-#[allow(clippy::too_many_arguments)]
 fn build_microvm_from_json(
     seccomp_filters: &BpfThreadMap,
     event_manager: &mut EventManager,
@@ -589,11 +585,9 @@ fn build_microvm_from_json(
     instance_info: InstanceInfo,
     boot_timer_enabled: bool,
     pci_enabled: bool,
-    mmds_size_limit: usize,
-    metadata_json: Option<&str>,
 ) -> Result<Arc<Mutex<vmm::Vmm>>, BuildFromJsonError> {
     let mut vm_resources =
-        VmResources::from_json(&config_json, &instance_info, mmds_size_limit, metadata_json)
+        VmResources::from_json(&config_json, &instance_info, HTTP_MAX_PAYLOAD_SIZE, None)
             .map_err(BuildFromJsonError::ParseFromJson)?;
     vm_resources.boot_timer = boot_timer_enabled;
     vm_resources.pci_enabled = pci_enabled;
@@ -622,10 +616,8 @@ fn run_without_api(
     seccomp_filters: &BpfThreadMap,
     config_json: Option<String>,
     instance_info: InstanceInfo,
-    bool_timer_enabled: bool,
+    boot_timer_enabled: bool,
     pci_enabled: bool,
-    mmds_size_limit: usize,
-    metadata_json: Option<&str>,
 ) -> Result<(), RunWithoutApiError> {
     let mut event_manager = EventManager::new().expect("Unable to create EventManager");
 
@@ -640,10 +632,8 @@ fn run_without_api(
         // Safe to unwrap since '--no-api' requires this to be set.
         config_json.unwrap(),
         instance_info,
-        bool_timer_enabled,
+        boot_timer_enabled,
         pci_enabled,
-        mmds_size_limit,
-        metadata_json,
     )
     .map_err(RunWithoutApiError::BuildMicroVMFromJson)?;
 

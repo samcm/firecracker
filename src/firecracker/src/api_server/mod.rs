@@ -22,7 +22,6 @@ use vmm::logger::{
 };
 use vmm::rpc_interface::{ApiRequest, ApiResponse, VmmAction};
 use vmm::seccomp::BpfProgramRef;
-use vmm::vmm_config::snapshot::SnapshotType;
 use vmm_sys_util::eventfd::EventFd;
 
 /// Structure associated with the API server implementation.
@@ -150,16 +149,6 @@ impl ApiServer {
         request_processing_start_us: u64,
     ) -> Response {
         let metric_with_action = match *vmm_action {
-            VmmAction::CreateSnapshot(ref params) => match params.snapshot_type {
-                SnapshotType::Full => Some((
-                    &METRICS.latencies_us.full_create_snapshot,
-                    "create full snapshot",
-                )),
-                SnapshotType::Diff => Some((
-                    &METRICS.latencies_us.diff_create_snapshot,
-                    "create diff snapshot",
-                )),
-            },
             VmmAction::LoadSnapshot(_) => {
                 Some((&METRICS.latencies_us.load_snapshot, "load snapshot"))
             }
@@ -212,7 +201,7 @@ mod tests {
     use vmm::rpc_interface::{VmmActionError, VmmData};
     use vmm::seccomp::get_empty_filters;
     use vmm::vmm_config::instance_info::InstanceInfo;
-    use vmm::vmm_config::snapshot::CreateSnapshotParams;
+    use vmm::vmm_config::snapshot::LoadSnapshotParams;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::request::cpu_configuration::parse_put_cpu_config;
@@ -268,34 +257,29 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NoContent);
         assert_ne!(METRICS.latencies_us.pause_vm.fetch(), 0);
 
-        assert_eq!(METRICS.latencies_us.diff_create_snapshot.fetch(), 0);
+        assert_eq!(METRICS.latencies_us.load_snapshot.fetch(), 0);
         to_api
-            .send(Box::new(Err(VmmActionError::OperationNotSupportedPreBoot)))
+            .send(Box::new(Err(VmmActionError::OperationNotSupportedPostBoot)))
             .unwrap();
         let response = api_server.serve_vmm_action_request(
-            Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
-                snapshot_type: SnapshotType::Diff,
-                snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+            Box::new(VmmAction::LoadSnapshot(LoadSnapshotParams {
+                resume_vm: false,
             })),
             start_time_us,
         );
         assert_eq!(response.status(), StatusCode::BadRequest);
         // The metric should not be updated if the request wasn't successful.
-        assert_eq!(METRICS.latencies_us.diff_create_snapshot.fetch(), 0);
+        assert_eq!(METRICS.latencies_us.load_snapshot.fetch(), 0);
 
         to_api.send(Box::new(Ok(VmmData::Empty))).unwrap();
         let response = api_server.serve_vmm_action_request(
-            Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
-                snapshot_type: SnapshotType::Diff,
-                snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+            Box::new(VmmAction::LoadSnapshot(LoadSnapshotParams {
+                resume_vm: false,
             })),
             start_time_us,
         );
         assert_eq!(response.status(), StatusCode::NoContent);
-        assert_ne!(METRICS.latencies_us.diff_create_snapshot.fetch(), 0);
-        assert_eq!(METRICS.latencies_us.full_create_snapshot.fetch(), 0);
+        assert_ne!(METRICS.latencies_us.load_snapshot.fetch(), 0);
     }
 
     #[test]
@@ -339,7 +323,7 @@ mod tests {
         // Test erroneous request.
         sender
             .write_all(
-                b"GET /mmds HTTP/1.1\r\n\
+                b"GET /version HTTP/1.1\r\n\
                 Content-Type: application/json\r\n\
                 Content-Length: 2\r\n\r\n{}",
             )
@@ -442,7 +426,7 @@ mod tests {
 
         let mut sock = UnixStream::connect(PathBuf::from(path_to_socket)).unwrap();
 
-        // Send a GET mmds request.
+        // Send an oversized request.
         sock.write_all(
             b"PUT http://localhost/home HTTP/1.1\r\n\
                   Content-Length: 50000\r\n\r\naaaaaa",

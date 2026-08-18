@@ -4,10 +4,6 @@
         "filter_action": "allow",
         "filter": [
             {
-                "syscall": "stat",
-                "comment": "Used when creating snapshots in vmm:persist::snapshot_memory_to_file through std::fs::File::metadata"
-            },
-            {
                 "syscall": "epoll_ctl"
             },
             {
@@ -29,7 +25,8 @@
                 "syscall": "write"
             },
             {
-                "syscall": "mincore"
+                "syscall": "pwrite64",
+                "comment": "Used to fill the capture buffer memfds received over the guest memory channel"
             },
             {
                 "syscall": "writev",
@@ -83,11 +80,11 @@
             },
             {
                 "syscall": "ftruncate",
-                "comment": "Used for snapshotting"
+                "comment": "Used to size the memfd backing the IovDeque ring buffer"
             },
             {
                 "syscall": "lseek",
-                "comment": "Used by the block device"
+                "comment": "Used by the block device, and to rewind a capture buffer memfd before filling it"
             },
             {
                 "syscall": "mremap",
@@ -132,7 +129,7 @@
             },
             {
                 "syscall": "fcntl",
-                "comment": "Used by snapshotting, drive patching and rescanning",
+                "comment": "Used by drive patching and rescanning",
                 "args": [
                     {
                         "index": 1,
@@ -147,6 +144,32 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "FCNTL_FD_CLOEXEC"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Used to check the access mode of a descriptor received over the guest memory channel",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "F_GETFL"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Used to check that a descriptor received over the guest memory channel is a sealed memfd",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1034,
+                        "comment": "F_GET_SEALS"
                     }
                 ]
             },
@@ -217,38 +240,53 @@
             },
             {
                 "syscall": "madvise",
-                "comment": "Used by the VirtIO balloon device and by musl for some customer workloads. It is also used by aws-lc during random number generation. They setup a memory page that mark with MADV_WIPEONFORK to be able to detect forks. They also call it with -1 to see if madvise is supported in certain platforms."
-            },
-            {
-                "syscall": "msync",
-                "comment": "Used by the VirtIO pmem device to sync the file content with the backing file.",
+                "comment": "Used to keep transparent huge pages away from the guest memory extents",
                 "args": [
                     {
                         "index": 2,
                         "type": "dword",
                         "op": "eq",
-                        "val": 4,
-                        "comment": "libc::MS_SYNC"
+                        "val": 15,
+                        "comment": "libc::MADV_NOHUGEPAGE"
                     }
                 ]
             },
             {
-                "syscall": "mmap",
-                "comment": "Used by the VirtIO balloon device",
+                "syscall": "madvise",
+                "comment": "Used by aws-lc during random number generation. It marks a memory page with MADV_WIPEONFORK to be able to detect forks.",
                 "args": [
-                    {
-                        "index": 3,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 50,
-                        "comment": "libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
-                    },
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
-                        "val": 0,
-                        "comment": "Ensure PROT_EXEC is not set"
+                        "op": "eq",
+                        "val": 18,
+                        "comment": "libc::MADV_WIPEONFORK"
+                    }
+                ]
+            },
+            {
+                "syscall": "madvise",
+                "comment": "Used by aws-lc with an invalid advice to see if madvise is supported on certain platforms",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4294967295,
+                        "comment": "-1"
+                    }
+                ]
+            },
+            {
+                "syscall": "mlock2",
+                "comment": "Used to pin the guest memory extents so that they cannot be reclaimed",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "MLOCK_ONFAULT"
                     }
                 ]
             },
@@ -274,7 +312,7 @@
             },
             {
                 "syscall": "mmap",
-                "comment": "Used by rust's stdlib, particularly when creating a diff snapshot of a VM with ~16 GB of memory",
+                "comment": "Used by rust's stdlib for large allocations, for example the dirty bitmap harvested during a capture",
                 "args": [
                     {
                         "index": 3,
@@ -302,66 +340,6 @@
                         "op": "eq",
                         "val": 32769,
                         "comment": "libc::MAP_SHARED | libc::MAP_POPULATE"
-                    },
-                    {
-                        "index": 2,
-                        "type": "dword",
-                        "op": {"masked_eq": 4},
-                        "val": 0,
-                        "comment": "Ensure PROT_EXEC is not set"
-                    }
-                ]
-            },
-            {
-                "syscall": "mmap",
-                "comment": "Used by pmem device to mmap the backing file",
-                "args": [
-                    {
-                        "index": 3,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 16385,
-                        "comment": "libc::MAP_SHARED | libc::MAP_NORESERVE"
-                    },
-                    {
-                        "index": 2,
-                        "type": "dword",
-                        "op": {"masked_eq": 4},
-                        "val": 0,
-                        "comment": "Ensure PROT_EXEC is not set"
-                    }
-                ]
-            },
-            {
-                "syscall": "mmap",
-                "comment": "Used by pmem device for aligned anonymous mapping",
-                "args": [
-                    {
-                        "index": 3,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 16418,
-                        "comment": "libc::MAP_PRIVATE | libc::MAP_NORESERVE | libc::MAP_ANONYMOUS"
-                    },
-                    {
-                        "index": 2,
-                        "type": "dword",
-                        "op": {"masked_eq": 4},
-                        "val": 0,
-                        "comment": "Ensure PROT_EXEC is not set"
-                    }
-                ]
-            },
-            {
-                "syscall": "mmap",
-                "comment": "Used by pmem device to overlay file mapping on anonymous region",
-                "args": [
-                    {
-                        "index": 3,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 16401,
-                        "comment": "libc::MAP_SHARED | libc::MAP_NORESERVE | libc::MAP_FIXED"
                     },
                     {
                         "index": 2,
@@ -573,6 +551,7 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Used to harvest the guest dirty log during a capture",
                 "args": [
                     {
                         "index": 1,
@@ -580,6 +559,19 @@
                         "op": "eq",
                         "val": 1074835010,
                         "comment": "KVM_GET_DIRTY_LOG"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Used to clear the guest dirty log after harvesting it during a capture",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3222843072,
+                        "comment": "KVM_CLEAR_DIRTY_LOG"
                     }
                 ]
             },
@@ -616,18 +608,6 @@
                         "op": "eq",
                         "val": 2154868383,
                         "comment": "KVM_GET_PIT2"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 1075883590,
-                        "comment": "KVM_SET_USER_MEMORY_REGION, used to (un)plug memory for the virtio-mem device"
                     }
                 ]
             },
@@ -702,26 +682,65 @@
             },
             {
                 "syscall": "sendmsg",
-                "comment": "Used by vhost-user frontend to communicate with the backend"
+                "comment": "Used to send a datagram to the pagemaster over the guest memory channel"
             },
             {
                 "syscall": "recvmsg",
-                "comment": "Used by vhost-user frontend to read response from the backend"
+                "comment": "Used to receive a datagram and its SCM_RIGHTS descriptors from the pagemaster over the guest memory channel"
             },
             {
                 "syscall": "restart_syscall",
                 "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
             },
             {
-                "syscall": "mprotect",
-                "comment": "Used by memory hotplug to protect access to underlying host memory",
+                "syscall": "prctl",
+                "comment": "Used to make the process dumpable so that the pagemaster can access its memory",
                 "args": [
                     {
-                        "index": 2,
+                        "index": 0,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
-                        "val": 0,
-                        "comment": "Ensure PROT_EXEC is not set"
+                        "op": "eq",
+                        "val": 4,
+                        "comment": "PR_SET_DUMPABLE"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1
+                    }
+                ]
+            },
+            {
+                "syscall": "prctl",
+                "comment": "Used to allow the pagemaster to ptrace this process",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1499557217,
+                        "comment": "PR_SET_PTRACER"
+                    }
+                ]
+            },
+            {
+                "syscall": "prctl",
+                "comment": "Used to request SIGKILL when the parent process dies",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "PR_SET_PDEATHSIG"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 9,
+                        "comment": "libc::SIGKILL"
                     }
                 ]
             }
@@ -796,8 +815,8 @@
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
             },
             {
-              "syscall": "getrandom",
-              "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
+                "syscall": "getrandom",
+                "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
             },
             {
                 "syscall": "accept4",
@@ -809,19 +828,6 @@
                         "op": "eq",
                         "val": 524288,
                         "comment": "libc::SOCK_CLOEXEC"
-                    }
-                ]
-            },
-            {
-                "syscall": "fcntl",
-                "comment": "Used by MMDS version 2 to extract entropy",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 2,
-                        "comment": "FCNTL_F_SETFD"
                     }
                 ]
             },
@@ -887,19 +893,6 @@
                         "op": "eq",
                         "val": 129,
                         "comment": "FUTEX_WAKE_PRIVATE"
-                    }
-                ]
-            },
-            {
-                "syscall": "madvise",
-                "comment": "Triggered by musl for some customer workloads",
-                "args": [
-                    {
-                        "index": 2,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 4,
-                        "comment": "libc::MADV_DONTNEED"
                     }
                 ]
             },
@@ -1143,19 +1136,6 @@
                 ]
             },
             {
-                "syscall": "madvise",
-                "comment": "Triggered by musl for some customer workloads",
-                "args": [
-                    {
-                        "index": 2,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 4,
-                        "comment": "libc::MADV_DONTNEED"
-                    }
-                ]
-            },
-            {
                 "syscall": "mmap",
                 "comment": "Used for reading the timezone in LocalTime::now()",
                 "args": [
@@ -1205,18 +1185,6 @@
                         "op": "eq",
                         "val": 6,
                         "comment": "SIGABRT"
-                    }
-                ]
-            },
-            {
-                "syscall": "timerfd_settime",
-                "comment": "Needed for updating the balloon statistics interval",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 0
                     }
                 ]
             },
@@ -1416,10 +1384,6 @@
             {
                 "syscall": "sched_yield",
                 "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
-            },
-            {
-                "syscall": "sendmsg",
-                "comment": "Used by vhost-user frontend to communicate with the backend"
             },
             {
                 "syscall": "restart_syscall",

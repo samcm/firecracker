@@ -10,8 +10,8 @@ use std::thread;
 use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
 use vmm::logger::{ProcessTimeReporter, error_unrestricted, info_unrestricted, warn_unrestricted};
 use vmm::rpc_interface::{
-    ApiRequest, ApiResponse, BuildMicrovmFromRequestsError, PrebootApiController,
-    RuntimeApiController, VmmAction,
+    ApiRequest, ApiRequestChannels, ApiResponse, BuildMicrovmFromRequestsError,
+    PrebootApiController, RuntimeApiController, VmmAction,
 };
 use vmm::seccomp::BpfThreadMap;
 use vmm::vmm_config::instance_info::InstanceInfo;
@@ -66,10 +66,7 @@ impl ApiServerAdapter {
             event_manager
                 .run()
                 .expect("EventManager events driver fatal error");
-            api_adapter
-                .lock()
-                .expect("Poisoned lock")
-                .handle_request(event_manager);
+            api_adapter.lock().expect("Poisoned lock").handle_request();
 
             match vmm.lock().unwrap().shutdown_exit_code() {
                 Some(FcExitCode::Ok) => break,
@@ -80,8 +77,8 @@ impl ApiServerAdapter {
         Ok(())
     }
 
-    fn _handle_request(&mut self, req_action: VmmAction, event_manager: &mut EventManager) {
-        let response = self.controller.handle_request(req_action, event_manager);
+    fn _handle_request(&mut self, req_action: VmmAction) {
+        let response = self.controller.handle_request(req_action);
         // Send back the result.
         self.to_api
             .send(Box::new(response))
@@ -89,10 +86,10 @@ impl ApiServerAdapter {
             .expect("one-shot channel closed");
     }
 
-    fn handle_request(&mut self, event_manager: &mut EventManager) {
+    fn handle_request(&mut self) {
         if let Some(api_request) = self.request.take() {
             let request_is_pause = *api_request == VmmAction::Pause;
-            self._handle_request(*api_request, event_manager);
+            self._handle_request(*api_request);
 
             // If the latest req is a pause request, temporarily switch to a mode where we
             // do blocking `recv`s on the `from_api` receiver in a loop, until we get
@@ -105,7 +102,7 @@ impl ApiServerAdapter {
                 loop {
                     let req = self.from_api.recv().expect("Error receiving API request.");
                     let req_is_resume = *req == VmmAction::Resume;
-                    self._handle_request(*req, event_manager);
+                    self._handle_request(*req);
                     if req_is_resume {
                         break;
                     }
@@ -155,8 +152,6 @@ pub(crate) fn run_with_api(
     boot_timer_enabled: bool,
     pci_enabled: bool,
     api_payload_limit: usize,
-    mmds_size_limit: usize,
-    metadata_json: Option<&str>,
 ) -> Result<(), ApiServerError> {
     // FD to notify of API events. This is a blocking eventfd by design.
     // It is used in the config/pre-boot loop which is a simple blocking loop
@@ -224,21 +219,19 @@ pub(crate) fn run_with_api(
             instance_info,
             boot_timer_enabled,
             pci_enabled,
-            mmds_size_limit,
-            metadata_json,
         )
         .map_err(ApiServerError::BuildFromJson),
         None => PrebootApiController::build_microvm_from_requests(
             seccomp_filters,
             &mut event_manager,
             instance_info,
-            &from_api,
-            &to_api,
-            &api_event_fd,
+            ApiRequestChannels {
+                from_api: &from_api,
+                to_api: &to_api,
+                event_fd: &api_event_fd,
+            },
             boot_timer_enabled,
             pci_enabled,
-            mmds_size_limit,
-            metadata_json,
         )
         .map_err(ApiServerError::BuildMicroVmError),
     };
