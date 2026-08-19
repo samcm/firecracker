@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use userfaultfd::{RegisterMode, Uffd};
 use userfaultfd_sys::{
     UFFD_API, UFFD_FEATURE_MINOR_SHMEM, UFFD_FEATURE_MISSING_SHMEM, UFFD_FEATURE_PAGEFAULT_FLAG_WP,
-    uffdio_api,
+    UFFD_FEATURE_WP_HUGETLBFS_SHMEM, uffdio_api,
 };
 use vm_memory::GuestAddress;
 use vm_memory::bitmap::{AtomicBitmap, NewBitmap};
@@ -51,9 +51,13 @@ const REQUIRED_BACKING_SEALS: i32 =
     libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_FUTURE_WRITE;
 /// Seals a capture buffer must carry: it is written, but its size is fixed.
 const REQUIRED_BUFFER_SEALS: i32 = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
-/// Userfaultfd features the deployment kernel must provide for shmem-backed guest memory.
-const REQUIRED_UFFD_FEATURES: u64 =
-    UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_MISSING_SHMEM | UFFD_FEATURE_MINOR_SHMEM;
+/// Userfaultfd features the deployment kernel must provide for shmem-backed guest memory. Guest
+/// extents are file mappings, so write protection over them needs the shmem write-protect feature
+/// as well as write-protect fault reporting.
+const REQUIRED_UFFD_FEATURES: u64 = UFFD_FEATURE_PAGEFAULT_FLAG_WP
+    | UFFD_FEATURE_MISSING_SHMEM
+    | UFFD_FEATURE_MINOR_SHMEM
+    | UFFD_FEATURE_WP_HUGETLBFS_SHMEM;
 
 /// Upper bound Firecracker guarantees for a serialized vmstate of its device set, reported so
 /// pagemaster preallocates the capture buffer before the source is frozen.
