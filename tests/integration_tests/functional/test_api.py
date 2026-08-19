@@ -4,7 +4,6 @@
 
 # Disable pylint C0302: Too many lines in module
 # pylint: disable=C0302
-import os
 import platform
 import re
 import resource
@@ -12,7 +11,6 @@ import resource
 import pytest
 import semver
 
-import host_tools.drive as drive_tools
 import host_tools.network as net_tools
 from framework import utils
 from framework.utils import get_firecracker_version_from_toml
@@ -45,27 +43,15 @@ def test_api_happy_start(uvm_plain):
         assert "Kernel loaded using PVH boot protocol" in test_microvm.log_data
 
 
-def test_api_put_update_pre_boot(uvm_plain, io_engine):
+def test_api_put_update_pre_boot(uvm_plain):
     """
     Test that PUT updates are allowed before the microvm boots.
 
-    Tests updates on drives, boot source and machine config.
+    Tests updates on boot source and machine config.
     """
     test_microvm = uvm_plain
     test_microvm.spawn()
-
-    # Set up the microVM with 2 vCPUs, 256 MiB of RAM  and
-    # a root file system with the rw permission.
     test_microvm.basic_config()
-
-    fs1 = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "scratch"))
-    test_microvm.api.drive.put(
-        drive_id="scratch",
-        path_on_host=test_microvm.create_jailed_resource(fs1.path),
-        is_root_device=False,
-        is_read_only=False,
-        io_engine=io_engine,
-    )
 
     # Updates to `kernel_image_path` with an invalid path are not allowed.
     expected_msg = re.escape(
@@ -77,27 +63,6 @@ def test_api_put_update_pre_boot(uvm_plain, io_engine):
     # Updates to `kernel_image_path` with a valid path are allowed.
     test_microvm.api.boot.put(
         kernel_image_path=test_microvm.get_jailed_resource(test_microvm.kernel_file)
-    )
-
-    # Updates to `is_root_device` that result in two root block devices are not
-    # allowed.
-    with pytest.raises(RuntimeError, match="A root block device already exists"):
-        test_microvm.api.drive.put(
-            drive_id="scratch",
-            path_on_host=test_microvm.get_jailed_resource(fs1.path),
-            is_read_only=False,
-            is_root_device=True,
-            io_engine=io_engine,
-        )
-
-    # Valid updates to `path_on_host` and `is_read_only` are allowed.
-    fs2 = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "otherscratch"))
-    test_microvm.api.drive.put(
-        drive_id="scratch",
-        path_on_host=test_microvm.create_jailed_resource(fs2.path),
-        is_read_only=True,
-        is_root_device=False,
-        io_engine=io_engine,
     )
 
     # Valid updates to all fields in the machine configuration are allowed.
@@ -363,61 +328,12 @@ def test_api_put_update_post_boot(uvm_plain):
         test_microvm.api.machine_config.put(vcpu_count=4, mem_size_mib=128)
 
 
-def test_rate_limiters_api_config(uvm_plain, io_engine):
+def test_rate_limiters_api_config(uvm_plain):
     """
     Test the IO rate limiter API config.
     """
     test_microvm = uvm_plain
     test_microvm.spawn()
-
-    # Test the DRIVE rate limiting API.
-
-    # Test drive with bw rate-limiting.
-    fs1 = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "bw"))
-    test_microvm.api.drive.put(
-        drive_id="bw",
-        path_on_host=test_microvm.create_jailed_resource(fs1.path),
-        is_read_only=False,
-        is_root_device=False,
-        rate_limiter={"bandwidth": {"size": 1000000, "refill_time": 100}},
-        io_engine=io_engine,
-    )
-
-    # Test drive with ops rate-limiting.
-    fs2 = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "ops"))
-    test_microvm.api.drive.put(
-        drive_id="ops",
-        path_on_host=test_microvm.create_jailed_resource(fs2.path),
-        is_read_only=False,
-        is_root_device=False,
-        rate_limiter={"ops": {"size": 1, "refill_time": 100}},
-        io_engine=io_engine,
-    )
-
-    # Test drive with bw and ops rate-limiting.
-    fs3 = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "bwops"))
-    test_microvm.api.drive.put(
-        drive_id="bwops",
-        path_on_host=test_microvm.create_jailed_resource(fs3.path),
-        is_read_only=False,
-        is_root_device=False,
-        rate_limiter={
-            "bandwidth": {"size": 1000000, "refill_time": 100},
-            "ops": {"size": 1, "refill_time": 100},
-        },
-        io_engine=io_engine,
-    )
-
-    # Test drive with 'empty' rate-limiting (same as not specifying the field)
-    fs4 = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "nada"))
-    test_microvm.api.drive.put(
-        drive_id="nada",
-        path_on_host=test_microvm.create_jailed_resource(fs4.path),
-        is_read_only=False,
-        is_root_device=False,
-        rate_limiter={},
-        io_engine=io_engine,
-    )
 
     # Test the NET rate limiting API.
 
@@ -471,26 +387,13 @@ def test_rate_limiters_api_config(uvm_plain, io_engine):
     )
 
 
-def test_api_patch_pre_boot(uvm_plain, io_engine):
+def test_api_patch_pre_boot(uvm_plain):
     """
     Test that PATCH updates are not allowed before the microvm boots.
     """
     test_microvm = uvm_plain
     test_microvm.spawn()
-
-    # Sets up the microVM with 2 vCPUs, 256 MiB of RAM, 1 network interface
-    # and a root file system with the rw permission.
     test_microvm.basic_config()
-
-    fs1 = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "scratch"))
-    drive_id = "scratch"
-    test_microvm.api.drive.put(
-        drive_id=drive_id,
-        path_on_host=test_microvm.create_jailed_resource(fs1.path),
-        is_root_device=False,
-        is_read_only=False,
-        io_engine=io_engine,
-    )
 
     iface_id = "1"
     tapname = test_microvm.id[:8] + "tap" + iface_id
@@ -512,34 +415,18 @@ def test_api_patch_pre_boot(uvm_plain, io_engine):
     with pytest.raises(RuntimeError, match="Invalid request method"):
         test_microvm.api.logger.patch(level="Error")
 
-    # Patching drive before boot is not allowed.
-    with pytest.raises(RuntimeError, match=NOT_SUPPORTED_BEFORE_START):
-        test_microvm.api.drive.patch(drive_id=drive_id, path_on_host="foo.bar")
-
     # Patching net before boot is not allowed.
     with pytest.raises(RuntimeError, match=NOT_SUPPORTED_BEFORE_START):
         test_microvm.api.network.patch(iface_id=iface_id)
 
 
-def test_negative_api_patch_post_boot(uvm_plain, io_engine):
+def test_negative_api_patch_post_boot(uvm_plain):
     """
     Test PATCH updates that are not allowed after the microvm boots.
     """
     test_microvm = uvm_plain
     test_microvm.spawn()
-
-    # Sets up the microVM with 2 vCPUs, 256 MiB of RAM, 1 network iface and
-    # a root file system with the rw permission.
     test_microvm.basic_config()
-
-    fs1 = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "scratch"))
-    test_microvm.api.drive.put(
-        drive_id="scratch",
-        path_on_host=test_microvm.create_jailed_resource(fs1.path),
-        is_root_device=False,
-        is_read_only=False,
-        io_engine=io_engine,
-    )
 
     iface_id = "1"
     tapname = test_microvm.id[:8] + "tap" + iface_id
@@ -563,35 +450,6 @@ def test_negative_api_patch_post_boot(uvm_plain, io_engine):
         test_microvm.api.logger.patch(level="Error")
 
 
-def test_drive_patch(uvm_plain, io_engine):
-    """
-    Extensively test drive PATCH scenarios before and after boot.
-    """
-    test_microvm = uvm_plain
-    test_microvm.spawn()
-
-    # Sets up the microVM with 2 vCPUs, 256 MiB of RAM and
-    # a root file system with the rw permission.
-    test_microvm.basic_config(rootfs_io_engine="Sync")
-
-    fs = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "scratch"))
-    test_microvm.add_drive(
-        drive_id="scratch",
-        path_on_host=fs.path,
-        is_root_device=False,
-        is_read_only=False,
-        io_engine=io_engine,
-    )
-
-    # Patching drive before boot is not allowed.
-    with pytest.raises(RuntimeError, match=NOT_SUPPORTED_BEFORE_START):
-        test_microvm.api.drive.patch(drive_id="scratch", path_on_host="foo.bar")
-
-    test_microvm.start()
-
-    _drive_patch(test_microvm, io_engine)
-
-
 @pytest.mark.skipif(
     platform.machine() != "x86_64", reason="not yet implemented on aarch64"
 )
@@ -613,108 +471,6 @@ def test_send_ctrl_alt_del(uvm_plain_any):
     # If everything goes as expected, the guest OS will issue a reboot,
     # causing Firecracker to exit.
     test_microvm.mark_killed()
-
-
-def _drive_patch(test_microvm, io_engine):
-    """Exercise drive patch test scenarios."""
-    # Patches without mandatory fields for virtio block are not allowed.
-    expected_msg = "Running method expected different backend."
-    with pytest.raises(RuntimeError, match=expected_msg):
-        test_microvm.api.drive.patch(drive_id="scratch")
-
-    drive_path = "foo.bar"
-
-    # Cannot patch drive permissions post boot.
-    with pytest.raises(RuntimeError, match="unknown field `is_read_only`"):
-        test_microvm.api.drive.patch(
-            drive_id="scratch", path_on_host=drive_path, is_read_only=True
-        )
-
-    # Cannot patch io_engine post boot.
-    with pytest.raises(RuntimeError, match="unknown field `io_engine`"):
-        test_microvm.api.drive.patch(
-            drive_id="scratch", path_on_host=drive_path, io_engine="Sync"
-        )
-
-    # Updates to `is_root_device` with a valid value are not allowed.
-    with pytest.raises(RuntimeError, match="unknown field `is_root_device`"):
-        test_microvm.api.drive.patch(
-            drive_id="scratch", path_on_host=drive_path, is_root_device=False
-        )
-
-    # Updates to `path_on_host` with an invalid path are not allowed.
-    expected_msg = f"Error manipulating the backing file: No such file or directory (os error 2) {drive_path}"
-    with pytest.raises(RuntimeError, match=re.escape(expected_msg)):
-        test_microvm.api.drive.patch(drive_id="scratch", path_on_host=drive_path)
-
-    fs = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "scratch_new"))
-    # Updates to `path_on_host` with a valid path are allowed.
-    test_microvm.api.drive.patch(
-        drive_id="scratch", path_on_host=test_microvm.create_jailed_resource(fs.path)
-    )
-
-    # Updates to valid `path_on_host` and `rate_limiter` are allowed.
-    test_microvm.api.drive.patch(
-        drive_id="scratch",
-        path_on_host=test_microvm.create_jailed_resource(fs.path),
-        rate_limiter={
-            "bandwidth": {"size": 1000000, "refill_time": 100},
-            "ops": {"size": 1, "refill_time": 100},
-        },
-    )
-
-    # Updates to `rate_limiter` only are allowed.
-    test_microvm.api.drive.patch(
-        drive_id="scratch",
-        rate_limiter={
-            "bandwidth": {"size": 5000, "refill_time": 100},
-            "ops": {"size": 500, "refill_time": 100},
-        },
-    )
-
-    # Updates to `rate_limiter` and invalid path fail.
-    with pytest.raises(RuntimeError, match="No such file or directory"):
-        test_microvm.api.drive.patch(
-            drive_id="scratch",
-            path_on_host="foo.bar",
-            rate_limiter={
-                "bandwidth": {"size": 5000, "refill_time": 100},
-                "ops": {"size": 500, "refill_time": 100},
-            },
-        )
-
-    # Validate full vm configuration after patching drives.
-    response = test_microvm.api.vm_config.get().json()
-    expected_drives = [
-        {
-            "drive_id": "rootfs",
-            "partuuid": None,
-            "is_root_device": True,
-            "cache_type": "Unsafe",
-            "is_read_only": True,
-            "fd": 4,
-            "rate_limiter": None,
-            "io_engine": "Sync",
-            "socket": None,
-        },
-        {
-            "drive_id": "scratch",
-            "partuuid": None,
-            "is_root_device": False,
-            "cache_type": "Unsafe",
-            "is_read_only": False,
-            "path_on_host": "/scratch_new.ext4",
-            "rate_limiter": {
-                "bandwidth": {"size": 5000, "one_time_burst": None, "refill_time": 100},
-                "ops": {"size": 500, "one_time_burst": None, "refill_time": 100},
-            },
-            "io_engine": io_engine,
-            "socket": None,
-        },
-    ]
-    assert sorted(response["drives"], key=lambda d: d["drive_id"]) == sorted(
-        expected_drives, key=lambda d: d["drive_id"]
-    )
 
 
 def test_api_version(uvm_plain):

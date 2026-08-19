@@ -34,23 +34,29 @@ pub fn default_block(file_engine_type: FileEngineType) -> VirtioBlock {
     f.as_file().set_len(0x1000).unwrap();
 
     // The default block device is read-write and non-root.
-    default_block_with_backing(f.as_file().as_raw_fd(), false, file_engine_type)
+    default_block_with_backing(f.as_file().as_raw_fd(), false, false, file_engine_type)
 }
 
-/// Create a read-only Block instance backed by an inherited descriptor, to be used in tests.
-pub fn default_block_with_descriptor(fd: RawFd, file_engine_type: FileEngineType) -> VirtioBlock {
-    default_block_with_backing(fd, true, file_engine_type)
+/// Create a read-only Block instance backed by an inherited descriptor, to be used in tests. The
+/// sealed root image backs the root device, the sealed bootstrap image does not.
+pub fn default_block_with_descriptor(
+    fd: RawFd,
+    is_root_device: bool,
+    file_engine_type: FileEngineType,
+) -> VirtioBlock {
+    default_block_with_backing(fd, is_root_device, true, file_engine_type)
 }
 
 fn default_block_with_backing(
     fd: RawFd,
+    is_root_device: bool,
     is_read_only: bool,
     file_engine_type: FileEngineType,
 ) -> VirtioBlock {
     let config = VirtioBlockConfig {
         drive_id: "test".to_string(),
         fd,
-        is_root_device: false,
+        is_root_device,
         partuuid: None,
         is_read_only,
         cache_type: CacheType::Unsafe,

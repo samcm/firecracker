@@ -12,7 +12,9 @@ use super::RateLimiterConfig;
 use crate::VmmError;
 use crate::devices::virtio::block::device::Block;
 pub use crate::devices::virtio::block::virtio::device::FileEngineType;
-use crate::devices::virtio::block::{BlockError, CacheType};
+use crate::devices::virtio::block::{
+    BOOTSTRAP_DESCRIPTOR_FILENO, BlockError, CacheType, ROOT_DESCRIPTOR_FILENO,
+};
 use crate::devices::virtio::device::VirtioDevice;
 
 /// Errors associated with the operations allowed on a drive.
@@ -22,14 +24,22 @@ pub enum DriveError {
     CreateBlockDevice(BlockError),
     /// Cannot create RateLimiter: {0}
     CreateRateLimiter(io::Error),
+    /// Descriptor {0} is not inherited: {1}
+    DescriptorNotInherited(RawFd, io::Error),
+    /// Descriptor {0} contradicts `is_root_device`: only the root image backs the root device.
+    DescriptorRoleMismatch(RawFd),
     /// Unable to patch the block device: {0} Please verify the request arguments.
     DeviceUpdate(VmmError),
-    /// A drive backed by `fd` requires `is_read_only` to be true.
-    InvalidRootDescriptor,
     /// A read-only drive has no write-back cache to flush.
     ReadOnlyWriteback,
     /// A root block device already exists!
     RootBlockDeviceAlreadyAdded,
+    /// Descriptor {0} is not one of the descriptors the jailer inherits a sealed drive image at.
+    UnreservedDescriptor(RawFd),
+    /// Descriptor {0} is not read-only.
+    WritableDescriptor(RawFd),
+    /// A drive backed by `fd` requires `is_read_only` to be true.
+    WritableDrive,
 }
 
 /// Use this structure to set up the Block Device before booting the kernel.
@@ -53,7 +63,8 @@ pub struct BlockDeviceConfig {
     /// If set to true, the drive is opened in read-only mode. Otherwise, the
     /// drive is opened as read-write.
     pub is_read_only: Option<bool>,
-    /// Descriptor the sealed read-only root image was inherited at.
+    /// Descriptor the sealed read-only image backing this drive was inherited at: the root image
+    /// at [`ROOT_DESCRIPTOR_FILENO`], the bootstrap image at [`BOOTSTRAP_DESCRIPTOR_FILENO`].
     pub fd: RawFd,
     /// Rate Limiter for I/O operations.
     pub rate_limiter: Option<RateLimiterConfig>,
@@ -63,16 +74,46 @@ pub struct BlockDeviceConfig {
 }
 
 impl BlockDeviceConfig {
-    /// Validates the descriptor backing this drive. A descriptor is only ever inherited for the
-    /// sealed read-only root image, so it requires `is_read_only`.
+    /// Pairs the descriptors the jailer inherits with the drive each one backs: the sealed root
+    /// image at [`ROOT_DESCRIPTOR_FILENO`] backs the root device, and the sealed bootstrap image
+    /// at [`BOOTSTRAP_DESCRIPTOR_FILENO`] backs a drive that never is. No other number names a
+    /// drive's backing store.
+    pub fn reserved_descriptor(&self) -> Result<RawFd, DriveError> {
+        let backs_root = match self.fd {
+            ROOT_DESCRIPTOR_FILENO => true,
+            BOOTSTRAP_DESCRIPTOR_FILENO => false,
+            fd => return Err(DriveError::UnreservedDescriptor(fd)),
+        };
+        if self.is_root_device != backs_root {
+            return Err(DriveError::DescriptorRoleMismatch(self.fd));
+        }
+        Ok(self.fd)
+    }
+
+    /// Validates the descriptor backing this drive. Every inherited image is sealed read-only, so
+    /// the drive requires `is_read_only` and the number must still name a read-only descriptor.
     pub fn descriptor(&self) -> Result<RawFd, DriveError> {
+        let fd = self.reserved_descriptor()?;
         if self.is_read_only != Some(true) {
-            return Err(DriveError::InvalidRootDescriptor);
+            return Err(DriveError::WritableDrive);
         }
         if self.cache_type == CacheType::Writeback {
             return Err(DriveError::ReadOnlyWriteback);
         }
-        Ok(self.fd)
+        // The jailer owns memfd identity, sealing and size; Firecracker only confirms that the
+        // number it was handed still names an inherited read-only descriptor.
+        // SAFETY: `F_GETFL` only reads descriptor flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(DriveError::DescriptorNotInherited(
+                fd,
+                io::Error::last_os_error(),
+            ));
+        }
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return Err(DriveError::WritableDescriptor(fd));
+        }
+        Ok(fd)
     }
 }
 
@@ -186,6 +227,7 @@ impl BlockBuilder {
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsRawFd;
+    use std::panic::AssertUnwindSafe;
 
     use vmm_sys_util::tempfile::TempFile;
 
@@ -215,11 +257,56 @@ mod tests {
         }
     }
 
-    /// A non-empty image whose descriptor stands in for the one the jailer inherits.
-    fn root_image() -> TempFile {
-        let image = TempFile::new().unwrap();
-        image.as_file().set_len(0x1000).unwrap();
-        image
+    /// Runs `body` in a child process, so retiring one of the inherited descriptors stands in for a
+    /// supervisor that passed none without disturbing the rest of the test binary.
+    fn in_child(body: impl FnOnce()) {
+        // SAFETY: the fork is taken for its private descriptor table and the child never returns
+        // to the test harness.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", io::Error::last_os_error());
+        if child == 0 {
+            // The harness routes panic output to a per-thread buffer the parent never reads, so
+            // the child reports on the inherited stderr instead.
+            std::panic::set_hook(Box::new(|panic| {
+                let report = format!("{panic}\n");
+                // SAFETY: the buffer is initialized and outlives the call.
+                unsafe { libc::write(libc::STDERR_FILENO, report.as_ptr().cast(), report.len()) };
+            }));
+            let failed = std::panic::catch_unwind(AssertUnwindSafe(body)).is_err();
+            // SAFETY: the child must neither unwind into the harness nor flush inherited buffers.
+            unsafe { libc::_exit(i32::from(failed)) }
+        }
+
+        let mut status = 0;
+        // SAFETY: `waitpid` writes nothing but `status`.
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(waited, child, "waitpid: {}", io::Error::last_os_error());
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the child retiring an inherited descriptor failed"
+        );
+    }
+
+    /// The drive the sealed root image backs.
+    fn root_drive(drive_id: &str) -> BlockDeviceConfig {
+        BlockDeviceConfig {
+            drive_id: drive_id.to_string(),
+            is_root_device: true,
+            is_read_only: Some(true),
+            fd: ROOT_DESCRIPTOR_FILENO,
+            ..Default::default()
+        }
+    }
+
+    /// The drive the sealed bootstrap image backs.
+    fn bootstrap_drive(drive_id: &str) -> BlockDeviceConfig {
+        BlockDeviceConfig {
+            drive_id: drive_id.to_string(),
+            is_root_device: false,
+            is_read_only: Some(true),
+            fd: BOOTSTRAP_DESCRIPTOR_FILENO,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -229,402 +316,187 @@ mod tests {
     }
 
     #[test]
-    fn test_add_non_root_block_device() {
-        let dummy_image = root_image();
-        let dummy_id = String::from("1");
-        let dummy_block_device = BlockDeviceConfig {
-            drive_id: dummy_id.clone(),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
+    fn test_add_bootstrap_block_device() {
+        let bootstrap = bootstrap_drive("1");
 
         let mut block_devs = BlockBuilder::new();
-        block_devs.insert(dummy_block_device.clone()).unwrap();
+        block_devs.insert(bootstrap.clone()).unwrap();
 
         assert!(!block_devs.has_root_device());
         assert_eq!(block_devs.devices.len(), 1);
-        assert_eq!(block_devs.get_index_of_drive_id(&dummy_id), Some(0));
+        assert_eq!(block_devs.get_index_of_drive_id("1"), Some(0));
 
         let block = block_devs.devices[0].lock().unwrap();
-        assert_eq!(block.id(), dummy_block_device.drive_id);
-        assert_eq!(block.partuuid(), &dummy_block_device.partuuid);
-        assert_eq!(block.read_only(), dummy_block_device.is_read_only.unwrap());
+        assert_eq!(block.id(), bootstrap.drive_id);
+        assert_eq!(block.partuuid(), &bootstrap.partuuid);
+        assert!(block.read_only());
     }
 
     #[test]
     fn test_add_one_root_block_device() {
-        let dummy_image = root_image();
-
-        let dummy_block_device = BlockDeviceConfig {
-            drive_id: String::from("1"),
-            partuuid: None,
-            is_root_device: true,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
+        let root = root_drive("1");
 
         let mut block_devs = BlockBuilder::new();
-        block_devs.insert(dummy_block_device.clone()).unwrap();
+        block_devs.insert(root.clone()).unwrap();
 
         assert!(block_devs.has_root_device());
         assert_eq!(block_devs.devices.len(), 1);
         let block = block_devs.devices[0].lock().unwrap();
-        assert_eq!(block.id(), dummy_block_device.drive_id);
-        assert_eq!(block.partuuid(), &dummy_block_device.partuuid);
-        assert_eq!(block.read_only(), dummy_block_device.is_read_only.unwrap());
+        assert_eq!(block.id(), root.drive_id);
+        assert_eq!(block.partuuid(), &root.partuuid);
+        assert!(block.read_only());
     }
 
     #[test]
     fn test_add_two_root_block_devs() {
-        let dummy_image_1 = root_image();
-        let root_block_device_1 = BlockDeviceConfig {
-            drive_id: String::from("1"),
-            partuuid: None,
-            is_root_device: true,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_1.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        let dummy_image_2 = root_image();
-        let root_block_device_2 = BlockDeviceConfig {
-            drive_id: String::from("2"),
-            partuuid: None,
-            is_root_device: true,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_2.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
         let mut block_devs = BlockBuilder::new();
-        block_devs.insert(root_block_device_1).unwrap();
+        block_devs.insert(root_drive("1")).unwrap();
         assert_eq!(
-            block_devs.insert(root_block_device_2).unwrap_err(),
+            block_devs.insert(root_drive("2")).unwrap_err(),
             DriveError::RootBlockDeviceAlreadyAdded
         );
     }
 
     #[test]
-    // Test BlockDevicesConfigs::add when you first add the root device and then the other devices.
-    fn test_add_root_block_device_first() {
-        let dummy_image_1 = root_image();
-        let root_block_device = BlockDeviceConfig {
-            drive_id: String::from("1"),
-            partuuid: None,
-            is_root_device: true,
-            cache_type: CacheType::Unsafe,
+    // The root device is first in the list whichever order the drives were added in.
+    fn test_root_block_device_is_first() {
+        for order in [
+            [root_drive("1"), bootstrap_drive("2")],
+            [bootstrap_drive("2"), root_drive("1")],
+        ] {
+            let mut block_devs = BlockBuilder::new();
+            for config in order {
+                block_devs.insert(config).unwrap();
+            }
 
-            is_read_only: Some(true),
-            fd: dummy_image_1.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        let dummy_image_2 = root_image();
-        let dummy_block_dev_2 = BlockDeviceConfig {
-            drive_id: String::from("2"),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_2.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        let dummy_image_3 = root_image();
-        let dummy_block_dev_3 = BlockDeviceConfig {
-            drive_id: String::from("3"),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_3.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        let mut block_devs = BlockBuilder::new();
-        block_devs.insert(dummy_block_dev_2.clone()).unwrap();
-        block_devs.insert(dummy_block_dev_3.clone()).unwrap();
-        block_devs.insert(root_block_device.clone()).unwrap();
-
-        assert_eq!(block_devs.devices.len(), 3);
-
-        let mut block_iter = block_devs.devices.iter();
-        assert_eq!(
-            block_iter.next().unwrap().lock().unwrap().id(),
-            root_block_device.drive_id
-        );
-        assert_eq!(
-            block_iter.next().unwrap().lock().unwrap().id(),
-            dummy_block_dev_2.drive_id
-        );
-        assert_eq!(
-            block_iter.next().unwrap().lock().unwrap().id(),
-            dummy_block_dev_3.drive_id
-        );
-    }
-
-    #[test]
-    // Test BlockDevicesConfigs::add when you add other devices first and then the root device.
-    fn test_root_block_device_add_last() {
-        let dummy_image_1 = root_image();
-        let root_block_device = BlockDeviceConfig {
-            drive_id: String::from("1"),
-            partuuid: None,
-            is_root_device: true,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_1.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        let dummy_image_2 = root_image();
-        let dummy_block_dev_2 = BlockDeviceConfig {
-            drive_id: String::from("2"),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_2.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        let dummy_image_3 = root_image();
-        let dummy_block_dev_3 = BlockDeviceConfig {
-            drive_id: String::from("3"),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_3.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        let mut block_devs = BlockBuilder::new();
-        block_devs.insert(dummy_block_dev_2.clone()).unwrap();
-        block_devs.insert(dummy_block_dev_3.clone()).unwrap();
-        block_devs.insert(root_block_device.clone()).unwrap();
-
-        assert_eq!(block_devs.devices.len(), 3);
-
-        let mut block_iter = block_devs.devices.iter();
-        // The root device should be first in the list no matter of the order in
-        // which the devices were added.
-        assert_eq!(
-            block_iter.next().unwrap().lock().unwrap().id(),
-            root_block_device.drive_id
-        );
-        assert_eq!(
-            block_iter.next().unwrap().lock().unwrap().id(),
-            dummy_block_dev_2.drive_id
-        );
-        assert_eq!(
-            block_iter.next().unwrap().lock().unwrap().id(),
-            dummy_block_dev_3.drive_id
-        );
+            assert_eq!(block_devs.devices.len(), 2);
+            let mut block_iter = block_devs.devices.iter();
+            assert_eq!(block_iter.next().unwrap().lock().unwrap().id(), "1");
+            assert_eq!(block_iter.next().unwrap().lock().unwrap().id(), "2");
+        }
     }
 
     #[test]
     fn test_update() {
-        let dummy_image_1 = root_image();
-        let root_block_device = BlockDeviceConfig {
-            drive_id: String::from("1"),
-            partuuid: None,
-            is_root_device: true,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_1.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        let dummy_image_2 = root_image();
-        let mut dummy_block_device_2 = BlockDeviceConfig {
-            drive_id: String::from("2"),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_2.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
+        let mut bootstrap = bootstrap_drive("2");
 
         let mut block_devs = BlockBuilder::new();
+        block_devs.insert(root_drive("1")).unwrap();
+        block_devs.insert(bootstrap.clone()).unwrap();
 
-        // Add 2 block devices.
-        block_devs.insert(root_block_device.clone()).unwrap();
-        block_devs.insert(dummy_block_device_2.clone()).unwrap();
+        assert_eq!(block_devs.get_index_of_drive_id("1"), Some(0));
+        assert!(block_devs.get_index_of_drive_id("foo").is_none());
 
-        // Get index zero.
-        assert_eq!(
-            block_devs.get_index_of_drive_id(&String::from("1")),
-            Some(0)
-        );
-
-        // Get None.
-        assert!(
-            block_devs
-                .get_index_of_drive_id(&String::from("foo"))
-                .is_none()
-        );
-
-        // Test several update cases using dummy_block_device_2.
-        // Validate `dummy_block_device_2` is already in the list
-        assert!(
-            block_devs
-                .get_index_of_drive_id(&dummy_block_device_2.drive_id)
-                .is_some()
-        );
         // Update OK.
-        dummy_block_device_2.partuuid = Some("0eaa91a0-02".to_string());
-        block_devs.insert(dummy_block_device_2.clone()).unwrap();
+        bootstrap.partuuid = Some("0eaa91a0-02".to_string());
+        block_devs.insert(bootstrap.clone()).unwrap();
 
         let index = block_devs
-            .get_index_of_drive_id(&dummy_block_device_2.drive_id)
+            .get_index_of_drive_id(&bootstrap.drive_id)
             .unwrap();
-        // Validate update was successful.
         assert_eq!(
             block_devs.devices[index].lock().unwrap().partuuid(),
-            &dummy_block_device_2.partuuid
+            &bootstrap.partuuid
         );
         assert!(block_devs.devices[index].lock().unwrap().read_only());
 
         // Update with 2 root block devices.
-        dummy_block_device_2.is_root_device = true;
+        let mut second_root = root_drive("2");
+        second_root.partuuid = Some("0eaa91a0-01".to_string());
         assert_eq!(
-            block_devs.insert(dummy_block_device_2),
+            block_devs.insert(second_root),
             Err(DriveError::RootBlockDeviceAlreadyAdded)
         );
 
-        // Switch roots and add a PARTUUID for the new one.
-        let mut root_block_device_old = root_block_device;
-        root_block_device_old.is_root_device = false;
-        let root_block_device_new = BlockDeviceConfig {
-            drive_id: String::from("2"),
-            partuuid: Some("0eaa91a0-01".to_string()),
-            is_root_device: true,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image_2.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        block_devs.insert(root_block_device_old).unwrap();
-        let root_block_id = root_block_device_new.drive_id.clone();
-        block_devs.insert(root_block_device_new).unwrap();
-        assert!(block_devs.has_root_device());
-        // Verify it's been moved to the first position.
-        assert_eq!(block_devs.devices[0].lock().unwrap().id(), root_block_id);
+        // The descriptor pins the role, so the root drive cannot become a secondary one.
+        let mut demoted_root = root_drive("1");
+        demoted_root.is_root_device = false;
+        assert_eq!(
+            block_devs.insert(demoted_root),
+            Err(DriveError::DescriptorRoleMismatch(ROOT_DESCRIPTOR_FILENO))
+        );
     }
 
     #[test]
     fn test_block_config() {
-        let dummy_image = root_image();
-
-        let dummy_block_device = BlockDeviceConfig {
-            drive_id: String::from("1"),
-            partuuid: None,
-            is_root_device: true,
-            cache_type: CacheType::Unsafe,
-
-            is_read_only: Some(true),
-            fd: dummy_image.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: Some(FileEngineType::Sync),
-        };
+        let mut root = root_drive("1");
+        root.file_engine_type = Some(FileEngineType::Sync);
 
         let mut block_devs = BlockBuilder::new();
-        block_devs.insert(dummy_block_device.clone()).unwrap();
+        block_devs.insert(root.clone()).unwrap();
 
         let configs = block_devs.configs();
         assert_eq!(configs.len(), 1);
-        assert_eq!(configs.first().unwrap(), &dummy_block_device);
+        assert_eq!(configs.first().unwrap(), &root);
     }
 
     #[test]
     fn test_add_device() {
         let mut block_devs = BlockBuilder::new();
-        let backing_image = root_image();
-
-        let block_id = "test_id";
-        let config = BlockDeviceConfig {
-            drive_id: block_id.to_string(),
-            partuuid: None,
-            is_root_device: true,
-            cache_type: CacheType::default(),
-
-            is_read_only: Some(true),
-            fd: backing_image.as_file().as_raw_fd(),
-            rate_limiter: None,
-            file_engine_type: None,
-        };
-
-        let block = Block::new(config).unwrap();
+        let block = Block::new(bootstrap_drive("test_id")).unwrap();
 
         block_devs.add_virtio_device(Arc::new(Mutex::new(block)));
         assert_eq!(block_devs.devices.len(), 1);
         assert_eq!(
             block_devs.devices.pop_back().unwrap().lock().unwrap().id(),
-            block_id
+            "test_id"
         );
     }
 
     #[test]
-    fn test_descriptor_validation() {
-        let descriptor = BlockDeviceConfig {
-            drive_id: String::from("root"),
-            is_read_only: Some(true),
-            fd: 4,
-            ..Default::default()
-        };
-        assert_eq!(descriptor.descriptor().unwrap(), 4);
+    fn test_descriptor_admission_matrix() {
+        // The sealed root image backs the root device, the sealed bootstrap image a second drive
+        // that never is.
+        assert_eq!(
+            root_drive("root").descriptor().unwrap(),
+            ROOT_DESCRIPTOR_FILENO
+        );
+        assert_eq!(
+            bootstrap_drive("bootstrap").descriptor().unwrap(),
+            BOOTSTRAP_DESCRIPTOR_FILENO
+        );
 
-        let mut writable = descriptor.clone();
+        // Neither descriptor backs the other's role.
+        let mut demoted_root = root_drive("root");
+        demoted_root.is_root_device = false;
+        assert_eq!(
+            demoted_root.descriptor().unwrap_err(),
+            DriveError::DescriptorRoleMismatch(ROOT_DESCRIPTOR_FILENO)
+        );
+
+        let mut promoted_bootstrap = bootstrap_drive("bootstrap");
+        promoted_bootstrap.is_root_device = true;
+        assert_eq!(
+            promoted_bootstrap.descriptor().unwrap_err(),
+            DriveError::DescriptorRoleMismatch(BOOTSTRAP_DESCRIPTOR_FILENO)
+        );
+
+        // No other number names a drive's backing store.
+        for fd in [0, 3, 6, 9] {
+            let mut unreserved = root_drive("root");
+            unreserved.fd = fd;
+            assert_eq!(
+                unreserved.descriptor().unwrap_err(),
+                DriveError::UnreservedDescriptor(fd)
+            );
+        }
+
+        // A sealed image is neither writable nor flushable.
+        let mut writable = root_drive("root");
         writable.is_read_only = Some(false);
         assert_eq!(
             writable.descriptor().unwrap_err(),
-            DriveError::InvalidRootDescriptor
+            DriveError::WritableDrive
         );
 
-        let mut unspecified = descriptor.clone();
+        let mut unspecified = root_drive("root");
         unspecified.is_read_only = None;
         assert_eq!(
             unspecified.descriptor().unwrap_err(),
-            DriveError::InvalidRootDescriptor
+            DriveError::WritableDrive
         );
 
-        let mut writeback = descriptor;
+        let mut writeback = root_drive("root");
         writeback.cache_type = CacheType::Writeback;
         assert_eq!(
             writeback.descriptor().unwrap_err(),
@@ -633,29 +505,54 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_descriptor_backed_root_device() {
-        let image = root_image();
-        let fd = image.as_file().as_raw_fd();
+    fn test_uninherited_descriptor_is_refused() {
+        in_child(|| {
+            // A supervisor that passes no bootstrap descriptor leaves the number closed.
+            // SAFETY: the descriptor belongs to this child alone.
+            assert_eq!(unsafe { libc::close(BOOTSTRAP_DESCRIPTOR_FILENO) }, 0);
+            assert_eq!(
+                bootstrap_drive("bootstrap").descriptor().unwrap_err(),
+                DriveError::DescriptorNotInherited(
+                    BOOTSTRAP_DESCRIPTOR_FILENO,
+                    io::Error::from_raw_os_error(libc::EBADF)
+                )
+            );
 
+            // A writable descriptor never carries a sealed image.
+            let writable_image = TempFile::new().unwrap();
+            writable_image.as_file().set_len(0x1000).unwrap();
+            // SAFETY: `dup2` rewrites this child's own descriptor table alone.
+            let installed = unsafe {
+                libc::dup2(
+                    writable_image.as_file().as_raw_fd(),
+                    BOOTSTRAP_DESCRIPTOR_FILENO,
+                )
+            };
+            assert_eq!(installed, BOOTSTRAP_DESCRIPTOR_FILENO);
+            assert_eq!(
+                bootstrap_drive("bootstrap").descriptor().unwrap_err(),
+                DriveError::WritableDescriptor(BOOTSTRAP_DESCRIPTOR_FILENO)
+            );
+        });
+    }
+
+    #[test]
+    fn test_insert_descriptor_backed_drives() {
         let mut block_devs = BlockBuilder::new();
-        block_devs
-            .insert(BlockDeviceConfig {
-                drive_id: String::from("root"),
-                is_root_device: true,
-                is_read_only: Some(true),
-                fd,
-                ..Default::default()
-            })
-            .unwrap();
+        block_devs.insert(root_drive("root")).unwrap();
+        block_devs.insert(bootstrap_drive("bootstrap")).unwrap();
 
         assert!(block_devs.has_root_device());
-        {
-            let block = block_devs.devices[0].lock().unwrap();
+        for device in &block_devs.devices {
+            let block = device.lock().unwrap();
             assert!(block.read_only());
             assert_ne!(block.avail_features() & (1u64 << VIRTIO_BLK_F_RO), 0);
         }
 
         let configs = block_devs.configs();
-        assert_eq!(configs[0].fd, fd);
+        assert_eq!(configs[0].fd, ROOT_DESCRIPTOR_FILENO);
+        assert!(configs[0].is_root_device);
+        assert_eq!(configs[1].fd, BOOTSTRAP_DESCRIPTOR_FILENO);
+        assert!(!configs[1].is_root_device);
     }
 }

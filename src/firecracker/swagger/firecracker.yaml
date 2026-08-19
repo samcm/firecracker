@@ -666,9 +666,13 @@ definitions:
 
   Drive:
     type: object
+    description:
+      Drive backed by a descriptor the jailer inherits, never by a path. The root drive is backed
+      by the sealed root image and a second, bootstrap drive is the only other drive permitted.
     required:
       - drive_id
       - is_root_device
+      - is_read_only
       - fd
     properties:
       drive_id:
@@ -681,6 +685,9 @@ definitions:
           field is true.
       is_root_device:
         type: boolean
+        description:
+          Whether this drive is the root device. It is true for the drive backed by the root
+          image and false for the bootstrap drive.
       cache_type:
         type: string
         description:
@@ -691,14 +698,18 @@ definitions:
       is_read_only:
         type: boolean
         description:
-          Is block read only. This field is required for virtio-block config.
+          Is block read only. Both inherited images are sealed read-only, so this field is
+          required and must be true.
       fd:
         type: integer
         format: int32
-        minimum: 0
+        minimum: 4
+        maximum: 5
         description:
-          Number of an inherited descriptor for the sealed, read-only memfd backing
-          this drive. Requires is_read_only to be true.
+          Number of the inherited descriptor for the sealed, read-only memfd backing this drive.
+          It is 4 for the root image, which requires is_root_device to be true, and 5 for the
+          bootstrap image, which requires is_root_device to be false. No other descriptor backs
+          a drive.
       rate_limiter:
         $ref: "#/definitions/RateLimiter"
       io_engine:

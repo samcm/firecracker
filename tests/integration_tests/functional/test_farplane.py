@@ -546,7 +546,6 @@ def test_root_drive_is_served_from_the_sealed_memfd(farplane_factory):
         for page in pagemaster.harvest().set_pages()
     ), "the guest never read the sealed root image"
     pagemaster.resume(run_vcpus=1)
-
     for body, message in [
         (
             {"drive_id": "second", "fd": 4, "is_read_only": False},
@@ -571,32 +570,112 @@ def test_root_drive_is_served_from_the_sealed_memfd(farplane_factory):
         assert message in response.text, response.text
 
 
+def test_bootstrap_drive_is_served_from_the_sealed_memfd(farplane_factory):
+    """The bootstrap device comes from fd 5 and transfers its bytes to the guest."""
+    vm = farplane_factory()
+    vm.bootstrap_file = vm.rootfs
+    vm.spawn()
+    pagemaster = vm.start_pagemaster()
+    vm.configure(
+        boot_args=(
+            "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0"
+            " cryptomgr.notests pci=off root=/dev/vdb ro"
+        )
+    )
+    vm.api.drive.put(
+        drive_id="bootstrap",
+        fd=fp.BOOTSTRAP_FILENO,
+        is_root_device=False,
+        is_read_only=True,
+    )
+    vm.start()
+    pagemaster.wait_ready()
+
+    assert (
+        fp.seals_of(vm.bootstrap_fd) & fp.F_SEAL_WRITE
+    ), "the bootstrap memfd is writable"
+    assert os.readlink(f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}").startswith(
+        "/memfd:bootstrap"
+    )
+
+    pagemaster.capture_buffers()
+    pagemaster.quiesce()
+    pagemaster.dirty_snapshot()
+    with open(vm.bootstrap_file, "rb") as image:
+        signature = image.read(64)
+    assert any(
+        pagemaster.read_guest(page, 64) == signature
+        for page in pagemaster.harvest().set_pages()
+    ), "the guest never read the sealed bootstrap image"
+    pagemaster.resume(run_vcpus=1)
+
+
+def test_bootstrap_fd_is_closed_when_not_handed_to_the_jailer(farplane_factory):
+    """The absent bootstrap descriptor is not reserved in Firecracker."""
+    vm = farplane_factory()
+    boot(vm)
+
+    with pytest.raises(FileNotFoundError):
+        os.readlink(f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}")
+
+
+def test_api_refuses_bootstrap_fd_without_the_bootstrap_memfd(farplane_factory):
+    """fd 5 cannot configure a drive when the jailer did not receive it."""
+    vm = farplane_factory()
+    boot(vm)
+
+    response = raw(
+        vm.api,
+        "PUT",
+        "/drives/bootstrap",
+        {
+            "drive_id": "bootstrap",
+            "fd": fp.BOOTSTRAP_FILENO,
+            "is_root_device": False,
+            "is_read_only": True,
+        },
+    )
+    assert response.status_code == 400, response.text
+
+
 @pytest.mark.parametrize(
-    "flaw,expected",
+    "descriptor,flaw,expected",
     [
-        ("writable", "--root-fd must be opened O_RDONLY"),
-        ("unsealed", "--root-fd is missing required memfd seals"),
-        ("empty", "--root-fd size must be nonzero"),
-        ("not_a_memfd", "--root-fd is not a memfd"),
+        ("root", "writable", "--root-fd must be opened O_RDONLY"),
+        ("root", "unsealed", "--root-fd is missing required memfd seals"),
+        ("root", "empty", "--root-fd size must be nonzero"),
+        ("root", "not_a_memfd", "--root-fd is not a memfd"),
+        ("bootstrap", "writable", "--bootstrap-fd must be opened O_RDONLY"),
+        (
+            "bootstrap",
+            "unsealed",
+            "--bootstrap-fd is missing required memfd seals",
+        ),
+        ("bootstrap", "empty", "--bootstrap-fd size must be nonzero"),
+        ("bootstrap", "not_a_memfd", "--bootstrap-fd is not a memfd"),
     ],
 )
-def test_jailer_refuses_a_bad_root_fd(farplane_factory, flaw, expected):
-    """Every root descriptor precondition is enforced before the jail is built."""
-    vm = farplane_factory(f"rootfd-{flaw}")
+def test_jailer_refuses_a_bad_block_fd(farplane_factory, descriptor, flaw, expected):
+    """Every root and bootstrap descriptor precondition is enforced before the jail is built."""
+    vm = farplane_factory(f"{descriptor}fd-{flaw}")
+    open_memfd = vm.open_root_memfd if descriptor == "root" else vm.open_bootstrap_memfd
     if flaw == "writable":
-        root_fd = vm.open_root_memfd(size=PAGE, read_only=False)
+        block_fd = open_memfd(size=PAGE, read_only=False)
     elif flaw == "unsealed":
-        root_fd = vm.open_root_memfd(size=PAGE, seals=fp.F_SEAL_GROW)
+        block_fd = open_memfd(size=PAGE, seals=fp.F_SEAL_GROW)
     elif flaw == "empty":
-        root_fd = vm.open_root_memfd(size=0)
+        block_fd = open_memfd(size=0)
     else:
         # A directory is never a shmem file, so F_GET_SEALS fails whatever the host filesystem
         # under the jail happens to be.
         vm.chroot_base.mkdir(parents=True, exist_ok=True)
-        root_fd = os.open(vm.chroot_base, os.O_RDONLY | os.O_DIRECTORY)
-        vm.root_fd = root_fd
+        block_fd = os.open(vm.chroot_base, os.O_RDONLY | os.O_DIRECTORY)
+        if descriptor == "root":
+            vm.root_fd = block_fd
+        else:
+            vm.bootstrap_fd = block_fd
 
-    vm.spawn(root_fd=root_fd, wait=False)
+    vm.spawn(**{f"{descriptor}_fd": block_fd}, wait=False)
     assert vm.proc.wait(timeout=30) != 0
     assert expected in vm.stdio_text()
     assert not vm.api_socket.exists()
@@ -694,20 +773,35 @@ def test_patch_vm_during_a_capture_conflicts(farplane_factory):
 def test_jail_hands_over_renumbered_fds_and_a_stripped_process(farplane_factory):
     """The jailer renumbers the inherited descriptors and strips the process it execs."""
     vm = farplane_factory()
-    base = vm.open_root_memfd()
-    spares = [os.dup(base) for _ in range(8)]
-    high = next(fd for fd in spares if fd > fp.ROOT_FILENO)
-    for fd in [base] + [fd for fd in spares if fd != high]:
+    root_base = vm.open_root_memfd()
+    bootstrap_base = vm.open_root_memfd()
+    root_spares = [os.dup(root_base) for _ in range(8)]
+    bootstrap_spares = [os.dup(bootstrap_base) for _ in range(8)]
+    root_high = next(fd for fd in root_spares if fd > fp.BOOTSTRAP_FILENO)
+    bootstrap_high = next(fd for fd in bootstrap_spares if fd > fp.BOOTSTRAP_FILENO)
+    for fd in [root_base] + [fd for fd in root_spares if fd != root_high]:
         os.close(fd)
-    vm.root_fd = high
+    for fd in [bootstrap_base] + [
+        fd for fd in bootstrap_spares if fd != bootstrap_high
+    ]:
+        os.close(fd)
+    vm.root_fd = root_high
+    vm.bootstrap_fd = bootstrap_high
 
-    boot(vm)
+    vm.spawn(root_fd=root_high, bootstrap_fd=bootstrap_high)
+    pagemaster = vm.start_pagemaster()
+    vm.configure()
+    vm.start()
+    pagemaster.wait_ready()
 
     device = f"/proc/{vm.pid}/fd/{fp.UFFD_DEVICE_FILENO}"
     root = f"/proc/{vm.pid}/fd/{fp.ROOT_FILENO}"
+    bootstrap = f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}"
     assert os.readlink(device) == str(fp.DEV_USERFAULTFD)
     assert os.stat(device).st_rdev == fp.DEV_USERFAULTFD.stat().st_rdev
     assert os.readlink(root).startswith("/memfd:rootfs")
+    assert os.readlink(bootstrap).startswith("/memfd:rootfs")
+    assert os.stat(root).st_ino != os.stat(bootstrap).st_ino
 
     status = Path(f"/proc/{vm.pid}/status").read_text(encoding="utf-8")
     caps = dict(

@@ -24,13 +24,10 @@ def _configure_vm_from_json(test_microvm, vm_config_file):
     """
     # since we don't use basic-config, we do it by hand
     test_microvm.create_jailed_resource(test_microvm.kernel_file)
-    test_microvm.create_jailed_resource(test_microvm.rootfs_file)
 
     vm_config_file = Path(vm_config_file)
     obj = json.load(vm_config_file.open(encoding="UTF-8"))
     obj["boot-source"]["kernel_image_path"] = str(test_microvm.kernel_file.name)
-    obj["drives"][0]["path_on_host"] = str(test_microvm.rootfs_file.name)
-    obj["drives"][0]["is_read_only"] = True
     vm_config = Path(test_microvm.chroot()) / vm_config_file.name
     vm_config.write_text(json.dumps(obj))
     test_microvm.jailer.extra_args = {"config-file": vm_config.name}

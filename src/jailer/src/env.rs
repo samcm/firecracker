@@ -20,7 +20,7 @@ use vmm_sys_util::syscall::SyscallReturnCode;
 
 use crate::chroot::chroot;
 use crate::resource_limits::{FSIZE_ARG, MEMLOCK_ARG, NO_FILE_ARG, ResourceLimits};
-use crate::{JailerError, ROOT_FILENO, UFFD_FILENO, close_inherited_fds};
+use crate::{BOOTSTRAP_FILENO, JailerError, ROOT_FILENO, UFFD_FILENO, close_inherited_fds};
 
 const DEV_KVM: &CStr = c"/dev/kvm";
 const DEV_KVM_MAJOR: u32 = 10;
@@ -76,12 +76,12 @@ fn open_userfaultfd_device() -> Result<RawFd, JailerError> {
 /// Moves `fd` past the descriptor numbers reserved for Firecracker, so that renumbering one of
 /// them cannot overwrite the other. The copy is returned and the original is closed.
 fn move_off_reserved_fds(fd: RawFd) -> Result<RawFd, JailerError> {
-    if fd > ROOT_FILENO {
+    if fd > BOOTSTRAP_FILENO {
         return Ok(fd);
     }
     // SAFETY: `F_DUPFD` returns the lowest free descriptor number greater than or equal to its
     // argument, and the return code is checked.
-    let moved = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_DUPFD, ROOT_FILENO + 1) })
+    let moved = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_DUPFD, BOOTSTRAP_FILENO + 1) })
         .into_result()
         .map_err(JailerError::Dup2)?;
     close(fd)?;
@@ -116,6 +116,7 @@ pub struct Env {
     extra_args: Vec<String>,
     resource_limits: ResourceLimits,
     root_fd: RawFd,
+    bootstrap_fd: Option<RawFd>,
     cgroup_join: Option<PathBuf>,
 }
 
@@ -173,6 +174,14 @@ impl Env {
             .parse::<RawFd>()
             .map_err(|_| JailerError::RootFdArgument(root_fd_str.to_owned()))?;
 
+        let bootstrap_fd = arguments
+            .single_value("bootstrap-fd")
+            .map(|fd| {
+                fd.parse::<RawFd>()
+                    .map_err(|_| JailerError::BootstrapFdArgument(fd.to_owned()))
+            })
+            .transpose()?;
+
         let mut resource_limits = ResourceLimits::default();
         if let Some(args) = arguments.multiple_values("resource-limit") {
             Env::parse_resource_limits(&mut resource_limits, args)?;
@@ -202,6 +211,7 @@ impl Env {
             extra_args: arguments.extra_args(),
             resource_limits,
             root_fd,
+            bootstrap_fd,
             cgroup_join,
         })
     }
@@ -380,17 +390,38 @@ impl Env {
         fs::write(&procs, id().to_string()).map_err(|err| JailerError::CgroupJoin(procs, err))
     }
 
-    /// Hands Firecracker the userfaultfd device as [`UFFD_FILENO`] and the sealed root image as
-    /// [`ROOT_FILENO`]. The root descriptor is moved clear of both slots first, because the
-    /// caller is free to pass it in at either of them.
+    /// Hands Firecracker the userfaultfd device as [`UFFD_FILENO`], the sealed root image as
+    /// [`ROOT_FILENO`] and, when the caller passes one, the sealed bootstrap image as
+    /// [`BOOTSTRAP_FILENO`]. Every passed descriptor is moved clear of the reserved slots first,
+    /// because the caller is free to pass them in at any number.
     fn install_inherited_fds(&self) -> Result<(), JailerError> {
         let uffd_device = open_userfaultfd_device()?;
 
-        validate_root_fd(self.root_fd)?;
+        validate_image_fd("--root-fd", self.root_fd)?;
         let root_fd = move_off_reserved_fds(self.root_fd)?;
 
+        let bootstrap_fd = match self.bootstrap_fd {
+            Some(fd) => {
+                validate_image_fd("--bootstrap-fd", fd)?;
+                Some(move_off_reserved_fds(fd)?)
+            }
+            None => None,
+        };
+
         place_fd(uffd_device, UFFD_FILENO)?;
-        place_fd(root_fd, ROOT_FILENO)
+        place_fd(root_fd, ROOT_FILENO)?;
+        match bootstrap_fd {
+            Some(fd) => place_fd(fd, BOOTSTRAP_FILENO),
+            None => Ok(()),
+        }
+    }
+
+    /// Last descriptor number Firecracker is given, which is the highest one that survives exec.
+    fn highest_reserved_fd(&self) -> libc::c_int {
+        match self.bootstrap_fd {
+            Some(_) => BOOTSTRAP_FILENO,
+            None => ROOT_FILENO,
+        }
     }
 
     fn exec_command(&self, chroot_exec_file: PathBuf) -> io::Error {
@@ -502,7 +533,7 @@ impl Env {
         self.install_inherited_fds()?;
         self.join_cgroup()?;
         self.resource_limits.install()?;
-        close_inherited_fds()?;
+        close_inherited_fds(self.highest_reserved_fd())?;
 
         #[cfg(target_arch = "aarch64")]
         self.copy_cache_info()?;
@@ -525,29 +556,29 @@ impl Env {
     }
 }
 
-/// Checks that `fd` is the descriptor the sandbox is contracted to pass: a sealed, read-only,
-/// non-empty memfd holding the root block device image. The image itself is never read here.
-fn validate_root_fd(fd: RawFd) -> Result<(), JailerError> {
+/// Checks that `fd` is a descriptor the sandbox is contracted to pass: a sealed, read-only,
+/// non-empty memfd holding a block device image. The image itself is never read here.
+fn validate_image_fd(flag: &'static str, fd: RawFd) -> Result<(), JailerError> {
     // SAFETY: `F_GETFL` writes nothing and the return code is checked.
     let flags = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GETFL) })
         .into_result()
-        .map_err(JailerError::RootFdInspect)?;
+        .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
     if flags & libc::O_ACCMODE != libc::O_RDONLY {
-        return Err(JailerError::RootFdNotReadOnly);
+        return Err(JailerError::ImageFdNotReadOnly(flag));
     }
 
     let mut stat = MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` is a valid, aligned, sufficiently sized allocation for a `libc::stat`.
     SyscallReturnCode(unsafe { libc::fstat(fd, stat.as_mut_ptr()) })
         .into_empty_result()
-        .map_err(JailerError::RootFdInspect)?;
+        .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
     // SAFETY: `fstat` returned success, so it initialized the whole struct.
     let stat = unsafe { stat.assume_init() };
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(JailerError::RootFdNotMemfd);
+        return Err(JailerError::ImageFdNotMemfd(flag));
     }
     if stat.st_size == 0 {
-        return Err(JailerError::RootFdEmpty);
+        return Err(JailerError::ImageFdEmpty(flag));
     }
 
     // Only shmem-backed files answer `F_GET_SEALS`; anything else fails with EINVAL. Plain tmpfs
@@ -556,19 +587,19 @@ fn validate_root_fd(fd: RawFd) -> Result<(), JailerError> {
     let seals = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GET_SEALS) })
         .into_result()
         .map_err(|err| match err.raw_os_error() {
-            Some(libc::EINVAL) => JailerError::RootFdNotMemfd,
-            _ => JailerError::RootFdInspect(err),
+            Some(libc::EINVAL) => JailerError::ImageFdNotMemfd(flag),
+            _ => JailerError::ImageFdInspect(flag, err),
         })?;
     // Seals only ever remove abilities, and a kernel with vm.memfd_noexec enabled adds
     // F_SEAL_EXEC by itself, so anything beyond the required set is accepted.
     if seals & REQUIRED_ROOT_SEALS != REQUIRED_ROOT_SEALS {
-        return Err(JailerError::RootFdNotSealed);
+        return Err(JailerError::ImageFdNotSealed(flag));
     }
 
-    let link =
-        fs::read_link(format!("/proc/self/fd/{}", fd)).map_err(JailerError::RootFdInspect)?;
+    let link = fs::read_link(format!("/proc/self/fd/{}", fd))
+        .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
     if !link.as_os_str().as_bytes().starts_with(MEMFD_LINK_PREFIX) {
-        return Err(JailerError::RootFdNotMemfd);
+        return Err(JailerError::ImageFdNotMemfd(flag));
     }
 
     Ok(())
@@ -652,6 +683,31 @@ mod tests {
         assert_eq!(env.uid(), 1001);
         assert_eq!(env.gid(), 1002);
         assert_eq!(env.root_fd, 7);
+        assert_eq!(env.bootstrap_fd, None);
+        assert_eq!(env.highest_reserved_fd(), ROOT_FILENO);
+    }
+
+    /// A bootstrap image is optional, and reserving fd 5 follows from passing one.
+    #[test]
+    fn test_bootstrap_fd_reserves_its_slot_only_when_passed() {
+        let env = new_env(&cmdline(
+            "7",
+            &["--chroot-base-dir", "/", "--bootstrap-fd", "8"],
+        ))
+        .unwrap();
+        assert_eq!(env.bootstrap_fd, Some(8));
+        assert_eq!(env.highest_reserved_fd(), BOOTSTRAP_FILENO);
+    }
+
+    #[test]
+    fn test_bootstrap_fd_must_be_a_descriptor_number() {
+        assert!(matches!(
+            new_env(&cmdline(
+                "7",
+                &["--chroot-base-dir", "/", "--bootstrap-fd", "/dev/bootstrap"]
+            )),
+            Err(JailerError::BootstrapFdArgument(_))
+        ));
     }
 
     #[test]
@@ -673,12 +729,55 @@ mod tests {
         ));
     }
 
+    /// The bootstrap image is held to the same contract as the root image, reported under its own
+    /// flag name so a caller can tell which descriptor it got wrong.
+    #[test]
+    fn test_validate_bootstrap_fd_holds_the_root_contract() {
+        let sealed = memfd(4096, REQUIRED_ROOT_SEALS);
+        let read_only = reopen_read_only(sealed);
+        validate_image_fd("--bootstrap-fd", read_only).unwrap();
+        close(read_only).unwrap();
+
+        assert!(matches!(
+            validate_image_fd("--bootstrap-fd", sealed),
+            Err(JailerError::ImageFdNotReadOnly("--bootstrap-fd"))
+        ));
+        close(sealed).unwrap();
+
+        let unsealed = memfd(4096, libc::F_SEAL_WRITE);
+        let read_only = reopen_read_only(unsealed);
+        assert!(matches!(
+            validate_image_fd("--bootstrap-fd", read_only),
+            Err(JailerError::ImageFdNotSealed("--bootstrap-fd"))
+        ));
+        close(read_only).unwrap();
+        close(unsealed).unwrap();
+
+        let empty = memfd(0, REQUIRED_ROOT_SEALS);
+        let read_only = reopen_read_only(empty);
+        assert!(matches!(
+            validate_image_fd("--bootstrap-fd", read_only),
+            Err(JailerError::ImageFdEmpty("--bootstrap-fd"))
+        ));
+        close(read_only).unwrap();
+        close(empty).unwrap();
+
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        assert!(matches!(
+            validate_image_fd("--bootstrap-fd", pipe[0]),
+            Err(JailerError::ImageFdNotMemfd("--bootstrap-fd"))
+        ));
+        close(pipe[0]).unwrap();
+        close(pipe[1]).unwrap();
+    }
+
     #[test]
     fn test_validate_root_fd_accepts_sealed_read_only_memfd() {
         let fd = memfd(4096, REQUIRED_ROOT_SEALS);
         let read_only = reopen_read_only(fd);
 
-        validate_root_fd(read_only).unwrap();
+        validate_image_fd("--root-fd", read_only).unwrap();
 
         close(fd).unwrap();
         close(read_only).unwrap();
@@ -689,8 +788,8 @@ mod tests {
         let fd = memfd(4096, REQUIRED_ROOT_SEALS);
 
         assert!(matches!(
-            validate_root_fd(fd),
-            Err(JailerError::RootFdNotReadOnly)
+            validate_image_fd("--root-fd", fd),
+            Err(JailerError::ImageFdNotReadOnly("--root-fd"))
         ));
 
         close(fd).unwrap();
@@ -702,8 +801,8 @@ mod tests {
         let read_only = reopen_read_only(fd);
 
         assert!(matches!(
-            validate_root_fd(read_only),
-            Err(JailerError::RootFdNotSealed)
+            validate_image_fd("--root-fd", read_only),
+            Err(JailerError::ImageFdNotSealed("--root-fd"))
         ));
 
         close(fd).unwrap();
@@ -716,8 +815,8 @@ mod tests {
         let read_only = reopen_read_only(fd);
 
         assert!(matches!(
-            validate_root_fd(read_only),
-            Err(JailerError::RootFdEmpty)
+            validate_image_fd("--root-fd", read_only),
+            Err(JailerError::ImageFdEmpty("--root-fd"))
         ));
 
         close(fd).unwrap();
@@ -730,8 +829,8 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
 
         assert!(matches!(
-            validate_root_fd(pipe[0]),
-            Err(JailerError::RootFdNotMemfd)
+            validate_image_fd("--root-fd", pipe[0]),
+            Err(JailerError::ImageFdNotMemfd("--root-fd"))
         ));
 
         close(pipe[0]).unwrap();

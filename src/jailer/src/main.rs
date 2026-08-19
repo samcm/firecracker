@@ -23,6 +23,9 @@ const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const UFFD_FILENO: libc::c_int = 3;
 /// Descriptor Firecracker reads the sealed root block device image from.
 pub(crate) const ROOT_FILENO: libc::c_int = 4;
+/// Descriptor Firecracker reads the sealed bootstrap block device image from, when the caller
+/// passes one.
+pub(crate) const BOOTSTRAP_FILENO: libc::c_int = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JailerError {
@@ -94,18 +97,20 @@ pub enum JailerError {
     ResLimitValue(String, String),
     #[error("Failed to remove old jail root directory: {0}")]
     RmOldRootDir(io::Error),
+    #[error("--bootstrap-fd is not a descriptor number: {0}")]
+    BootstrapFdArgument(String),
     #[error("--root-fd is not a descriptor number: {0}")]
     RootFdArgument(String),
-    #[error("--root-fd must have a nonzero size")]
-    RootFdEmpty,
-    #[error("Failed to inspect --root-fd: {0}")]
-    RootFdInspect(io::Error),
-    #[error("--root-fd is not a memfd")]
-    RootFdNotMemfd,
-    #[error("--root-fd must be opened O_RDONLY")]
-    RootFdNotReadOnly,
-    #[error("--root-fd is missing the write, grow, shrink or seal memfd seal")]
-    RootFdNotSealed,
+    #[error("{0} must have a nonzero size")]
+    ImageFdEmpty(&'static str),
+    #[error("Failed to inspect {0}: {1}")]
+    ImageFdInspect(&'static str, io::Error),
+    #[error("{0} is not a memfd")]
+    ImageFdNotMemfd(&'static str),
+    #[error("{0} must be opened O_RDONLY")]
+    ImageFdNotReadOnly(&'static str),
+    #[error("{0} is missing the write, grow, shrink or seal memfd seal")]
+    ImageFdNotSealed(&'static str),
     #[error("Failed to change current directory: {0}")]
     SetCurrentDir(io::Error),
     #[error("Failed to join network namespace: netns: {0}")]
@@ -161,6 +166,10 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                      validated and handed to Firecracker as fd 4.",
                 ),
         )
+        .arg(Argument::new("bootstrap-fd").takes_value(true).help(
+            "Inherited descriptor of the sealed read-only bootstrap block device image. \
+                     It is validated and handed to Firecracker as fd 5.",
+        ))
         .arg(
             Argument::new("chroot-base-dir")
                 .takes_value(true)
@@ -212,14 +221,16 @@ pub fn readln_special<T: AsRef<Path> + Debug>(file_path: &T) -> Result<String, J
 }
 
 /// Closes every inherited descriptor above the ones the jailed binary needs: the standard
-/// streams, [`UFFD_FILENO`] and [`ROOT_FILENO`], which are the highest reserved number.
-pub(crate) fn close_inherited_fds() -> Result<(), JailerError> {
+/// streams and the descriptors Firecracker is given. `highest_reserved` is the last of those:
+/// [`BOOTSTRAP_FILENO`] when the caller passed a bootstrap image, [`ROOT_FILENO`] otherwise, so an
+/// absent bootstrap image leaves fd 5 unreserved.
+pub(crate) fn close_inherited_fds(highest_reserved: libc::c_int) -> Result<(), JailerError> {
     // SAFETY: closing a range which holds no open descriptors is a no-op, and the return code
     // of the syscall is checked.
     SyscallReturnCode(unsafe {
         libc::syscall(
             libc::SYS_close_range,
-            ROOT_FILENO + 1,
+            highest_reserved + 1,
             libc::c_uint::MAX,
             libc::CLOSE_RANGE_UNSHARE,
         )

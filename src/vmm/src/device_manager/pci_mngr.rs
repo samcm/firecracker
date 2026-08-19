@@ -365,7 +365,7 @@ impl<'a> Persist<'a> for PciDevices {
 
         for block_state in &state.block_devices {
             let device = Arc::new(Mutex::new(Block::restore(
-                BlockConstructorArgs::root(mem.clone()),
+                BlockConstructorArgs::inherited(mem.clone(), &block_state.device_state),
                 &block_state.device_state,
             )?));
 

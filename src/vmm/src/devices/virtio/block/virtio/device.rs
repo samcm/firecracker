@@ -174,7 +174,7 @@ pub struct VirtioBlockConfig {
     /// If set to true, the drive is opened in read-only mode. Otherwise, the
     /// drive is opened as read-write.
     pub is_read_only: bool,
-    /// Descriptor the sealed read-only root image was inherited at.
+    /// Descriptor the sealed read-only image backing this drive was inherited at.
     pub fd: RawFd,
     /// Rate Limiter for I/O operations.
     pub rate_limiter: Option<RateLimiterConfig>,
@@ -676,16 +676,19 @@ mod tests {
 
     #[test]
     fn test_from_config() {
-        let descriptor_backed = BlockDeviceConfig {
+        // The conversion resolves the descriptor, so a number the jailer never inherits a sealed
+        // image at cannot reach a device.
+        let unreserved = BlockDeviceConfig {
             drive_id: "root".to_string(),
+            is_root_device: true,
             is_read_only: Some(true),
-            fd: 4,
+            fd: 9,
             ..Default::default()
         };
-        assert_eq!(
-            VirtioBlockConfig::try_from(&descriptor_backed).unwrap().fd,
-            4
-        );
+        assert!(matches!(
+            VirtioBlockConfig::try_from(&unreserved),
+            Err(DriveError::UnreservedDescriptor(9))
+        ));
     }
 
     #[test]
@@ -724,12 +727,16 @@ mod tests {
         f.as_file().set_len(0x1000).unwrap();
 
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
-            let block = default_block_with_descriptor(f.as_file().as_raw_fd(), engine);
+            for is_root_device in [true, false] {
+                let block =
+                    default_block_with_descriptor(f.as_file().as_raw_fd(), is_root_device, engine);
 
-            assert!(block.read_only);
-            assert_ne!(block.avail_features & (1u64 << VIRTIO_BLK_F_RO), 0);
-            assert_eq!(block.avail_features & (1u64 << VIRTIO_BLK_F_FLUSH), 0);
-            assert_eq!(block.config_space.capacity, 0x1000 >> SECTOR_SHIFT);
+                assert_eq!(block.root_device, is_root_device);
+                assert!(block.read_only);
+                assert_ne!(block.avail_features & (1u64 << VIRTIO_BLK_F_RO), 0);
+                assert_eq!(block.avail_features & (1u64 << VIRTIO_BLK_F_FLUSH), 0);
+                assert_eq!(block.config_space.capacity, 0x1000 >> SECTOR_SHIFT);
+            }
         }
     }
 
@@ -739,8 +746,15 @@ mod tests {
         f.as_file().set_len(0x1000).unwrap();
         f.as_file().write_all(&[0x11; 0x1000]).unwrap();
 
-        for engine in [FileEngineType::Sync, FileEngineType::Async] {
-            let mut block = default_block_with_descriptor(f.as_file().as_raw_fd(), engine);
+        // The root image and the bootstrap image are both sealed read-only.
+        for (engine, is_root_device) in [
+            (FileEngineType::Sync, true),
+            (FileEngineType::Sync, false),
+            (FileEngineType::Async, true),
+            (FileEngineType::Async, false),
+        ] {
+            let mut block =
+                default_block_with_descriptor(f.as_file().as_raw_fd(), is_root_device, engine);
             let mem = default_mem();
             let interrupt = default_interrupt();
             let vq = VirtQueue::new(GuestAddress(0), &mem, 16);

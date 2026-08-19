@@ -80,6 +80,7 @@ class Microvm:
 
         self.kernel_file = None
         self.rootfs_file = None
+        self.bootstrap_file = None
         self.distro = None
         self.ssh_key = None
         self.initrd_file = None
@@ -112,6 +113,7 @@ class Microvm:
         self.console_log = None
         self.pagemaster = None
         self._root_fd = None
+        self._bootstrap_fd = None
 
         self.time_api_requests = global_props.host_linux_version != "6.1"
         # disable the HTTP API timings as they cause a lot of false positives
@@ -270,6 +272,9 @@ class Microvm:
         if self._root_fd is not None:
             os.close(self._root_fd)
             self._root_fd = None
+        if self._bootstrap_fd is not None:
+            os.close(self._bootstrap_fd)
+            self._bootstrap_fd = None
         if self._console_fd is not None:
             os.close(self._console_fd)
             self._console_fd = None
@@ -555,9 +560,9 @@ class Microvm:
     ):
         """Spawn the microVM.
 
-        The root image reaches Firecracker as a sealed memfd the jailer
-        renumbers to `ROOT_FILENO`, and guest memory is served over the memory
-        channel a `Pagemaster` binds inside the jail.
+        The root image and optional bootstrap image reach Firecracker as sealed
+        memfds the jailer renumbers to `ROOT_FILENO` and fd 5, and guest memory
+        is served over the memory channel a `Pagemaster` binds inside the jail.
         """
         # pylint: disable=too-many-branches
         self.jailer.setup()
@@ -602,6 +607,11 @@ class Microvm:
         assert self.rootfs_file is not None, "the jailer requires a root image"
         self._root_fd = memfd_from_file("rootfs", self.rootfs_file)
         self.jailer.root_fd = self._root_fd
+        if self.bootstrap_file is not None:
+            self._bootstrap_fd = memfd_from_file("bootstrap", self.bootstrap_file)
+            self.jailer.bootstrap_fd = self._bootstrap_fd
+        else:
+            self.jailer.bootstrap_fd = None
         self.pagemaster = self.start_pagemaster()
         self.jailer.extra_args["farplane-mem-socket"] = f"/{self.MEM_SOCKET_NAME}"
 
@@ -611,16 +621,18 @@ class Microvm:
             *self.jailer.construct_param_list(),
         ]
 
-        # The jailer execs into Firecracker, so the root descriptor has to
-        # survive the fork: `pass_fds` keeps exactly that number open, which is
-        # the number `--root-fd` names.
+        # The jailer execs into Firecracker, so the root and optional bootstrap
+        # descriptors have to survive the fork: `pass_fds` keeps exactly the
+        # numbers `--root-fd` and `--bootstrap-fd` name open.
         console = self._open_console()
         self._jailer_proc = subprocess.Popen(
             cmd,
             stdin=console,
             stdout=console,
             stderr=console,
-            pass_fds=(self._root_fd,),
+            pass_fds=tuple(
+                fd for fd in (self._root_fd, self._bootstrap_fd) if fd is not None
+            ),
         )
         os.close(console)
 
@@ -789,41 +801,6 @@ class Microvm:
         # custom CPU template
         elif isinstance(cpu_template, dict):
             self.api.cpu_config.put(**cpu_template["template"])
-
-    def add_drive(
-        self,
-        drive_id,
-        path_on_host,
-        is_root_device=False,
-        is_read_only=False,
-        partuuid=None,
-        cache_type=None,
-        io_engine=None,
-    ):
-        """Add a block device."""
-
-        path_on_jail = self.create_jailed_resource(path_on_host)
-        self.api.drive.put(
-            drive_id=drive_id,
-            path_on_host=path_on_jail,
-            is_root_device=is_root_device,
-            is_read_only=is_read_only,
-            partuuid=partuuid,
-            cache_type=cache_type,
-            io_engine=io_engine,
-        )
-        self.disks[drive_id] = path_on_host
-
-    def patch_drive(self, drive_id, file=None):
-        """Modify/patch an existing block device."""
-        if file:
-            self.api.drive.patch(
-                drive_id=drive_id,
-                path_on_host=self.create_jailed_resource(file.path),
-            )
-            self.disks[drive_id] = Path(file.path)
-        else:
-            self.api.drive.patch(drive_id=drive_id)
 
     def add_net_iface(self, iface=None, api=True, **kwargs):
         """Add a network interface"""

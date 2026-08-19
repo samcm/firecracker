@@ -48,6 +48,7 @@ ERROR_BODY = struct.Struct("<IHH128s")
 DEV_USERFAULTFD = Path("/dev/userfaultfd")
 UFFD_DEVICE_FILENO = 3
 ROOT_FILENO = 4
+BOOTSTRAP_FILENO = 5
 
 ARCH_X86_64 = 1
 ARCH_AARCH64 = 2
@@ -860,6 +861,7 @@ class FarplaneMicrovm:
         self.microvm_id = microvm_id
         self.kernel = Path(kernel) if kernel else None
         self.rootfs = Path(rootfs) if rootfs else None
+        self.bootstrap_file = None
         self.netns = netns
         self.uid = uid
         self.gid = gid
@@ -867,6 +869,7 @@ class FarplaneMicrovm:
         self.proc = None
         self.wrapper = None
         self.root_fd = None
+        self.bootstrap_fd = None
         self.api = None
         self.pagemaster = None
         self._pid = None
@@ -926,10 +929,28 @@ class FarplaneMicrovm:
             )
         return self.root_fd
 
+    def open_bootstrap_memfd(self, *, seals=ROOT_SEALS, read_only=True, size=None):
+        """Create the bootstrap memfd the jailer validates and renumbers to fd 5."""
+        if size is None:
+            self.bootstrap_fd = memfd_from_file(
+                "bootstrap", self.bootstrap_file, seals=seals, read_only=read_only
+            )
+        else:
+            self.bootstrap_fd = sealed_memfd(
+                "bootstrap", size, seals=seals, read_only=read_only
+            )
+        return self.bootstrap_fd
+
     # -------------------------------------------------------------------- launch
 
     def jailer_argv(
-        self, *, root_fd=None, cgroup_join=None, resource_limits=(), fc_args=()
+        self,
+        *,
+        root_fd=None,
+        bootstrap_fd=None,
+        cgroup_join=None,
+        resource_limits=(),
+        fc_args=(),
     ):
         """The exact command line used to launch this microVM."""
         argv = [
@@ -942,13 +963,14 @@ class FarplaneMicrovm:
             str(self.uid),
             "--gid",
             str(self.gid),
-            "--chroot-base-dir",
-            str(self.chroot_base),
         ]
-        if self.netns is not None:
-            argv += ["--netns", str(self.netns.path)]
         if root_fd is not None:
             argv += ["--root-fd", str(root_fd)]
+        if bootstrap_fd is not None:
+            argv += ["--bootstrap-fd", str(bootstrap_fd)]
+        argv += ["--chroot-base-dir", str(self.chroot_base)]
+        if self.netns is not None:
+            argv += ["--netns", str(self.netns.path)]
         if cgroup_join is not None:
             argv += ["--cgroup-join", str(cgroup_join)]
         for limit in resource_limits:
@@ -969,6 +991,7 @@ class FarplaneMicrovm:
         self,
         *,
         root_fd=-1,
+        bootstrap_fd=-1,
         cgroup_join=None,
         resource_limits=(),
         fc_args=(),
@@ -980,15 +1003,27 @@ class FarplaneMicrovm:
             root_fd = (
                 self.root_fd if self.root_fd is not None else self.open_root_memfd()
             )
+        if bootstrap_fd == -1:
+            if self.bootstrap_file is None:
+                bootstrap_fd = None
+            else:
+                bootstrap_fd = (
+                    self.bootstrap_fd
+                    if self.bootstrap_fd is not None
+                    else self.open_bootstrap_memfd()
+                )
         argv = self.jailer_argv(
             root_fd=root_fd,
+            bootstrap_fd=bootstrap_fd,
             cgroup_join=cgroup_join,
             resource_limits=resource_limits,
             fc_args=fc_args,
         )
         self.chroot_base.mkdir(parents=True, exist_ok=True)
         stdio = self.stdio.open("wb")
-        pass_fds = tuple(fd for fd in [root_fd] if fd is not None and fd >= 0)
+        pass_fds = tuple(
+            fd for fd in [root_fd, bootstrap_fd] if fd is not None and fd >= 0
+        )
         if via_wrapper:
             # A shell that outlives the exec so the test can kill Firecracker's parent.
             quoted = " ".join(f"'{arg}'" for arg in argv)
@@ -1107,3 +1142,9 @@ class FarplaneMicrovm:
             except OSError:
                 pass
             self.root_fd = None
+        if self.bootstrap_fd is not None:
+            try:
+                os.close(self.bootstrap_fd)
+            except OSError:
+                pass
+            self.bootstrap_fd = None

@@ -21,6 +21,7 @@ jailer --id <id> \
        [--chroot-base-dir <chroot_base>] \
        [--netns <netns>] \
        --root-fd <n> \
+       [--bootstrap-fd <n>] \
        [--cgroup-join <absolute_cgroupfs_path>] \
        [--resource-limit <no-file|fsize|memlock>=<value>] \
        [--...extra arguments for Firecracker]
@@ -39,6 +40,9 @@ jailer --id <id> \
   jailer will use this to join the associated network namespace.
 - `--root-fd` is required and identifies the inherited sealed read-only root
   memfd. The jailer renumbers it to file descriptor 4.
+- `--bootstrap-fd` is optional and identifies an inherited sealed read-only
+  bootstrap memfd. The jailer renumbers it to file descriptor 5; when absent,
+  file descriptor 5 is not reserved.
 - `--cgroup-join` identifies an absolute cgroupfs path for a pre-created leaf
   cgroup. The jailer joins that cgroup and does not create cgroups.
 - For extra security and control over resource usage, `--resource-limit` can be

@@ -61,6 +61,14 @@ pub struct VirtioBlockState {
     file_engine_type: FileEngineTypeState,
 }
 
+impl VirtioBlockState {
+    /// States whether the saved drive was the root device, which is what tells a restore which
+    /// inherited descriptor backs it.
+    pub fn root_device(&self) -> bool {
+        self.root_device
+    }
+}
+
 impl Persist<'_> for VirtioBlock {
     type State = VirtioBlockState;
     type ConstructorArgs = BlockConstructorArgs;
