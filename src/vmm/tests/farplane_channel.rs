@@ -20,7 +20,7 @@ use vm_memory::GuestAddress;
 use vmm::vstate::farplane::protocol::{
     self, Arch, BackendReadyRegion, ChannelError, ERROR_DETAIL_LEN, EXTENT_RECORD_LEN,
     ExtentRecord, HEADER_LEN, Header, MAGIC, MAX_DATAGRAM, MAX_EXTENTS, Mode, MsgType,
-    REGION_RECORD_LEN, RegionRecord, VERSION,
+    READY_REGION_RECORD_LEN, REGION_RECORD_LEN, RegionRecord, VERSION,
 };
 use vmm::vstate::farplane::{BackendError, ErrorCode, FEATURE_IDENTITY, FarplaneBackend};
 use vmm_sys_util::tempdir::TempDir;
@@ -758,11 +758,17 @@ fn a_full_conversation_round_trips_bodies_and_descriptors() {
         "the received descriptor must name the same object"
     );
     assert_eq!(
-        u64::from_le_bytes(got.body[24 + 4..24 + 12].try_into().unwrap()),
+        u32::from_le_bytes(got.body[0..4].try_into().unwrap()),
+        1,
+        "the region count leads the body"
+    );
+    let tail = 4 + READY_REGION_RECORD_LEN;
+    assert_eq!(
+        u64::from_le_bytes(got.body[tail + 4..tail + 12].try_into().unwrap()),
         0b11
     );
     assert_eq!(
-        u64::from_le_bytes(got.body[24 + 12..24 + 20].try_into().unwrap()),
+        u64::from_le_bytes(got.body[tail + 12..tail + 20].try_into().unwrap()),
         8
     );
 

@@ -6,7 +6,6 @@ use std::fs::{self, File, OpenOptions, Permissions};
 use std::io;
 use std::io::Write;
 use std::mem::MaybeUninit;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -40,9 +39,10 @@ const FOLDER_HIERARCHY: [&str; 4] = ["/", "/dev", "/dev/net", "/run"];
 const FOLDER_PERMISSIONS: u32 = 0o700;
 const PID_FILE_EXTENSION: &str = ".pid";
 
-/// A memfd link target always starts with this prefix, regardless of the name it was created
-/// with.
-const MEMFD_LINK_PREFIX: &[u8] = b"/memfd:";
+/// Filesystem magic of the internal shmem mount every memfd lives on.
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+/// Filesystem magic of hugetlbfs, where a memfd created with `MFD_HUGETLB` lives.
+const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
 const REQUIRED_ROOT_SEALS: libc::c_int =
     libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
 
@@ -581,8 +581,7 @@ fn validate_image_fd(flag: &'static str, fd: RawFd) -> Result<(), JailerError> {
         return Err(JailerError::ImageFdEmpty(flag));
     }
 
-    // Only shmem-backed files answer `F_GET_SEALS`; anything else fails with EINVAL. Plain tmpfs
-    // files answer it too, which is what the link target below rules out.
+    // Only shmem and hugetlbfs descriptors answer `F_GET_SEALS`; anything else fails with EINVAL.
     // SAFETY: `F_GET_SEALS` writes nothing and the return code is checked.
     let seals = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GET_SEALS) })
         .into_result()
@@ -596,9 +595,19 @@ fn validate_image_fd(flag: &'static str, fd: RawFd) -> Result<(), JailerError> {
         return Err(JailerError::ImageFdNotSealed(flag));
     }
 
-    let link = fs::read_link(format!("/proc/self/fd/{}", fd))
+    // A memfd lives on the internal shmem mount or on hugetlbfs and nowhere else. Together with
+    // the seals above this proves identity without procfs, which no jail is required to have.
+    let mut fs_stat = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `fs_stat` is a valid, aligned, sufficiently sized allocation for a `libc::statfs`.
+    SyscallReturnCode(unsafe { libc::fstatfs(fd, fs_stat.as_mut_ptr()) })
+        .into_empty_result()
         .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
-    if !link.as_os_str().as_bytes().starts_with(MEMFD_LINK_PREFIX) {
+    // SAFETY: `fstatfs` returned success, so it initialized the whole struct.
+    let fs_stat = unsafe { fs_stat.assume_init() };
+    // `f_type` is a signed word on some targets and an unsigned one on others, so both sides are
+    // widened to a type that holds either representation exactly.
+    let magic = i128::from(fs_stat.f_type);
+    if magic != i128::from(TMPFS_MAGIC) && magic != i128::from(HUGETLBFS_MAGIC) {
         return Err(JailerError::ImageFdNotMemfd(flag));
     }
 

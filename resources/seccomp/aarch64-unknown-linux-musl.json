@@ -79,6 +79,10 @@
                 "comment": "Used for drive patching & rescanning, for reading the local timezone from /etc/localtime"
             },
             {
+                "syscall": "fstatfs",
+                "comment": "Used to prove a descriptor received over the guest memory channel is a memfd"
+            },
+            {
                 "syscall": "lseek",
                 "comment": "Used by the block device, and to rewind a capture buffer memfd before filling it"
             },

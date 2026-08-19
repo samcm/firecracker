@@ -526,11 +526,15 @@ class Pagemaster:
         return sealed_memfd("farplane-extents", len(table), content=table)
 
     def _parse_backend_ready(self, body, fds):
-        count = len(self.regions)
+        (count,) = struct.unpack_from("<I", body, 0)
+        if count != len(self.regions):
+            raise ChannelViolation(
+                f"backend_ready reports {count} regions, the plan tiled {len(self.regions)}"
+            )
         self.ready_regions = []
         for index in range(count):
             addr, size, host_base = READY_REGION.unpack_from(
-                body, index * READY_REGION.size
+                body, 4 + index * READY_REGION.size
             )
             self.ready_regions.append(
                 {"guest_addr": addr, "size": size, "host_base": host_base}
@@ -540,7 +544,7 @@ class Pagemaster:
             self.uffd_features,
             self.dirty_bitmap_bytes,
             self.vmstate_capacity_bytes,
-        ) = READY_TAIL.unpack_from(body, count * READY_REGION.size)
+        ) = READY_TAIL.unpack_from(body, 4 + count * READY_REGION.size)
         if len(fds) != 1:
             raise ChannelViolation("backend_ready must carry the userfaultfd duplicate")
         self.uffd = fds[0]

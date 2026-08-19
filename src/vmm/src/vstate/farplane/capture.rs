@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +17,7 @@ use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
 use crate::logger::{error, warn};
 use crate::persist::{MicrovmState, VmInfo};
 use crate::snapshot::Snapshot;
-use crate::utils::u64_to_usize;
+use crate::utils::{u64_to_usize, usize_to_u64};
 use crate::vmm_config::instance_info::VmState;
 use crate::{EventManager, Vmm};
 
@@ -133,6 +133,16 @@ impl CaptureService {
         }
         if let Err(err) = vmm.drain_guest_memory_writers() {
             error!("Farplane quiesce could not stop every guest-memory writer: {err}");
+            // The epoch never opened, so the source is handed back exactly as it was found and the
+            // backend stays `Ready`: pagemaster may arm the epoch again. A source that cannot be
+            // handed back is no longer describable, so the channel fails and the supervisor kills
+            // this process.
+            if were_running && let Err(err) = vmm.resume_vm() {
+                error!(
+                    "Farplane quiesce could not restart the vCPUs after the failed drain: {err}"
+                );
+                BackendState::fail();
+            }
             drop(vmm);
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
@@ -370,16 +380,69 @@ impl MutEventSubscriber for CaptureService {
     }
 }
 
-/// Writes the vmstate at offset zero of the armed buffer and reports its length.
+/// Writes the vmstate at offset zero of the armed buffer and reports its length. The writer stops
+/// at the capacity `backend_ready` advertised, so a vmstate larger than the bound fails here
+/// instead of overrunning what pagemaster reserved.
 fn serialize_vmstate(buffer: &mut File, state: MicrovmState) -> Result<u64, ErrorCode> {
     buffer
         .seek(SeekFrom::Start(0))
         .map_err(|_| ErrorCode::VmstateWriteFailed)?;
+    let mut bounded = BoundedWriter {
+        inner: buffer,
+        remaining: u64_to_usize(VMSTATE_CAPACITY_BYTES),
+    };
     Snapshot::new(state)
-        .save(buffer)
+        .save(&mut bounded)
         .map_err(|_| ErrorCode::VmstateWriteFailed)?;
-    buffer.flush().map_err(|_| ErrorCode::VmstateWriteFailed)?;
-    buffer
-        .stream_position()
-        .map_err(|_| ErrorCode::VmstateWriteFailed)
+    bounded.flush().map_err(|_| ErrorCode::VmstateWriteFailed)?;
+    Ok(VMSTATE_CAPACITY_BYTES - usize_to_u64(bounded.remaining))
+}
+
+/// Writer that refuses to write past the capacity `backend_ready` advertised.
+#[derive(Debug)]
+struct BoundedWriter<'a> {
+    inner: &'a mut File,
+    /// Bytes the advertised capacity still allows.
+    remaining: usize,
+}
+
+impl Write for BoundedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > self.remaining {
+            return Err(io::Error::from_raw_os_error(libc::EFBIG));
+        }
+        let written = self.inner.write(buf)?;
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vmm_sys_util::tempfile::TempFile;
+
+    use super::*;
+
+    /// The advertised vmstate capacity is a bound, not a promise: a serialization that would pass
+    /// it fails instead of writing past what pagemaster reserved.
+    #[test]
+    fn the_vmstate_writer_stops_at_the_advertised_capacity() {
+        let mut file = TempFile::new().unwrap().into_file();
+        let mut writer = BoundedWriter {
+            inner: &mut file,
+            remaining: 8,
+        };
+
+        assert_eq!(writer.write(&[0u8; 6]).unwrap(), 6);
+        assert_eq!(
+            writer.write(&[0u8; 4]).unwrap_err().raw_os_error(),
+            Some(libc::EFBIG)
+        );
+        assert_eq!(writer.write(&[0u8; 2]).unwrap(), 2);
+        assert_eq!(writer.remaining, 0);
+    }
 }

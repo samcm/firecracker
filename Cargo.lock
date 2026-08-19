@@ -384,7 +384,6 @@ version = "1.16.1"
 dependencies = [
  "clap",
  "displaydoc",
- "libc",
  "log-instrument",
  "serde",
  "serde_json",

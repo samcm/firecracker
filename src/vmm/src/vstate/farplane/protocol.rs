@@ -17,8 +17,10 @@ pub const HEADER_LEN: usize = 32;
 pub const MAX_DATAGRAM: usize = 65_536;
 /// Largest extent table accepted, in records.
 pub const MAX_EXTENTS: u32 = 65_536;
-/// Largest number of backing descriptors accepted for one plan.
+/// Largest number of backing descriptors accepted for one plan, across datagrams.
 pub const MAX_PLAN_FDS: u32 = 1_024;
+/// Largest number of descriptors one datagram carries: the kernel's `SCM_MAX_FD`.
+pub const MAX_SCM_FDS: usize = 253;
 /// Compatibility identity of this protocol, quiesce semantics and vmstate format.
 pub const FEATURE_IDENTITY: &str = "farplane/1";
 /// Size of one extent table record.
@@ -27,6 +29,8 @@ pub const EXTENT_RECORD_LEN: usize = 32;
 pub const REGION_RECORD_LEN: usize = 16;
 /// Size of the region record reported by `backend_ready`.
 pub const READY_REGION_RECORD_LEN: usize = 24;
+/// Size of the fixed tail of a `backend_ready` body, which follows the region records.
+pub const BACKEND_READY_TAIL_LEN: usize = 28;
 /// Size of the detail field of an `error` frame.
 pub const ERROR_DETAIL_LEN: usize = 128;
 /// Size of the feature identity field of a `hello` frame.
@@ -386,11 +390,16 @@ pub fn send_frame(
     Ok(())
 }
 
+/// Control buffer of a received frame, in 64-bit words: one `SCM_RIGHTS` header plus the kernel's
+/// per-datagram descriptor limit. A smaller buffer turns a legal plan datagram into `MSG_CTRUNC`.
+const CONTROL_WORDS: usize =
+    (size_of::<libc::cmsghdr>() + MAX_SCM_FDS * size_of::<RawFd>()).div_ceil(size_of::<u64>());
+
 /// Receives exactly one frame. A datagram whose payload or control message did not fit is a
 /// protocol violation, never a partially parsed frame.
 pub fn recv_frame(sock: &UnixStream) -> Result<Incoming, ChannelError> {
     let mut buf = vec![0u8; MAX_DATAGRAM];
-    let mut control = [0u64; 64];
+    let mut control = [0u64; CONTROL_WORDS];
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
@@ -500,7 +509,8 @@ pub fn encode_hello(
     body
 }
 
-/// Serializes a `backend_ready` body.
+/// Serializes a `backend_ready` body: the region count, one record per mapped region, then the
+/// fixed tail.
 pub fn encode_backend_ready(
     regions: &[BackendReadyRegion],
     kvm_slot_count: u32,
@@ -508,7 +518,11 @@ pub fn encode_backend_ready(
     dirty_bitmap_bytes: u64,
     vmstate_capacity_bytes: u64,
 ) -> Vec<u8> {
-    let mut body = Vec::with_capacity(28 + regions.len() * READY_REGION_RECORD_LEN);
+    let mut body =
+        Vec::with_capacity(4 + BACKEND_READY_TAIL_LEN + regions.len() * READY_REGION_RECORD_LEN);
+    let region_count =
+        u32::try_from(regions.len()).expect("region count is bounded by the plan datagram");
+    body.extend_from_slice(&region_count.to_le_bytes());
     for region in regions {
         body.extend_from_slice(&region.encode());
     }
@@ -698,6 +712,30 @@ mod tests {
         assert_eq!(frame.header.msg(), MsgType::Quiesced);
         assert_eq!(frame.body, body);
         assert_eq!(frame.fds.len(), 1);
+    }
+
+    #[test]
+    fn frame_carries_the_kernel_descriptor_limit() {
+        let (tx, rx) = seqpacket_pair();
+        set_buffers(&tx);
+        set_buffers(&rx);
+        let memfd = memfd(b"farplane-fd-limit\0");
+        let fds = vec![memfd.as_raw_fd(); MAX_SCM_FDS];
+
+        let count = u32::try_from(MAX_SCM_FDS).unwrap();
+        send_frame(&tx, MsgType::PlanFds, 0, &count.to_le_bytes(), &fds).unwrap();
+
+        let frame = recv_frame(&rx).unwrap();
+        assert_eq!(frame.header.msg(), MsgType::PlanFds);
+        assert_eq!(frame.fds.len(), MAX_SCM_FDS);
+    }
+
+    #[test]
+    fn control_buffer_holds_the_kernel_descriptor_limit() {
+        // SAFETY: `CMSG_LEN` is a pure computation over a constant.
+        let header = unsafe { libc::CMSG_LEN(0) } as usize;
+        let payload = CONTROL_WORDS * size_of::<u64>() - header;
+        assert!(payload / size_of::<RawFd>() >= MAX_SCM_FDS);
     }
 
     #[test]

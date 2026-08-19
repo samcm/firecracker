@@ -42,9 +42,10 @@ use ioctls::{UFFDIO_API, USERFAULTFD_IOC_NEW};
 
 /// Descriptor the jailer hands the userfaultfd device on.
 const UFFD_DEVICE_FILENO: RawFd = 3;
-/// A memfd link target always starts with this prefix, regardless of the name it was created
-/// with.
-const MEMFD_LINK_PREFIX: &[u8] = b"/memfd:";
+/// Filesystem magic of the internal shmem mount every memfd lives on.
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+/// Filesystem magic of hugetlbfs, where a memfd created with `MFD_HUGETLB` lives.
+const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
 /// Seals a backing descriptor must carry before it is mapped.
 const REQUIRED_BACKING_SEALS: i32 =
     libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_FUTURE_WRITE;
@@ -261,9 +262,7 @@ pub fn dirty_bitmap_len(regions: &[RegionRecord]) -> u64 {
 /// Validates a capture buffer descriptor against the requirement reported at `backend_ready`. A
 /// buffer is written during the freeze, so it has to be writable now rather than fail then.
 pub fn validate_buffer_fd(fd: RawFd, min_size: u64) -> Result<(), ErrorCode> {
-    if !is_memfd(fd) {
-        return Err(ErrorCode::FdNotMemfd);
-    }
+    let seals = memfd_seals(fd).ok_or(ErrorCode::FdNotMemfd)?;
     let stat = fstat(fd).ok_or(ErrorCode::FdNotMemfd)?;
     // SAFETY: `F_GETFL` only reads descriptor flags.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -273,7 +272,6 @@ pub fn validate_buffer_fd(fd: RawFd, min_size: u64) -> Result<(), ErrorCode> {
     if flags & libc::O_ACCMODE != libc::O_RDWR {
         return Err(ErrorCode::FdNotSealed);
     }
-    let seals = seals(fd).ok_or(ErrorCode::FdNotMemfd)?;
     if seals & REQUIRED_BUFFER_SEALS != REQUIRED_BUFFER_SEALS
         || seals & (libc::F_SEAL_WRITE | libc::F_SEAL_FUTURE_WRITE) != 0
     {
@@ -607,26 +605,27 @@ fn peer_cred(sock: &UnixStream) -> Result<libc::ucred, BackendError> {
     Ok(cred)
 }
 
-/// States whether a descriptor refers to a memfd; nothing else has this link target.
-fn is_memfd(fd: RawFd) -> bool {
-    std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok_and(|target| {
-        target
-            .as_os_str()
-            .as_encoded_bytes()
-            .starts_with(MEMFD_LINK_PREFIX)
-    })
+/// Reads the seals of a descriptor that is a memfd, or `None` when it is neither.
+///
+/// Identity is proven without procfs, which the jail does not have: only shmem and hugetlbfs
+/// descriptors answer `F_GET_SEALS` at all, and those two filesystems are the only place a memfd
+/// lives. A file opened from a mounted tmpfs would pass both, but carries `F_SEAL_SEAL` alone and
+/// so can never satisfy the seals its role requires.
+fn memfd_seals(fd: RawFd) -> Option<i32> {
+    let seals = seals(fd)?;
+    // `f_type` is a signed word on some targets and an unsigned one on others, so both sides are
+    // widened to a type that holds either representation exactly.
+    let magic = i128::from(fstatfs(fd)?.f_type);
+    (magic == i128::from(TMPFS_MAGIC) || magic == i128::from(HUGETLBFS_MAGIC)).then_some(seals)
 }
 
 /// Returns the size of a backing descriptor that satisfies every precondition.
 fn validate_backing_fd(fd: RawFd) -> Result<u64, ErrorCode> {
-    if !is_memfd(fd) {
-        return Err(ErrorCode::FdNotMemfd);
-    }
+    let seals = memfd_seals(fd).ok_or(ErrorCode::FdNotMemfd)?;
     let stat = fstat(fd).ok_or(ErrorCode::FdNotMemfd)?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(ErrorCode::FdNotMemfd);
     }
-    let seals = seals(fd).ok_or(ErrorCode::FdNotMemfd)?;
     // SAFETY: `F_GETFL` only reads descriptor flags.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
@@ -662,9 +661,20 @@ fn fstat(fd: RawFd) -> Option<libc::stat> {
     Some(unsafe { stat.assume_init() })
 }
 
+/// Reads the filesystem identity of a descriptor.
+fn fstatfs(fd: RawFd) -> Option<libc::statfs> {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `fstatfs` fills `stat` or fails without touching it.
+    if unsafe { libc::fstatfs(fd, stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `fstatfs` returned success, so `stat` is initialized.
+    Some(unsafe { stat.assume_init() })
+}
+
 /// Reads the extent table out of its sealed descriptor.
 fn read_extent_table(fd: &OwnedFd, count: u32) -> Result<Vec<ExtentRecord>, ErrorCode> {
-    if seals(fd.as_raw_fd())
+    if memfd_seals(fd.as_raw_fd())
         .is_none_or(|seals| seals & REQUIRED_BACKING_SEALS != REQUIRED_BACKING_SEALS)
     {
         return Err(ErrorCode::FdNotSealed);
@@ -956,6 +966,8 @@ fn dup_cloexec(fd: RawFd) -> Result<OwnedFd, BackendError> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
+
     use super::*;
 
     fn plan(regions: &[RegionRecord], extent_count: u32) -> BackingPlanBody {
@@ -981,6 +993,29 @@ mod tests {
         host_page_size() as u64
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            out.push_str(&format!("{byte:02x}"));
+            out
+        })
+    }
+
+    fn memfd(name: &CStr, size: libc::off_t) -> RawFd {
+        // SAFETY: `name` is a NUL-terminated string that outlives the call.
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                name.as_ptr(),
+                libc::MFD_ALLOW_SEALING,
+            )
+        };
+        assert!(raw >= 0, "{}", io::Error::last_os_error());
+        let fd = RawFd::try_from(raw).unwrap();
+        // SAFETY: `fd` is an owned memfd of this process.
+        assert_eq!(unsafe { libc::ftruncate(fd, size) }, 0);
+        fd
+    }
+
     #[test]
     fn dirty_bitmap_size_is_one_word_per_64_pages_per_region() {
         let page = page();
@@ -999,20 +1034,8 @@ mod tests {
 
     #[test]
     fn capture_buffer_must_be_sealed_and_large_enough() {
-        let name = c"farplane-capture-buffer";
-        // SAFETY: `name` is a NUL-terminated string that outlives the call.
-        let raw = unsafe {
-            libc::syscall(
-                libc::SYS_memfd_create,
-                name.as_ptr(),
-                libc::MFD_ALLOW_SEALING,
-            )
-        };
-        assert!(raw >= 0, "{}", io::Error::last_os_error());
-        let buffer = RawFd::try_from(raw).unwrap();
+        let buffer = memfd(c"farplane-capture-buffer", 4096);
 
-        // SAFETY: `buffer` is an owned memfd of this process.
-        assert_eq!(unsafe { libc::ftruncate(buffer, 4096) }, 0);
         assert_eq!(
             validate_buffer_fd(buffer, 4096),
             Err(ErrorCode::FdNotSealed)
@@ -1029,6 +1052,75 @@ mod tests {
 
         // SAFETY: `buffer` is owned by this test and no longer used.
         unsafe { libc::close(buffer) };
+    }
+
+    /// The bytes of `backend_ready` are the seam with pagemaster: the region count leads the body,
+    /// records follow, then the fixed tail. The same datagram is pinned on the Go side.
+    #[test]
+    fn backend_ready_matches_the_cross_language_fixture() {
+        // Dirty bitmap of this geometry on a 4 KiB-page host, stated as a constant so the fixture
+        // does not depend on the page size of the machine running the test.
+        const DIRTY_BITMAP_BYTES: u64 = 0x9000;
+        let regions = [
+            BackendReadyRegion {
+                guest_addr: 0,
+                size: 0x0800_0000,
+                host_base: 0x0000_7f00_0000_0000,
+            },
+            BackendReadyRegion {
+                guest_addr: 0x1_0000_0000,
+                size: 0x4000_0000,
+                host_base: 0x0000_7f10_0000_0000,
+            },
+        ];
+
+        let body = protocol::encode_backend_ready(
+            &regions,
+            u32::try_from(regions.len()).unwrap(),
+            REQUIRED_UFFD_FEATURES,
+            DIRTY_BITMAP_BYTES,
+            VMSTATE_CAPACITY_BYTES,
+        );
+        let header = protocol::Header::new(
+            MsgType::BackendReady,
+            0,
+            u32::try_from(body.len()).unwrap(),
+            1,
+        );
+        let mut datagram = header.encode().to_vec();
+        datagram.extend_from_slice(&body);
+        assert_eq!(
+            hex(&datagram),
+            include_str!("testdata/backend_ready.hex").trim()
+        );
+
+        if host_page_size() == 4096 {
+            let plan_regions = regions.map(|region| RegionRecord {
+                guest_addr: region.guest_addr,
+                size: region.size,
+            });
+            assert_eq!(dirty_bitmap_len(&plan_regions), DIRTY_BITMAP_BYTES);
+        }
+    }
+
+    /// Descriptor identity is proven from the descriptor alone: the jail has no procfs to read a
+    /// link target from.
+    #[test]
+    fn memfd_identity_is_proven_without_procfs() {
+        let image = memfd(c"farplane-backing", 4096);
+        assert_eq!(memfd_seals(image), Some(0));
+
+        let mut pipe = [-1i32; 2];
+        // SAFETY: `pipe` has room for the two descriptors the call returns.
+        let created = unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(created, 0, "{}", io::Error::last_os_error());
+        assert_eq!(memfd_seals(pipe[0]), None);
+        assert_eq!(validate_backing_fd(pipe[0]), Err(ErrorCode::FdNotMemfd));
+
+        for fd in [image, pipe[0], pipe[1]] {
+            // SAFETY: every descriptor is owned by this test and no longer used.
+            unsafe { libc::close(fd) };
+        }
     }
 
     #[test]
