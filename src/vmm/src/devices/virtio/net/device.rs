@@ -1996,7 +1996,7 @@ pub mod tests {
 
             // following TX procedure should succeed because bandwidth should now be available
             {
-                // tx_count increments 1 from write_to_mmds_or_tap()
+                // tx_count increments 1 from write_to_tap()
                 check_metric_after_block!(
                     th.net().metrics.tx_count,
                     1,
@@ -2013,7 +2013,7 @@ pub mod tests {
 
             // following TX procedure should succeed to handle the second frame as well
             {
-                // tx_count increments 1 from write_to_mmds_or_tap()
+                // tx_count increments 1 from write_to_tap()
                 check_metric_after_block!(
                     th.net().metrics.tx_count,
                     1,
