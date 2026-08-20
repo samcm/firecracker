@@ -4,6 +4,7 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::raw::c_ulong;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -17,7 +18,7 @@ use userfaultfd_sys::{
 use vm_memory::GuestAddress;
 use vm_memory::bitmap::{AtomicBitmap, NewBitmap};
 use vm_memory::mmap::MmapRegionBuilder;
-use vmm_sys_util::ioctl::ioctl_with_mut_ref;
+use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_val};
 
 use super::protocol::{
     self, Arch, BackendReadyRegion, BackingPlanBody, ChannelError, ErrorCode, ExtentRecord,
@@ -874,10 +875,10 @@ fn wrap_guest_memory(mapped: &[MappedRegion]) -> Result<Vec<GuestRegionMmap>, Ba
 fn create_uffd() -> Result<Uffd, BackendError> {
     // SAFETY: fd 3 is the userfaultfd device the jailer opened; the argument is a flag word.
     let raw = unsafe {
-        libc::ioctl(
-            UFFD_DEVICE_FILENO,
+        ioctl_with_val(
+            &BorrowedFd::borrow_raw(UFFD_DEVICE_FILENO),
             USERFAULTFD_IOC_NEW(),
-            libc::O_CLOEXEC | libc::O_NONBLOCK,
+            c_ulong::from((libc::O_CLOEXEC | libc::O_NONBLOCK).cast_unsigned()),
         )
     };
     if raw < 0 {
