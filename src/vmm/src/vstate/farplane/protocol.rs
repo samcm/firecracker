@@ -395,6 +395,15 @@ pub fn send_frame(
 const CONTROL_WORDS: usize =
     (size_of::<libc::cmsghdr>() + MAX_SCM_FDS * size_of::<RawFd>()).div_ceil(size_of::<u64>());
 
+/// Narrows a control buffer length to the width `msghdr` declares for it, which is a `size_t` on
+/// one C library and a `socklen_t` on another.
+fn control_len<T: TryFrom<usize>>(len: usize) -> T {
+    match T::try_from(len) {
+        Ok(len) => len,
+        Err(_) => unreachable!("the control buffer is smaller than any msghdr length"),
+    }
+}
+
 /// Receives exactly one frame. A datagram whose payload or control message did not fit is a
 /// protocol violation, never a partially parsed frame.
 pub fn recv_frame(sock: &UnixStream) -> Result<Incoming, ChannelError> {
@@ -409,7 +418,7 @@ pub fn recv_frame(sock: &UnixStream) -> Result<Incoming, ChannelError> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = std::mem::size_of_val(&control) as _;
+    msg.msg_controllen = control_len(std::mem::size_of_val(&control));
 
     // SAFETY: the socket is open, and the buffers outlive the call.
     let nbytes = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
