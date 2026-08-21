@@ -77,6 +77,7 @@ impl CaptureService {
             return Err(ChannelError::Malformed);
         }
 
+        error!("farplane trace: serving msg={:?} id={} state={:?}", msg, request_id, BackendState::load());
         match msg {
             MsgType::CaptureBuffers => self.arm_buffers(incoming),
             MsgType::Quiesce => self.quiesce(request_id),
@@ -94,6 +95,7 @@ impl CaptureService {
     /// Validates and arms the buffers of one capture epoch.
     fn arm_buffers(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
+        error!("farplane trace: arm_buffers state={:?}", BackendState::load());
         if BackendState::load() != BackendState::Ready {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::CaptureBuffers);
         }
@@ -124,13 +126,16 @@ impl CaptureService {
             _ => return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Quiesce),
         }
 
+        error!("farplane trace: quiesce locking vmm");
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
+        error!("farplane trace: quiesce locked vmm state={:?}", vmm.instance_info.state);
         let were_running = vmm.instance_info.state == VmState::Running;
         if were_running && let Err(err) = vmm.pause_vm() {
             error!("Farplane quiesce could not pause the vCPUs: {err}");
             drop(vmm);
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
+        error!("farplane trace: quiesce paused vcpus, draining writers");
         if let Err(err) = vmm.drain_guest_memory_writers() {
             error!("Farplane quiesce could not stop every guest-memory writer: {err}");
             // The epoch never opened, so the source is handed back exactly as it was found and the
@@ -351,6 +356,7 @@ impl CaptureService {
 
 impl MutEventSubscriber for CaptureService {
     fn init(&mut self, ops: &mut EventOps) {
+        error!("farplane trace: registering the channel on the event loop");
         if let Err(err) = ops.add(Events::new(&self.channel.sock, EventSet::IN)) {
             error!("Farplane channel could not join the event loop: {err}");
             BackendState::fail();
@@ -358,6 +364,7 @@ impl MutEventSubscriber for CaptureService {
     }
 
     fn process(&mut self, event: Events, ops: &mut EventOps) {
+        error!("farplane trace: process entry state={:?}", BackendState::load());
         if BackendState::load() == BackendState::ChannelFailed {
             return;
         }
