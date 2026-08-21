@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_ulong;
 use std::os::unix::net::UnixStream;
@@ -696,6 +696,12 @@ fn read_extent_table(fd: &OwnedFd, count: u32) -> Result<Vec<ExtentRecord>, Erro
 /// Parses the vmstate handed over with a restore plan.
 fn parse_vmstate(fd: &OwnedFd) -> Result<MicrovmState, ErrorCode> {
     let mut file = File::from(fd.try_clone().map_err(|_| ErrorCode::VmstateParseFailed)?);
+    // The vmstate always starts at offset zero, and a descriptor a live source
+    // wrote through arrives with that source's own offset: the writer seeks to
+    // the start and leaves the cursor past the bytes it wrote. Reading is
+    // absolute so a forked child parses the same buffer its parent produced.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ErrorCode::VmstateParseFailed)?;
     Snapshot::<MicrovmState>::load(&mut file)
         .map(|snapshot| snapshot.data)
         .map_err(|_| ErrorCode::VmstateParseFailed)
