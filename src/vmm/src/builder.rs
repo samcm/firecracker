@@ -307,22 +307,25 @@ pub fn build_microvm_for_boot(
     // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
     // altogether is the desired behaviour.
     // Keep this as the last step before resuming vcpus.
-    crate::seccomp::apply_filter(
-        seccomp_filters
-            .get("vmm")
-            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?,
-    )
-    .map_err(VmmError::SeccompFilters)?;
+    let vmm_filter = seccomp_filters
+        .get("vmm")
+        .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+        .clone();
 
-    event_manager.add_subscriber(vmm.clone());
-
+    // The channel's thread is started before this thread is confined, because it
+    // confines itself with the same filter and a filtered thread may not be
+    // allowed to create another.
     let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
-    CaptureService::register(
+    CaptureService::spawn(
         channel,
         vmm.clone(),
         VmInfo::from(vm_resources),
-        event_manager,
+        vmm_filter.clone(),
     );
+
+    crate::seccomp::apply_filter(&vmm_filter).map_err(VmmError::SeccompFilters)?;
+
+    event_manager.add_subscriber(vmm.clone());
 
     Ok(vmm)
 }
@@ -496,12 +499,18 @@ pub fn build_microvm_from_snapshot(
     vmm.lock().unwrap().set_vm_state(VmState::Paused);
     event_manager.add_subscriber(vmm.clone());
 
+    // Started before this thread is confined: the channel's thread confines
+    // itself with the same filter, and a filtered thread may not be allowed to
+    // create another.
     let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
-    CaptureService::register(
+    CaptureService::spawn(
         channel,
         vmm.clone(),
         VmInfo::from(&*vm_resources),
-        event_manager,
+        seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone(),
     );
 
     // Load seccomp filters for the VMM thread.

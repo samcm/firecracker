@@ -6,20 +6,18 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
-use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
-use vmm_sys_util::epoll::EventSet;
 
 use super::backend::{
     BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, send_error, set_capture_buffers_armed,
     validate_buffer_fd,
 };
 use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
-use crate::logger::{error, warn};
+use crate::logger::error;
 use crate::persist::{MicrovmState, VmInfo};
 use crate::snapshot::Snapshot;
 use crate::utils::{u64_to_usize, usize_to_u64};
 use crate::vmm_config::instance_info::VmState;
-use crate::{EventManager, Vmm};
+use crate::Vmm;
 
 /// Buffers pagemaster preallocated for one capture epoch.
 #[derive(Debug)]
@@ -41,18 +39,47 @@ pub struct CaptureService {
 
 impl CaptureService {
     /// Starts serving capture commands for `vmm`.
-    pub fn register(
+    /// Serves the memory channel on a thread of its own.
+    ///
+    /// The event loop this used to run on stops while the API has the instance
+    /// paused: that thread takes API requests inline and deliberately does not
+    /// relinquish control to the event manager. Every capture command arrives
+    /// while the source is paused, so a channel served from that loop could
+    /// never be answered. The thread installs the filter the VMM thread runs
+    /// under, so it is spawned before that filter is applied and confined by it
+    /// from its first instruction.
+    pub fn spawn(
         channel: MemoryChannel,
         vmm: Arc<Mutex<Vmm>>,
         vm_info: VmInfo,
-        event_manager: &mut EventManager,
+        filter: Arc<crate::seccomp::BpfProgram>,
     ) {
-        event_manager.add_subscriber(Arc::new(Mutex::new(Self {
-            channel,
-            vmm,
-            vm_info,
-            buffers: None,
-        })));
+        std::thread::Builder::new()
+            .name("fc_farplane".to_string())
+            .spawn(move || {
+                if let Err(err) = crate::seccomp::apply_filter(&filter) {
+                    error!("Farplane channel could not install its filter: {err}");
+                    BackendState::fail();
+                    return;
+                }
+                let mut service = Self {
+                    channel,
+                    vmm,
+                    vm_info,
+                    buffers: None,
+                };
+                loop {
+                    if BackendState::load() == BackendState::ChannelFailed {
+                        return;
+                    }
+                    if let Err(err) = service.serve_one() {
+                        error!("Farplane memory channel failed: {err}");
+                        BackendState::fail();
+                        return;
+                    }
+                }
+            })
+            .expect("Failed to spawn the farplane memory channel thread");
     }
 
     /// Serves exactly one command.
@@ -344,47 +371,6 @@ impl CaptureService {
         Ok(())
     }
 
-    /// Stops serving commands for good. Nothing else changes: the guest keeps running, faults keep
-    /// resolving on the retained userfaultfd, and only the supervisor kills this process.
-    fn fail(&mut self, ops: &mut EventOps) {
-        BackendState::fail();
-        if let Err(err) = ops.remove(Events::new(&self.channel.sock, EventSet::IN)) {
-            warn!("Farplane channel could not be removed from the event loop: {err}");
-        }
-    }
-}
-
-impl MutEventSubscriber for CaptureService {
-    fn init(&mut self, ops: &mut EventOps) {
-        error!("farplane trace: registering the channel on the event loop");
-        if let Err(err) = ops.add(Events::new(&self.channel.sock, EventSet::IN)) {
-            error!("Farplane channel could not join the event loop: {err}");
-            BackendState::fail();
-        }
-    }
-
-    fn process(&mut self, event: Events, ops: &mut EventOps) {
-        error!("farplane trace: process entry state={:?}", BackendState::load());
-        if BackendState::load() == BackendState::ChannelFailed {
-            return;
-        }
-        if !event.event_set().contains(EventSet::IN) {
-            self.fail(ops);
-            return;
-        }
-        // While the capture epoch is open the next command is served inline, so no other event
-        // source of this loop runs until pagemaster resumes.
-        loop {
-            if let Err(err) = self.serve_one() {
-                error!("Farplane memory channel failed: {err}");
-                self.fail(ops);
-                return;
-            }
-            if BackendState::load() != BackendState::Quiesced {
-                return;
-            }
-        }
-    }
 }
 
 /// Writes the vmstate at offset zero of the armed buffer and reports its length. The writer stops
