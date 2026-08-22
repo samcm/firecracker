@@ -699,7 +699,8 @@ mod tests {
     #[test]
     fn test_prepare_save_emits_transport_reset_when_active() {
         // The snapshot path goes through prepare_save -> send_transport_reset_event.
-        // Both the evq publication and the RX gate must be observable afterwards.
+        // The event must reach the event queue for whoever restores the snapshot,
+        // while the guest that is still running is left able to receive.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
@@ -707,7 +708,10 @@ mod tests {
 
         ctx.device.prepare_save();
 
-        assert!(ctx.device.pending_event_ack);
+        assert!(
+            !ctx.device.pending_event_ack,
+            "the live guest keeps receiving; the reset is for the restore"
+        );
         assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
     }
 
