@@ -291,6 +291,7 @@ where
         // suppressed by EVENT_IDX.
         queue.enable_notification();
 
+        error!("farplane diag: reset published, live guest left ungated (build v5)");
         // The event is published for whoever restores this snapshot, not for the
         // guest that is still running. Farplane resumes a source past its own
         // capture, and a source gated here has nothing to acknowledge: the reset
