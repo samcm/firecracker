@@ -292,14 +292,6 @@ impl CaptureService {
             return self.reject(request_id, ErrorCode::ResumeFailed, MsgType::Resume);
         }
         let running = vmm.instance_info.state == VmState::Running;
-        // Saving the device set publishes a transport-reset event the guest must
-        // acknowledge before its vsock accepts anything again. A restore delivers
-        // that notification by kicking its devices; a source that keeps running
-        // past its own capture is owed the same kick, or it never learns the event
-        // is there and stays deaf for the rest of its life.
-        if running {
-            vmm.device_manager.kick_virtio_devices();
-        }
         drop(vmm);
 
         self.buffers = None;

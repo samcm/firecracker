@@ -272,6 +272,7 @@ where
 
         let queue = &mut self.queues[EVQ_INDEX];
         let head = queue.pop()?.ok_or_else(|| {
+            error!("farplane diag: transport reset NOT published, event queue empty");
             METRICS.ev_queue_event_fails.inc();
             DeviceError::VsockError(VsockError::EmptyQueue)
         })?;
@@ -414,10 +415,13 @@ where
     fn kick(&mut self) {
         if self.is_activated() {
             error!(
-                "farplane diag: vsock kick, arming pending_event_ack (was {})",
+                "farplane diag: vsock kick, pending_event_ack={}",
                 self.pending_event_ack
             );
-            self.pending_event_ack = true;
+            // Whether a transport reset is waiting for the guest is what
+            // `send_transport_reset_event` recorded: it arms this flag only when it
+            // actually published an event. Arming it here regardless shuts RX on a
+            // guest that has nothing to acknowledge, and nothing else ever opens it.
 
             // Vsock has a complicated protocol that isn't resilient to any packet loss,
             // so for Vsock we don't support connection persistence through snapshot. Any
@@ -631,10 +635,10 @@ mod tests {
     }
 
     #[test]
-    fn test_kick_when_active_arms_pending_event_ack() {
-        // Restore path: kick() is invoked after the snapshot is loaded to re-deliver the
-        // TRANSPORT_RESET interrupt. It must arm the RX gate so the post-restore RX/EVQ
-        // race cannot deliver data ahead of the guest ack.
+    fn test_kick_does_not_arm_without_a_published_reset() {
+        // A reset the device never published is a reset the guest can never
+        // acknowledge. Arming the gate for one shuts RX for the life of the guest,
+        // because only the guest's evq kick reopens it.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
@@ -643,14 +647,28 @@ mod tests {
         ctx.device.kick();
 
         assert!(
-            ctx.device.pending_event_ack,
-            "kick() on an active device must arm the RX gate"
+            !ctx.device.pending_event_ack,
+            "kick() must not gate RX on a reset that was never published"
         );
 
-        // After kick(), the gate must actually suppress RX delivery.
         ctx.device.backend.set_pending_rx(true);
-        let progressed = ctx.device.process_rx().unwrap();
-        assert!(!progressed);
+        assert!(ctx.device.process_rx().unwrap(), "RX must flow when nothing is owed");
+    }
+
+    #[test]
+    fn test_kick_keeps_a_published_reset_gated() {
+        // The other half: a reset that was published stays gated until the guest
+        // acknowledges it over the event queue.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        ctx.device.pending_event_ack = true;
+        ctx.device.kick();
+
+        assert!(ctx.device.pending_event_ack);
+        ctx.device.backend.set_pending_rx(true);
+        assert!(!ctx.device.process_rx().unwrap());
         assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
     }
 
