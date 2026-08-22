@@ -31,6 +31,10 @@ pub struct VsockFrontendState {
     /// Context Identifier.
     pub cid: u64,
     pub virtio_state: VirtioDeviceState,
+    /// Whether a transport-reset event is waiting for the guest to acknowledge it.
+    /// RX is gated until that ack arrives, so a restore that assumed an outstanding
+    /// reset the snapshot never carried would gate RX for the life of the guest.
+    pub pending_event_ack: bool,
 }
 
 /// The Vsock Unix Backend serializable state.
@@ -92,6 +96,7 @@ where
         VsockFrontendState {
             cid: self.cid(),
             virtio_state: VirtioDeviceState::from_device(self),
+            pending_event_ack: self.pending_event_ack,
         }
     }
 
@@ -113,6 +118,7 @@ where
 
         vsock.acked_features = state.virtio_state.acked_features;
         vsock.avail_features = state.virtio_state.avail_features;
+        vsock.pending_event_ack = state.pending_event_ack;
         vsock.device_state = DeviceState::Inactive;
         Ok(vsock)
     }
