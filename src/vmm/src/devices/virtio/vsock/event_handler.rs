@@ -108,6 +108,7 @@ where
         // Guest's evq kick = TRANSPORT_RESET ack. Clear the gate and drain any RX the
         // backend buffered while it was up. Assumes TRANSPORT_RESET is the only evq event
         // we publish; new event types would need to disambiguate before clearing.
+        error!("farplane diag: evq ack from guest, clearing pending_event_ack");
         self.pending_event_ack = false;
         if self.backend.has_pending_rx() {
             match self.process_rx() {

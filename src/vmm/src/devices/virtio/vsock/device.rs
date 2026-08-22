@@ -43,6 +43,11 @@ use crate::logger::{IncMetric, error, info, warn};
 use crate::utils::byte_order;
 use crate::vstate::memory::{Bytes, GuestMemoryMmap};
 
+
+/// Counts refused RX deliveries so a restored guest that never acknowledges the
+/// transport reset is visible in the log instead of silently unreachable.
+static FARPLANE_RX_GATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) const RXQ_INDEX: usize = 0;
 pub(crate) const TXQ_INDEX: usize = 1;
 pub(crate) const EVQ_INDEX: usize = 2;
@@ -166,6 +171,10 @@ where
     /// suppression).
     pub fn process_rx(&mut self) -> Result<bool, InvalidAvailIdx> {
         if self.pending_event_ack {
+            let n = FARPLANE_RX_GATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 20 {
+                error!("farplane diag: process_rx refused, pending_event_ack set (hit {})", n + 1);
+            }
             return Ok(false);
         }
 
@@ -404,6 +413,10 @@ where
 
     fn kick(&mut self) {
         if self.is_activated() {
+            error!(
+                "farplane diag: vsock kick, arming pending_event_ack (was {})",
+                self.pending_event_ack
+            );
             self.pending_event_ack = true;
 
             // Vsock has a complicated protocol that isn't resilient to any packet loss,
