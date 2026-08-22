@@ -291,7 +291,10 @@ where
         // suppressed by EVENT_IDX.
         queue.enable_notification();
 
-        self.pending_event_ack = true;
+        // The event is published for whoever restores this snapshot, not for the
+        // guest that is still running. Farplane resumes a source past its own
+        // capture, and a source gated here has nothing to acknowledge: the reset
+        // belongs to the snapshot, so gating it only makes the live guest deaf.
 
         // NOTE: kick() will be called on resume and it will trigger the interrupt again. As calling
         // it multiple times should not cause any harm, it would be safer to call it here as well
@@ -571,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn test_send_transport_reset_event_sets_pending_event_ack() {
+    fn test_send_transport_reset_event_leaves_the_live_guest_ungated() {
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
@@ -582,8 +585,8 @@ mod tests {
         ctx.device.send_transport_reset_event().unwrap();
 
         assert!(
-            ctx.device.pending_event_ack,
-            "TRANSPORT_RESET emission must arm the RX gate"
+            !ctx.device.pending_event_ack,
+            "the reset belongs to the snapshot, so the live guest stays ungated"
         );
         assert_eq!(
             ctx.guest_evvq.used.idx.get(),
