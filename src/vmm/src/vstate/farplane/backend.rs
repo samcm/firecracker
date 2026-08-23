@@ -915,7 +915,12 @@ fn create_uffd() -> Result<Uffd, BackendError> {
 
 /// Registers missing, minor and write-protect faults over every extent mapping.
 fn register_uffd(uffd: &Uffd, mapped: &[MappedRegion]) -> Result<(), BackendError> {
-    let mode = RegisterMode::MISSING | RegisterMode::MINOR | RegisterMode::WRITE_PROTECT;
+    // Every page the plan names already resolves to a descriptor and offset, so the
+    // kernel can fault it straight from that mapping: a clean page arrives shared,
+    // a hole arrives zeroed, and a write copies on write. Intercepting the first
+    // touch instead forced UFFDIO_CONTINUE to install a private copy per consumer,
+    // which is the whole cost fanout exists to avoid. Only divergence needs a fault.
+    let mode = RegisterMode::WRITE_PROTECT;
     for region in mapped {
         for extent in &region.extents {
             uffd.register_with_mode(
