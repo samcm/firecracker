@@ -346,10 +346,9 @@ pub fn build_and_boot_microvm(
     debug!("event_start: build microvm for boot");
     let vmm = build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?;
     debug!("event_end: build microvm for boot");
-    // The vcpus start off in the `Paused` state, let them run.
-    debug!("event_start: boot microvm");
-    vmm.lock().unwrap().resume_vm()?;
-    debug!("event_end: boot microvm");
+    // The vcpus stay in the `Paused` state they were built in. The supervisor
+    // resumes the instance once the envelope around it is armed, the same
+    // hand-off a snapshot restore performs; nothing may execute before then.
     Ok(vmm)
 }
 

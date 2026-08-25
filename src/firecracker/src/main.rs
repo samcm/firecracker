@@ -617,6 +617,14 @@ fn build_microvm_from_json(
     )
     .map_err(BuildFromJsonError::StartMicroVM)?;
 
+    // No API client exists to resume a boot that stays paused, so this path
+    // resumes the instance itself.
+    vmm.lock()
+        .unwrap()
+        .resume_vm()
+        .map_err(vmm::builder::StartMicrovmError::Internal)
+        .map_err(BuildFromJsonError::StartMicroVM)?;
+
     info_unrestricted!("Successfully started microvm that was configured from one single json");
 
     Ok(vmm)
