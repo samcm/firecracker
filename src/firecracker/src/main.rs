@@ -510,9 +510,14 @@ fn resize_fdtable() -> Result<(), ResizeFdTableError> {
 }
 
 /// Keeps this process's own pages resident, so reclaim cannot fault them back in during a freeze.
+///
+/// Not `MCL_FUTURE`: it makes every later `mmap` charge `RLIMIT_MEMLOCK` by virtual size, and the
+/// kernel checks a `MAP_FIXED` overlay against the limit before subtracting the locked reservation
+/// it replaces, so mapping the guest would need a ceiling of twice its size. Guest residency is
+/// applied per extent once the mappings exist.
 fn lock_working_set() -> Result<(), MainError> {
     // SAFETY: `mlockall` only changes this process's own memory policy.
-    let ret = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) };
+    let ret = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_ONFAULT) };
     if ret != 0 {
         return Err(MainError::LockWorkingSet(io::Error::last_os_error()));
     }
