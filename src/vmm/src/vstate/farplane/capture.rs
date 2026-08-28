@@ -3,7 +3,8 @@
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 use super::backend::{
@@ -170,12 +171,81 @@ fn serve_dirty_snapshot(
     }
 }
 
+/// Stable identity of one descriptor a frame carried: which file it refers to, and how large that
+/// file is. Two descriptors duplicated from one memfd report the same identity; a descriptor of
+/// another memfd does not. Descriptor numbers are process-local and say nothing, so they are not
+/// part of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DescriptorIdentity {
+    dev: libc::dev_t,
+    ino: libc::ino_t,
+    size: libc::off_t,
+}
+
+/// Reads the identity of one received descriptor, or reports that it could not be proven.
+fn descriptor_identity(fd: RawFd) -> Option<DescriptorIdentity> {
+    // SAFETY: `stat` is a plain data structure with no invalid bit patterns.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is owned by the frame being served, and `stat` outlives the call.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    Some(DescriptorIdentity {
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+        size: stat.st_size,
+    })
+}
+
+/// Exactly which command one frame carried: its message type, its bytes, and the files its
+/// descriptors refer to.
+///
+/// The command bodies of this protocol are at most four bytes, so the bytes themselves are kept
+/// rather than a digest of them: a digest would make two different commands under one identifier
+/// collide into an acknowledgement of work that was never done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandKey {
+    msg: MsgType,
+    body: Vec<u8>,
+    /// Identity of each descriptor, in the order the frame carried them, or `None` when one of
+    /// them could not be proven.
+    descriptors: Option<Vec<DescriptorIdentity>>,
+}
+
+impl CommandKey {
+    /// Reads the identity of the command a frame carries.
+    fn of(msg: MsgType, body: &[u8], fds: &[OwnedFd]) -> Self {
+        Self {
+            msg,
+            body: body.to_vec(),
+            descriptors: fds
+                .iter()
+                .map(|fd| descriptor_identity(fd.as_raw_fd()))
+                .collect(),
+        }
+    }
+
+    /// Whether this is exactly the command `answered` was.
+    ///
+    /// `CaptureBuffers` and `DirtyUnion` carry their input in descriptors, and a retry duplicates
+    /// the descriptors of the same memfds rather than sending the same count of other ones. An
+    /// identity that could not be proven is never exact, on either side, so such a command is
+    /// refused rather than acknowledged with an answer about resources that may have changed.
+    fn is_exactly(&self, answered: &Self) -> bool {
+        self.descriptors.is_some()
+            && answered.descriptors.is_some()
+            && self.msg == answered.msg
+            && self.body == answered.body
+            && self.descriptors == answered.descriptors
+    }
+}
+
 /// One answer already sent on this connection.
 #[derive(Debug)]
 struct CachedReply {
     request_id: u64,
-    /// Digest of the command that produced this answer.
-    fingerprint: u64,
+    /// The command that produced this answer.
+    command: CommandKey,
     msg: MsgType,
     body: Vec<u8>,
 }
@@ -187,7 +257,7 @@ enum FrameDisposition {
     Serve,
     /// The identifier and the command are the ones already answered: send that answer again.
     Replay(MsgType, Vec<u8>),
-    /// The identifier was used before, with different contents or too long ago to answer from
+    /// The identifier was used before, for a different command or too long ago to answer from
     /// memory. Serving it again could repeat an effect, so it is refused.
     Reused,
 }
@@ -198,8 +268,7 @@ enum FrameDisposition {
 /// Pagemaster retries a command whose reply it never saw, with the identifier and the contents it
 /// sent the first time. Phase alone cannot make that safe: a `dirty_union` legitimately reopens
 /// the dirty set, and the retried `dirty_snapshot` behind it would harvest again. The identifier
-/// plus a digest of the frame answers it exactly instead, for the life of the connection and
-/// across epochs.
+/// plus the exact command answers it instead, for the life of the connection and across epochs.
 ///
 /// The history is bounded by `protocol::MAX_RETRYABLE_REQUESTS`: an identifier older than that
 /// cannot be answered from memory, so it is refused rather than served a second time.
@@ -211,14 +280,14 @@ struct ReplyCache {
 }
 
 impl ReplyCache {
-    /// States what to do with a frame that carries `request_id` and digests to `fingerprint`.
-    fn disposition(&self, request_id: u64, fingerprint: u64) -> FrameDisposition {
+    /// States what to do with a frame that carries `request_id` and the command `command`.
+    fn disposition(&self, request_id: u64, command: &CommandKey) -> FrameDisposition {
         if let Some(answer) = self
             .answers
             .iter()
             .find(|answer| answer.request_id == request_id)
         {
-            if answer.fingerprint == fingerprint {
+            if command.is_exactly(&answer.command) {
                 return FrameDisposition::Replay(answer.msg, answer.body.clone());
             }
             return FrameDisposition::Reused;
@@ -230,13 +299,13 @@ impl ReplyCache {
     }
 
     /// Records the answer sent for one command.
-    fn record(&mut self, request_id: u64, fingerprint: u64, msg: MsgType, body: Vec<u8>) {
+    fn record(&mut self, request_id: u64, command: CommandKey, msg: MsgType, body: Vec<u8>) {
         if self.answers.len() == protocol::MAX_RETRYABLE_REQUESTS {
             self.answers.pop_front();
         }
         self.answers.push_back(CachedReply {
             request_id,
-            fingerprint,
+            command,
             msg,
             body,
         });
@@ -244,27 +313,26 @@ impl ReplyCache {
     }
 }
 
-/// Digests one command frame: the message type, the body and the number of descriptors it
-/// carried. Two frames with the same identifier are the same command only if they digest alike.
+/// Sends one answer and records it for an exact retry.
 ///
-/// The digest is FNV-1a, which is deterministic and only ever compared with digests taken by this
-/// process, of frames on this connection.
-fn fingerprint(msg: MsgType, body: &[u8], fd_count: usize) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |byte: u8| {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    for byte in (msg as u16).to_le_bytes() {
-        mix(byte);
+/// The answer is recorded whether or not the send reached pagemaster: the command's effect has
+/// already happened, so a retry of it has to be answered from the record rather than served a
+/// second time. `pending` names the command the answer belongs to, and is consumed either way.
+fn send_and_record(
+    sock: &UnixStream,
+    replies: &mut ReplyCache,
+    pending: &mut Option<(u64, CommandKey)>,
+    request_id: u64,
+    msg: MsgType,
+    body: Vec<u8>,
+) -> Result<(), ChannelError> {
+    let sent = protocol::send_frame(sock, msg, request_id, &body, &[]);
+    if let Some((pending_id, command)) = pending.take()
+        && pending_id == request_id
+    {
+        replies.record(request_id, command, msg, body);
     }
-    for byte in usize_to_u64(fd_count).to_le_bytes() {
-        mix(byte);
-    }
-    for &byte in body {
-        mix(byte);
-    }
-    hash
+    sent
 }
 
 /// Serves the capture half of the memory channel on the event loop that owns the microVM: while a
@@ -279,8 +347,8 @@ pub struct CaptureService {
     order: EpochOrder,
     /// Answers this connection has sent, so an exact retry is replayed.
     replies: ReplyCache,
-    /// Identifier and digest of the command being served, which the answer is recorded under.
-    pending: Option<(u64, u64)>,
+    /// Identifier and exact command of the frame being served, which the answer is recorded under.
+    pending: Option<(u64, CommandKey)>,
 }
 
 impl CaptureService {
@@ -358,9 +426,11 @@ impl CaptureService {
 
         // Exact replay is decided before the phase is consulted: an identifier this connection
         // has already answered gets that answer back, whatever the epoch has done since, and an
-        // identifier reused for different contents is refused rather than served.
-        let fingerprint = fingerprint(msg, &incoming.body, incoming.fds.len());
-        match self.replies.disposition(request_id, fingerprint) {
+        // identifier that names a different command is refused rather than served. Both paths
+        // return with `incoming` still owning the descriptors the frame carried, so they are
+        // closed on the way out exactly as a served command closes them.
+        let command = CommandKey::of(msg, &incoming.body, &incoming.fds);
+        match self.replies.disposition(request_id, &command) {
             FrameDisposition::Serve => {}
             FrameDisposition::Replay(cached_msg, cached_body) => {
                 return protocol::send_frame(
@@ -385,7 +455,7 @@ impl CaptureService {
             }
         }
 
-        self.pending = Some((request_id, fingerprint));
+        self.pending = Some((request_id, command));
         match msg {
             MsgType::CaptureBuffers => self.arm_buffers(incoming),
             MsgType::Quiesce => self.quiesce(request_id),
@@ -680,15 +750,16 @@ impl CaptureService {
         self.answer(request_id, MsgType::Error, body)
     }
 
-    /// Sends one answer and records it under the digest of the command being served.
+    /// Sends one answer and records it as the answer of the command being served.
     fn answer(&mut self, request_id: u64, msg: MsgType, body: Vec<u8>) -> Result<(), ChannelError> {
-        let sent = protocol::send_frame(&self.channel.sock, msg, request_id, &body, &[]);
-        if let Some((pending_id, fingerprint)) = self.pending.take()
-            && pending_id == request_id
-        {
-            self.replies.record(request_id, fingerprint, msg, body);
-        }
-        sent
+        send_and_record(
+            &self.channel.sock,
+            &mut self.replies,
+            &mut self.pending,
+            request_id,
+            msg,
+            body,
+        )
     }
 }
 
@@ -768,6 +839,8 @@ impl Write for BoundedWriter<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::FromRawFd;
+
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -1010,62 +1083,203 @@ mod tests {
         assert_eq!(order.phase, EpochPhase::Harvested);
     }
 
-    /// Digest of a `dirty_snapshot` frame: no body, no descriptors.
-    fn harvest_frame() -> u64 {
-        fingerprint(MsgType::DirtySnapshot, &[], 0)
+    /// A memfd of `size` bytes, owned by the caller.
+    fn memfd(name: &std::ffi::CStr, size: u64) -> OwnedFd {
+        // SAFETY: `name` is a NUL-terminated string that outlives the call.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: the descriptor was just created and is not owned by anything else.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: `owned` is a fresh memfd, so it may be sized.
+        let sized = unsafe { libc::ftruncate(owned.as_raw_fd(), size.cast_signed()) };
+        assert_eq!(sized, 0, "{}", io::Error::last_os_error());
+        owned
     }
 
-    /// The retry of an answered command is replayed by identifier and contents, whatever the
+    /// Another descriptor for the same open file, as a retry of a descriptor-bearing command
+    /// carries: duplicated, not reopened.
+    fn duplicate(fd: &OwnedFd) -> OwnedFd {
+        fd.try_clone().unwrap()
+    }
+
+    /// The command a bodyless frame with no descriptors carries.
+    fn command(msg: MsgType) -> CommandKey {
+        CommandKey::of(msg, &[], &[])
+    }
+
+    /// The retry of an answered command is replayed by identifier and exact command, whatever the
     /// epoch has done since. This is the case phase alone cannot cover: a `dirty_union` reopens
     /// the dirty set, so the phase would harvest again for a command already answered.
     #[test]
     fn an_answered_request_is_replayed_after_later_commands() {
         let mut replies = ReplyCache::default();
-        replies.record(7, harvest_frame(), MsgType::DirtySnapshotDone, Vec::new());
+        replies.record(
+            7,
+            command(MsgType::DirtySnapshot),
+            MsgType::DirtySnapshotDone,
+            Vec::new(),
+        );
 
         // A union and a resume happen on other identifiers, and a new epoch follows.
+        let bitmap = memfd(c"farplane-union", 4096);
         replies.record(
             8,
-            fingerprint(MsgType::DirtyUnion, &[], 1),
+            CommandKey::of(MsgType::DirtyUnion, &[], std::slice::from_ref(&bitmap)),
             MsgType::UnionDone,
             Vec::new(),
         );
         let resumed = 1u32.to_le_bytes().to_vec();
         replies.record(
             9,
-            fingerprint(MsgType::Resume, &resumed, 0),
+            CommandKey::of(MsgType::Resume, &resumed, &[]),
             MsgType::Resumed,
             resumed.clone(),
         );
-        replies.record(
-            10,
-            fingerprint(MsgType::Quiesce, &[], 0),
-            MsgType::Quiesced,
-            resumed,
-        );
+        replies.record(10, command(MsgType::Quiesce), MsgType::Quiesced, resumed);
 
         assert_eq!(
-            replies.disposition(7, harvest_frame()),
+            replies.disposition(7, &command(MsgType::DirtySnapshot)),
             FrameDisposition::Replay(MsgType::DirtySnapshotDone, Vec::new()),
             "the original harvest reply must be replayed, not harvested again"
         );
     }
 
-    /// One identifier names one command: reusing it for different contents is refused, because
-    /// the answer on record is not an answer to what arrived.
+    /// A retry of a descriptor-bearing command duplicates the descriptors of the same memfds. The
+    /// descriptor numbers differ, the files do not, so the answer is replayed.
     #[test]
-    fn reusing_an_identifier_for_other_contents_is_refused() {
+    fn a_retry_with_duplicated_descriptors_is_replayed() {
+        let dirty = memfd(c"farplane-dirty", 4096);
+        let vmstate = memfd(c"farplane-vmstate", 8192);
+        let sent = [duplicate(&dirty), duplicate(&vmstate)];
         let mut replies = ReplyCache::default();
-        replies.record(7, harvest_frame(), MsgType::DirtySnapshotDone, Vec::new());
+        replies.record(
+            3,
+            CommandKey::of(MsgType::CaptureBuffers, &[], &sent),
+            MsgType::CaptureBuffersArmed,
+            Vec::new(),
+        );
 
-        assert_eq!(
-            replies.disposition(7, fingerprint(MsgType::WriteVmstate, &[], 0)),
-            FrameDisposition::Reused
+        let retried = [duplicate(&dirty), duplicate(&vmstate)];
+        assert_ne!(
+            retried[0].as_raw_fd(),
+            sent[0].as_raw_fd(),
+            "the retry must carry other descriptor numbers for the same files"
         );
         assert_eq!(
-            replies.disposition(7, fingerprint(MsgType::DirtySnapshot, &[], 1)),
+            replies.disposition(3, &CommandKey::of(MsgType::CaptureBuffers, &[], &retried)),
+            FrameDisposition::Replay(MsgType::CaptureBuffersArmed, Vec::new())
+        );
+    }
+
+    /// Same identifier, same message, same body, same descriptor count, other memfds: the answer
+    /// on record acknowledged buffers that are not these, so it is refused.
+    #[test]
+    fn a_retry_naming_other_memfds_is_refused() {
+        let dirty = memfd(c"farplane-dirty", 4096);
+        let vmstate = memfd(c"farplane-vmstate", 8192);
+        let mut replies = ReplyCache::default();
+        replies.record(
+            3,
+            CommandKey::of(
+                MsgType::CaptureBuffers,
+                &[],
+                &[duplicate(&dirty), duplicate(&vmstate)],
+            ),
+            MsgType::CaptureBuffersArmed,
+            Vec::new(),
+        );
+
+        // Other files of exactly the same sizes, in the same order.
+        let other_dirty = memfd(c"farplane-dirty", 4096);
+        let other_vmstate = memfd(c"farplane-vmstate", 8192);
+        assert_eq!(
+            replies.disposition(
+                3,
+                &CommandKey::of(MsgType::CaptureBuffers, &[], &[other_dirty, other_vmstate])
+            ),
             FrameDisposition::Reused,
-            "the descriptor count is part of what the identifier named"
+            "a frame naming other memfds is not the command that was answered"
+        );
+
+        // Nor is the same file in the other position.
+        assert_eq!(
+            replies.disposition(
+                3,
+                &CommandKey::of(
+                    MsgType::CaptureBuffers,
+                    &[],
+                    &[duplicate(&vmstate), duplicate(&dirty)]
+                )
+            ),
+            FrameDisposition::Reused,
+            "descriptor order is part of the command"
+        );
+    }
+
+    /// Equality is over the command bytes themselves, not a digest of them: a message or a body
+    /// that differs is a different command, whatever any hash of it would say.
+    #[test]
+    fn a_different_message_or_body_is_refused() {
+        let mut replies = ReplyCache::default();
+        replies.record(
+            7,
+            command(MsgType::DirtySnapshot),
+            MsgType::DirtySnapshotDone,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            replies.disposition(7, &command(MsgType::WriteVmstate)),
+            FrameDisposition::Reused
+        );
+
+        let mut replies = ReplyCache::default();
+        let stop = 0u32.to_le_bytes().to_vec();
+        replies.record(
+            9,
+            CommandKey::of(MsgType::Resume, &stop, &[]),
+            MsgType::Resumed,
+            Vec::new(),
+        );
+        assert_eq!(
+            replies.disposition(
+                9,
+                &CommandKey::of(MsgType::Resume, &1u32.to_le_bytes(), &[])
+            ),
+            FrameDisposition::Reused,
+            "the body of a resume decides whether the vCPUs run"
+        );
+    }
+
+    /// A descriptor whose identity could not be read is never exact, on either side: such a
+    /// command is refused rather than acknowledged with an answer about resources that may have
+    /// changed.
+    #[test]
+    fn an_unprovable_descriptor_identity_is_never_exact() {
+        let unprovable = CommandKey {
+            msg: MsgType::DirtyUnion,
+            body: Vec::new(),
+            descriptors: None,
+        };
+        assert!(!unprovable.is_exactly(&unprovable));
+
+        let bitmap = memfd(c"farplane-union", 4096);
+        let provable = CommandKey::of(MsgType::DirtyUnion, &[], std::slice::from_ref(&bitmap));
+        assert!(!unprovable.is_exactly(&provable));
+        assert!(!provable.is_exactly(&unprovable));
+
+        let mut replies = ReplyCache::default();
+        replies.record(4, unprovable.clone(), MsgType::UnionDone, Vec::new());
+        assert_eq!(
+            replies.disposition(4, &unprovable),
+            FrameDisposition::Reused
+        );
+
+        let mut replies = ReplyCache::default();
+        replies.record(4, provable, MsgType::UnionDone, Vec::new());
+        assert_eq!(
+            replies.disposition(4, &unprovable),
+            FrameDisposition::Reused
         );
     }
 
@@ -1077,7 +1291,7 @@ mod tests {
         for request_id in 1..=protocol::MAX_RETRYABLE_REQUESTS as u64 + 1 {
             replies.record(
                 request_id,
-                fingerprint(MsgType::Quiesce, &[], 0),
+                command(MsgType::Quiesce),
                 MsgType::Quiesced,
                 Vec::new(),
             );
@@ -1089,27 +1303,69 @@ mod tests {
             "the history is bounded"
         );
         assert_eq!(
-            replies.disposition(1, fingerprint(MsgType::Quiesce, &[], 0)),
+            replies.disposition(1, &command(MsgType::Quiesce)),
             FrameDisposition::Reused,
             "an evicted answer must not be re-served"
         );
         assert_eq!(
-            replies.disposition(9_999, fingerprint(MsgType::Quiesce, &[], 0)),
+            replies.disposition(9_999, &command(MsgType::Quiesce)),
             FrameDisposition::Serve
         );
     }
 
-    /// The digest separates the commands an epoch is made of, so a replay is exact.
+    /// A send that never reached pagemaster does not undo the command: the answer is recorded, so
+    /// the retry that follows the lost reply is answered rather than served again.
     #[test]
-    fn the_frame_digest_separates_commands() {
-        assert_ne!(
-            fingerprint(MsgType::DirtySnapshot, &[], 0),
-            fingerprint(MsgType::WriteVmstate, &[], 0)
+    fn an_answer_whose_send_failed_is_still_recorded() {
+        let (sock, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        let mut replies = ReplyCache::default();
+        let mut pending = Some((5, command(MsgType::DirtySnapshot)));
+
+        let sent = send_and_record(
+            &sock,
+            &mut replies,
+            &mut pending,
+            5,
+            MsgType::DirtySnapshotDone,
+            Vec::new(),
         );
-        assert_ne!(
-            fingerprint(MsgType::Resume, &0u32.to_le_bytes(), 0),
-            fingerprint(MsgType::Resume, &1u32.to_le_bytes(), 0)
+
+        assert!(
+            sent.is_err(),
+            "the peer is gone, so the send cannot succeed"
         );
-        assert_eq!(harvest_frame(), fingerprint(MsgType::DirtySnapshot, &[], 0));
+        assert_eq!(
+            replies.disposition(5, &command(MsgType::DirtySnapshot)),
+            FrameDisposition::Replay(MsgType::DirtySnapshotDone, Vec::new()),
+            "the effect happened, so the answer has to survive the failed send"
+        );
+        assert!(pending.is_none(), "the command was answered exactly once");
+    }
+
+    /// The descriptors a replayed or refused frame carried are closed on the way out, exactly as
+    /// a served command closes them: `Incoming` owns them, and dropping it is that close.
+    #[test]
+    fn a_frames_descriptors_are_closed_when_it_is_not_served() {
+        let bitmap = memfd(c"farplane-union", 4096);
+        let raw = bitmap.as_raw_fd();
+        let incoming = Incoming {
+            header: protocol::Header::new(MsgType::DirtyUnion, 11, 0, 1),
+            body: Vec::new(),
+            fds: vec![bitmap],
+        };
+        // SAFETY: `F_GETFD` only reads the flags of a descriptor.
+        let open = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert!(open >= 0, "the frame should own an open descriptor");
+
+        drop(incoming);
+
+        // SAFETY: as above; the descriptor is expected to be closed by now.
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF),
+            "a frame that was not served must not leak its descriptors"
+        );
     }
 }

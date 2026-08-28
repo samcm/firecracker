@@ -404,6 +404,52 @@ def test_an_exact_retry_of_a_frame_is_answered_not_served(farplane_factory):
     assert bytes(pagemaster.harvest().data) == bytes(harvested.data)
 
 
+def test_a_retry_of_a_descriptor_command_must_name_the_same_memfds(farplane_factory):
+    """`capture_buffers` carries its input in descriptors, so identity is the files, not the count.
+
+    A retry duplicates the descriptors of the same memfds and is answered from the record.
+    The same identifier naming other memfds of the same sizes is a different command: the
+    answer on record acknowledged buffers that are not these, so it is refused.
+    """
+    vm = farplane_factory()
+    pagemaster = boot(vm)
+
+    def buffers():
+        return (
+            fp.sealed_memfd(
+                "farplane-dirty",
+                pagemaster.dirty_bitmap_bytes,
+                seals=fp.BUFFER_SEALS,
+                read_only=False,
+            ),
+            fp.sealed_memfd(
+                "farplane-vmstate",
+                pagemaster.vmstate_capacity_bytes,
+                seals=fp.BUFFER_SEALS,
+                read_only=False,
+            ),
+        )
+
+    dirty, vmstate = buffers()
+    arm_id = pagemaster.next_request_id()
+    frame = pagemaster.frame(fp.Msg.CAPTURE_BUFFERS, arm_id, fd_count=2)
+
+    armed = pagemaster.exchange(frame, fds=[dirty, vmstate])
+    assert armed.msg == fp.Msg.CAPTURE_BUFFERS_ARMED
+
+    # The retry sends the same open files again; SCM_RIGHTS hands Firecracker other
+    # descriptor numbers for them, which must not make it a different command.
+    replay = pagemaster.exchange(frame, fds=[dirty, vmstate])
+    assert replay.msg == fp.Msg.CAPTURE_BUFFERS_ARMED
+
+    other_dirty, other_vmstate = buffers()
+    refused = pagemaster.exchange(frame, fds=[other_dirty, other_vmstate])
+    assert refused.error == (fp.Err.REQUEST_ID_REUSED, fp.Msg.CAPTURE_BUFFERS)
+
+    for descriptor in (dirty, vmstate, other_dirty, other_vmstate):
+        os.close(descriptor)
+
+
 def test_a_harvest_before_the_vmstate_is_refused(farplane_factory):
     """The vmstate is serialized before the dirty log is harvested, or not at all.
 
