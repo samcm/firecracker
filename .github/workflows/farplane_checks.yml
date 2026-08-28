@@ -66,6 +66,12 @@ jobs:
   # compile path: clippy over every target of the workspace, on the GNU target because
   # musl does not cross-compile cleanly. It runs in the public dev container, so it needs
   # no toolchain of its own.
+  #
+  # This lane compiles for aarch64 and does not execute tests there. Running them needs an
+  # aarch64 runner, and emulating one under qemu-user would report a pass for a machine the
+  # fork never runs on, which is worse than the gap. The architecture-dependent wire values
+  # are covered instead by fixtures for both `hello` frames, which the x86_64 lane checks.
+  # Executing the suite natively on aarch64 stays a manual step until a runner exists.
   aarch64_compile:
     name: aarch64 compile check
     runs-on: ubuntu-latest
