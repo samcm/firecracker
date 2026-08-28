@@ -88,9 +88,10 @@ jobs:
 
       # Directives alone do not prove which file the linker opened: its default search
       # directories follow every explicit `-L`. Build the real seccompiler binary in an
-      # isolated target directory with GNU ld's input trace enabled and require that trace
-      # to name the supplied library. This catches both a lost build-script directive and a
-      # linker that silently fell through to the runner's packaged copy.
+      # isolated target directory and require GNU ld's link map to name the supplied
+      # library. Rustc consumes a successful linker's stdout, so `-Wl,-t` never reaches the
+      # cargo log. The map is a durable linker output instead. A single build job prevents
+      # dependency linkers from racing to overwrite it before the final binary is linked.
       - name: "The seccompiler binary links the supplied libseccomp"
         run: |
           set -euo pipefail
@@ -103,12 +104,13 @@ jobs:
           cp -L "$supplied" "$private/libseccomp.so"
 
           target=$(mktemp -d)
-          log=$(mktemp)
+          map=$(mktemp)
           LIBSECCOMP_LIB_PATH="$private" \
             CARGO_TARGET_DIR="$target" \
-            RUSTFLAGS="-C link-arg=-Wl,-t" \
-            cargo build -p seccompiler --bin seccompiler-bin -vv 2>&1 | tee "$log"
-          grep -qxF "$private/libseccomp.so" "$log"
+            CARGO_BUILD_JOBS=1 \
+            RUSTFLAGS="-C link-arg=-Wl,-Map=$map" \
+            cargo build -p seccompiler --bin seccompiler-bin -vv
+          grep -qxF "LOAD $private/libseccomp.so" "$map"
           test -x "$target/debug/seccompiler-bin"
           echo "the linker opened $private/libseccomp.so"
 
