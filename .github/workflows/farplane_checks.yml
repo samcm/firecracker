@@ -29,28 +29,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: "Install the pinned toolchain"
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add clippy
 
-      # `cargo test <filter>` exits 0 when the filter selects nothing, so a renamed module
-      # would leave these suites green without executing a test. `guarded_cargo_test` pipes
-      # cargo through `tee`, keeps cargo's own exit status (`set -o pipefail`, which a
-      # GitHub `run:` block does not set), then sums the `N passed` counts of libtest's
-      # `test result:` summary lines and fails when that sum is zero.
+      # `cargo test <filter>` exits 0 when the filter selects nothing, and a sum taken over
+      # several modules stays green when one of them stops existing.
+      # `guarded_cargo_test <min> <cargo args...>` pipes cargo through `tee`, keeps cargo's
+      # own exit status (`set -o pipefail`, which a GitHub `run:` block does not set), sums
+      # the `N passed` counts of libtest's `test result:` summary lines and fails when that
+      # sum is below `<min>`. Every required module is invoked on its own with its own
+      # floor, so a renamed, deleted or `#[cfg]`-ed out module takes its own suite below its
+      # floor instead of shrinking an aggregate.
       #
-      # The last invocation passes a filter that matches nothing on purpose and fails
-      # unless the guard rejects it, so every run also checks that the guard is fail-closed.
-      # There is one copy of the guard: the negative proof calls the same function.
-      - name: "Filtered Rust suites, guarded against executing zero tests"
+      # Arguments after `--` reach libtest. The vsock device family runs single-threaded
+      # because `devices::virtio::vsock::unix::muxer::tests::{test_muxer_killq,
+      # test_vsock_basic_metrics}` assert absolute values of the process-global `METRICS`
+      # counters, which the other muxer tests also move. Its filter is the module path and
+      # not the bare word `vsock`, which additionally selects
+      # `builder::tests::test_attach_vsock_device` (opens /dev/kvm) and
+      # `resources::tests::test_set_vsock_device` (opens /dev/net/tun).
+      #
+      # The two closing invocations fail unless the guard rejects them: a filter that
+      # matches nothing, and a real filter carrying an unreachable floor. There is one copy
+      # of the guard, so both proofs exercise the function the suites above run through.
+      - name: "Filtered Rust suites, guarded by a per-suite floor"
         run: |
           set -euo pipefail
 
           guarded_cargo_test() {
-            local log passed
+            local min=$1 log passed
+            shift
             log=$(mktemp)
             if ! cargo test "$@" 2>&1 | tee "$log"; then
               echo "guard: cargo test $* exited nonzero"
@@ -60,37 +72,93 @@ jobs:
             passed=$(sed -n 's/^test result: [A-Za-z]*\. \([0-9][0-9]*\) passed;.*/\1/p' "$log" \
               | awk '{ total += $1 } END { print total + 0 }')
             rm -f "$log"
-            if [ "$passed" -eq 0 ]; then
-              echo "guard: cargo test $* executed 0 tests; the filter selects nothing"
+            if [ "$passed" -lt "$min" ]; then
+              echo "guard: cargo test $* executed $passed tests, fewer than the required $min"
               return 1
             fi
-            echo "guard: cargo test $* executed $passed tests"
+            echo "guard: cargo test $* executed $passed tests, the floor is $min"
           }
 
-          guarded_cargo_test -p vmm --lib vstate::farplane
-          guarded_cargo_test -p vmm --lib vsock
-          guarded_cargo_test -p vmm --test farplane_channel
+          guarded_cargo_test 3 -p vmm --lib vstate::farplane::dispatch
+          guarded_cargo_test 20 -p vmm --lib vstate::farplane::capture
+          guarded_cargo_test 13 -p vmm --lib vstate::farplane::backend
+          guarded_cargo_test 13 -p vmm --lib vstate::farplane::protocol
+          guarded_cargo_test 14 -p vmm --lib devices::virtio::vsock::device
+          guarded_cargo_test 12 -p vmm --lib devices::virtio::vsock::event_handler
+          guarded_cargo_test 6 -p vmm --lib devices::virtio::vsock::persist
+          guarded_cargo_test 11 -p vmm --lib snapshot::
+          guarded_cargo_test 25 -p vmm --test farplane_channel
+          guarded_cargo_test 1 -p firecracker --bin firecracker api_server_adapter
 
-          if guarded_cargo_test -p vmm --lib vstate::farplane::this_filter_matches_nothing; then
-            echo "::error::the zero-test guard accepted a filter that selects no tests"
+          # This filter is a superset of the three vsock module filters above, so their
+          # floors add up to a floor for the family whatever the muxer contributes.
+          guarded_cargo_test 32 -p vmm --lib devices::virtio::vsock -- --test-threads=1
+
+          if guarded_cargo_test 1 -p vmm --lib vstate::farplane::this_filter_matches_nothing; then
+            echo "::error::the guard accepted a filter that selects no tests"
             exit 1
           fi
-          echo "the zero-test guard rejected a filter that selects nothing, as it must"
+          echo "the guard rejected a filter that selects nothing, as it must"
+
+          if guarded_cargo_test 100000 -p vmm --lib vstate::farplane::dispatch; then
+            echo "::error::the guard accepted a suite that executed fewer tests than its floor"
+            exit 1
+          fi
+          echo "the guard rejected a suite below its floor, as it must"
 
       - name: "Clippy over the crate the fork changes"
         run: cargo clippy -p vmm --lib --tests -- -D warnings
 
+      # Distributions and versions come from tools/devctr/poetry.lock, the set the suite
+      # resolves to in the dev container: pytest and pytest-json-report for the
+      # `--json-report` that tests/pytest.ini pins in `addopts`, pytest-timeout for its
+      # `timeout = 300`, and what the test module imports through `host_tools.farplane`,
+      # which reaches `framework/http_api.py` (requests, and requests-unixsocket2, whose
+      # module name is `requests_unixsocket`) and through it
+      # `framework/swagger_validator.py` (PyYAML, jsonschema).
       - name: "Install the Python test requirements"
-        run: python3 -m pip install --break-system-packages pytest requests requests-unixsocket
+        run: >
+          python3 -m pip install --break-system-packages
+          pytest==9.0.3 pytest-json-report==1.5.0 pytest-timeout==2.4.0
+          requests==2.33.1 requests-unixsocket2==0.4.2
+          PyYAML==6.0.3 jsonschema==4.26.0
 
       # `--confcutdir` keeps the session conftest out: it wants a built binary and the test
-      # artifacts, and these tests read only checked-in sources.
+      # artifacts, and these tests read only checked-in sources. `python3 -m pytest`, unlike
+      # `pytest`, puts the working directory on `sys.path`, which is what resolves
+      # `import host_tools.farplane` without that conftest.
+      #
+      # tests/pytest.ini points `--json-report` at the suite-wide `../test_results` path;
+      # this run redirects the report to a path of its own and reads the executed-test count
+      # back out of it. pytest exits 5 rather than failing when nothing is collected, so the
+      # count is asserted against a floor as well: the module declares four test functions,
+      # one of them parametrized over two fixtures, so it executes five tests.
       - name: "Cross-language wire tests"
         working-directory: tests
-        run: >
-          python3 -m pytest -q
-          --confcutdir=integration_tests/build
-          integration_tests/build/test_farplane_wire.py
+        run: |
+          set -euo pipefail
+          report="$(mktemp -d)/wire-report.json"
+          status=0
+          python3 -m pytest -q \
+            --confcutdir=integration_tests/build \
+            --json-report --json-report-file="$report" \
+            integration_tests/build/test_farplane_wire.py || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the farplane wire tests exited $status"
+            exit "$status"
+          fi
+          if [ ! -f "$report" ]; then
+            echo "::error::pytest wrote no json report; the session did not reach its end"
+            exit 1
+          fi
+          executed=$(python3 -c \
+            'import json,sys; print(len(json.load(open(sys.argv[1])).get("tests", [])))' \
+            "$report")
+          if [ "$executed" -lt 5 ]; then
+            echo "::error::the wire tests executed $executed of the 5 tests the module declares"
+            exit 1
+          fi
+          echo "the wire tests executed $executed tests"
 
   # The fork ships musl binaries. `tools/devtool build` defaults to `--libc musl`
   # (tools/devtool:501) and hands the profile to `tools/release.sh`, which derives its
@@ -111,7 +179,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: "Checkout repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # The musl target follows `uname -m`, so a non-aarch64 host here would build and
       # green the wrong triple.
@@ -162,7 +230,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: "Cross clippy for the aarch64 GNU target"
         run: ./tools/devtool -y checkbuild -m aarch64
@@ -183,7 +251,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: "Checkout repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: "Require the devices and the kernel the functional tests need"
         run: |
