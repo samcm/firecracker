@@ -458,15 +458,17 @@ impl<'a> PrebootApiController<'a> {
             // If restore fails, we consider the process is too dirty to recover.
             self.fatal_error = Some(BuildMicrovmFromRequestsError::Restore);
         })?;
-        // Resume VM
+        // Resume VM. The restored microVM's capture service is already serving, so the resume
+        // takes the farplane dispatch hold: an epoch that opened between the restore and here
+        // runs to its end before the vCPUs start.
         if load_params.resume_vm {
-            vmm.lock()
-                .expect("Poisoned lock")
-                .resume_vm()
-                .inspect_err(|_| {
-                    // If resume fails, we consider the process is too dirty to recover.
-                    self.fatal_error = Some(BuildMicrovmFromRequestsError::Resume);
-                })?;
+            crate::vstate::farplane::outside_capture_epoch(|| {
+                vmm.lock().expect("Poisoned lock").resume_vm()
+            })
+            .inspect_err(|_| {
+                // If resume fails, we consider the process is too dirty to recover.
+                self.fatal_error = Some(BuildMicrovmFromRequestsError::Resume);
+            })?;
         }
         // Set the VM
         self.built_vmm = Some(vmm);

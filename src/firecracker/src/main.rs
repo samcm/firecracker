@@ -617,11 +617,11 @@ fn build_microvm_from_json(
     )
     .map_err(BuildFromJsonError::StartMicroVM)?;
 
-    // No API client exists to resume a boot that stays paused, so this path
-    // resumes the instance itself.
-    vmm.lock()
-        .unwrap()
-        .resume_vm()
+    // No API client exists to resume a boot that stays paused, so this path resumes the instance
+    // itself. The capture service is already serving by now, so the resume takes the farplane
+    // dispatch hold: a capture epoch that opened during startup runs to its end before the guest
+    // is allowed to execute.
+    vmm::vstate::farplane::outside_capture_epoch(|| vmm.lock().unwrap().resume_vm())
         .map_err(vmm::builder::StartMicrovmError::Internal)
         .map_err(BuildFromJsonError::StartMicroVM)?;
 

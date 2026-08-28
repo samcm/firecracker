@@ -276,7 +276,6 @@ pub(crate) fn run_with_api(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
 
     use vmm::rpc_interface::VmmData;
 
@@ -309,8 +308,8 @@ mod tests {
             );
         });
 
-        // The gate is closed, so no amount of waiting lets the action run.
-        thread::sleep(Duration::from_millis(50));
+        // The action is provably parked on the gate, not merely late, and stays there.
+        vmm::vstate::farplane::gate().wait_for_parked(1);
         assert!(
             !EXECUTED.load(Ordering::SeqCst),
             "the action ran inside the capture epoch"
