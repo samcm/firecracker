@@ -37,7 +37,11 @@ use crate::snapshot::crc::CRC64Writer;
 pub use crate::snapshot::persist::Persist;
 
 /// Version of the snapshot format produced and accepted by this crate.
-pub const SNAPSHOT_VERSION: Version = Version::new(10, 0, 0);
+///
+/// The major version was raised for the farplane fork: `VsockFrontendState` carries the
+/// transport-reset gate, and bitcode requires exact types, so a snapshot of the previous layout
+/// cannot be read. It is refused by the version check rather than decoded into something else.
+pub const SNAPSHOT_VERSION: Version = Version::new(11, 0, 0);
 
 #[cfg(target_arch = "x86_64")]
 const SNAPSHOT_MAGIC_ID: u64 = 0x0710_1984_8664_0000u64;
@@ -65,6 +69,13 @@ pub enum SnapshotError {
     Io(#[from] std::io::Error),
     /// Snapshot size exceeds limit of {0} bytes
     SizeLimitExceeded(usize),
+    /// Snapshot was produced under feature identity {found}, but this build is {expected}
+    IncompatibleFeatureIdentity {
+        /// Identity of the binary reading the snapshot.
+        expected: String,
+        /// Identity recorded by the binary that produced the snapshot.
+        found: String,
+    },
 }
 
 fn serialize<S: Serialize, W: Write>(data: &S, write: &mut W) -> Result<(), SnapshotError> {
@@ -79,6 +90,13 @@ struct SnapshotHdr {
     magic: u64,
     /// Snapshot data version
     version: Version,
+    /// Feature identity of the binary that produced this snapshot.
+    ///
+    /// The identity the handshake reports proves only what is running now. A restore reads state
+    /// another binary wrote, so the identity travels with the state and is checked before that
+    /// state is used for anything: the capture order, the quiesce semantics and the vmstate layout
+    /// it names are properties of the image, not of the process reading it.
+    feature_identity: String,
 }
 
 /// Assumes the raw bytes stream read from the given [`Read`] instance is a snapshot file,
@@ -141,6 +159,7 @@ impl<Data> Snapshot<Data> {
             header: SnapshotHdr {
                 magic: SNAPSHOT_MAGIC_ID,
                 version: SNAPSHOT_VERSION.clone(),
+                feature_identity: crate::vstate::farplane::FEATURE_IDENTITY.to_string(),
             },
             data,
         }
@@ -174,6 +193,15 @@ impl<Data: DeserializeOwned> Snapshot<Data> {
             return Err(SnapshotError::InvalidFormatVersion(
                 snapshot.header.version.clone(),
             ));
+        }
+
+        // Checked with the rest of the header, which is before the state is handed to a caller:
+        // guest memory is mapped from a plan the caller only builds once this returns.
+        if snapshot.header.feature_identity != crate::vstate::farplane::FEATURE_IDENTITY {
+            return Err(SnapshotError::IncompatibleFeatureIdentity {
+                expected: crate::vstate::farplane::FEATURE_IDENTITY.to_string(),
+                found: snapshot.header.feature_identity.clone(),
+            });
         }
 
         Ok(snapshot)
@@ -242,6 +270,59 @@ mod tests {
 
         Snapshot::new(state).save(&mut buf).unwrap();
         Snapshot::<MicrovmState>::load(&mut buf.as_slice()).unwrap();
+    }
+
+    /// A snapshot this build produced carries this build's identity, and is accepted.
+    #[test]
+    fn a_snapshot_of_this_identity_is_accepted() {
+        let mut buf = Vec::new();
+        let snapshot = Snapshot::new(MicrovmState::default());
+        assert_eq!(
+            snapshot.header.feature_identity,
+            crate::vstate::farplane::FEATURE_IDENTITY
+        );
+        assert_eq!(snapshot.header.feature_identity, "farplane/2");
+
+        snapshot.save(&mut buf).unwrap();
+
+        let loaded = Snapshot::<MicrovmState>::load(&mut buf.as_slice()).unwrap();
+        assert_eq!(loaded.header.feature_identity, "farplane/2");
+    }
+
+    /// A warm image baked by an older identity is refused before its state is used: the capture
+    /// order and the vmstate layout that identity named are not the ones this build reads.
+    #[test]
+    fn a_snapshot_of_an_older_identity_is_refused() {
+        let mut snapshot = Snapshot::new(MicrovmState::default());
+        snapshot.header.feature_identity = "farplane/1".to_string();
+        let mut buf = Vec::new();
+        snapshot.save(&mut buf).unwrap();
+
+        let err = Snapshot::<MicrovmState>::load(&mut buf.as_slice()).unwrap_err();
+        match err {
+            SnapshotError::IncompatibleFeatureIdentity { expected, found } => {
+                assert_eq!(found, "farplane/1");
+                assert_eq!(expected, "farplane/2");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// The vsock frontend layout changed with this fork, and bitcode requires exact types: the
+    /// format version says so rather than leaving an old snapshot to decode into something else.
+    #[test]
+    fn the_format_version_records_the_layout_change() {
+        assert_eq!(SNAPSHOT_VERSION, Version::new(11, 0, 0));
+
+        let mut snapshot = Snapshot::new(MicrovmState::default());
+        snapshot.header.version = Version::new(10, 0, 0);
+        let mut buf = Vec::new();
+        snapshot.save(&mut buf).unwrap();
+
+        assert!(matches!(
+            Snapshot::<MicrovmState>::load(&mut buf.as_slice()),
+            Err(SnapshotError::InvalidFormatVersion(version)) if version == Version::new(10, 0, 0)
+        ));
     }
 
     #[test]
