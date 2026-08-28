@@ -24,6 +24,7 @@ use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::super::super::DeviceError;
@@ -59,6 +60,24 @@ pub(crate) const AVAIL_FEATURES: u64 = (1 << VIRTIO_F_VERSION_1 as u64)
     | (1 << VIRTIO_F_IN_ORDER as u64)
     | (1 << VIRTIO_RING_F_EVENT_IDX as u64);
 
+/// Whether the guest owes an acknowledgement of a `TRANSPORT_RESET`, and whether the event has
+/// reached its event queue.
+///
+/// A reset tells the guest that the backend connections it believes in are gone. It needs a
+/// descriptor on the event queue, which the guest may not have provided, so being owed a reset and
+/// having published one are different states: only the published one can be acknowledged, and only
+/// the acknowledgement lets guest data cross again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransportReset {
+    /// No reset is outstanding. RX and TX flow.
+    Settled,
+    /// A reset is owed to the guest, and the event queue had no descriptor to publish it into.
+    /// Data is gated until a descriptor arrives and the event is published.
+    Owed,
+    /// The reset is in the guest's event queue. Data is gated until the guest acknowledges it.
+    Published,
+}
+
 /// Structure representing the vsock device.
 #[derive(Debug)]
 pub struct Vsock<B> {
@@ -79,8 +98,9 @@ pub struct Vsock<B> {
     pub rx_packet: VsockPacketRx,
     pub tx_packet: VsockPacketTx,
 
-    /// Gates RX delivery while a TRANSPORT_RESET is awaiting guest ack.
-    pub(crate) pending_event_ack: bool,
+    /// Whether the guest owes an acknowledgement of a `TRANSPORT_RESET`. Guest data is gated
+    /// until it arrives.
+    pub(crate) transport_reset: TransportReset,
 }
 
 // TODO: Detect / handle queue deadlock:
@@ -115,7 +135,7 @@ where
             device_state: DeviceState::Inactive,
             rx_packet: VsockPacketRx::new()?,
             tx_packet: VsockPacketTx::default(),
-            pending_event_ack: false,
+            transport_reset: TransportReset::Settled,
         })
     }
 
@@ -136,6 +156,16 @@ where
     /// Access the backend behind the device.
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Whether an outstanding `TRANSPORT_RESET` gates guest data.
+    ///
+    /// From the moment a reset is owed until the guest acknowledges it, the guest still believes
+    /// in connections the host no longer has. Both directions are held: a TX packet would be sent
+    /// to a connection that is gone, and an RX packet would be delivered onto one, so neither may
+    /// cross before the guest has been told.
+    pub(crate) fn data_gated(&self) -> bool {
+        !matches!(self.transport_reset, TransportReset::Settled)
     }
 
     /// Signal the guest driver that we've used some virtio buffers that it had previously made
@@ -165,7 +195,7 @@ where
     /// have pending. Return `true` if the guest needs to be notified (respecting notification
     /// suppression).
     pub fn process_rx(&mut self) -> Result<bool, InvalidAvailIdx> {
-        if self.pending_event_ack {
+        if self.data_gated() {
             return Ok(false);
         }
 
@@ -222,6 +252,10 @@ where
     /// to the backend for processing. Return `true` if the guest needs to be notified (respecting
     /// notification suppression).
     pub fn process_tx(&mut self) -> Result<bool, InvalidAvailIdx> {
+        if self.data_gated() {
+            return Ok(false);
+        }
+
         // This is safe since we checked in the event handler that the device is activated.
         let mem = &self.device_state.active_state().unwrap().mem;
 
@@ -254,18 +288,40 @@ where
         Ok(have_used && queue.prepare_kick())
     }
 
-    // Send TRANSPORT_RESET_EVENT to driver. According to specs, the driver shuts down established
-    // connections and the guest_cid configuration field is fetched again. Existing listen sockets
-    // remain but their CID is updated to reflect the current guest_cid.
+    /// Publishes a `TRANSPORT_RESET` event to the guest.
+    ///
+    /// According to specs, the driver shuts down established connections and the guest_cid
+    /// configuration field is fetched again. Existing listen sockets remain but their CID is
+    /// updated to reflect the current guest_cid.
+    ///
+    /// Publication needs an available descriptor on the event queue. A queue that has none leaves
+    /// the reset owed rather than dropped: the event queue notification is armed so the guest's
+    /// refill reaches the device, and guest data stays gated until the event is published and
+    /// acknowledged.
     pub fn send_transport_reset_event(&mut self) -> Result<(), DeviceError> {
         // This is safe since we checked in the caller function that the device is activated.
         let mem = &self.device_state.active_state().unwrap().mem;
 
         let queue = &mut self.queues[EVQ_INDEX];
-        let head = queue.pop()?.ok_or_else(|| {
-            METRICS.ev_queue_event_fails.inc();
-            DeviceError::VsockError(VsockError::EmptyQueue)
-        })?;
+        let head = match queue.pop() {
+            Ok(Some(head)) => head,
+            Ok(None) => {
+                // The evq is only popped here, so `avail_event` is not advanced by a drain loop.
+                // Arm it, or EVENT_IDX would suppress the guest's refill of the queue and no
+                // descriptor would ever arrive to carry the reset.
+                queue.enable_notification();
+                self.transport_reset = TransportReset::Owed;
+                METRICS.ev_queue_event_fails.inc();
+                return Err(DeviceError::VsockError(VsockError::EmptyQueue));
+            }
+            // A queue the device cannot read cannot carry the reset either, so the guest is still
+            // owed one and data stays gated.
+            Err(err) => {
+                self.transport_reset = TransportReset::Owed;
+                METRICS.ev_queue_event_fails.inc();
+                return Err(err.into());
+            }
+        };
 
         mem.write_obj::<u32>(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, head.addr)
             .unwrap_or_else(|err| error!("Failed to write virtio vsock reset event: {:?}", err));
@@ -275,13 +331,11 @@ where
         });
         queue.advance_used_ring_idx();
 
-        // The evq is only popped here, not via a drain loop, so
-        // `avail_event` is not advanced by `pop_or_enable_notification`.
-        // Arm it so the driver's refill of the consumed head is not
-        // suppressed by EVENT_IDX.
+        // Arm the notification so the driver's refill of the consumed head is not suppressed by
+        // EVENT_IDX: that refill is also the acknowledgement this device waits for.
         queue.enable_notification();
 
-        self.pending_event_ack = true;
+        self.transport_reset = TransportReset::Published;
 
         // NOTE: kick() will be called on resume and it will trigger the interrupt again. As calling
         // it multiple times should not cause any harm, it would be safer to call it here as well
@@ -403,26 +457,44 @@ where
     }
 
     fn kick(&mut self) {
-        if self.is_activated() {
-            // Whether a transport reset is outstanding is what the snapshot recorded, not
-            // something a resume may assume: `send_transport_reset_event` only publishes the
-            // reset when the event queue has an available descriptor, so a snapshot can carry
-            // none. Arming `pending_event_ack` here regardless would hold RX shut for the life
-            // of the restored guest, because the ack that opens the gate can never arrive.
-            //
+        if !self.is_activated() {
+            return;
+        }
+
+        match self.transport_reset {
+            // The snapshot could not publish the reset: the event queue held no descriptor. Try
+            // again now, and if it is still empty the notification armed by the failure brings the
+            // device back when the guest refills the queue. Data stays gated until the reset is
+            // published and acknowledged, so the guest cannot use connections the host has lost.
+            TransportReset::Owed => {
+                if let Err(err) = self.send_transport_reset_event() {
+                    info!(
+                        "[{:?}:{}] transport reset still owed to the guest: {:?}",
+                        self.device_type(),
+                        self.id(),
+                        err
+                    );
+                }
+            }
+
             // Vsock has a complicated protocol that isn't resilient to any packet loss,
             // so for Vsock we don't support connection persistence through snapshot. Any
             // in-flight packets or events are simply lost and Vsock is restored 'empty'.
             // We signal the event queue to make the guest process the
             // `TRANSPORT_RESET_EVENT` event we sent during snapshot creation. (We signal
             // it host->guest rather than writing its eventfd, which would invoke the
-            // guest's reset-ack path and clear `pending_event_ack` prematurely.)
-            info!(
-                "[{:?}:{}] signaling event queue",
-                self.device_type(),
-                self.id()
-            );
-            self.signal_used_queue(EVQ_INDEX).unwrap();
+            // guest's acknowledgement path and clear the gate prematurely.)
+            //
+            // TX is not replayed here: it is gated until the acknowledgement, and the
+            // acknowledgement path walks it.
+            TransportReset::Published => {
+                info!(
+                    "[{:?}:{}] signaling event queue",
+                    self.device_type(),
+                    self.id()
+                );
+                self.signal_used_queue(EVQ_INDEX).unwrap();
+            }
 
             // Replay the TX queue notification, like the default `VirtioDevice::kick`
             // does for its data queues, so the device re-processes any TX descriptor
@@ -432,32 +504,34 @@ where
             // Under EVENT_IDX the guest only notifies us when `avail_idx` crosses
             // `avail_event`; since it is already past, the guest considers itself to
             // have notified us and stays silent, so we never process the queue and
-            // guest-to-host connections hang. RX needs no replay: an outstanding reset gates it
-            // until the guest acks, and the host pulls from the backend rather than waiting on a
-            // guest RX notification.
-            info!(
-                "[{:?}:{}] notifying tx queue",
-                self.device_type(),
-                self.id()
-            );
-            if let Err(err) = self.queue_events[TXQ_INDEX].write(1) {
-                error!(
-                    "[{:?}:{}] error notifying tx queue: {}",
+            // guest-to-host connections hang. RX needs no replay: the host pulls from the
+            // backend rather than waiting on a guest RX notification.
+            TransportReset::Settled => {
+                info!(
+                    "[{:?}:{}] notifying tx queue",
                     self.device_type(),
-                    self.id(),
-                    err
+                    self.id()
                 );
+                if let Err(err) = self.queue_events[TXQ_INDEX].write(1) {
+                    error!(
+                        "[{:?}:{}] error notifying tx queue: {}",
+                        self.device_type(),
+                        self.id(),
+                        err
+                    );
+                }
             }
         }
     }
 
     fn prepare_save(&mut self) {
-        // Send Transport event to reset connections if device
-        // is activated.
-        if self.is_activated() {
-            self.send_transport_reset_event().unwrap_or_else(|err| {
-                error!("Failed to send reset transport event: {:?}", err);
-            });
+        // Reset the guest's connections: the backend ones do not survive the snapshot. A reset
+        // that cannot be published is recorded as owed rather than dropped, so the restored
+        // device publishes it before it lets any guest data cross.
+        if self.is_activated()
+            && let Err(err) = self.send_transport_reset_event()
+        {
+            warn!("Failed to send reset transport event: {:?}", err);
         }
     }
 }
@@ -467,23 +541,9 @@ mod tests {
     use vmm_sys_util::epoll::EventSet;
 
     use super::*;
-    use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::vsock::defs::uapi;
-    use crate::devices::virtio::vsock::test_utils::{EventHandlerContext, TestContext};
+    use crate::devices::virtio::vsock::test_utils::{EVQ_PAYLOAD_GUEST_ADDR, TestContext};
     use crate::vstate::memory::GuestAddress;
-
-    /// Guest address used for the writable evq descriptor payload in tests.
-    const EVQ_PAYLOAD_GUEST_ADDR: u64 = 0x0040_2000;
-
-    /// Publish a single 4-byte writable descriptor on the event virtqueue and reload the
-    /// device-side queue so it sees the new avail index. Required by any test that exercises
-    /// `send_transport_reset_event` directly.
-    fn publish_evq_descriptor(ctx: &mut EventHandlerContext<'_>) {
-        ctx.guest_evvq.dtable[0].set(EVQ_PAYLOAD_GUEST_ADDR, 4, VIRTQ_DESC_F_WRITE, 0);
-        ctx.guest_evvq.avail.ring[0].set(0);
-        ctx.guest_evvq.avail.idx.set(1);
-        ctx.device.queues[EVQ_INDEX] = ctx.guest_evvq.create_queue();
-    }
 
     #[test]
     fn test_virtio_device() {
@@ -558,19 +618,20 @@ mod tests {
     }
 
     #[test]
-    fn test_send_transport_reset_event_sets_pending_event_ack() {
+    fn test_send_transport_reset_event_publishes_and_gates() {
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
-        publish_evq_descriptor(&mut ctx);
+        ctx.publish_evq_descriptor();
 
-        assert!(!ctx.device.pending_event_ack);
+        assert_eq!(ctx.device.transport_reset, TransportReset::Settled);
 
         ctx.device.send_transport_reset_event().unwrap();
 
-        assert!(
-            ctx.device.pending_event_ack,
-            "TRANSPORT_RESET emission must arm the RX gate"
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Published,
+            "TRANSPORT_RESET emission must gate guest data until the guest acknowledges it"
         );
         assert_eq!(
             ctx.guest_evvq.used.idx.get(),
@@ -588,8 +649,9 @@ mod tests {
     }
 
     #[test]
-    fn test_send_transport_reset_event_empty_queue() {
-        // No available descriptors on the evq -> the device cannot publish the event.
+    fn test_send_transport_reset_event_empty_queue_owes_the_reset() {
+        // No available descriptors on the evq -> the device cannot publish the event, so the
+        // guest is owed one and data stays gated until it is published and acknowledged.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
@@ -599,44 +661,53 @@ mod tests {
             DeviceError::VsockError(VsockError::EmptyQueue) => (),
             other => panic!("unexpected error variant: {other:?}"),
         }
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Owed,
+            "a reset that could not be published must not be dropped"
+        );
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            0,
+            "nothing may be published into an empty event queue"
+        );
         assert!(
-            !ctx.device.pending_event_ack,
-            "flag must not be armed if the event was never published"
+            ctx.device.data_gated(),
+            "guest data must not cross while the reset is owed"
         );
     }
 
     #[test]
     fn test_kick_when_inactive_is_a_noop() {
-        // The fix runs `kick()` only when activated. The inactive branch must not arm
-        // the RX gate, otherwise a freshly restored-but-unactivated device would refuse
-        // RX forever.
+        // The fix runs `kick()` only when activated. The inactive branch must not gate data,
+        // otherwise a freshly restored-but-unactivated device would refuse RX forever.
         let mut ctx = TestContext::new();
         assert!(!ctx.device.is_activated());
 
         ctx.device.kick();
 
-        assert!(
-            !ctx.device.pending_event_ack,
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Settled,
             "kick() on an inactive device must remain a no-op"
         );
     }
 
     #[test]
-    fn test_kick_keeps_the_rx_gate_the_snapshot_recorded() {
-        // Restore path: kick() re-delivers the TRANSPORT_RESET interrupt, but whether a reset
-        // is outstanding belongs to the snapshot. A snapshot taken with an empty event queue
-        // carries no reset, so nothing can ever acknowledge one; arming the gate here would
-        // shut RX for the life of the restored guest.
+    fn test_kick_keeps_the_state_the_snapshot_recorded() {
+        // Restore path: whether a reset is outstanding belongs to the snapshot. A snapshot that
+        // recorded none leaves data flowing.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.pending_event_ack = false;
+        ctx.device.transport_reset = TransportReset::Settled;
         ctx.device.kick();
 
-        assert!(
-            !ctx.device.pending_event_ack,
-            "kick() must not arm a gate the snapshot never recorded"
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Settled,
+            "kick() must not gate data the snapshot never gated"
         );
 
         // With no reset outstanding, RX delivers.
@@ -645,22 +716,54 @@ mod tests {
     }
 
     #[test]
-    fn test_kick_preserves_an_outstanding_rx_gate() {
-        // The other half: a snapshot taken while a reset was outstanding restores that gate,
-        // and RX stays shut until the guest acknowledges it.
+    fn test_kick_preserves_a_published_reset() {
+        // The other half: a snapshot taken while a published reset was unacknowledged restores
+        // that gate, and data stays shut until the guest acknowledges it.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.pending_event_ack = true;
+        ctx.device.transport_reset = TransportReset::Published;
         ctx.device.kick();
 
-        assert!(ctx.device.pending_event_ack);
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
 
         ctx.device.backend.set_pending_rx(true);
-        let progressed = ctx.device.process_rx().unwrap();
-        assert!(!progressed);
+        assert!(!ctx.device.process_rx().unwrap());
         assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+        assert!(!ctx.device.process_tx().unwrap());
+        assert_eq!(ctx.guest_txvq.used.idx.get(), 0);
+    }
+
+    #[test]
+    fn test_kick_publishes_an_owed_reset_when_a_descriptor_is_there() {
+        // A restored device that owes a reset publishes it as soon as it can, and data stays
+        // gated until the guest acknowledges the published event.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.publish_evq_descriptor();
+
+        ctx.device.transport_reset = TransportReset::Owed;
+        ctx.device.kick();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        // The TX queue is not replayed while the reset is unacknowledged.
+        ctx.device.queue_events[TXQ_INDEX].read().unwrap_err();
+    }
+
+    #[test]
+    fn test_kick_keeps_an_owed_reset_owed_without_a_descriptor() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        ctx.device.transport_reset = TransportReset::Owed;
+        ctx.device.kick();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
     }
 
     #[test]
@@ -686,16 +789,30 @@ mod tests {
     #[test]
     fn test_prepare_save_emits_transport_reset_when_active() {
         // The snapshot path goes through prepare_save -> send_transport_reset_event.
-        // Both the evq publication and the RX gate must be observable afterwards.
+        // Both the evq publication and the gate must be observable afterwards.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
-        publish_evq_descriptor(&mut ctx);
+        ctx.publish_evq_descriptor();
 
         ctx.device.prepare_save();
 
-        assert!(ctx.device.pending_event_ack);
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
         assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+    }
+
+    #[test]
+    fn test_prepare_save_owes_the_reset_it_cannot_publish() {
+        // An empty event queue at snapshot time is what used to lose the reset: the error was
+        // logged and the state said nothing was outstanding.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        ctx.device.prepare_save();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
     }
 
     #[test]
@@ -703,36 +820,38 @@ mod tests {
         let mut ctx = TestContext::new();
         assert!(!ctx.device.is_activated());
 
-        // Must not panic, must not arm the gate.
+        // Must not panic, must not gate data.
         ctx.device.prepare_save();
 
-        assert!(!ctx.device.pending_event_ack);
+        assert_eq!(ctx.device.transport_reset, TransportReset::Settled);
     }
 
     #[test]
-    fn test_pending_event_ack_default_is_false() {
+    fn test_transport_reset_default_is_settled() {
         let ctx = TestContext::new();
-        assert!(
-            !ctx.device.pending_event_ack,
-            "freshly created device must have the RX gate disarmed"
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Settled,
+            "freshly created device must not gate guest data"
         );
     }
 
     #[test]
     fn test_evq_event_with_non_in_evset_is_a_noop() {
-        // Spurious evset flavours must not flip the gate or drain the RX queue.
+        // Spurious evset flavours must not clear the gate or drain the RX queue.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.pending_event_ack = true;
+        ctx.device.transport_reset = TransportReset::Published;
         ctx.device.backend.set_pending_rx(true);
 
         let used = ctx.device.handle_evq_event(EventSet::OUT);
 
         assert!(used.is_empty());
-        assert!(
-            ctx.device.pending_event_ack,
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Published,
             "non-IN evset must not clear the gate"
         );
         assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);

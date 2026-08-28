@@ -104,6 +104,9 @@ impl VsockEpollListener for TestBackend {
 }
 impl VsockBackend for TestBackend {}
 
+/// Guest address the writable event-queue descriptor points at in tests.
+pub const EVQ_PAYLOAD_GUEST_ADDR: u64 = 0x0040_2000;
+
 #[derive(Debug)]
 pub struct TestContext {
     pub cid: u64,
@@ -201,6 +204,23 @@ impl EventHandlerContext<'_> {
     pub fn signal_rxq_event(&mut self) {
         self.device.queue_events[RXQ_INDEX].write(1).unwrap();
         self.device.handle_rxq_event(EventSet::IN);
+    }
+
+    /// Publishes a single 4-byte writable descriptor on the event virtqueue and reloads the
+    /// device-side queue so it sees the new avail index. This is what the guest driver does when
+    /// it refills the event queue, and what any test that exercises `send_transport_reset_event`
+    /// needs.
+    pub fn publish_evq_descriptor(&mut self) {
+        self.guest_evvq.dtable[0].set(EVQ_PAYLOAD_GUEST_ADDR, 4, VIRTQ_DESC_F_WRITE, 0);
+        self.guest_evvq.avail.ring[0].set(0);
+        self.guest_evvq.avail.idx.set(1);
+        self.device.queues[EVQ_INDEX] = self.guest_evvq.create_queue();
+    }
+
+    /// Drives one event-queue notification, as the guest's kick of that queue does.
+    pub fn signal_evq_event(&mut self) -> Vec<u16> {
+        self.device.queue_events[EVQ_INDEX].write(1).unwrap();
+        self.device.handle_evq_event(EventSet::IN)
     }
 }
 
