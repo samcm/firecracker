@@ -63,15 +63,8 @@ impl ApiServerAdapter {
         }));
         event_manager.add_subscriber(api_adapter.clone());
         loop {
-            {
-                // Dispatch runs in slices, each of them holding the farplane gate: a capture
-                // epoch closes the gate and this loop parks here for its duration, so no device
-                // handler can write guest memory or device state between capture commands.
-                let _dispatch = vmm::vstate::farplane::hold_for_dispatch();
-                event_manager
-                    .run_with_timeout(vmm::vstate::farplane::DISPATCH_SLICE_MS)
-                    .expect("EventManager events driver fatal error");
-            }
+            vmm::vstate::farplane::dispatch_slice(event_manager)
+                .expect("EventManager events driver fatal error");
             api_adapter.lock().expect("Poisoned lock").handle_request();
 
             match vmm.lock().unwrap().shutdown_exit_code() {
@@ -83,37 +76,58 @@ impl ApiServerAdapter {
         Ok(())
     }
 
-    fn _handle_request(&mut self, req_action: VmmAction) {
-        let response = self.controller.handle_request(req_action);
-        // Send back the result.
-        self.to_api
-            .send(Box::new(response))
+    fn handle_request(&mut self) {
+        let staged = self.request.take();
+        let controller = &mut self.controller;
+        serve_actions(staged, &self.from_api, &self.to_api, |action| {
+            Box::new(controller.handle_request(action))
+        });
+    }
+}
+
+/// Serves one staged API action and, if it paused the microVM, every action up to the resume.
+///
+/// Each action executes inside `outside_capture_epoch`: an action staged before a capture epoch
+/// closed the dispatch gate reaches the microVM only once the epoch ends, so it cannot mutate VM
+/// or device state between the vmstate and the dirty harvest of the same checkpoint.
+///
+/// The hold is taken per action and never across the blocking receive of the paused mode: an
+/// adapter waiting for the next action would otherwise keep a capture from starting at all.
+fn serve_actions(
+    staged: Option<ApiRequest>,
+    from_api: &Receiver<ApiRequest>,
+    to_api: &Sender<ApiResponse>,
+    mut execute: impl FnMut(VmmAction) -> ApiResponse,
+) {
+    let Some(staged) = staged else {
+        return;
+    };
+    let respond = |response: ApiResponse| {
+        to_api
+            .send(response)
             .map_err(|_| ())
             .expect("one-shot channel closed");
+    };
+
+    let staged_is_pause = *staged == VmmAction::Pause;
+    respond(vmm::vstate::farplane::outside_capture_epoch(|| {
+        execute(*staged)
+    }));
+    if !staged_is_pause {
+        return;
     }
 
-    fn handle_request(&mut self) {
-        if let Some(api_request) = self.request.take() {
-            let request_is_pause = *api_request == VmmAction::Pause;
-            self._handle_request(*api_request);
-
-            // If the latest req is a pause request, temporarily switch to a mode where we
-            // do blocking `recv`s on the `from_api` receiver in a loop, until we get
-            // unpaused. The device emulation is implicitly paused since we do not
-            // relinquish control to the event manager because we're not returning from
-            // `process`.
-            if request_is_pause {
-                // This loop only attempts to process API requests, so things like the
-                // metric flush timerfd handling are frozen as well.
-                loop {
-                    let req = self.from_api.recv().expect("Error receiving API request.");
-                    let req_is_resume = *req == VmmAction::Resume;
-                    self._handle_request(*req);
-                    if req_is_resume {
-                        break;
-                    }
-                }
-            }
+    // A pause switches to blocking receives on `from_api` until the resume arrives. Control is
+    // never handed back to the event manager in that state, so device emulation is implicitly
+    // paused and so is everything else the loop drives, such as the metric flush timer.
+    loop {
+        let request = from_api.recv().expect("Error receiving API request.");
+        let request_is_resume = *request == VmmAction::Resume;
+        respond(vmm::vstate::farplane::outside_capture_epoch(|| {
+            execute(*request)
+        }));
+        if request_is_resume {
+            return;
         }
     }
 }
@@ -257,4 +271,65 @@ pub(crate) fn run_with_api(
     api_thread.join().expect("Api thread should join");
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use vmm::rpc_interface::VmmData;
+
+    use super::*;
+
+    /// An action staged before a capture epoch closed the gate does not reach the microVM inside
+    /// the epoch: it waits for the epoch to end, so it cannot mutate VM or device state between
+    /// the vmstate and the dirty harvest.
+    #[test]
+    fn a_staged_action_waits_for_the_capture_epoch_to_end() {
+        static EXECUTED: AtomicBool = AtomicBool::new(false);
+
+        let (_to_vmm, from_api) = channel::<ApiRequest>();
+        let (to_api, from_vmm) = channel::<ApiResponse>();
+
+        // The epoch closes with the Resume already staged, exactly as a capture that starts while
+        // the API thread has handed an action over leaves it.
+        vmm::vstate::farplane::gate().close();
+
+        let served = thread::spawn(move || {
+            serve_actions(
+                Some(Box::new(VmmAction::Resume)),
+                &from_api,
+                &to_api,
+                |action| {
+                    assert_eq!(action, VmmAction::Resume);
+                    EXECUTED.store(true, Ordering::SeqCst);
+                    Box::new(Ok(VmmData::Empty))
+                },
+            );
+        });
+
+        // The gate is closed, so no amount of waiting lets the action run.
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !EXECUTED.load(Ordering::SeqCst),
+            "the action ran inside the capture epoch"
+        );
+        assert!(
+            from_vmm.try_recv().is_err(),
+            "a response was sent for an action that must not have run"
+        );
+
+        vmm::vstate::farplane::gate().open();
+
+        served.join().expect("action thread panicked");
+        assert!(
+            EXECUTED.load(Ordering::SeqCst),
+            "the action did not run once the epoch ended"
+        );
+        assert!(
+            matches!(*from_vmm.recv().expect("no response"), Ok(VmmData::Empty)),
+            "the action's response did not reach the API thread"
+        );
+    }
 }

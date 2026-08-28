@@ -12,7 +12,7 @@ pub mod protocol;
 
 pub use backend::{BackendError, BackendState, FarplaneBackend, FarplaneState};
 pub use capture::CaptureService;
-pub use dispatch::{DISPATCH_SLICE_MS, DispatchGate, DispatchHold, gate, hold_for_dispatch};
+pub use dispatch::{dispatch_slice, gate, outside_capture_epoch};
 pub use protocol::{
     Arch, BackendReadyRegion, ChannelError, ErrorCode, ExtentRecord, FEATURE_IDENTITY, Header,
     MAGIC, MAX_DATAGRAM, MAX_EXTENTS, MAX_PLAN_FDS, Mode, MsgType, RegionRecord, VERSION,

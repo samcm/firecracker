@@ -3,6 +3,8 @@
 
 use std::sync::{Condvar, Mutex};
 
+use crate::EventManager;
+
 /// Stops event dispatch for the whole of a capture epoch.
 ///
 /// Pausing the vCPUs and draining asynchronous block IO leaves one writer of guest memory
@@ -36,8 +38,9 @@ pub struct DispatchHold<'a> {
 }
 
 impl DispatchGate {
-    /// Builds an open gate with nothing dispatching.
-    pub const fn new() -> Self {
+    /// Builds an open gate with nothing dispatching. The event loop and the capture service share
+    /// one gate, so the only instances are `GATE` and the ones the tests build.
+    const fn new() -> Self {
         Self {
             state: Mutex::new(GateState {
                 closed: false,
@@ -84,12 +87,6 @@ impl DispatchGate {
     }
 }
 
-impl Default for DispatchGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for DispatchHold<'_> {
     fn drop(&mut self) {
         let mut state = self.gate.state.lock().expect("Poisoned lock");
@@ -112,11 +109,29 @@ pub fn gate() -> &'static DispatchGate {
 /// The loop takes a hold for the length of a slice, so the slice bounds how long `close` waits for
 /// dispatch that is already running. An idle loop wakes ten times a second, which costs nothing
 /// and is what lets a capture start promptly.
-pub const DISPATCH_SLICE_MS: i32 = 100;
+const DISPATCH_SLICE_MS: i32 = 100;
 
-/// Takes a hold for one dispatch slice of the event loop, blocking while a capture epoch is open.
-pub fn hold_for_dispatch() -> DispatchHold<'static> {
-    GATE.enter()
+/// Runs one dispatch slice of the microVM's event loop, parked while a capture epoch is open.
+///
+/// The hold lives exactly as long as the slice: `close` waits for a slice that has started, and a
+/// slice that has not started waits for the epoch to end.
+pub fn dispatch_slice(event_manager: &mut EventManager) -> event_manager::Result<usize> {
+    let _hold = GATE.enter();
+    event_manager.run_with_timeout(DISPATCH_SLICE_MS)
+}
+
+/// Runs work that mutates microVM or device state, parked while a capture epoch is open.
+///
+/// This is the path for an API action. The action reaches the microVM either before the epoch
+/// closes the gate or after `resume` opens it, never in between, so a queued action cannot land
+/// between the vmstate and the dirty harvest.
+///
+/// The wait happens before `f` runs and takes no other lock, so an action parked here holds
+/// nothing the capture service needs: `close` runs before the capture service takes the VMM lock,
+/// and this hold is dropped by the time `f` returns.
+pub fn outside_capture_epoch<T>(f: impl FnOnce() -> T) -> T {
+    let _hold = GATE.enter();
+    f()
 }
 
 #[cfg(test)]
