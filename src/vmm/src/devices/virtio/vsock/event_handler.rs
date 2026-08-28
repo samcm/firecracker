@@ -54,6 +54,10 @@ where
             return used_queues;
         }
 
+        // A guest that kicks a data queue may have refilled the event queue without the device
+        // seeing a notification for it, so this is a retry point for a reset the device owes.
+        self.retry_owed_transport_reset();
+
         if let Err(err) = self.queue_events[RXQ_INDEX].read() {
             error!("Failed to get vsock rx queue event: {:?}", err);
             METRICS.rx_queue_event_fails.inc();
@@ -73,6 +77,8 @@ where
             METRICS.tx_queue_event_fails.inc();
             return used_queues;
         }
+
+        self.retry_owed_transport_reset();
 
         if let Err(err) = self.queue_events[TXQ_INDEX].read() {
             error!("Failed to get vsock tx queue event: {:?}", err);

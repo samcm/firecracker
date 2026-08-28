@@ -217,6 +217,16 @@ impl EventHandlerContext<'_> {
         self.device.queues[EVQ_INDEX] = self.guest_evvq.create_queue();
     }
 
+    /// Publishes a descriptor on the event virtqueue the way the guest driver does, leaving the
+    /// device-side queue object alone: the device reads the avail ring from guest memory, so a
+    /// queue whose EVENT_IDX state must survive is not rebuilt. `slot` is the avail ring position
+    /// the guest writes, which is also the new avail index minus one.
+    pub fn guest_refills_evq(&mut self, slot: u16) {
+        self.guest_evvq.dtable[0].set(EVQ_PAYLOAD_GUEST_ADDR, 4, VIRTQ_DESC_F_WRITE, 0);
+        self.guest_evvq.avail.ring[usize::from(slot)].set(0);
+        self.guest_evvq.avail.idx.set(slot + 1);
+    }
+
     /// Drives one event-queue notification, as the guest's kick of that queue does.
     pub fn signal_evq_event(&mut self) -> Vec<u16> {
         self.device.queue_events[EVQ_INDEX].write(1).unwrap();

@@ -64,6 +64,14 @@ pub(super) struct VsockDeviceMetrics {
     pub tx_queue_event_fails: SharedIncMetric,
     /// Number of times when handling event queue events on a vsock device failed.
     pub ev_queue_event_fails: SharedIncMetric,
+    /// Number of `TRANSPORT_RESET` events published into the guest's event queue.
+    pub transport_reset_published: SharedIncMetric,
+    /// Number of times a `TRANSPORT_RESET` could not be published and is owed to the guest.
+    /// Guest data is gated for as long as one is owed.
+    pub transport_reset_owed: SharedIncMetric,
+    /// Number of times publishing an owed `TRANSPORT_RESET` failed again. A climbing count is a
+    /// guest that is not refilling its event queue, with data gated until it does.
+    pub transport_reset_stuck: SharedIncMetric,
     /// Number of times when handling muxer events on a vsock device failed.
     pub muxer_event_fails: SharedIncMetric,
     /// Number of times when handling connection events on a vsock device failed.
@@ -106,6 +114,9 @@ impl VsockDeviceMetrics {
             rx_queue_event_fails: SharedIncMetric::new(),
             tx_queue_event_fails: SharedIncMetric::new(),
             ev_queue_event_fails: SharedIncMetric::new(),
+            transport_reset_published: SharedIncMetric::new(),
+            transport_reset_owed: SharedIncMetric::new(),
+            transport_reset_stuck: SharedIncMetric::new(),
             muxer_event_fails: SharedIncMetric::new(),
             conn_event_fails: SharedIncMetric::new(),
             rx_queue_event_count: SharedIncMetric::new(),

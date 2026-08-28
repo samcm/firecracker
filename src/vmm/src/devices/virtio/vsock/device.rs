@@ -295,29 +295,29 @@ where
     /// updated to reflect the current guest_cid.
     ///
     /// Publication needs an available descriptor on the event queue. A queue that has none leaves
-    /// the reset owed rather than dropped: the event queue notification is armed so the guest's
-    /// refill reaches the device, and guest data stays gated until the event is published and
-    /// acknowledged.
+    /// the reset owed rather than dropped, with the event queue notification armed, and guest data
+    /// stays gated until the event is published and acknowledged.
     pub fn send_transport_reset_event(&mut self) -> Result<(), DeviceError> {
         // This is safe since we checked in the caller function that the device is activated.
         let mem = &self.device_state.active_state().unwrap().mem;
 
         let queue = &mut self.queues[EVQ_INDEX];
-        let head = match queue.pop() {
+        // `pop_or_enable_notification` arms `avail_event` and rechecks the ring as one step, so a
+        // descriptor the guest publishes concurrently either carries the reset now or produces the
+        // notification that carries it later. A bare `enable_notification` loses that race: it
+        // arms at an avail index the guest has already passed, and EVENT_IDX does not repeat the
+        // notification the guest has already given, so the reset would never be published.
+        let head = match queue.pop_or_enable_notification() {
             Ok(Some(head)) => head,
             Ok(None) => {
-                // The evq is only popped here, so `avail_event` is not advanced by a drain loop.
-                // Arm it, or EVENT_IDX would suppress the guest's refill of the queue and no
-                // descriptor would ever arrive to carry the reset.
-                queue.enable_notification();
-                self.transport_reset = TransportReset::Owed;
+                self.owe_transport_reset();
                 METRICS.ev_queue_event_fails.inc();
                 return Err(DeviceError::VsockError(VsockError::EmptyQueue));
             }
             // A queue the device cannot read cannot carry the reset either, so the guest is still
             // owed one and data stays gated.
             Err(err) => {
-                self.transport_reset = TransportReset::Owed;
+                self.owe_transport_reset();
                 METRICS.ev_queue_event_fails.inc();
                 return Err(err.into());
             }
@@ -332,10 +332,13 @@ where
         queue.advance_used_ring_idx();
 
         // Arm the notification so the driver's refill of the consumed head is not suppressed by
-        // EVENT_IDX: that refill is also the acknowledgement this device waits for.
+        // EVENT_IDX: that refill is also the acknowledgement this device waits for. The driver
+        // cannot refill before it has seen this used-ring update, which is what makes arming
+        // without a recheck correct here.
         queue.enable_notification();
 
         self.transport_reset = TransportReset::Published;
+        METRICS.transport_reset_published.inc();
 
         // NOTE: kick() will be called on resume and it will trigger the interrupt again. As calling
         // it multiple times should not cause any harm, it would be safer to call it here as well
@@ -344,6 +347,37 @@ where
         self.signal_used_queue(EVQ_INDEX)?;
 
         Ok(())
+    }
+
+    /// Records that the guest is owed a reset the device could not publish.
+    ///
+    /// A reset that is already in the guest's event queue is never downgraded: it has been
+    /// published, the guest can answer it, and a second event for the same fact would consume
+    /// another descriptor and outlive the single acknowledgement that clears the gate. A repeated
+    /// failure while already owed is counted instead: the guest is not answering, and data stays
+    /// gated for as long as that holds.
+    fn owe_transport_reset(&mut self) {
+        match self.transport_reset {
+            TransportReset::Published => {}
+            TransportReset::Owed => METRICS.transport_reset_stuck.inc(),
+            TransportReset::Settled => {
+                self.transport_reset = TransportReset::Owed;
+                METRICS.transport_reset_owed.inc();
+            }
+        }
+    }
+
+    /// Publishes a reset the device owes the guest, if it owes one.
+    ///
+    /// Guest activity on the data queues is a retry point: the event queue may hold a descriptor
+    /// the device has no notification for, and data stays gated until the reset is published.
+    pub(crate) fn retry_owed_transport_reset(&mut self) {
+        if !self.device_state.is_activated() || self.transport_reset != TransportReset::Owed {
+            return;
+        }
+        if let Err(err) = self.send_transport_reset_event() {
+            warn!("vsock: transport reset still owed to the guest: {:?}", err);
+        }
     }
 }
 
@@ -525,12 +559,22 @@ where
     }
 
     fn prepare_save(&mut self) {
+        if !self.is_activated() {
+            return;
+        }
+
+        // A reset the guest has not answered yet covers this snapshot too: the connections it is
+        // about are already gone. Publishing a second event would consume another descriptor for
+        // the same fact, and a repeated capture that found the event queue empty would downgrade a
+        // published reset to an owed one, dropping the event the guest can still answer.
+        if self.data_gated() {
+            return;
+        }
+
         // Reset the guest's connections: the backend ones do not survive the snapshot. A reset
         // that cannot be published is recorded as owed rather than dropped, so the restored
         // device publishes it before it lets any guest data cross.
-        if self.is_activated()
-            && let Err(err) = self.send_transport_reset_event()
-        {
+        if let Err(err) = self.send_transport_reset_event() {
             warn!("Failed to send reset transport event: {:?}", err);
         }
     }
@@ -813,6 +857,145 @@ mod tests {
 
         assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
         assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
+    }
+
+    #[test]
+    fn test_repeated_capture_keeps_a_published_reset_published() {
+        // Descriptor exhaustion across two captures. The first capture publishes into the only
+        // descriptor the guest provided; the second finds the event queue empty. The published
+        // reset must survive: it is the event the guest can still answer, and downgrading it to
+        // owed would drop it and leave data gated on an acknowledgement of nothing.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.publish_evq_descriptor();
+
+        ctx.device.prepare_save();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+
+        // Second capture, no new descriptor: the reset already outstanding covers it.
+        ctx.device.prepare_save();
+
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Published,
+            "a repeated capture must not downgrade a published reset"
+        );
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            1,
+            "a repeated capture must not publish a second event for the same reset"
+        );
+
+        // Even a direct publication attempt that runs out of descriptors leaves the published
+        // reset alone.
+        let err = ctx.device.send_transport_reset_event().unwrap_err();
+        assert!(matches!(
+            err,
+            DeviceError::VsockError(VsockError::EmptyQueue)
+        ));
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+    }
+
+    #[test]
+    fn test_repeated_capture_keeps_an_owed_reset_owed() {
+        // Both captures find the event queue empty. The debt stays exactly one debt, and the
+        // repeated failure is counted as a guest that is not answering.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        ctx.device.prepare_save();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
+
+        let stuck_before = METRICS.transport_reset_stuck.count();
+        ctx.device.prepare_save();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
+        assert_eq!(
+            METRICS.transport_reset_stuck.count(),
+            stuck_before,
+            "a repeated capture must not even attempt to publish while a reset is owed"
+        );
+
+        // A retry that runs out of descriptors keeps the debt and reports it.
+        ctx.device.retry_owed_transport_reset();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
+        assert!(
+            METRICS.transport_reset_stuck.count() > stuck_before,
+            "a failed retry of an owed reset must be counted"
+        );
+    }
+
+    #[test]
+    fn test_event_idx_arms_the_event_queue_for_an_owed_reset() {
+        // With EVENT_IDX the guest suppresses notifications until the device asks for one. A reset
+        // the device cannot publish therefore has to arm the event queue, or the refill that would
+        // carry it never announces itself.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.device
+            .ack_features_by_page(0, 1 << VIRTIO_RING_F_EVENT_IDX);
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        // `avail_event` is only ever written by the notification-suppression path.
+        ctx.guest_evvq.used.event.set(0xffff);
+
+        ctx.device.prepare_save();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
+        assert_eq!(
+            ctx.guest_evvq.used.event.get(),
+            0,
+            "the device must arm avail_event at the index it will next read"
+        );
+
+        // The guest refills the queue and kicks it: the notification the device armed for.
+        ctx.guest_refills_evq(0);
+        let used = ctx.signal_evq_event();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            1,
+            "the refilled descriptor must carry the reset"
+        );
+        assert!(used.is_empty(), "publishing a reset signals no data queue");
+
+        // The guest answers the published event, and only then does data cross.
+        ctx.device.backend.set_pending_rx(true);
+        ctx.guest_refills_evq(1);
+        let used = ctx.signal_evq_event();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Settled);
+        assert!(used.contains(&RXQ_INDEX.try_into().unwrap()));
+    }
+
+    #[test]
+    fn test_event_idx_publishes_a_descriptor_that_arrived_without_a_notification() {
+        // With EVENT_IDX the guest may have refilled the event queue before the device armed it,
+        // in which case no further notification is coming: the guest considers itself to have
+        // notified already. The next guest activity of any kind must publish the owed reset rather
+        // than wait for a notification that never arrives.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.device
+            .ack_features_by_page(0, 1 << VIRTIO_RING_F_EVENT_IDX);
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        ctx.device.prepare_save();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
+
+        // The descriptor appears with no event-queue kick behind it.
+        ctx.guest_refills_evq(0);
+        ctx.signal_rxq_event();
+
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Published,
+            "a data-queue kick must retry the owed reset"
+        );
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
     }
 
     #[test]
