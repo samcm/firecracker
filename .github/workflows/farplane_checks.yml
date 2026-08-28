@@ -36,6 +36,18 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup component add clippy
 
+      # `src/seccompiler/build.rs` emits `cargo::rustc-link-lib=seccomp`, so anything that
+      # links the seccompiler library needs libseccomp present at link time. Here that is
+      # the `firecracker` build script, which compiles the seccomp policies through
+      # seccompiler as a library: without the package its link ends in `unable to find
+      # library -lseccomp` and takes `-p firecracker` with it. The dev container carries a
+      # static libseccomp under /usr/local/lib; a hosted runner carries none.
+      - name: "Install the libseccomp the firecracker build script links"
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev
+
       # `cargo test <filter>` exits 0 when the filter selects nothing, and a sum taken over
       # several modules stays green when one of them stops existing.
       # `guarded_cargo_test <min> <cargo args...>` pipes cargo through `tee`, keeps cargo's
@@ -225,15 +237,61 @@ jobs:
   # because musl does not cross-compile cleanly (tools/devtool:1249-1250). It type-checks
   # and lints the aarch64 code and links nothing, so it says nothing about the musl
   # binaries; the musl proof is the `aarch64_musl_build` job.
+  #
+  # The clippy invocation below is the one `devtool checkbuild -m aarch64` runs
+  # (tools/devtool:1250), without the dev container around it. devtool runs every command
+  # inside `public.ecr.aws/firecracker/fcuvm`, whose anonymous pull is rate-limited per
+  # source address and answers `toomanyrequests` often enough on a shared hosted runner to
+  # decide this lane. Nothing here needs that container: clippy emits metadata and links no
+  # Rust artifact for the target, so the aarch64 GNU toolchain is a rustup target plus the
+  # cross C toolchain the step below installs. The musl binaries still come out of the
+  # container, in `aarch64_musl_build`.
   aarch64_gnu_checkbuild:
-    name: aarch64 GNU cross clippy (devtool checkbuild)
+    name: aarch64 GNU cross clippy
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: "Install the pinned toolchain and the aarch64 GNU target"
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy
+          rustup target add aarch64-unknown-linux-gnu
+
+      # Two native pieces the dev container would otherwise provide. `vmm` depends on
+      # `aws-lc-rs`, whose `aws-lc-sys` build script compiles C for the *target*, so the
+      # aarch64 cross toolchain from tools/devctr/Dockerfile:158-166 has to be here, along
+      # with the cmake and clang that build drives. libseccomp is for the host side: the
+      # `firecracker` build script links seccompiler and a build script is always built for
+      # the host, whatever `--target` says.
+      - name: "Install the cross toolchain and the libseccomp the build scripts need"
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libseccomp-dev cmake clang \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross
+
       - name: "Cross clippy for the aarch64 GNU target"
-        run: ./tools/devtool -y checkbuild -m aarch64
+        run: >
+          cargo clippy --target aarch64-unknown-linux-gnu
+          --all --all-targets --all-features -- -D warnings
+
+      # `.cargo/config.toml` sets the target directory and cargo names the subdirectory
+      # after the triple, so this path exists only if clippy really checked the aarch64
+      # target: a dropped or mistyped `--target` would lint the runner's x86_64 host and
+      # produce an otherwise identical green.
+      - name: "Assert the aarch64 target is the one that was linted"
+        run: |
+          set -euo pipefail
+          out=build/cargo_target/aarch64-unknown-linux-gnu/debug
+          if [ ! -d "$out" ]; then
+            echo "::error::clippy produced no $out, so it did not check the aarch64 target"
+            exit 1
+          fi
+          echo "clippy wrote $out"
 
   # Functional proof of the parts that need host devices: userfaultfd for the guest
   # mappings, KVM for the dirty log and the vCPUs. Manual only, and the precondition step

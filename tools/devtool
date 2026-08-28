@@ -212,6 +212,8 @@ retry_cmd() {
             echo "$command failed, retrying..."
             sleep "$sleep_int"
             retry_cmd "$command" "$retry_cnt" "$sleep_int"
+        else
+            return 1
         fi
     }
 }
@@ -230,9 +232,9 @@ ensure_devctr() {
     [[ $(docker images -q "$DEVCTR_IMAGE" | wc -l) -gt 0 ]] || {
         say "About to pull docker image $DEVCTR_IMAGE"
 
-        # Run docker pull 5 times in case it fails - sleep 3 seconds
-        # between attempts
-        retry_cmd "docker pull $DEVCTR_IMAGE" 5 3
+        # Run docker pull up to 5 times in case it fails - sleep 15 seconds between
+        # attempts, which outlasts a registry rate limit
+        retry_cmd "docker pull $DEVCTR_IMAGE" 5 15
 
         ok_or_die "Error pulling docker image. Aborting."
     }
@@ -309,6 +311,10 @@ validate_kernel_version() {
 # Usage: run_devctr <docker args> -- <container args>
 # Example: run_devctr --privileged -- bash -c "echo 'hello world'"
 run_devctr() {
+    # `docker run` pulls an absent image itself, once and without retry, so every path
+    # into the container acquires the image through the retried pull first.
+    ensure_devctr
+
     docker_args=()
     ctr_args=()
     docker_args_done=false
@@ -1343,7 +1349,7 @@ cmd_install() {
     profile="release"
     target="$TARGET_PREFIX""musl"
     install_path="/usr/local/bin"
-    binaries=("firecracker" "jailer" "seccompiler-bin" "rebase-snap" "cpu-template-helper")
+    binaries=("firecracker" "jailer" "seccompiler-bin" "cpu-template-helper")
 
     # Parse any command line args.
     while [ $# -gt 0 ]; do

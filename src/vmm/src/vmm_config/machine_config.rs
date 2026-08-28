@@ -45,6 +45,7 @@ pub struct MachineConfig {
         serialize_with = "serialize_static_template"
     )]
     pub cpu_template: Option<CpuTemplateType>,
+    /// Path of the UNIX socket the GDB stub listens on.
     #[cfg(feature = "gdb")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gdb_socket_path: Option<String>,
@@ -111,6 +112,7 @@ pub struct MachineConfigUpdate {
     /// A CPU template that it is used to filter the CPU features exposed to the guest.
     #[serde(default)]
     pub cpu_template: Option<StaticCpuTemplate>,
+    /// Path of the UNIX socket the GDB stub listens on.
     #[cfg(feature = "gdb")]
     #[serde(default)]
     pub gdb_socket_path: Option<String>,

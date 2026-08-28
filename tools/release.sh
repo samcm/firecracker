@@ -122,13 +122,15 @@ if [ "$PROFILE" = "release" ]; then
     CARGO_OPTS+=" --release"
 fi
 
-ARTIFACTS=(firecracker jailer seccompiler-bin rebase-snap cpu-template-helper snapshot-editor)
+# Every name here must be a bin target of the workspace: release mode strips each one and
+# a release copies each one out by name.
+ARTIFACTS=(firecracker jailer seccompiler-bin cpu-template-helper)
 
 if [ "$LIBC" == "gnu" ]; then
     # Don't build jailer. See commit 3bf285c8f
     echo "Not building jailer because glibc selected instead of musl"
     CARGO_OPTS+=" --exclude jailer"
-    ARTIFACTS=(firecracker seccompiler-bin rebase-snap cpu-template-helper snapshot-editor)
+    ARTIFACTS=(firecracker seccompiler-bin cpu-template-helper)
 fi
 
 say "Building version=$VERSION, profile=$PROFILE, target=$CARGO_TARGET, Rust toolchain=${RUST_TOOLCHAIN}..."
