@@ -21,8 +21,10 @@ pub const MAX_EXTENTS: u32 = 65_536;
 pub const MAX_PLAN_FDS: u32 = 1_024;
 /// Largest number of descriptors one datagram carries: the kernel's `SCM_MAX_FD`.
 pub const MAX_SCM_FDS: usize = 253;
-/// Compatibility identity of this protocol, quiesce semantics and vmstate format.
-pub const FEATURE_IDENTITY: &str = "farplane/1";
+/// Compatibility identity of this protocol, quiesce semantics and vmstate format. A warm image
+/// baked by another identity is refused rather than restored: the capture command order and the
+/// vmstate the epoch produces are part of what this string names.
+pub const FEATURE_IDENTITY: &str = "farplane/2";
 /// Size of one extent table record.
 pub const EXTENT_RECORD_LEN: usize = 32;
 /// Size of one region record.
@@ -148,14 +150,11 @@ pub enum ErrorCode {
     ResumeFailed = 20,
     /// Guest-memory writers could not be stopped.
     QuiesceFailed = 21,
+    /// A capture command arrived out of order within one epoch: the vmstate must be serialized
+    /// before the dirty accumulator is harvested.
+    CaptureOrderViolation = 22,
 }
 
-    /// A capture command arrived out of order within one epoch: the vmstate must be serialized
-    /// before the dirty accumulator is harvested.
-    CaptureOrderViolation = 22,
-    /// A capture command arrived out of order within one epoch: the vmstate must be serialized
-    /// before the dirty accumulator is harvested.
-    CaptureOrderViolation = 22,
 /// Architecture Firecracker is running on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -842,8 +841,26 @@ mod tests {
     fn error_codes_are_stable() {
         assert_eq!(ErrorCode::GeometryMismatch as u32, 1);
         assert_eq!(ErrorCode::NoCaptureBuffers as u32, 17);
-        assert_eq!(ErrorCode::CaptureOrderViolation as u32, 22);
         assert_eq!(ErrorCode::PeercredMismatch as u32, 19);
+        assert_eq!(ErrorCode::CaptureOrderViolation as u32, 22);
+    }
+
+    /// The `hello` frame is the only place the feature identity crosses to pagemaster, so its
+    /// bytes are pinned by a fixture the Python fake decodes as well. A change to the identity or
+    /// to the body layout has to be made in both languages or this fails.
+    #[test]
+    fn hello_frame_matches_the_shared_fixture() {
+        let regions = [RegionRecord {
+            guest_addr: 0,
+            size: 0x0800_0000,
+        }];
+        let body = encode_hello(4242, 4096, Arch::X86_64, Mode::Boot, &regions);
+        let header = Header::new(MsgType::Hello, 0, u32::try_from(body.len()).unwrap(), 0);
+        let mut datagram = header.encode().to_vec();
+        datagram.extend_from_slice(&body);
+
+        let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, include_str!("testdata/hello.hex").trim());
+        assert_eq!(FEATURE_IDENTITY, "farplane/2");
     }
 }
-        assert_eq!(ErrorCode::CaptureOrderViolation as u32, 22);
