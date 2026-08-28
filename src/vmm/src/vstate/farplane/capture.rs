@@ -11,12 +11,12 @@ use super::backend::{
     validate_buffer_fd,
 };
 use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
+use crate::Vmm;
 use crate::logger::error;
 use crate::persist::{MicrovmState, VmInfo};
 use crate::snapshot::Snapshot;
 use crate::utils::{u64_to_usize, usize_to_u64};
 use crate::vmm_config::instance_info::VmState;
-use crate::Vmm;
 
 /// Buffers pagemaster preallocated for one capture epoch.
 #[derive(Debug)]
@@ -33,6 +33,12 @@ struct CaptureBuffers {
 /// would report a bitmap that predates those writes, so pagemaster would copy pages the restored
 /// vmstate no longer agrees with. The order is a property of the epoch, not of one command, so it
 /// is tracked here and enforced for both directions.
+///
+/// The phase also makes a repeated command a replay rather than a second effect. A reply lost on
+/// the way back to pagemaster is answered by a retry, and a retry that redid the work would
+/// destroy what the first one produced: a second harvest would overwrite the armed bitmap with the
+/// accumulator the first one cleared, and a second serialization would run `prepare_save()` again
+/// and write a vmstate the harvested bitmap does not cover.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum EpochPhase {
     /// Nothing has been written or harvested yet in this epoch.
@@ -40,50 +46,126 @@ enum EpochPhase {
     Open,
     /// The vmstate has been serialized: the dirty accumulator may now be harvested.
     StateWritten,
-    /// The dirty accumulator has been harvested: nothing may write guest memory again.
+    /// The dirty accumulator has been harvested into the armed bitmap.
     Harvested,
+}
+
+/// What a `write_vmstate` has to do, given what the epoch has already produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmstateStep {
+    /// The epoch owes a vmstate: serialize it into the armed buffer.
+    Serialize,
+    /// The vmstate is already in the armed buffer: answer with the length it reported, without
+    /// serializing a second, possibly different one.
+    Replay(u64),
+    /// The command cannot be served in this phase.
+    Refuse(ErrorCode),
+}
+
+/// What a `dirty_snapshot` has to do, given what the epoch has already produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HarvestStep {
+    /// The accumulator holds the epoch's dirty set: harvest it into the armed buffer.
+    Harvest,
+    /// The armed buffer already holds this epoch's harvest: answer without reading or clearing
+    /// the accumulator, which no longer holds those bits.
+    Replay,
+    /// The command cannot be served in this phase.
+    Refuse(ErrorCode),
 }
 
 /// Order guard of one capture epoch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct EpochOrder {
     phase: EpochPhase,
+    /// Length the epoch's serialization reported, replayed by a repeat of the command.
+    vmstate_len: u64,
 }
 
 impl EpochOrder {
     /// Opens a fresh epoch, discarding whatever the previous one reached.
     fn open(&mut self) {
         self.phase = EpochPhase::Open;
+        self.vmstate_len = 0;
     }
 
-    /// States whether the vmstate may be serialized now.
-    fn may_write_vmstate(self) -> Result<(), ErrorCode> {
+    /// What to do with a `write_vmstate` in this phase.
+    fn vmstate_step(self) -> VmstateStep {
         match self.phase {
-            EpochPhase::Open | EpochPhase::StateWritten => Ok(()),
-            // The harvest already reported the epoch's dirty set, so writes this serialization
+            EpochPhase::Open => VmstateStep::Serialize,
+            EpochPhase::StateWritten => VmstateStep::Replay(self.vmstate_len),
+            // The harvest already reported the epoch's dirty set, so writes a serialization
             // performs could never reach pagemaster.
-            EpochPhase::Harvested => Err(ErrorCode::CaptureOrderViolation),
+            EpochPhase::Harvested => VmstateStep::Refuse(ErrorCode::CaptureOrderViolation),
         }
     }
 
     /// Records a vmstate that reached the armed buffer.
-    fn vmstate_written(&mut self) {
-        if self.phase == EpochPhase::Open {
-            self.phase = EpochPhase::StateWritten;
-        }
+    fn vmstate_written(&mut self, bytes: u64) {
+        self.phase = EpochPhase::StateWritten;
+        self.vmstate_len = bytes;
     }
 
-    /// States whether the dirty accumulator may be harvested now.
-    fn may_harvest(self) -> Result<(), ErrorCode> {
+    /// What to do with a `dirty_snapshot` in this phase.
+    fn harvest_step(self) -> HarvestStep {
         match self.phase {
-            EpochPhase::Open => Err(ErrorCode::CaptureOrderViolation),
-            EpochPhase::StateWritten | EpochPhase::Harvested => Ok(()),
+            EpochPhase::Open => HarvestStep::Refuse(ErrorCode::CaptureOrderViolation),
+            EpochPhase::StateWritten => HarvestStep::Harvest,
+            EpochPhase::Harvested => HarvestStep::Replay,
         }
     }
 
     /// Records a harvest that reached the armed buffer.
     fn harvested(&mut self) {
         self.phase = EpochPhase::Harvested;
+    }
+
+    /// Records a bitmap folded back into the accumulator: those bits are no longer reported by
+    /// the armed buffer, so the epoch owes a harvest again and a repeat may not replay.
+    fn unioned(&mut self) {
+        if self.phase == EpochPhase::Harvested {
+            self.phase = EpochPhase::StateWritten;
+        }
+    }
+}
+
+/// Serves one `write_vmstate` against `order`, running `serialize` only when the epoch owes a
+/// vmstate. A repeat of the command replays the length the first one reported.
+fn serve_write_vmstate(
+    order: &mut EpochOrder,
+    serialize: impl FnOnce() -> Result<u64, ErrorCode>,
+) -> Result<u64, ErrorCode> {
+    match order.vmstate_step() {
+        VmstateStep::Refuse(code) => Err(code),
+        VmstateStep::Replay(bytes) => Ok(bytes),
+        VmstateStep::Serialize => {
+            // A serialization that failed records nothing: the epoch still owes one, and the
+            // writes `prepare_save()` performed before the failure are still in the accumulator
+            // for the harvest that a later serialization unblocks.
+            let bytes = serialize()?;
+            order.vmstate_written(bytes);
+            Ok(bytes)
+        }
+    }
+}
+
+/// Serves one `dirty_snapshot` against `order`, running `harvest` only when the accumulator still
+/// holds the epoch's dirty set. A repeat of the command leaves the armed bitmap exactly as the
+/// harvest left it.
+fn serve_dirty_snapshot(
+    order: &mut EpochOrder,
+    harvest: impl FnOnce() -> Result<(), ErrorCode>,
+) -> Result<(), ErrorCode> {
+    match order.harvest_step() {
+        HarvestStep::Refuse(code) => Err(code),
+        HarvestStep::Replay => Ok(()),
+        HarvestStep::Harvest => {
+            // A harvest that failed cleared nothing, so the epoch is still one whose dirty set is
+            // in the accumulator: the retry harvests rather than replays.
+            harvest()?;
+            order.harvested();
+            Ok(())
+        }
     }
 }
 
@@ -254,31 +336,36 @@ impl CaptureService {
     ///
     /// The harvest closes the epoch's dirty set, so it is refused until the vmstate has been
     /// serialized: `prepare_save()` may write guest memory, and those writes have to land in the
-    /// bitmap pagemaster reads.
+    /// bitmap pagemaster reads. Once it has run, a repeat of the command is answered without
+    /// touching the accumulator or the armed bitmap: the bits are no longer in the accumulator, so
+    /// harvesting again would overwrite the only copy of them with an empty one.
     fn dirty_snapshot(&mut self, request_id: u64) -> Result<(), ChannelError> {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::DirtySnapshot);
         }
-        if let Err(code) = self.order.may_harvest() {
-            return self.reject(request_id, code, MsgType::DirtySnapshot);
-        }
-        let Some(mut buffers) = self.buffers.take() else {
+        if self.buffers.is_none() {
             return self.reject(
                 request_id,
                 ErrorCode::NoCaptureBuffers,
                 MsgType::DirtySnapshot,
             );
-        };
+        }
 
-        let result = self.harvest(&mut buffers.dirty);
-        self.buffers = Some(buffers);
+        let Self {
+            channel,
+            vmm,
+            buffers,
+            order,
+            ..
+        } = self;
+        let result = serve_dirty_snapshot(order, || {
+            let buffers = buffers
+                .as_mut()
+                .expect("the armed buffers were just checked");
+            harvest(vmm, channel.dirty_bitmap_bytes, &mut buffers.dirty)
+        });
         match result {
-            Ok(()) => {
-                self.order.harvested();
-                self.reply(request_id, MsgType::DirtySnapshotDone, &[])
-            }
-            // A failed harvest left every bit where it was, so the epoch is still one where the
-            // dirty set has not been reported: it may be harvested again.
+            Ok(()) => self.reply(request_id, MsgType::DirtySnapshotDone, &[]),
             Err(code) => self.reject(request_id, code, MsgType::DirtySnapshot),
         }
     }
@@ -286,46 +373,52 @@ impl CaptureService {
     /// Serializes the vmstate into the armed buffer.
     ///
     /// Refused once the dirty accumulator has been harvested: device serialization may write guest
-    /// memory, and the epoch has no way left to report those writes.
+    /// memory, and the epoch has no way left to report those writes. Before the harvest, a repeat
+    /// of the command replays the length the first serialization reported rather than running
+    /// `prepare_save()` again and leaving a second, possibly different vmstate in the buffer.
     fn write_vmstate(&mut self, request_id: u64) -> Result<(), ChannelError> {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::WriteVmstate);
         }
-        if let Err(code) = self.order.may_write_vmstate() {
-            return self.reject(request_id, code, MsgType::WriteVmstate);
-        }
-        let Some(mut buffers) = self.buffers.take() else {
+        if self.buffers.is_none() {
             return self.reject(
                 request_id,
                 ErrorCode::NoCaptureBuffers,
                 MsgType::WriteVmstate,
             );
-        };
+        }
 
-        let saved = self
-            .vmm
-            .lock()
-            .expect("Poisoned lock")
-            .save_state(&self.vm_info)
-            .map_err(|err| {
-                error!("Farplane capture could not save the microVM state: {err}");
-                ErrorCode::VmstateWriteFailed
-            });
-        let result = saved.and_then(|state| serialize_vmstate(&mut buffers.vmstate, state));
-        self.buffers = Some(buffers);
+        let Self {
+            vmm,
+            vm_info,
+            buffers,
+            order,
+            ..
+        } = self;
+        let result = serve_write_vmstate(order, || {
+            let buffers = buffers
+                .as_mut()
+                .expect("the armed buffers were just checked");
+            let state = vmm
+                .lock()
+                .expect("Poisoned lock")
+                .save_state(vm_info)
+                .map_err(|err| {
+                    error!("Farplane capture could not save the microVM state: {err}");
+                    ErrorCode::VmstateWriteFailed
+                })?;
+            serialize_vmstate(&mut buffers.vmstate, state)
+        });
         match result {
-            Ok(bytes) => {
-                self.order.vmstate_written();
-                self.reply(request_id, MsgType::VmstateWritten, &bytes.to_le_bytes())
-            }
-            // `save_state` may have run `prepare_save()` before it failed, so the writes it
-            // performed are in the accumulator: the epoch stays one that owes a serialization, and
-            // a harvest is still refused until one succeeds.
+            Ok(bytes) => self.reply(request_id, MsgType::VmstateWritten, &bytes.to_le_bytes()),
             Err(code) => self.reject(request_id, code, MsgType::WriteVmstate),
         }
     }
 
     /// Returns a previously harvested bitmap to the accumulator so the next harvest reports it.
+    ///
+    /// The returned bits are back in the accumulator and no longer in the armed bitmap, so the
+    /// epoch owes a harvest again: the next `dirty_snapshot` harvests rather than replaying.
     fn dirty_union(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
         if BackendState::load() != BackendState::Quiesced {
@@ -353,6 +446,7 @@ impl CaptureService {
                     }
                 }
                 drop(vmm);
+                self.order.unioned();
                 self.reply(request_id, MsgType::UnionDone, &[])
             }
             Err(code) => self.reject(request_id, code, MsgType::DirtyUnion),
@@ -390,39 +484,6 @@ impl CaptureService {
         )
     }
 
-    /// Snapshots the dirty accumulator, writes it out, and only then clears it.
-    fn harvest(&self, buffer: &mut File) -> Result<(), ErrorCode> {
-        let vmm = self.vmm.lock().expect("Poisoned lock");
-        let kvm_vm = vmm.kvm_vm().ok_or(ErrorCode::DirtyHarvestFailed)?;
-        let snapshot = kvm_vm.snapshot_dirty_log().map_err(|err| {
-            error!("Farplane capture could not read the dirty log: {err}");
-            ErrorCode::DirtyHarvestFailed
-        })?;
-
-        let bytes: u64 = snapshot.iter().map(|words| words.len() as u64 * 8).sum();
-        if bytes != self.channel.dirty_bitmap_bytes {
-            return Err(ErrorCode::DirtyHarvestFailed);
-        }
-        buffer
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| ErrorCode::DirtyHarvestFailed)?;
-        for words in &snapshot {
-            // SAFETY: the words are a contiguous little-endian bitmap, which is exactly the wire
-            // representation, so they are written without a second copy.
-            let raw =
-                unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 8) };
-            buffer
-                .write_all(raw)
-                .map_err(|_| ErrorCode::DirtyHarvestFailed)?;
-        }
-        buffer.flush().map_err(|_| ErrorCode::DirtyHarvestFailed)?;
-
-        kvm_vm.clear_dirty_log(&snapshot).map_err(|err| {
-            error!("Farplane capture could not clear the dirty log: {err}");
-            ErrorCode::DirtyHarvestFailed
-        })
-    }
-
     /// Reads a bitmap of the geometry's exact shape out of a descriptor.
     fn read_bitmap(&self, file: &mut File) -> Result<Vec<Vec<u64>>, ErrorCode> {
         let page = crate::arch::host_page_size() as u64;
@@ -456,7 +517,39 @@ impl CaptureService {
         send_error(&self.channel.sock, request_id, code, op);
         Ok(())
     }
+}
 
+/// Snapshots the dirty accumulator, writes it out, and only then clears it.
+fn harvest(vmm: &Mutex<Vmm>, dirty_bitmap_bytes: u64, buffer: &mut File) -> Result<(), ErrorCode> {
+    let vmm = vmm.lock().expect("Poisoned lock");
+    let kvm_vm = vmm.kvm_vm().ok_or(ErrorCode::DirtyHarvestFailed)?;
+    let snapshot = kvm_vm.snapshot_dirty_log().map_err(|err| {
+        error!("Farplane capture could not read the dirty log: {err}");
+        ErrorCode::DirtyHarvestFailed
+    })?;
+
+    let bytes: u64 = snapshot.iter().map(|words| words.len() as u64 * 8).sum();
+    if bytes != dirty_bitmap_bytes {
+        return Err(ErrorCode::DirtyHarvestFailed);
+    }
+    buffer
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ErrorCode::DirtyHarvestFailed)?;
+    for words in &snapshot {
+        // SAFETY: the words are a contiguous little-endian bitmap, which is exactly the wire
+        // representation, so they are written without a second copy.
+        let raw =
+            unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 8) };
+        buffer
+            .write_all(raw)
+            .map_err(|_| ErrorCode::DirtyHarvestFailed)?;
+    }
+    buffer.flush().map_err(|_| ErrorCode::DirtyHarvestFailed)?;
+
+    kvm_vm.clear_dirty_log(&snapshot).map_err(|err| {
+        error!("Farplane capture could not clear the dirty log: {err}");
+        ErrorCode::DirtyHarvestFailed
+    })
 }
 
 /// Writes the vmstate at offset zero of the armed buffer and reports its length. The writer stops
@@ -525,14 +618,29 @@ mod tests {
         assert_eq!(writer.remaining, 0);
     }
 
+    /// A counting stand-in for the effect a capture command performs, so a test can prove the
+    /// effect ran exactly once however many times the command arrives.
+    #[derive(Debug, Default)]
+    struct Effect {
+        runs: std::cell::Cell<u32>,
+    }
+
+    impl Effect {
+        /// Runs the effect, reporting `outcome`.
+        fn run<T>(&self, outcome: Result<T, ErrorCode>) -> Result<T, ErrorCode> {
+            self.runs.set(self.runs.get() + 1);
+            outcome
+        }
+    }
+
     /// The order one epoch's commands may arrive in: the vmstate first, the harvest after it.
     #[test]
     fn the_capture_order_accepts_state_then_harvest() {
         let mut order = EpochOrder::default();
 
-        order.may_write_vmstate().unwrap();
-        order.vmstate_written();
-        order.may_harvest().unwrap();
+        assert_eq!(order.vmstate_step(), VmstateStep::Serialize);
+        order.vmstate_written(4096);
+        assert_eq!(order.harvest_step(), HarvestStep::Harvest);
         order.harvested();
 
         assert_eq!(order.phase, EpochPhase::Harvested);
@@ -545,46 +653,87 @@ mod tests {
         let mut order = EpochOrder::default();
 
         assert_eq!(
-            order.may_harvest(),
-            Err(ErrorCode::CaptureOrderViolation),
+            order.harvest_step(),
+            HarvestStep::Refuse(ErrorCode::CaptureOrderViolation),
             "a harvest must not precede the vmstate"
         );
-        // The refusal changed nothing: the epoch still accepts the vmstate, and the harvest that
-        // follows it.
-        order.may_write_vmstate().unwrap();
-        order.vmstate_written();
-        order.may_harvest().unwrap();
+        // The refusal changed nothing: the epoch still owes a vmstate, and the harvest that
+        // follows it is served.
+        assert_eq!(order.vmstate_step(), VmstateStep::Serialize);
+        order.vmstate_written(4096);
+        assert_eq!(order.harvest_step(), HarvestStep::Harvest);
     }
 
-    /// Serializing again after the harvest is the same violation seen from the other side: the
-    /// writes that serialization performs have no harvest left to report them.
+    /// Serializing after the harvest is the same violation seen from the other side: the writes
+    /// that serialization performs have no harvest left to report them.
     #[test]
     fn the_capture_order_refuses_a_vmstate_after_the_harvest() {
         let mut order = EpochOrder::default();
-        order.vmstate_written();
+        order.vmstate_written(4096);
         order.harvested();
 
         assert_eq!(
-            order.may_write_vmstate(),
-            Err(ErrorCode::CaptureOrderViolation)
+            order.vmstate_step(),
+            VmstateStep::Refuse(ErrorCode::CaptureOrderViolation)
         );
-        // A second harvest of the same epoch is not a violation: it reports whatever the guest
-        // dirtied since, and the accumulator was cleared by the first one.
-        order.may_harvest().unwrap();
     }
 
-    /// A repeated serialization before any harvest is legal, and does not turn into the state the
-    /// harvest leaves behind.
+    /// A repeat of `dirty_snapshot` is a replay, not a second harvest: the accumulator no longer
+    /// holds the bits the armed bitmap does, so harvesting again would overwrite the only copy of
+    /// this epoch's dirty set with an empty one.
     #[test]
-    fn the_capture_order_allows_the_vmstate_to_be_rewritten() {
+    fn a_repeated_harvest_replays_instead_of_clearing_the_bitmap() {
+        let mut order = EpochOrder::default();
+        order.vmstate_written(4096);
+        order.harvested();
+
+        assert_eq!(order.harvest_step(), HarvestStep::Replay);
+        // The replay is not a state change either: however many arrive, the epoch stays harvested.
+        assert_eq!(order.harvest_step(), HarvestStep::Replay);
+        assert_eq!(order.phase, EpochPhase::Harvested);
+    }
+
+    /// A repeat of `write_vmstate` replays the exact length the first one reported rather than
+    /// running `prepare_save()` again and leaving a different vmstate in the buffer.
+    #[test]
+    fn a_repeated_vmstate_replays_the_length_the_first_one_reported() {
         let mut order = EpochOrder::default();
 
-        order.vmstate_written();
-        order.may_write_vmstate().unwrap();
-        order.vmstate_written();
+        order.vmstate_written(12_345);
+
+        assert_eq!(order.vmstate_step(), VmstateStep::Replay(12_345));
+        assert_eq!(order.vmstate_step(), VmstateStep::Replay(12_345));
+        assert_eq!(order.harvest_step(), HarvestStep::Harvest);
+    }
+
+    /// A bitmap folded back into the accumulator is no longer in the armed bitmap, so the epoch
+    /// owes a harvest again: the next `dirty_snapshot` harvests rather than replaying.
+    #[test]
+    fn a_union_makes_the_next_harvest_run_again() {
+        let mut order = EpochOrder::default();
+        order.vmstate_written(4096);
+        order.harvested();
+
+        order.unioned();
 
         assert_eq!(order.phase, EpochPhase::StateWritten);
-        order.may_harvest().unwrap();
+        assert_eq!(order.harvest_step(), HarvestStep::Harvest);
+        // The vmstate is still the one the epoch recorded: a union does not ask for another.
+        assert_eq!(order.vmstate_step(), VmstateStep::Replay(4096));
+    }
+
+    /// A union before any harvest leaves the epoch where it was: it owes nothing back.
+    #[test]
+    fn a_union_before_the_harvest_changes_nothing() {
+        let mut order = EpochOrder::default();
+
+        order.unioned();
+        assert_eq!(order.phase, EpochPhase::Open);
+
+        order.vmstate_written(4096);
+        order.unioned();
+        assert_eq!(order.phase, EpochPhase::StateWritten);
+        assert_eq!(order.vmstate_step(), VmstateStep::Replay(4096));
     }
 
     /// Every epoch starts owing a vmstate, whatever the previous one reached: `quiesce` and
@@ -592,35 +741,99 @@ mod tests {
     #[test]
     fn opening_an_epoch_forgets_what_the_last_one_reached() {
         let mut order = EpochOrder::default();
-        order.vmstate_written();
+        order.vmstate_written(4096);
         order.harvested();
 
         order.open();
 
         assert_eq!(order.phase, EpochPhase::Open);
         assert_eq!(
-            order.may_harvest(),
-            Err(ErrorCode::CaptureOrderViolation),
+            order.harvest_step(),
+            HarvestStep::Refuse(ErrorCode::CaptureOrderViolation),
             "a fresh epoch must not inherit the last epoch's vmstate"
         );
-        order.may_write_vmstate().unwrap();
+        assert_eq!(
+            order.vmstate_step(),
+            VmstateStep::Serialize,
+            "a fresh epoch must not replay the last epoch's length"
+        );
     }
 
-    /// A failure leaves the phase where it was: a serialization that failed still owes one, and a
-    /// harvest that failed lost no bit, so both may be retried in the same epoch.
+    /// The service half of the harvest: the second command reports success without reading or
+    /// clearing the accumulator, so the bitmap the first one produced survives the retry.
     #[test]
-    fn a_failed_command_leaves_the_epoch_order_alone() {
+    fn the_served_harvest_runs_once_however_often_it_arrives() {
         let mut order = EpochOrder::default();
+        serve_write_vmstate(&mut order, || Ok(4096)).unwrap();
+        let effect = Effect::default();
 
-        // A `write_vmstate` that fails records nothing, so the harvest stays refused.
-        assert_eq!(order.phase, EpochPhase::Open);
-        assert_eq!(order.may_harvest(), Err(ErrorCode::CaptureOrderViolation));
+        serve_dirty_snapshot(&mut order, || effect.run(Ok(()))).unwrap();
+        serve_dirty_snapshot(&mut order, || effect.run(Ok(()))).unwrap();
+        serve_dirty_snapshot(&mut order, || effect.run(Ok(()))).unwrap();
 
-        // A `dirty_snapshot` that fails records nothing either, so it may be harvested again.
-        order.vmstate_written();
-        order.may_harvest().unwrap();
-        assert_eq!(order.phase, EpochPhase::StateWritten);
-        order.may_harvest().unwrap();
-        order.may_write_vmstate().unwrap();
+        assert_eq!(
+            effect.runs.get(),
+            1,
+            "a repeated dirty_snapshot must not harvest a second time"
+        );
+    }
+
+    /// The service half of the serialization: the second command reports the first one's length
+    /// without running device serialization again.
+    #[test]
+    fn the_served_vmstate_runs_once_and_replays_its_length() {
+        let mut order = EpochOrder::default();
+        let effect = Effect::default();
+
+        let first = serve_write_vmstate(&mut order, || effect.run(Ok(9_001))).unwrap();
+        let second = serve_write_vmstate(&mut order, || effect.run(Ok(7))).unwrap();
+
+        assert_eq!(first, 9_001);
+        assert_eq!(
+            second, 9_001,
+            "a repeated write_vmstate must report the length that is in the buffer"
+        );
+        assert_eq!(
+            effect.runs.get(),
+            1,
+            "a repeated write_vmstate must not serialize a second time"
+        );
+    }
+
+    /// A failure records nothing: the retry of a failed command does the work, and a failed
+    /// serialization still blocks the harvest.
+    #[test]
+    fn a_failed_command_is_retried_rather_than_replayed() {
+        let mut order = EpochOrder::default();
+        let effect = Effect::default();
+
+        assert_eq!(
+            serve_write_vmstate(&mut order, || effect
+                .run(Err(ErrorCode::VmstateWriteFailed))),
+            Err(ErrorCode::VmstateWriteFailed)
+        );
+        assert_eq!(
+            serve_dirty_snapshot(&mut order, || effect.run(Ok(()))),
+            Err(ErrorCode::CaptureOrderViolation),
+            "a serialization that failed leaves the epoch owing one"
+        );
+        assert_eq!(effect.runs.get(), 1, "the refused harvest must not run");
+
+        assert_eq!(
+            serve_write_vmstate(&mut order, || effect.run(Ok(64))),
+            Ok(64)
+        );
+        assert_eq!(
+            serve_dirty_snapshot(&mut order, || effect
+                .run(Err(ErrorCode::DirtyHarvestFailed))),
+            Err(ErrorCode::DirtyHarvestFailed)
+        );
+        // The failed harvest cleared nothing, so the retry harvests instead of replaying.
+        assert_eq!(
+            serve_dirty_snapshot(&mut order, || effect.run(Ok(()))),
+            Ok(())
+        );
+        assert_eq!(effect.runs.get(), 4);
+        assert_eq!(order.phase, EpochPhase::Harvested);
     }
 }

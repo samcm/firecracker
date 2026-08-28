@@ -291,7 +291,7 @@ def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory, ro
 
 
 def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
-    """Harvesting clears the log, so a repeat returns nothing until the guest writes again."""
+    """Harvesting clears the log, so the next epoch reports nothing until the guest writes."""
     vm = farplane_factory()
     pagemaster = boot(vm)
 
@@ -302,6 +302,11 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     first = pagemaster.harvest()
     assert first.count() > 0, "booting dirtied no page"
 
+    # Come back to Ready without letting a vCPU run, so nothing can re-dirty the log.
+    pagemaster.resume(run_vcpus=0)
+    pagemaster.capture_buffers()
+    pagemaster.quiesce()
+    pagemaster.write_vmstate()
     pagemaster.dirty_snapshot()
     second = pagemaster.harvest()
     assert (
@@ -315,6 +320,45 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     pagemaster.dirty_snapshot()
     third = pagemaster.harvest()
     assert third.count() > 0, "writes after the harvest were not tracked"
+
+
+def test_a_repeated_capture_command_replays_its_answer(farplane_factory):
+    """A retry after a lost reply must answer, not redo the work it already did.
+
+    A second harvest would overwrite the armed bitmap with the accumulator the first one
+    cleared, which loses the only copy of the epoch's dirty set. A second serialization
+    would run device `prepare_save()` again and leave a different vmstate in the buffer.
+    """
+    vm = farplane_factory()
+    pagemaster = boot(vm)
+
+    pagemaster.capture_buffers()
+    pagemaster.quiesce()
+
+    first_write = pagemaster.write_vmstate()
+    assert first_write.error is None
+    repeat_write = pagemaster.write_vmstate()
+    assert repeat_write.error is None
+    assert repeat_write.body == first_write.body, "the repeat reported a different length"
+    (length,) = struct.unpack("<Q", first_write.body)
+    vmstate = pagemaster.vmstate(length)
+
+    assert pagemaster.dirty_snapshot().error is None
+    harvested = pagemaster.harvest()
+    assert harvested.count() > 0
+
+    assert pagemaster.dirty_snapshot().error is None
+    replayed = pagemaster.harvest()
+    assert bytes(replayed.data) == bytes(
+        harvested.data
+    ), "the repeated harvest overwrote the bitmap the first one produced"
+    assert pagemaster.vmstate(length) == vmstate, "the vmstate buffer changed under a repeat"
+
+    # A union puts the bits back in the accumulator, so the next harvest runs again rather
+    # than replaying what the armed bitmap already holds.
+    assert pagemaster.dirty_union(harvested).error is None
+    assert pagemaster.dirty_snapshot().error is None
+    assert bytes(pagemaster.harvest().data) == bytes(harvested.data)
 
 
 def test_a_harvest_before_the_vmstate_is_refused(farplane_factory):
