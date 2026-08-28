@@ -7,9 +7,10 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use super::backend::{
-    BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, send_error, set_capture_buffers_armed,
+    BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, set_capture_buffers_armed,
     validate_buffer_fd,
 };
+use super::dispatch;
 use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
 use crate::Vmm;
 use crate::logger::error;
@@ -169,6 +170,103 @@ fn serve_dirty_snapshot(
     }
 }
 
+/// One answer already sent on this connection.
+#[derive(Debug)]
+struct CachedReply {
+    request_id: u64,
+    /// Digest of the command that produced this answer.
+    fingerprint: u64,
+    msg: MsgType,
+    body: Vec<u8>,
+}
+
+/// What to do with a frame, given the answers this connection has already sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FrameDisposition {
+    /// The identifier is new: serve the command.
+    Serve,
+    /// The identifier and the command are the ones already answered: send that answer again.
+    Replay(MsgType, Vec<u8>),
+    /// The identifier was used before, with different contents or too long ago to answer from
+    /// memory. Serving it again could repeat an effect, so it is refused.
+    Reused,
+}
+
+/// Answers of the commands this connection has served, so a retry of one is answered rather than
+/// executed a second time.
+///
+/// Pagemaster retries a command whose reply it never saw, with the identifier and the contents it
+/// sent the first time. Phase alone cannot make that safe: a `dirty_union` legitimately reopens
+/// the dirty set, and the retried `dirty_snapshot` behind it would harvest again. The identifier
+/// plus a digest of the frame answers it exactly instead, for the life of the connection and
+/// across epochs.
+///
+/// The history is bounded by `protocol::MAX_RETRYABLE_REQUESTS`: an identifier older than that
+/// cannot be answered from memory, so it is refused rather than served a second time.
+#[derive(Debug, Default)]
+struct ReplyCache {
+    answers: std::collections::VecDeque<CachedReply>,
+    /// Highest identifier this connection has answered.
+    highest: u64,
+}
+
+impl ReplyCache {
+    /// States what to do with a frame that carries `request_id` and digests to `fingerprint`.
+    fn disposition(&self, request_id: u64, fingerprint: u64) -> FrameDisposition {
+        if let Some(answer) = self
+            .answers
+            .iter()
+            .find(|answer| answer.request_id == request_id)
+        {
+            if answer.fingerprint == fingerprint {
+                return FrameDisposition::Replay(answer.msg, answer.body.clone());
+            }
+            return FrameDisposition::Reused;
+        }
+        if request_id <= self.highest {
+            return FrameDisposition::Reused;
+        }
+        FrameDisposition::Serve
+    }
+
+    /// Records the answer sent for one command.
+    fn record(&mut self, request_id: u64, fingerprint: u64, msg: MsgType, body: Vec<u8>) {
+        if self.answers.len() == protocol::MAX_RETRYABLE_REQUESTS {
+            self.answers.pop_front();
+        }
+        self.answers.push_back(CachedReply {
+            request_id,
+            fingerprint,
+            msg,
+            body,
+        });
+        self.highest = self.highest.max(request_id);
+    }
+}
+
+/// Digests one command frame: the message type, the body and the number of descriptors it
+/// carried. Two frames with the same identifier are the same command only if they digest alike.
+///
+/// The digest is FNV-1a, which is deterministic and only ever compared with digests taken by this
+/// process, of frames on this connection.
+fn fingerprint(msg: MsgType, body: &[u8], fd_count: usize) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for byte in (msg as u16).to_le_bytes() {
+        mix(byte);
+    }
+    for byte in usize_to_u64(fd_count).to_le_bytes() {
+        mix(byte);
+    }
+    for &byte in body {
+        mix(byte);
+    }
+    hash
+}
+
 /// Serves the capture half of the memory channel on the event loop that owns the microVM: while a
 /// command is served no device event source is dispatched, so between `quiesced` and `resume` no
 /// Firecracker thread writes guest memory.
@@ -179,6 +277,10 @@ pub struct CaptureService {
     vm_info: VmInfo,
     buffers: Option<CaptureBuffers>,
     order: EpochOrder,
+    /// Answers this connection has sent, so an exact retry is replayed.
+    replies: ReplyCache,
+    /// Identifier and digest of the command being served, which the answer is recorded under.
+    pending: Option<(u64, u64)>,
 }
 
 impl CaptureService {
@@ -212,6 +314,8 @@ impl CaptureService {
                     vm_info,
                     buffers: None,
                     order: EpochOrder::default(),
+                    replies: ReplyCache::default(),
+                    pending: None,
                 };
                 loop {
                     if BackendState::load() == BackendState::ChannelFailed {
@@ -219,6 +323,9 @@ impl CaptureService {
                     }
                     if let Err(err) = service.serve_one() {
                         error!("Farplane memory channel failed: {err}");
+                        // Fail closed: a channel that died inside an epoch leaves event dispatch
+                        // stopped, so nothing writes guest memory or device state behind a
+                        // half-taken checkpoint. The supervisor kills this process.
                         BackendState::fail();
                         return;
                     }
@@ -249,6 +356,36 @@ impl CaptureService {
             return Err(ChannelError::Malformed);
         }
 
+        // Exact replay is decided before the phase is consulted: an identifier this connection
+        // has already answered gets that answer back, whatever the epoch has done since, and an
+        // identifier reused for different contents is refused rather than served.
+        let fingerprint = fingerprint(msg, &incoming.body, incoming.fds.len());
+        match self.replies.disposition(request_id, fingerprint) {
+            FrameDisposition::Serve => {}
+            FrameDisposition::Replay(cached_msg, cached_body) => {
+                return protocol::send_frame(
+                    &self.channel.sock,
+                    cached_msg,
+                    request_id,
+                    &cached_body,
+                    &[],
+                );
+            }
+            FrameDisposition::Reused => {
+                // Not recorded: the answer to a reused identifier is not an answer to any
+                // command, so it must never be replayed for one.
+                let body = protocol::encode_error(ErrorCode::RequestIdReused, msg, "");
+                return protocol::send_frame(
+                    &self.channel.sock,
+                    MsgType::Error,
+                    request_id,
+                    &body,
+                    &[],
+                );
+            }
+        }
+
+        self.pending = Some((request_id, fingerprint));
         match msg {
             MsgType::CaptureBuffers => self.arm_buffers(incoming),
             MsgType::Quiesce => self.quiesce(request_id),
@@ -287,6 +424,12 @@ impl CaptureService {
     }
 
     /// Stops every guest-memory writer and enters the capture epoch.
+    ///
+    /// The vCPUs are paused, asynchronous block IO is drained, and event dispatch is stopped for
+    /// the whole epoch: every virtio device is a subscriber of its own, so a queue notification
+    /// served between two capture commands would write device state or guest memory the
+    /// checkpoint has already accounted for. Dispatch is only handed back by a successful
+    /// `resume`, or by a `quiesce` that failed before the epoch opened.
     fn quiesce(&mut self, request_id: u64) -> Result<(), ChannelError> {
         match BackendState::load() {
             BackendState::Ready => {}
@@ -296,11 +439,16 @@ impl CaptureService {
             _ => return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Quiesce),
         }
 
+        // Closed before the vCPUs are paused and before this thread takes the VMM lock: a handler
+        // in flight is waited for here, and no handler waits on a lock this thread holds.
+        dispatch::gate().close();
+
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
         let were_running = vmm.instance_info.state == VmState::Running;
         if were_running && let Err(err) = vmm.pause_vm() {
             error!("Farplane quiesce could not pause the vCPUs: {err}");
             drop(vmm);
+            dispatch::gate().open();
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
         if let Err(err) = vmm.drain_guest_memory_writers() {
@@ -316,6 +464,11 @@ impl CaptureService {
                 BackendState::fail();
             }
             drop(vmm);
+            // A backend that can no longer describe its source keeps dispatch stopped: the
+            // supervisor kills this process, and until it does no handler may write guest memory.
+            if BackendState::load() != BackendState::ChannelFailed {
+                dispatch::gate().open();
+            }
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
         drop(vmm);
@@ -453,9 +606,9 @@ impl CaptureService {
         }
     }
 
-    /// Leaves the capture epoch, restarting the vCPUs when pagemaster asks for it. The initial
-    /// boot and restore acknowledgement is answered by the handshake itself, so on this channel
-    /// the command is only ever a capture exit.
+    /// Leaves the capture epoch, restarting the vCPUs when pagemaster asks for it, and hands event
+    /// dispatch back. The initial boot and restore acknowledgement is answered by the handshake
+    /// itself, so on this channel the command is only ever a capture exit.
     fn resume(&mut self, request_id: u64, run_vcpus: u32) -> Result<(), ChannelError> {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Resume);
@@ -477,6 +630,9 @@ impl CaptureService {
         self.order.open();
         set_capture_buffers_armed(false);
         BackendState::Ready.store();
+        // The epoch is over, so the event loop may dispatch again. This is the only path that
+        // hands dispatch back once an epoch has opened.
+        dispatch::gate().open();
         self.reply(
             request_id,
             MsgType::Resumed,
@@ -507,15 +663,32 @@ impl CaptureService {
         Ok(bits)
     }
 
-    /// Sends a reply that echoes the request identifier.
-    fn reply(&self, request_id: u64, msg: MsgType, body: &[u8]) -> Result<(), ChannelError> {
-        protocol::send_frame(&self.channel.sock, msg, request_id, body, &[])
+    /// Sends a reply that echoes the request identifier, and records it for an exact retry.
+    fn reply(&mut self, request_id: u64, msg: MsgType, body: &[u8]) -> Result<(), ChannelError> {
+        self.answer(request_id, msg, body.to_vec())
     }
 
-    /// Rejects a command without changing any state.
-    fn reject(&self, request_id: u64, code: ErrorCode, op: MsgType) -> Result<(), ChannelError> {
-        send_error(&self.channel.sock, request_id, code, op);
-        Ok(())
+    /// Rejects a command without changing any state. The rejection is the command's answer, so a
+    /// retry of it is answered the same way rather than served.
+    fn reject(
+        &mut self,
+        request_id: u64,
+        code: ErrorCode,
+        op: MsgType,
+    ) -> Result<(), ChannelError> {
+        let body = protocol::encode_error(code, op, "");
+        self.answer(request_id, MsgType::Error, body)
+    }
+
+    /// Sends one answer and records it under the digest of the command being served.
+    fn answer(&mut self, request_id: u64, msg: MsgType, body: Vec<u8>) -> Result<(), ChannelError> {
+        let sent = protocol::send_frame(&self.channel.sock, msg, request_id, &body, &[]);
+        if let Some((pending_id, fingerprint)) = self.pending.take()
+            && pending_id == request_id
+        {
+            self.replies.record(request_id, fingerprint, msg, body);
+        }
+        sent
     }
 }
 
@@ -835,5 +1008,108 @@ mod tests {
         );
         assert_eq!(effect.runs.get(), 4);
         assert_eq!(order.phase, EpochPhase::Harvested);
+    }
+
+    /// Digest of a `dirty_snapshot` frame: no body, no descriptors.
+    fn harvest_frame() -> u64 {
+        fingerprint(MsgType::DirtySnapshot, &[], 0)
+    }
+
+    /// The retry of an answered command is replayed by identifier and contents, whatever the
+    /// epoch has done since. This is the case phase alone cannot cover: a `dirty_union` reopens
+    /// the dirty set, so the phase would harvest again for a command already answered.
+    #[test]
+    fn an_answered_request_is_replayed_after_later_commands() {
+        let mut replies = ReplyCache::default();
+        replies.record(7, harvest_frame(), MsgType::DirtySnapshotDone, Vec::new());
+
+        // A union and a resume happen on other identifiers, and a new epoch follows.
+        replies.record(
+            8,
+            fingerprint(MsgType::DirtyUnion, &[], 1),
+            MsgType::UnionDone,
+            Vec::new(),
+        );
+        let resumed = 1u32.to_le_bytes().to_vec();
+        replies.record(
+            9,
+            fingerprint(MsgType::Resume, &resumed, 0),
+            MsgType::Resumed,
+            resumed.clone(),
+        );
+        replies.record(
+            10,
+            fingerprint(MsgType::Quiesce, &[], 0),
+            MsgType::Quiesced,
+            resumed,
+        );
+
+        assert_eq!(
+            replies.disposition(7, harvest_frame()),
+            FrameDisposition::Replay(MsgType::DirtySnapshotDone, Vec::new()),
+            "the original harvest reply must be replayed, not harvested again"
+        );
+    }
+
+    /// One identifier names one command: reusing it for different contents is refused, because
+    /// the answer on record is not an answer to what arrived.
+    #[test]
+    fn reusing_an_identifier_for_other_contents_is_refused() {
+        let mut replies = ReplyCache::default();
+        replies.record(7, harvest_frame(), MsgType::DirtySnapshotDone, Vec::new());
+
+        assert_eq!(
+            replies.disposition(7, fingerprint(MsgType::WriteVmstate, &[], 0)),
+            FrameDisposition::Reused
+        );
+        assert_eq!(
+            replies.disposition(7, fingerprint(MsgType::DirtySnapshot, &[], 1)),
+            FrameDisposition::Reused,
+            "the descriptor count is part of what the identifier named"
+        );
+    }
+
+    /// A fresh identifier is served, and one below the high-water mark whose answer has been
+    /// evicted is refused rather than served a second time.
+    #[test]
+    fn an_identifier_too_old_to_replay_is_refused_rather_than_served() {
+        let mut replies = ReplyCache::default();
+        for request_id in 1..=protocol::MAX_RETRYABLE_REQUESTS as u64 + 1 {
+            replies.record(
+                request_id,
+                fingerprint(MsgType::Quiesce, &[], 0),
+                MsgType::Quiesced,
+                Vec::new(),
+            );
+        }
+
+        assert_eq!(
+            replies.answers.len(),
+            protocol::MAX_RETRYABLE_REQUESTS,
+            "the history is bounded"
+        );
+        assert_eq!(
+            replies.disposition(1, fingerprint(MsgType::Quiesce, &[], 0)),
+            FrameDisposition::Reused,
+            "an evicted answer must not be re-served"
+        );
+        assert_eq!(
+            replies.disposition(9_999, fingerprint(MsgType::Quiesce, &[], 0)),
+            FrameDisposition::Serve
+        );
+    }
+
+    /// The digest separates the commands an epoch is made of, so a replay is exact.
+    #[test]
+    fn the_frame_digest_separates_commands() {
+        assert_ne!(
+            fingerprint(MsgType::DirtySnapshot, &[], 0),
+            fingerprint(MsgType::WriteVmstate, &[], 0)
+        );
+        assert_ne!(
+            fingerprint(MsgType::Resume, &0u32.to_le_bytes(), 0),
+            fingerprint(MsgType::Resume, &1u32.to_le_bytes(), 0)
+        );
+        assert_eq!(harvest_frame(), fingerprint(MsgType::DirtySnapshot, &[], 0));
     }
 }

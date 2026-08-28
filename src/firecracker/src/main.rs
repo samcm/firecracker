@@ -671,9 +671,14 @@ fn run_without_api(
 
     // Run the EventManager that drives everything in the microVM.
     loop {
-        event_manager
-            .run()
-            .expect("Failed to start the event manager");
+        {
+            // One dispatch slice, holding the farplane gate: a capture epoch closes it and this
+            // loop parks here until the epoch ends, so no device handler runs inside it.
+            let _dispatch = vmm::vstate::farplane::hold_for_dispatch();
+            event_manager
+                .run_with_timeout(vmm::vstate::farplane::DISPATCH_SLICE_MS)
+                .expect("Failed to start the event manager");
+        }
 
         match vmm.lock().unwrap().shutdown_exit_code() {
             Some(FcExitCode::Ok) => break,

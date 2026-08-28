@@ -5,11 +5,14 @@
 pub mod backend;
 /// Capture half of the memory channel, served on the microVM's event loop.
 pub mod capture;
+/// Exclusion that stops event dispatch for the whole of a capture epoch.
+pub mod dispatch;
 /// Wire format of the pagemaster memory channel.
 pub mod protocol;
 
 pub use backend::{BackendError, BackendState, FarplaneBackend, FarplaneState};
 pub use capture::CaptureService;
+pub use dispatch::{DISPATCH_SLICE_MS, DispatchGate, DispatchHold, gate, hold_for_dispatch};
 pub use protocol::{
     Arch, BackendReadyRegion, ChannelError, ErrorCode, ExtentRecord, FEATURE_IDENTITY, Header,
     MAGIC, MAX_DATAGRAM, MAX_EXTENTS, MAX_PLAN_FDS, Mode, MsgType, RegionRecord, VERSION,

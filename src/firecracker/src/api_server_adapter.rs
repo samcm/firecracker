@@ -63,9 +63,15 @@ impl ApiServerAdapter {
         }));
         event_manager.add_subscriber(api_adapter.clone());
         loop {
-            event_manager
-                .run()
-                .expect("EventManager events driver fatal error");
+            {
+                // Dispatch runs in slices, each of them holding the farplane gate: a capture
+                // epoch closes the gate and this loop parks here for its duration, so no device
+                // handler can write guest memory or device state between capture commands.
+                let _dispatch = vmm::vstate::farplane::hold_for_dispatch();
+                event_manager
+                    .run_with_timeout(vmm::vstate::farplane::DISPATCH_SLICE_MS)
+                    .expect("EventManager events driver fatal error");
+            }
             api_adapter.lock().expect("Poisoned lock").handle_request();
 
             match vmm.lock().unwrap().shutdown_exit_code() {

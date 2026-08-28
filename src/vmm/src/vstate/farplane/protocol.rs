@@ -21,6 +21,11 @@ pub const MAX_EXTENTS: u32 = 65_536;
 pub const MAX_PLAN_FDS: u32 = 1_024;
 /// Largest number of descriptors one datagram carries: the kernel's `SCM_MAX_FD`.
 pub const MAX_SCM_FDS: usize = 253;
+/// Number of answered requests one connection keeps, so a retry of one is replayed rather than
+/// served twice. Pagemaster serves one command at a time, so this is a history of retries, not a
+/// window of requests in flight: an identifier older than this cannot be answered from memory and
+/// is refused instead.
+pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this protocol, quiesce semantics and vmstate format. A warm image
 /// baked by another identity is refused rather than restored: the capture command order and the
 /// vmstate the epoch produces are part of what this string names.
@@ -153,6 +158,9 @@ pub enum ErrorCode {
     /// A capture command arrived out of order within one epoch: the vmstate must be serialized
     /// before the dirty accumulator is harvested.
     CaptureOrderViolation = 22,
+    /// A request identifier this connection already answered arrived with different contents, or
+    /// too long ago to be answered from memory.
+    RequestIdReused = 23,
 }
 
 /// Architecture Firecracker is running on.
@@ -846,21 +854,29 @@ mod tests {
     }
 
     /// The `hello` frame is the only place the feature identity crosses to pagemaster, so its
-    /// bytes are pinned by a fixture the Python fake decodes as well. A change to the identity or
-    /// to the body layout has to be made in both languages or this fails.
+    /// bytes are pinned by fixtures the Python fake decodes as well. Both architectures are
+    /// pinned, because the frame is produced on both and only one of them is ever running here.
+    /// A change to the identity or to the body layout has to be made in both languages or this
+    /// fails.
     #[test]
-    fn hello_frame_matches_the_shared_fixture() {
+    fn hello_frames_match_the_shared_fixtures() {
         let regions = [RegionRecord {
             guest_addr: 0,
             size: 0x0800_0000,
         }];
-        let body = encode_hello(4242, 4096, Arch::X86_64, Mode::Boot, &regions);
-        let header = Header::new(MsgType::Hello, 0, u32::try_from(body.len()).unwrap(), 0);
-        let mut datagram = header.encode().to_vec();
-        datagram.extend_from_slice(&body);
 
-        let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(hex, include_str!("testdata/hello.hex").trim());
+        for (arch, fixture) in [
+            (Arch::X86_64, include_str!("testdata/hello.hex")),
+            (Arch::Aarch64, include_str!("testdata/hello_aarch64.hex")),
+        ] {
+            let body = encode_hello(4242, 4096, arch, Mode::Boot, &regions);
+            let header = Header::new(MsgType::Hello, 0, u32::try_from(body.len()).unwrap(), 0);
+            let mut datagram = header.encode().to_vec();
+            datagram.extend_from_slice(&body);
+
+            let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
+        }
         assert_eq!(FEATURE_IDENTITY, "farplane/2");
     }
 }

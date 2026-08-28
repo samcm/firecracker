@@ -105,6 +105,7 @@ class Err(IntEnum):
     RESUME_FAILED = 20
     QUIESCE_FAILED = 21
     CAPTURE_ORDER_VIOLATION = 22
+    REQUEST_ID_REUSED = 23
 
 
 F_ADD_SEALS = 1033
@@ -794,6 +795,26 @@ class Pagemaster:
                 (socket.SOL_SOCKET, socket.SCM_RIGHTS, array("i", list(fds)))
             )
         return self._sock.sendmsg([payload], ancillary)
+
+    def frame(self, msg, request_id, body=b"", fd_count=0):
+        """The exact datagram one command is carried by, so a retry can repeat it byte for byte."""
+        return (
+            HEADER.pack(MAGIC, VERSION, int(msg), request_id, len(body), fd_count, 0) + body
+        )
+
+    def exchange(self, payload, fds=(), timeout=30):
+        """Put a raw datagram on the channel and collect the reply it draws."""
+        self._sock.settimeout(timeout)
+        self.send_raw(payload, fds)
+        header, body, reply_fds = self._recv()
+        if header["msg_type"] == Msg.ERROR:
+            code, op, _, _ = ERROR_BODY.unpack(body)
+            return Reply(Msg.ERROR, body, reply_fds, (Err(code), Msg(op)))
+        return Reply(Msg(header["msg_type"]), body, reply_fds, None)
+
+    def next_request_id(self):
+        """The identifier the next command would carry."""
+        return self._next_id()
 
     def close_channel(self):
         """Shut the channel down so Firecracker observes EOF."""

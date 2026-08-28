@@ -361,6 +361,49 @@ def test_a_repeated_capture_command_replays_its_answer(farplane_factory):
     assert bytes(pagemaster.harvest().data) == bytes(harvested.data)
 
 
+def test_an_exact_retry_of_a_frame_is_answered_not_served(farplane_factory):
+    """The same datagram, resent, draws the same answer whatever happened in between.
+
+    Pagemaster resends a command whose reply it never saw. The answer is keyed by the
+    request identifier and the contents of the frame, so a retry cannot harvest again even
+    after a `dirty_union` has put the bits back and reopened the epoch's dirty set.
+    """
+    vm = farplane_factory()
+    pagemaster = boot(vm)
+
+    pagemaster.capture_buffers()
+    pagemaster.quiesce()
+    pagemaster.write_vmstate()
+
+    harvest_id = pagemaster.next_request_id()
+    harvest_frame = pagemaster.frame(fp.Msg.DIRTY_SNAPSHOT, harvest_id)
+    first = pagemaster.exchange(harvest_frame)
+    assert first.msg == fp.Msg.DIRTY_SNAPSHOT_DONE
+    harvested = pagemaster.harvest()
+    assert harvested.count() > 0
+
+    # The bits go back into the accumulator, so the phase alone would harvest again.
+    assert pagemaster.dirty_union(harvested).error is None
+
+    replay = pagemaster.exchange(harvest_frame)
+    assert replay.msg == fp.Msg.DIRTY_SNAPSHOT_DONE
+    assert bytes(pagemaster.harvest().data) == bytes(
+        harvested.data
+    ), "the retried frame harvested again instead of replaying its answer"
+
+    # The same identifier with other contents is not the command it answered.
+    reused = pagemaster.exchange(pagemaster.frame(fp.Msg.WRITE_VMSTATE, harvest_id))
+    assert reused.error == (fp.Err.REQUEST_ID_REUSED, fp.Msg.WRITE_VMSTATE)
+
+    # The answer survives leaving the epoch and opening the next one.
+    pagemaster.resume(run_vcpus=0)
+    pagemaster.capture_buffers()
+    pagemaster.quiesce()
+    across_epochs = pagemaster.exchange(harvest_frame)
+    assert across_epochs.msg == fp.Msg.DIRTY_SNAPSHOT_DONE
+    assert bytes(pagemaster.harvest().data) == bytes(harvested.data)
+
+
 def test_a_harvest_before_the_vmstate_is_refused(farplane_factory):
     """The vmstate is serialized before the dirty log is harvested, or not at all.
 

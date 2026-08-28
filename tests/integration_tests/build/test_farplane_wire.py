@@ -10,13 +10,15 @@ against the frame fixture both languages decode.
 import re
 from pathlib import Path
 
+import pytest
+
 import host_tools.farplane as fp  # pylint:disable=import-error
 
 # This test needs no built binary and no test artifacts, so it resolves the workspace itself
 # rather than through the framework, and runs on any Linux with the test requirements.
 WORKSPACE = Path(__file__).resolve().parents[3]
 PROTOCOL_RS = WORKSPACE / "src/vmm/src/vstate/farplane/protocol.rs"
-HELLO_FIXTURE = WORKSPACE / "src/vmm/src/vstate/farplane/testdata/hello.hex"
+FIXTURE_DIR = WORKSPACE / "src/vmm/src/vstate/farplane/testdata"
 
 
 def rust_constant(name):
@@ -46,9 +48,15 @@ def test_feature_identity_agrees_with_rust():
     assert rust_constant("FEATURE_IDENTITY") == fp.FEATURE_IDENTITY
 
 
-def test_hello_fixture_decodes_to_the_expected_identity():
-    """The fixture is the frame Rust encodes; the fake parses it with its own structs."""
-    datagram = bytes.fromhex(HELLO_FIXTURE.read_text(encoding="utf-8").strip())
+@pytest.mark.parametrize(
+    "fixture_name,expected_arch",
+    [("hello.hex", fp.ARCH_X86_64), ("hello_aarch64.hex", fp.ARCH_AARCH64)],
+)
+def test_hello_fixture_decodes_to_the_expected_identity(fixture_name, expected_arch):
+    """The fixtures are the frames Rust encodes on each architecture; the fake parses both."""
+    datagram = bytes.fromhex(
+        (FIXTURE_DIR / fixture_name).read_text(encoding="utf-8").strip()
+    )
 
     magic, version, msg_type, request_id, body_len, fd_count, reserved = (
         fp.HEADER.unpack_from(datagram)
@@ -64,7 +72,7 @@ def test_hello_fixture_decodes_to_the_expected_identity():
     body = datagram[fp.HEADER.size :]
     _pid, page_size, arch, mode, region_count, identity = fp.HELLO.unpack_from(body)
     assert page_size == 4096
-    assert arch == fp.ARCH_X86_64
+    assert arch == expected_arch
     assert mode == fp.MODE_BOOT
     assert region_count == 1
     assert identity.rstrip(b"\0").decode() == fp.FEATURE_IDENTITY
