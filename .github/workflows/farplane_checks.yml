@@ -1,0 +1,109 @@
+name: Farplane checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - farplane
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farplane-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Everything that needs no KVM, no userfaultfd and no guest: the memory channel wire
+  # format, the capture command state machine, the vsock device and its snapshot state.
+  # An ordinary runner and no container, so this stays the gate for ordinary changes.
+  unit_and_wire:
+    name: unit and wire tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Install the pinned toolchain"
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy
+
+      - name: "Farplane memory channel and capture tests"
+        run: cargo test -p vmm --lib vstate::farplane
+
+      - name: "Vsock device and snapshot state tests"
+        run: cargo test -p vmm --lib vsock
+
+      - name: "Memory channel wire tests"
+        run: cargo test -p vmm --test farplane_channel
+
+      - name: "Clippy over the crate the fork changes"
+        run: cargo clippy -p vmm --lib --tests -- -D warnings
+
+      - name: "Install the Python test requirements"
+        run: python3 -m pip install --break-system-packages pytest requests requests-unixsocket
+
+      # `--confcutdir` keeps the session conftest out: it wants a built binary and the test
+      # artifacts, and these tests read only checked-in sources.
+      - name: "Cross-language wire tests"
+        working-directory: tests
+        run: >
+          python3 -m pytest -q
+          --confcutdir=integration_tests/build
+          integration_tests/build/test_farplane_wire.py
+
+  # The fork ships on both architectures. `checkbuild` is the repository's own cross
+  # compile path: clippy over every target of the workspace, on the GNU target because
+  # musl does not cross-compile cleanly. It runs in the public dev container, so it needs
+  # no toolchain of its own.
+  aarch64_compile:
+    name: aarch64 compile check
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Cross compile check for aarch64"
+        run: ./tools/devtool -y checkbuild -m aarch64
+
+  # Functional proof of the parts that need host devices: userfaultfd for the guest
+  # mappings, KVM for the dirty log and the vCPUs. Skipped, not failed, where the host
+  # cannot host a microVM, so a runner without the devices does not block a merge and does
+  # not pretend to have proved anything.
+  kvm_functional:
+    name: KVM and userfaultfd functional tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Report what this host can prove"
+        id: host
+        run: |
+          kernel=$(uname -r | cut -d- -f1)
+          major=${kernel%%.*}
+          rest=${kernel#*.}
+          minor=${rest%%.*}
+          usable=yes
+          [ -c /dev/kvm ] || usable=no
+          [ -c /dev/userfaultfd ] || usable=no
+          [ "$major" -gt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -ge 1 ]; } || usable=no
+          echo "kernel=$kernel kvm=$([ -c /dev/kvm ] && echo yes || echo no)" \
+               "userfaultfd=$([ -c /dev/userfaultfd ] && echo yes || echo no)"
+          echo "usable=$usable" >> "$GITHUB_OUTPUT"
+
+      - name: "Skip: no KVM, no /dev/userfaultfd, or a kernel below 6.1"
+        if: steps.host.outputs.usable != 'yes'
+        run: |
+          echo "::notice::the functional farplane tests need /dev/kvm, /dev/userfaultfd and"\
+               "a kernel of at least 6.1; this host has none of that, so the unit and wire"\
+               "lane is the only proof for this run"
+
+      - name: "Build the binaries the functional tests drive"
+        if: steps.host.outputs.usable == 'yes'
+        run: ./tools/devtool -y build --release
+
+      - name: "Functional farplane tests"
+        if: steps.host.outputs.usable == 'yes'
+        run: ./tools/devtool -y test --no-build -- integration_tests/functional/test_farplane.py
