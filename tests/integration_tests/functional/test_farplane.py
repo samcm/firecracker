@@ -259,6 +259,7 @@ def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory, ro
 
     pagemaster.capture_buffers()
     pagemaster.quiesce()
+    assert pagemaster.write_vmstate().error is None
     assert pagemaster.dirty_snapshot().error is None
     harvest = pagemaster.harvest()
 
@@ -296,6 +297,7 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
 
     pagemaster.capture_buffers()
     pagemaster.quiesce()
+    pagemaster.write_vmstate()
     pagemaster.dirty_snapshot()
     first = pagemaster.harvest()
     assert first.count() > 0, "booting dirtied no page"
@@ -309,9 +311,44 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     pagemaster.resume(run_vcpus=1)
     time.sleep(2)
     pagemaster.quiesce()
+    pagemaster.write_vmstate()
     pagemaster.dirty_snapshot()
     third = pagemaster.harvest()
     assert third.count() > 0, "writes after the harvest were not tracked"
+
+
+def test_a_harvest_before_the_vmstate_is_refused(farplane_factory):
+    """The vmstate is serialized before the dirty log is harvested, or not at all.
+
+    Serializing the vmstate runs `prepare_save()` on every device, and a device may write
+    guest memory there, so a harvest that ran first would report a bitmap that predates
+    those writes.
+    """
+    vm = farplane_factory()
+    pagemaster = boot(vm)
+
+    pagemaster.capture_buffers()
+    pagemaster.quiesce()
+    early = pagemaster.dirty_snapshot()
+    assert early.error == (fp.Err.CAPTURE_ORDER_VIOLATION, fp.Msg.DIRTY_SNAPSHOT)
+
+    assert pagemaster.write_vmstate().error is None
+    assert pagemaster.dirty_snapshot().error is None
+    assert pagemaster.harvest().count() > 0
+
+    # The same violation from the other side: the writes a second serialization performs
+    # have no harvest left to report them.
+    late = pagemaster.write_vmstate()
+    assert late.error == (fp.Err.CAPTURE_ORDER_VIOLATION, fp.Msg.WRITE_VMSTATE)
+
+    # A fresh epoch owes a vmstate again, whatever the last one reached.
+    pagemaster.resume(run_vcpus=0)
+    pagemaster.capture_buffers()
+    pagemaster.quiesce()
+    assert pagemaster.dirty_snapshot().error == (
+        fp.Err.CAPTURE_ORDER_VIOLATION,
+        fp.Msg.DIRTY_SNAPSHOT,
+    )
 
 
 def test_dirty_union_restores_the_snapshot_and_is_refused_outside_quiesce(
@@ -323,6 +360,7 @@ def test_dirty_union_restores_the_snapshot_and_is_refused_outside_quiesce(
 
     pagemaster.capture_buffers()
     pagemaster.quiesce()
+    pagemaster.write_vmstate()
     pagemaster.dirty_snapshot()
     harvested = pagemaster.harvest()
     assert harvested.count() > 0
@@ -361,6 +399,7 @@ def test_a_failed_harvest_preserves_every_bit(farplane_factory):
     assert expected
 
     pagemaster.quiesce()
+    assert pagemaster.write_vmstate().error is None
     failed = pagemaster.dirty_snapshot()
     assert failed.error == (fp.Err.DIRTY_HARVEST_FAILED, fp.Msg.DIRTY_SNAPSHOT)
 
@@ -368,6 +407,7 @@ def test_a_failed_harvest_preserves_every_bit(farplane_factory):
     pagemaster.resume(run_vcpus=0)
     pagemaster.capture_buffers()
     pagemaster.quiesce()
+    assert pagemaster.write_vmstate().error is None
     assert pagemaster.dirty_snapshot().error is None
     harvest = pagemaster.harvest()
     for page in expected:
@@ -384,6 +424,7 @@ def test_guest_memory_is_frozen_between_quiesce_and_resume(farplane_factory):
 
     pagemaster.capture_buffers()
     pagemaster.quiesce()
+    pagemaster.write_vmstate()
     pagemaster.dirty_snapshot()
     hot = pagemaster.harvest().set_pages()[:256]
     assert hot, "no page was dirtied before the capture"
@@ -538,6 +579,7 @@ def test_root_drive_is_served_from_the_sealed_memfd(farplane_factory):
     # The guest read the image over virtio, so its bytes are in guest memory.
     pagemaster.capture_buffers()
     pagemaster.quiesce()
+    pagemaster.write_vmstate()
     pagemaster.dirty_snapshot()
     with open(vm.rootfs, "rb") as image:
         signature = image.read(64)
@@ -600,6 +642,7 @@ def test_bootstrap_drive_is_served_from_the_sealed_memfd(farplane_factory):
 
     pagemaster.capture_buffers()
     pagemaster.quiesce()
+    pagemaster.write_vmstate()
     pagemaster.dirty_snapshot()
     with open(vm.bootstrap_file, "rb") as image:
         signature = image.read(64)

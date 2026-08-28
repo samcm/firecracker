@@ -6,7 +6,6 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
-
 use super::backend::{
     BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, send_error, set_capture_buffers_armed,
     validate_buffer_fd,
@@ -26,6 +25,68 @@ struct CaptureBuffers {
     vmstate: File,
 }
 
+/// How far through one capture epoch the commands that produce a checkpoint have got.
+///
+/// The vmstate has to be serialized before the dirty accumulator is harvested. Serialization
+/// calls `prepare_save()` on every device, and a device may write guest memory there: virtio-vsock
+/// publishes a `TRANSPORT_RESET` event into the guest's event queue. A harvest that ran first
+/// would report a bitmap that predates those writes, so pagemaster would copy pages the restored
+/// vmstate no longer agrees with. The order is a property of the epoch, not of one command, so it
+/// is tracked here and enforced for both directions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum EpochPhase {
+    /// Nothing has been written or harvested yet in this epoch.
+    #[default]
+    Open,
+    /// The vmstate has been serialized: the dirty accumulator may now be harvested.
+    StateWritten,
+    /// The dirty accumulator has been harvested: nothing may write guest memory again.
+    Harvested,
+}
+
+/// Order guard of one capture epoch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EpochOrder {
+    phase: EpochPhase,
+}
+
+impl EpochOrder {
+    /// Opens a fresh epoch, discarding whatever the previous one reached.
+    fn open(&mut self) {
+        self.phase = EpochPhase::Open;
+    }
+
+    /// States whether the vmstate may be serialized now.
+    fn may_write_vmstate(self) -> Result<(), ErrorCode> {
+        match self.phase {
+            EpochPhase::Open | EpochPhase::StateWritten => Ok(()),
+            // The harvest already reported the epoch's dirty set, so writes this serialization
+            // performs could never reach pagemaster.
+            EpochPhase::Harvested => Err(ErrorCode::CaptureOrderViolation),
+        }
+    }
+
+    /// Records a vmstate that reached the armed buffer.
+    fn vmstate_written(&mut self) {
+        if self.phase == EpochPhase::Open {
+            self.phase = EpochPhase::StateWritten;
+        }
+    }
+
+    /// States whether the dirty accumulator may be harvested now.
+    fn may_harvest(self) -> Result<(), ErrorCode> {
+        match self.phase {
+            EpochPhase::Open => Err(ErrorCode::CaptureOrderViolation),
+            EpochPhase::StateWritten | EpochPhase::Harvested => Ok(()),
+        }
+    }
+
+    /// Records a harvest that reached the armed buffer.
+    fn harvested(&mut self) {
+        self.phase = EpochPhase::Harvested;
+    }
+}
+
 /// Serves the capture half of the memory channel on the event loop that owns the microVM: while a
 /// command is served no device event source is dispatched, so between `quiesced` and `resume` no
 /// Firecracker thread writes guest memory.
@@ -35,6 +96,7 @@ pub struct CaptureService {
     vmm: Arc<Mutex<Vmm>>,
     vm_info: VmInfo,
     buffers: Option<CaptureBuffers>,
+    order: EpochOrder,
 }
 
 impl CaptureService {
@@ -67,6 +129,7 @@ impl CaptureService {
                     vmm,
                     vm_info,
                     buffers: None,
+                    order: EpochOrder::default(),
                 };
                 loop {
                     if BackendState::load() == BackendState::ChannelFailed {
@@ -104,7 +167,6 @@ impl CaptureService {
             return Err(ChannelError::Malformed);
         }
 
-        error!("farplane trace: serving msg={:?} id={} state={:?}", msg, request_id, BackendState::load());
         match msg {
             MsgType::CaptureBuffers => self.arm_buffers(incoming),
             MsgType::Quiesce => self.quiesce(request_id),
@@ -122,7 +184,6 @@ impl CaptureService {
     /// Validates and arms the buffers of one capture epoch.
     fn arm_buffers(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
-        error!("farplane trace: arm_buffers state={:?}", BackendState::load());
         if BackendState::load() != BackendState::Ready {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::CaptureBuffers);
         }
@@ -153,16 +214,13 @@ impl CaptureService {
             _ => return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Quiesce),
         }
 
-        error!("farplane trace: quiesce locking vmm");
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
-        error!("farplane trace: quiesce locked vmm state={:?}", vmm.instance_info.state);
         let were_running = vmm.instance_info.state == VmState::Running;
         if were_running && let Err(err) = vmm.pause_vm() {
             error!("Farplane quiesce could not pause the vCPUs: {err}");
             drop(vmm);
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
-        error!("farplane trace: quiesce paused vcpus, draining writers");
         if let Err(err) = vmm.drain_guest_memory_writers() {
             error!("Farplane quiesce could not stop every guest-memory writer: {err}");
             // The epoch never opened, so the source is handed back exactly as it was found and the
@@ -180,6 +238,9 @@ impl CaptureService {
         }
         drop(vmm);
 
+        // A fresh epoch has produced neither a vmstate nor a harvest, whatever the last one
+        // reached before it was left.
+        self.order.open();
         BackendState::Quiesced.store();
         self.reply(
             request_id,
@@ -190,9 +251,16 @@ impl CaptureService {
 
     /// Harvests the dirty accumulator into the armed buffer and only then clears it, so a failure
     /// at any step leaves every bit where it was.
+    ///
+    /// The harvest closes the epoch's dirty set, so it is refused until the vmstate has been
+    /// serialized: `prepare_save()` may write guest memory, and those writes have to land in the
+    /// bitmap pagemaster reads.
     fn dirty_snapshot(&mut self, request_id: u64) -> Result<(), ChannelError> {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::DirtySnapshot);
+        }
+        if let Err(code) = self.order.may_harvest() {
+            return self.reject(request_id, code, MsgType::DirtySnapshot);
         }
         let Some(mut buffers) = self.buffers.take() else {
             return self.reject(
@@ -205,15 +273,26 @@ impl CaptureService {
         let result = self.harvest(&mut buffers.dirty);
         self.buffers = Some(buffers);
         match result {
-            Ok(()) => self.reply(request_id, MsgType::DirtySnapshotDone, &[]),
+            Ok(()) => {
+                self.order.harvested();
+                self.reply(request_id, MsgType::DirtySnapshotDone, &[])
+            }
+            // A failed harvest left every bit where it was, so the epoch is still one where the
+            // dirty set has not been reported: it may be harvested again.
             Err(code) => self.reject(request_id, code, MsgType::DirtySnapshot),
         }
     }
 
     /// Serializes the vmstate into the armed buffer.
+    ///
+    /// Refused once the dirty accumulator has been harvested: device serialization may write guest
+    /// memory, and the epoch has no way left to report those writes.
     fn write_vmstate(&mut self, request_id: u64) -> Result<(), ChannelError> {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::WriteVmstate);
+        }
+        if let Err(code) = self.order.may_write_vmstate() {
+            return self.reject(request_id, code, MsgType::WriteVmstate);
         }
         let Some(mut buffers) = self.buffers.take() else {
             return self.reject(
@@ -235,7 +314,13 @@ impl CaptureService {
         let result = saved.and_then(|state| serialize_vmstate(&mut buffers.vmstate, state));
         self.buffers = Some(buffers);
         match result {
-            Ok(bytes) => self.reply(request_id, MsgType::VmstateWritten, &bytes.to_le_bytes()),
+            Ok(bytes) => {
+                self.order.vmstate_written();
+                self.reply(request_id, MsgType::VmstateWritten, &bytes.to_le_bytes())
+            }
+            // `save_state` may have run `prepare_save()` before it failed, so the writes it
+            // performed are in the accumulator: the epoch stays one that owes a serialization, and
+            // a harvest is still refused until one succeeds.
             Err(code) => self.reject(request_id, code, MsgType::WriteVmstate),
         }
     }
@@ -295,6 +380,7 @@ impl CaptureService {
         drop(vmm);
 
         self.buffers = None;
+        self.order.open();
         set_capture_buffers_armed(false);
         BackendState::Ready.store();
         self.reply(
@@ -437,5 +523,104 @@ mod tests {
         );
         assert_eq!(writer.write(&[0u8; 2]).unwrap(), 2);
         assert_eq!(writer.remaining, 0);
+    }
+
+    /// The order one epoch's commands may arrive in: the vmstate first, the harvest after it.
+    #[test]
+    fn the_capture_order_accepts_state_then_harvest() {
+        let mut order = EpochOrder::default();
+
+        order.may_write_vmstate().unwrap();
+        order.vmstate_written();
+        order.may_harvest().unwrap();
+        order.harvested();
+
+        assert_eq!(order.phase, EpochPhase::Harvested);
+    }
+
+    /// A harvest ahead of the vmstate would report a bitmap that predates the guest-memory writes
+    /// `prepare_save()` performs, so it is refused with the order violation, not served.
+    #[test]
+    fn the_capture_order_refuses_a_harvest_before_the_vmstate() {
+        let mut order = EpochOrder::default();
+
+        assert_eq!(
+            order.may_harvest(),
+            Err(ErrorCode::CaptureOrderViolation),
+            "a harvest must not precede the vmstate"
+        );
+        // The refusal changed nothing: the epoch still accepts the vmstate, and the harvest that
+        // follows it.
+        order.may_write_vmstate().unwrap();
+        order.vmstate_written();
+        order.may_harvest().unwrap();
+    }
+
+    /// Serializing again after the harvest is the same violation seen from the other side: the
+    /// writes that serialization performs have no harvest left to report them.
+    #[test]
+    fn the_capture_order_refuses_a_vmstate_after_the_harvest() {
+        let mut order = EpochOrder::default();
+        order.vmstate_written();
+        order.harvested();
+
+        assert_eq!(
+            order.may_write_vmstate(),
+            Err(ErrorCode::CaptureOrderViolation)
+        );
+        // A second harvest of the same epoch is not a violation: it reports whatever the guest
+        // dirtied since, and the accumulator was cleared by the first one.
+        order.may_harvest().unwrap();
+    }
+
+    /// A repeated serialization before any harvest is legal, and does not turn into the state the
+    /// harvest leaves behind.
+    #[test]
+    fn the_capture_order_allows_the_vmstate_to_be_rewritten() {
+        let mut order = EpochOrder::default();
+
+        order.vmstate_written();
+        order.may_write_vmstate().unwrap();
+        order.vmstate_written();
+
+        assert_eq!(order.phase, EpochPhase::StateWritten);
+        order.may_harvest().unwrap();
+    }
+
+    /// Every epoch starts owing a vmstate, whatever the previous one reached: `quiesce` and
+    /// `resume` both open a fresh one.
+    #[test]
+    fn opening_an_epoch_forgets_what_the_last_one_reached() {
+        let mut order = EpochOrder::default();
+        order.vmstate_written();
+        order.harvested();
+
+        order.open();
+
+        assert_eq!(order.phase, EpochPhase::Open);
+        assert_eq!(
+            order.may_harvest(),
+            Err(ErrorCode::CaptureOrderViolation),
+            "a fresh epoch must not inherit the last epoch's vmstate"
+        );
+        order.may_write_vmstate().unwrap();
+    }
+
+    /// A failure leaves the phase where it was: a serialization that failed still owes one, and a
+    /// harvest that failed lost no bit, so both may be retried in the same epoch.
+    #[test]
+    fn a_failed_command_leaves_the_epoch_order_alone() {
+        let mut order = EpochOrder::default();
+
+        // A `write_vmstate` that fails records nothing, so the harvest stays refused.
+        assert_eq!(order.phase, EpochPhase::Open);
+        assert_eq!(order.may_harvest(), Err(ErrorCode::CaptureOrderViolation));
+
+        // A `dirty_snapshot` that fails records nothing either, so it may be harvested again.
+        order.vmstate_written();
+        order.may_harvest().unwrap();
+        assert_eq!(order.phase, EpochPhase::StateWritten);
+        order.may_harvest().unwrap();
+        order.may_write_vmstate().unwrap();
     }
 }

@@ -77,6 +77,7 @@ class Msg(IntEnum):
     UNION_DONE = 14
     RESUMED = 15
     ERROR = 16
+    CAPTURE_BUFFERS_ARMED = 17
 
 
 class Err(IntEnum):
@@ -101,6 +102,9 @@ class Err(IntEnum):
     NO_CAPTURE_BUFFERS = 17
     BUFFER_TOO_SMALL = 18
     PEERCRED_MISMATCH = 19
+    RESUME_FAILED = 20
+    QUIESCE_FAILED = 21
+    CAPTURE_ORDER_VIOLATION = 22
 
 
 F_ADD_SEALS = 1033

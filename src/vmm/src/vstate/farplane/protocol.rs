@@ -150,6 +150,12 @@ pub enum ErrorCode {
     QuiesceFailed = 21,
 }
 
+    /// A capture command arrived out of order within one epoch: the vmstate must be serialized
+    /// before the dirty accumulator is harvested.
+    CaptureOrderViolation = 22,
+    /// A capture command arrived out of order within one epoch: the vmstate must be serialized
+    /// before the dirty accumulator is harvested.
+    CaptureOrderViolation = 22,
 /// Architecture Firecracker is running on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -836,6 +842,8 @@ mod tests {
     fn error_codes_are_stable() {
         assert_eq!(ErrorCode::GeometryMismatch as u32, 1);
         assert_eq!(ErrorCode::NoCaptureBuffers as u32, 17);
+        assert_eq!(ErrorCode::CaptureOrderViolation as u32, 22);
         assert_eq!(ErrorCode::PeercredMismatch as u32, 19);
     }
 }
+        assert_eq!(ErrorCode::CaptureOrderViolation as u32, 22);
