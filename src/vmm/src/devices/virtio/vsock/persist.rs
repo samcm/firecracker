@@ -31,6 +31,10 @@ pub struct VsockFrontendState {
     /// Context Identifier.
     pub cid: u64,
     pub virtio_state: VirtioDeviceState,
+    /// Whether a transport-reset event is waiting for the guest to acknowledge it. RX is gated
+    /// until that ack arrives, so a restore that assumed an outstanding reset the snapshot never
+    /// carried would gate RX for the life of the guest.
+    pub pending_event_ack: bool,
 }
 
 /// The Vsock Unix Backend serializable state.
@@ -92,6 +96,7 @@ where
         VsockFrontendState {
             cid: self.cid(),
             virtio_state: VirtioDeviceState::from_device(self),
+            pending_event_ack: self.pending_event_ack,
         }
     }
 
@@ -113,6 +118,7 @@ where
 
         vsock.acked_features = state.virtio_state.acked_features;
         vsock.avail_features = state.virtio_state.avail_features;
+        vsock.pending_event_ack = state.pending_event_ack;
         vsock.device_state = DeviceState::Inactive;
         Ok(vsock)
     }
@@ -218,5 +224,77 @@ pub(crate) mod tests {
         let mut data = [0u8, 1, 2, 3, 4, 5, 6, 7];
         restored_device.read_config(2, &mut data);
         assert_eq!(data, [0u8, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// Serializes a device and restores it through the wire format the snapshot uses.
+    fn round_trip(device: &Vsock<TestBackend>, mem: &GuestMemoryMmap) -> Vsock<TestBackend> {
+        let state = VsockState {
+            backend: device.backend().save(),
+            frontend: device.save(),
+        };
+        let bytes = bitcode::serialize(&state).unwrap();
+        let restored: VsockState = bitcode::deserialize(&bytes).unwrap();
+        Vsock::restore(
+            VsockConstructorArgs {
+                mem: mem.clone(),
+                backend: TestBackend::new(),
+            },
+            &restored.frontend,
+        )
+        .unwrap()
+    }
+
+    /// A snapshot taken while a transport reset was outstanding carries the gate, so the restored
+    /// device knows an ack is still owed and holds RX until it arrives.
+    #[test]
+    fn test_persist_carries_an_outstanding_rx_gate() {
+        let mut ctx = TestContext::new();
+        ctx.device.pending_event_ack = true;
+
+        let restored = round_trip(&ctx.device, &ctx.mem);
+
+        assert!(
+            restored.pending_event_ack,
+            "a restored device must owe the ack the snapshot recorded"
+        );
+
+        // Chained restore: the gate survives a snapshot taken of a restored device, which is how
+        // a guest captured twice in a row loses it.
+        let chained = round_trip(&restored, &ctx.mem);
+        assert!(chained.pending_event_ack);
+    }
+
+    /// A snapshot taken with an empty event queue carries no reset: nothing can acknowledge one,
+    /// so the restored device must not owe an ack.
+    #[test]
+    fn test_persist_carries_a_disarmed_rx_gate() {
+        let ctx = TestContext::new();
+        assert!(!ctx.device.pending_event_ack);
+
+        let restored = round_trip(&ctx.device, &ctx.mem);
+
+        assert!(
+            !restored.pending_event_ack,
+            "a restore must not invent a gate the snapshot did not record"
+        );
+
+        let chained = round_trip(&restored, &ctx.mem);
+        assert!(!chained.pending_event_ack);
+    }
+
+    /// The gate the guest has acknowledged is gone from every later snapshot: the ack is what
+    /// clears it, and the restored device is the one that saw the ack.
+    #[test]
+    fn test_persist_drops_the_gate_the_guest_acknowledged() {
+        let mut ctx = TestContext::new();
+        ctx.device.pending_event_ack = true;
+
+        let mut restored = round_trip(&ctx.device, &ctx.mem);
+        // The evq ack path clears the gate; see the event-handler tests for the guest-driven
+        // route into this.
+        restored.pending_event_ack = false;
+
+        let chained = round_trip(&restored, &ctx.mem);
+        assert!(!chained.pending_event_ack);
     }
 }
