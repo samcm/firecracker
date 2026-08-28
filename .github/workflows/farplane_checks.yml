@@ -86,6 +86,32 @@ jobs:
           fi
           echo "the link search follows the supplied path and refuses a directory without one"
 
+      # Directives alone do not prove which file the linker opened: its default search
+      # directories follow every explicit `-L`. Build the real seccompiler binary in an
+      # isolated target directory with GNU ld's input trace enabled and require that trace
+      # to name the supplied library. This catches both a lost build-script directive and a
+      # linker that silently fell through to the runner's packaged copy.
+      - name: "The seccompiler binary links the supplied libseccomp"
+        run: |
+          set -euo pipefail
+          private=$(mktemp -d)
+          supplied=$(cc -print-file-name=libseccomp.so)
+          if [ "$supplied" = libseccomp.so ] || [ ! -f "$supplied" ]; then
+            echo "::error::the installed libseccomp development package exposed no linkable library"
+            exit 1
+          fi
+          cp -L "$supplied" "$private/libseccomp.so"
+
+          target=$(mktemp -d)
+          log=$(mktemp)
+          LIBSECCOMP_LIB_PATH="$private" \
+            CARGO_TARGET_DIR="$target" \
+            RUSTFLAGS="-C link-arg=-Wl,-t" \
+            cargo build -p seccompiler --bin seccompiler-bin -vv 2>&1 | tee "$log"
+          grep -qxF "$private/libseccomp.so" "$log"
+          test -x "$target/debug/seccompiler-bin"
+          echo "the linker opened $private/libseccomp.so"
+
       # `cargo test <filter>` exits 0 when the filter selects nothing, and a sum taken over
       # several modules stays green when one of them stops existing.
       # `guarded_cargo_test <min> <cargo args...>` pipes cargo through `tee`, keeps cargo's
@@ -242,8 +268,22 @@ jobs:
             exit 1
           fi
 
+      # A caller-supplied library is a host path. Populate one from the development
+      # container, then build through devtool with that path set. The build can see it only
+      # when run_devctr mounts and forwards the directory; seccompiler's build script then
+      # refuses an empty or wrong mount before linking.
+      - name: "Prepare a caller-supplied libseccomp"
+        run: |
+          set -euo pipefail
+          mkdir -p build/libseccomp-provenance
+          ./tools/devtool -y sh \
+            'cp /usr/local/lib/libseccomp.a build/libseccomp-provenance/libseccomp.a'
+
       - name: "Build the musl binaries the fork ships"
-        run: ./tools/devtool -y build --release --libc musl
+        run: |
+          set -euo pipefail
+          LIBSECCOMP_LIB_PATH="$PWD/build/libseccomp-provenance" \
+            ./tools/devtool -y build --release --libc musl
 
       # `release.sh` names the output directory after the target triple
       # (tools/release.sh:108-109), so reading that path asserts what the build selected:
@@ -285,7 +325,7 @@ jobs:
   # cross C toolchain the step below installs. The musl binaries still come out of the
   # container, in `aarch64_musl_build`.
   aarch64_gnu_checkbuild:
-    name: aarch64 GNU cross clippy
+    name: aarch64 GNU cross clippy (devtool checkbuild)
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout repository"
