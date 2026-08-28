@@ -5,6 +5,15 @@ on:
   push:
     branches:
       - farplane
+  # The functional lane runs only when it is asked for, on a runner that has the devices.
+  # An ordinary run has no such host, and a job that reported success there would look like
+  # proof of KVM behaviour that never executed.
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label for the functional lane; needs /dev/kvm, /dev/userfaultfd and a kernel of at least 6.1"
+        required: false
+        default: ubuntu-latest
 
 permissions:
   contents: read
@@ -68,42 +77,38 @@ jobs:
         run: ./tools/devtool -y checkbuild -m aarch64
 
   # Functional proof of the parts that need host devices: userfaultfd for the guest
-  # mappings, KVM for the dirty log and the vCPUs. Skipped, not failed, where the host
-  # cannot host a microVM, so a runner without the devices does not block a merge and does
-  # not pretend to have proved anything.
+  # mappings, KVM for the dirty log and the vCPUs. It is a separate lane on purpose, it
+  # never runs on a pull request, and it fails rather than passing where the devices are
+  # absent: the only green this job can produce is one that ran the tests.
   kvm_functional:
     name: KVM and userfaultfd functional tests
-    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    # The fallback keeps the expression valid on the events where this job is skipped.
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@v4
 
-      - name: "Report what this host can prove"
-        id: host
+      - name: "Require the devices and the kernel the functional tests need"
         run: |
           kernel=$(uname -r | cut -d- -f1)
           major=${kernel%%.*}
           rest=${kernel#*.}
           minor=${rest%%.*}
-          usable=yes
-          [ -c /dev/kvm ] || usable=no
-          [ -c /dev/userfaultfd ] || usable=no
-          [ "$major" -gt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -ge 1 ]; } || usable=no
           echo "kernel=$kernel kvm=$([ -c /dev/kvm ] && echo yes || echo no)" \
                "userfaultfd=$([ -c /dev/userfaultfd ] && echo yes || echo no)"
-          echo "usable=$usable" >> "$GITHUB_OUTPUT"
-
-      - name: "Skip: no KVM, no /dev/userfaultfd, or a kernel below 6.1"
-        if: steps.host.outputs.usable != 'yes'
-        run: |
-          echo "::notice::the functional farplane tests need /dev/kvm, /dev/userfaultfd and"\
-               "a kernel of at least 6.1; this host has none of that, so the unit and wire"\
-               "lane is the only proof for this run"
+          missing=""
+          [ -c /dev/kvm ] || missing="$missing /dev/kvm"
+          [ -c /dev/userfaultfd ] || missing="$missing /dev/userfaultfd"
+          [ "$major" -gt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -ge 1 ]; } \
+            || missing="$missing kernel>=6.1(have $kernel)"
+          if [ -n "$missing" ]; then
+            echo "::error::this host cannot run the functional farplane tests; missing:$missing"
+            exit 1
+          fi
 
       - name: "Build the binaries the functional tests drive"
-        if: steps.host.outputs.usable == 'yes'
         run: ./tools/devtool -y build --release
 
       - name: "Functional farplane tests"
-        if: steps.host.outputs.usable == 'yes'
         run: ./tools/devtool -y test --no-build -- integration_tests/functional/test_farplane.py
