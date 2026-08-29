@@ -31,8 +31,8 @@ pub struct BlockConstructorArgs {
 }
 
 impl BlockConstructorArgs {
-    /// Arguments for restoring a drive, backed by the descriptor the jailer inherited its sealed
-    /// image at: the root drive at [`ROOT_DESCRIPTOR_FILENO`], every other drive at
+    /// Arguments for restoring a drive, backed by the descriptor the jailer inherited its image
+    /// at: the root drive at [`ROOT_DESCRIPTOR_FILENO`], every other drive at
     /// [`BOOTSTRAP_DESCRIPTOR_FILENO`]. A snapshot never records a path or a descriptor number.
     pub fn inherited(mem: GuestMemoryMmap, state: &BlockState) -> Self {
         let descriptor = match state {

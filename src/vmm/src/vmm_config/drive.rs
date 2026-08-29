@@ -34,7 +34,7 @@ pub enum DriveError {
     ReadOnlyWriteback,
     /// A root block device already exists!
     RootBlockDeviceAlreadyAdded,
-    /// Descriptor {0} is not one of the descriptors the jailer inherits a sealed drive image at.
+    /// Descriptor {0} is not one of the descriptors the jailer reserves for inherited images.
     UnreservedDescriptor(RawFd),
     /// Descriptor {0} is not read-only.
     WritableDescriptor(RawFd),
@@ -63,8 +63,8 @@ pub struct BlockDeviceConfig {
     /// If set to true, the drive is opened in read-only mode. Otherwise, the
     /// drive is opened as read-write.
     pub is_read_only: Option<bool>,
-    /// Descriptor the sealed read-only image backing this drive was inherited at: the root image
-    /// at [`ROOT_DESCRIPTOR_FILENO`], the bootstrap image at [`BOOTSTRAP_DESCRIPTOR_FILENO`].
+    /// Descriptor the read-only image backing this drive was inherited at: the root image at
+    /// [`ROOT_DESCRIPTOR_FILENO`], the bootstrap image at [`BOOTSTRAP_DESCRIPTOR_FILENO`].
     pub fd: RawFd,
     /// Rate Limiter for I/O operations.
     pub rate_limiter: Option<RateLimiterConfig>,
@@ -74,10 +74,10 @@ pub struct BlockDeviceConfig {
 }
 
 impl BlockDeviceConfig {
-    /// Pairs the descriptors the jailer inherits with the drive each one backs: the sealed root
-    /// image at [`ROOT_DESCRIPTOR_FILENO`] backs the root device, and the sealed bootstrap image
-    /// at [`BOOTSTRAP_DESCRIPTOR_FILENO`] backs a drive that never is. No other number names a
-    /// drive's backing store.
+    /// Pairs the descriptors the jailer inherits with the drive each one backs: the root image at
+    /// [`ROOT_DESCRIPTOR_FILENO`] backs the root device, and the bootstrap image at
+    /// [`BOOTSTRAP_DESCRIPTOR_FILENO`] backs a drive that never is. No other number names a drive's
+    /// backing store.
     pub fn reserved_descriptor(&self) -> Result<RawFd, DriveError> {
         let backs_root = match self.fd {
             ROOT_DESCRIPTOR_FILENO => true,
@@ -90,8 +90,8 @@ impl BlockDeviceConfig {
         Ok(self.fd)
     }
 
-    /// Validates the descriptor backing this drive. Every inherited image is sealed read-only, so
-    /// the drive requires `is_read_only` and the number must still name a read-only descriptor.
+    /// Validates the descriptor backing this drive. Every inherited image descriptor is read-only,
+    /// so the drive requires `is_read_only` and the number must still name a read-only descriptor.
     pub fn descriptor(&self) -> Result<RawFd, DriveError> {
         let fd = self.reserved_descriptor()?;
         if self.is_read_only != Some(true) {
@@ -100,8 +100,8 @@ impl BlockDeviceConfig {
         if self.cache_type == CacheType::Writeback {
             return Err(DriveError::ReadOnlyWriteback);
         }
-        // The jailer owns memfd identity, sealing and size; Firecracker only confirms that the
-        // number it was handed still names an inherited read-only descriptor.
+        // The jailer owns image identity, immutability and size validation; Firecracker only
+        // confirms that the number it was handed still names an inherited read-only descriptor.
         // SAFETY: `F_GETFL` only reads descriptor flags.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
@@ -287,7 +287,7 @@ mod tests {
         );
     }
 
-    /// The drive the sealed root image backs.
+    /// The drive the inherited root image backs.
     fn root_drive(drive_id: &str) -> BlockDeviceConfig {
         BlockDeviceConfig {
             drive_id: drive_id.to_string(),
@@ -298,7 +298,7 @@ mod tests {
         }
     }
 
-    /// The drive the sealed bootstrap image backs.
+    /// The drive the inherited bootstrap image backs.
     fn bootstrap_drive(drive_id: &str) -> BlockDeviceConfig {
         BlockDeviceConfig {
             drive_id: drive_id.to_string(),
@@ -445,8 +445,7 @@ mod tests {
 
     #[test]
     fn test_descriptor_admission_matrix() {
-        // The sealed root image backs the root device, the sealed bootstrap image a second drive
-        // that never is.
+        // The root image backs the root device, the bootstrap image a second drive that never is.
         assert_eq!(
             root_drive("root").descriptor().unwrap(),
             ROOT_DESCRIPTOR_FILENO
@@ -481,7 +480,7 @@ mod tests {
             );
         }
 
-        // A sealed image is neither writable nor flushable.
+        // An inherited image is neither writable nor flushable.
         let mut writable = root_drive("root");
         writable.is_read_only = Some(false);
         assert_eq!(
@@ -518,7 +517,7 @@ mod tests {
                 )
             );
 
-            // A writable descriptor never carries a sealed image.
+            // A writable descriptor never carries an admitted image.
             let writable_image = TempFile::new().unwrap();
             writable_image.as_file().set_len(0x1000).unwrap();
             // SAFETY: `dup2` rewrites this child's own descriptor table alone.

@@ -38,7 +38,7 @@ pub fn default_block(file_engine_type: FileEngineType) -> VirtioBlock {
 }
 
 /// Create a read-only Block instance backed by an inherited descriptor, to be used in tests. The
-/// sealed root image backs the root device, the sealed bootstrap image does not.
+/// root image backs the root device, the bootstrap image does not.
 pub fn default_block_with_descriptor(
     fd: RawFd,
     is_root_device: bool,

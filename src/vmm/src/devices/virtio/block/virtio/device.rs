@@ -174,7 +174,7 @@ pub struct VirtioBlockConfig {
     /// If set to true, the drive is opened in read-only mode. Otherwise, the
     /// drive is opened as read-write.
     pub is_read_only: bool,
-    /// Descriptor the sealed read-only image backing this drive was inherited at.
+    /// Descriptor the read-only image backing this drive was inherited at.
     pub fd: RawFd,
     /// Rate Limiter for I/O operations.
     pub rate_limiter: Option<RateLimiterConfig>,
@@ -676,8 +676,8 @@ mod tests {
 
     #[test]
     fn test_from_config() {
-        // The conversion resolves the descriptor, so a number the jailer never inherits a sealed
-        // image at cannot reach a device.
+        // The conversion resolves the descriptor, so a number the jailer never reserves for an
+        // inherited image cannot reach a device.
         let unreserved = BlockDeviceConfig {
             drive_id: "root".to_string(),
             is_root_device: true,
@@ -746,7 +746,7 @@ mod tests {
         f.as_file().set_len(0x1000).unwrap();
         f.as_file().write_all(&[0x11; 0x1000]).unwrap();
 
-        // The root image and the bootstrap image are both sealed read-only.
+        // The root image and the bootstrap image are both read-only.
         for (engine, is_root_device) in [
             (FileEngineType::Sync, true),
             (FileEngineType::Sync, false),

@@ -730,7 +730,7 @@ class Microvm:
         It handles:
         - CPU and memory.
         - Kernel image (will load the one in the microVM allocated path).
-        - Root File System (the sealed descriptor the jailer handed over).
+        - Root File System (the read-only descriptor the jailer handed over).
         - Does not start the microvm.
 
         The function checks the response status code and asserts that
@@ -777,8 +777,8 @@ class Microvm:
         self.api.boot.put(**boot_source_args)
 
         if add_root_device:
-            # The root image is the sealed memfd the jailer placed at
-            # `ROOT_FILENO`, which Firecracker only accepts read-only.
+            # The jailer placed the root image descriptor at `ROOT_FILENO`,
+            # which Firecracker only accepts read-only.
             self.api.drive.put(
                 drive_id="rootfs",
                 fd=ROOT_FILENO,

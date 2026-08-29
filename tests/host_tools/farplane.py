@@ -5,8 +5,8 @@
 
 `Pagemaster` owns the SEQPACKET socket Firecracker connects to, hands over the sealed backing
 memfds and the canonical extent table, serves userfaultfd events for the guest mappings and drives
-the capture cycle. `FarplaneMicrovm` launches the jailer with the inherited root memfd so tests can
-talk to a real Firecracker over that channel.
+the capture cycle. `FarplaneMicrovm` launches the jailer with an inherited root image descriptor so
+tests can talk to a real Firecracker over that channel.
 """
 
 # pylint: disable=too-many-lines
