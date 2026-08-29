@@ -21,9 +21,9 @@ const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Descriptor Firecracker creates its userfaultfd from.
 pub(crate) const UFFD_FILENO: libc::c_int = 3;
-/// Descriptor Firecracker reads the sealed root block device image from.
+/// Descriptor Firecracker reads the read-only root block device image from.
 pub(crate) const ROOT_FILENO: libc::c_int = 4;
-/// Descriptor Firecracker reads the sealed bootstrap block device image from, when the caller
+/// Descriptor Firecracker reads the read-only bootstrap block device image from, when the caller
 /// passes one.
 pub(crate) const BOOTSTRAP_FILENO: libc::c_int = 5;
 
@@ -105,12 +105,22 @@ pub enum JailerError {
     ImageFdEmpty(&'static str),
     #[error("Failed to inspect {0}: {1}")]
     ImageFdInspect(&'static str, io::Error),
-    #[error("{0} is not a memfd")]
-    ImageFdNotMemfd(&'static str),
     #[error("{0} must be opened O_RDONLY")]
     ImageFdNotReadOnly(&'static str),
+    #[error("{0} must be a regular file")]
+    ImageFdNotRegularFile(&'static str),
     #[error("{0} is missing the write, grow, shrink or seal memfd seal")]
     ImageFdNotSealed(&'static str),
+    #[error("{0} must not be owned by the jailed uid")]
+    ImageFdOwnedByJailUid(&'static str),
+    #[error("{0} must be a sealed memfd because --uid is 0")]
+    ImageFdRegularFileAtRootUid(&'static str),
+    #[error("{0} answers F_GET_SEALS but does not live on shmem or hugetlbfs")]
+    ImageFdSealedNotShmem(&'static str),
+    #[error("{0} must not have the setuid, setgid or sticky bit set")]
+    ImageFdSpecialModeBits(&'static str),
+    #[error("{0} must not have any write permission bit set")]
+    ImageFdWritablePermissions(&'static str),
     #[error("Failed to change current directory: {0}")]
     SetCurrentDir(io::Error),
     #[error("Failed to join network namespace: netns: {0}")]
@@ -162,13 +172,15 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .required(true)
                 .takes_value(true)
                 .help(
-                    "Inherited descriptor of the sealed read-only root block device image. It is \
-                     validated and handed to Firecracker as fd 4.",
+                    "Inherited read-only descriptor of the root block device image, either a \
+                     sealed memfd or a regular file the jailed uid cannot write. It is validated \
+                     and handed to Firecracker as fd 4.",
                 ),
         )
         .arg(Argument::new("bootstrap-fd").takes_value(true).help(
-            "Inherited descriptor of the sealed read-only bootstrap block device image. \
-                     It is validated and handed to Firecracker as fd 5.",
+            "Inherited read-only descriptor of the bootstrap block device image, either a sealed \
+             memfd or a regular file the jailed uid cannot write. It is validated and handed to \
+             Firecracker as fd 5.",
         ))
         .arg(
             Argument::new("chroot-base-dir")

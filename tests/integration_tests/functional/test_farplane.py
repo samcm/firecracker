@@ -3,6 +3,8 @@
 
 """Tests for guest memory served over the farplane pagemaster channel."""
 
+# pylint: disable=too-many-lines
+
 import hashlib
 import json
 import os
@@ -339,7 +341,9 @@ def test_a_repeated_capture_command_replays_its_answer(farplane_factory):
     assert first_write.error is None
     repeat_write = pagemaster.write_vmstate()
     assert repeat_write.error is None
-    assert repeat_write.body == first_write.body, "the repeat reported a different length"
+    assert (
+        repeat_write.body == first_write.body
+    ), "the repeat reported a different length"
     (length,) = struct.unpack("<Q", first_write.body)
     vmstate = pagemaster.vmstate(length)
 
@@ -352,7 +356,9 @@ def test_a_repeated_capture_command_replays_its_answer(farplane_factory):
     assert bytes(replayed.data) == bytes(
         harvested.data
     ), "the repeated harvest overwrote the bitmap the first one produced"
-    assert pagemaster.vmstate(length) == vmstate, "the vmstate buffer changed under a repeat"
+    assert (
+        pagemaster.vmstate(length) == vmstate
+    ), "the vmstate buffer changed under a repeat"
 
     # A union puts the bits back in the accumulator, so the next harvest runs again rather
     # than replaying what the armed bitmap already holds.
@@ -698,6 +704,73 @@ def test_parent_death_kills_firecracker(farplane_factory):
     )
 
 
+def require_regular_image_filesystem(vm):
+    """Skip when the session directory seals its inodes.
+
+    A file there answers `F_GET_SEALS`, so the jailer holds it to the sealed-memfd arm of the
+    image descriptor contract and the regular-file arm is unreachable.
+    """
+    if fp.seals_files(vm.chroot_base):
+        pytest.skip(
+            f"{vm.chroot_base} seals its inodes, so a regular image is never accepted"
+        )
+
+
+def test_root_drive_is_served_from_a_shared_read_only_regular_file(farplane_factory):
+    """One published image file backs several microVMs, with no per-jail copy of it."""
+    first = farplane_factory("shared-image-a")
+    require_regular_image_filesystem(first)
+    second = farplane_factory("shared-image-b")
+
+    first.open_root_image_file()
+    second.open_root_image_file()
+    assert (
+        second.root_image_path == first.root_image_path
+    ), "the image was published once per microVM"
+
+    published = os.stat(first.root_image_path)
+    assert not published.st_mode & 0o222, "the published image is writable"
+    assert (
+        published.st_uid != first.uid
+    ), "the published image is owned by the jailed uid"
+
+    pagemaster = boot(first)
+    boot(second)
+
+    # Both jails hold the published inode itself, so one page cache serves both guests instead of
+    # one copy per microVM.
+    identity = (published.st_dev, published.st_ino)
+    for vm in (first, second):
+        jailed = os.stat(f"/proc/{vm.pid}/fd/{fp.ROOT_FILENO}")
+        assert (
+            jailed.st_dev,
+            jailed.st_ino,
+        ) == identity, f"{vm.microvm_id} holds another inode"
+
+    # The inherited descriptor is the only path to those bytes: nothing image-sized was staged
+    # inside either jail.
+    for vm in (first, second):
+        staged = [
+            path
+            for path in vm.chroot.rglob("*")
+            if path.is_file() and path.stat().st_size >= published.st_size
+        ]
+        assert not staged, f"an image was staged in {vm.chroot}: {staged}"
+
+    # The guest read the image over virtio, so its bytes are in guest memory.
+    pagemaster.capture_buffers()
+    pagemaster.quiesce()
+    pagemaster.write_vmstate()
+    pagemaster.dirty_snapshot()
+    with open(first.root_image_path, "rb") as image:
+        signature = image.read(64)
+    assert any(
+        pagemaster.read_guest(page, 64) == signature
+        for page in pagemaster.harvest().set_pages()
+    ), "the guest never read the published root image"
+    pagemaster.resume(run_vcpus=1)
+
+
 def test_root_drive_is_served_from_the_sealed_memfd(farplane_factory):
     """The root device comes from fd 4, which no one can write."""
     vm = farplane_factory()
@@ -818,32 +891,63 @@ def test_api_refuses_bootstrap_fd_without_the_bootstrap_memfd(farplane_factory):
     "descriptor,flaw,expected",
     [
         ("root", "writable", "--root-fd must be opened O_RDONLY"),
-        ("root", "unsealed", "--root-fd is missing required memfd seals"),
-        ("root", "empty", "--root-fd size must be nonzero"),
-        ("root", "not_a_memfd", "--root-fd is not a memfd"),
+        (
+            "root",
+            "unsealed",
+            "--root-fd is missing the write, grow, shrink or seal memfd seal",
+        ),
+        ("root", "empty", "--root-fd must have a nonzero size"),
+        ("root", "not_regular", "--root-fd must be a regular file"),
         ("bootstrap", "writable", "--bootstrap-fd must be opened O_RDONLY"),
         (
             "bootstrap",
             "unsealed",
-            "--bootstrap-fd is missing required memfd seals",
+            "--bootstrap-fd is missing the write, grow, shrink or seal memfd seal",
         ),
-        ("bootstrap", "empty", "--bootstrap-fd size must be nonzero"),
-        ("bootstrap", "not_a_memfd", "--bootstrap-fd is not a memfd"),
+        ("bootstrap", "empty", "--bootstrap-fd must have a nonzero size"),
+        ("bootstrap", "not_regular", "--bootstrap-fd must be a regular file"),
+        (
+            "root",
+            "regular_writable_mode",
+            "--root-fd must not have any write permission bit set",
+        ),
+        (
+            "root",
+            "regular_jail_owned",
+            "--root-fd must not be owned by the jailed uid",
+        ),
+        ("root", "regular_o_path", "--root-fd must be opened O_RDONLY"),
+        (
+            "bootstrap",
+            "regular_writable_mode",
+            "--bootstrap-fd must not have any write permission bit set",
+        ),
     ],
 )
 def test_jailer_refuses_a_bad_block_fd(farplane_factory, descriptor, flaw, expected):
     """Every root and bootstrap descriptor precondition is enforced before the jail is built."""
     vm = farplane_factory(f"{descriptor}fd-{flaw}")
     open_memfd = vm.open_root_memfd if descriptor == "root" else vm.open_bootstrap_memfd
-    if flaw == "writable":
+    if flaw.startswith("regular_"):
+        flaws = {
+            "regular_writable_mode": {"mode": 0o644},
+            "regular_jail_owned": {"owner": vm.uid},
+            "regular_o_path": {"open_flags": os.O_PATH},
+        }
+        if flaw != "regular_o_path":
+            # Mode and ownership are the regular-file arm of the contract, which is only reached
+            # off a sealing filesystem. The access mode is checked before either arm.
+            require_regular_image_filesystem(vm)
+        block_fd = vm.open_private_image_file(descriptor, **flaws[flaw])
+    elif flaw == "writable":
         block_fd = open_memfd(size=PAGE, read_only=False)
     elif flaw == "unsealed":
         block_fd = open_memfd(size=PAGE, seals=fp.F_SEAL_GROW)
     elif flaw == "empty":
         block_fd = open_memfd(size=0)
     else:
-        # A directory is never a shmem file, so F_GET_SEALS fails whatever the host filesystem
-        # under the jail happens to be.
+        # A directory is never a regular file, whatever the host filesystem under the jail
+        # happens to be.
         vm.chroot_base.mkdir(parents=True, exist_ok=True)
         block_fd = os.open(vm.chroot_base, os.O_RDONLY | os.O_DIRECTORY)
         if descriptor == "root":

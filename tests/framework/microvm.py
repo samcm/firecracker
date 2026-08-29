@@ -560,9 +560,10 @@ class Microvm:
     ):
         """Spawn the microVM.
 
-        The root image and optional bootstrap image reach Firecracker as sealed
-        memfds the jailer renumbers to `ROOT_FILENO` and fd 5, and guest memory
-        is served over the memory channel a `Pagemaster` binds inside the jail.
+        The root image and optional bootstrap image reach Firecracker as
+        read-only descriptors the jailer renumbers to `ROOT_FILENO` and fd 5,
+        and guest memory is served over the memory channel a `Pagemaster` binds
+        inside the jail.
         """
         # pylint: disable=too-many-branches
         self.jailer.setup()

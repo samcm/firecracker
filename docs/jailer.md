@@ -38,11 +38,12 @@ jailer --id <id> \
   The default is `/srv/jailer`.
 - `--netns` specifies the path to a network namespace handle. If present, the
   jailer will use this to join the associated network namespace.
-- `--root-fd` is required and identifies the inherited sealed read-only root
-  memfd. The jailer renumbers it to file descriptor 4.
-- `--bootstrap-fd` is optional and identifies an inherited sealed read-only
-  bootstrap memfd. The jailer renumbers it to file descriptor 5; when absent,
-  file descriptor 5 is not reserved.
+- `--root-fd` is required and identifies the inherited read-only root block
+  device image descriptor. The jailer validates it against the image descriptor
+  contract below and renumbers it to file descriptor 4.
+- `--bootstrap-fd` is optional and identifies an inherited read-only bootstrap
+  block device image descriptor, held to the same contract. The jailer renumbers
+  it to file descriptor 5; when absent, file descriptor 5 is not reserved.
 - `--cgroup-join` identifies an absolute cgroupfs path for a pre-created leaf
   cgroup. The jailer joins that cgroup and does not create cgroups.
 - For extra security and control over resource usage, `--resource-limit` can be
@@ -62,6 +63,59 @@ jailer --id <id> \
   the resources referenced within must be valid relative to a jailed
   Firecracker). Please note the jailer already passes `--id` parameter to the
   Firecracker process.
+
+## Image Descriptor Contract
+
+`--root-fd` and `--bootstrap-fd` name inherited descriptors of block device
+images. The jailer validates each one before it builds the jail, and rejects the
+launch if any check fails. It never reads the image.
+
+Every image descriptor must satisfy all of the following:
+
+- It is open for reading with an access mode of `O_RDONLY`, and it is not an
+  `O_PATH` descriptor.
+- `fstat` reports a regular file.
+- Its size is nonzero.
+
+Two kinds of descriptor then satisfy the immutability half of the contract. The
+jailer tells them apart by whether the inode answers `F_GET_SEALS`.
+
+A **sealed memfd** must carry all of `F_SEAL_WRITE`, `F_SEAL_GROW`,
+`F_SEAL_SHRINK` and `F_SEAL_SEAL`, and must live on the internal shmem mount or
+on hugetlbfs. Additional seals are accepted, because a seal only ever removes an
+ability and a kernel with `vm.memfd_noexec` enabled adds `F_SEAL_EXEC` on its
+own. Such an image is immutable in the kernel: the bytes cannot change for any
+holder of any descriptor to the inode, so no process has to be trusted.
+
+An **ordinary regular file**, which is what `F_GET_SEALS` failing with `EINVAL`
+identifies, must satisfy:
+
+- The `--uid` the jailer switches to is not 0. A jail that keeps uid 0 keeps
+  `CAP_DAC_OVERRIDE` and `CAP_FOWNER`, which override every permission bit and
+  every ownership check below, so this arm proves nothing there. A root jail
+  must be given a sealed memfd instead.
+- No write permission bit is set, for owner, group or other.
+- No setuid, setgid or sticky bit is set.
+- `st_uid` is not the `--uid` the jailer switches to, because owning an inode
+  carries the right to `chmod` it writable after the check.
+
+The image must not live on tmpfs or hugetlbfs. Every shmem inode answers
+`F_GET_SEALS`, whether or not it came from `memfd_create`, and an unsealed one
+reports `F_SEAL_SEAL` alone. Such a file therefore takes the sealed memfd arm
+above and is rejected for the seals it does not carry. Publish a regular image
+on an ordinary disk filesystem, or seal it into a memfd.
+
+This arm exists so a supervisor can keep one content-addressed image per node
+and hand the same inode to every microVM, sharing its page cache residency
+instead of copying it per jail.
+
+A regular file is not seal-equivalent, and the jailer does not claim it is. The
+kernel offers no guarantee that a regular file's bytes are stable, so byte
+stability remains the responsibility of the node or cache owner that published
+the image and holds write access to it. What the jailer proves is the part it
+owns: the confined process cannot obtain write access to the inode, neither
+through the inherited descriptor, nor by `chmod`-ing a file it owns, nor through
+a setuid or setgid transition.
 
 ## Jailer Operation
 
@@ -90,7 +144,8 @@ After starting, the Jailer goes through the following operations:
 - Use `mknod` to create a `/dev/kvm` equivalent inside the jail.
 - Open `/dev/userfaultfd` before dropping privileges and renumber its descriptor
   to file descriptor 3.
-- Renumber the inherited sealed read-only root memfd to file descriptor 4.
+- Validate the inherited root image descriptor against the image descriptor
+  contract and renumber it to file descriptor 4.
 - Use `chown` to change ownership of the `<chroot_dir>` (root path `/` as seen
   by the jailed firecracker), `/dev/net/tun`, and `/dev/kvm`. The ownership is
   changed to the provided `<uid>:<gid>`.
@@ -157,8 +212,8 @@ privileges. This is required to use multiple TAP interfaces when running jailed.
 Do the same for `/dev/kvm`.
 
 The jailer opens `/dev/userfaultfd` before dropping privileges and retains it as
-file descriptor 3. It renumbers the inherited sealed read-only root memfd to
-file descriptor 4.
+file descriptor 3. It validates the inherited root image descriptor and
+renumbers it to file descriptor 4.
 
 Change ownership of `<chroot_dir>` to `<uid>:<gid>` so that Firecracker can
 create its API socket there.

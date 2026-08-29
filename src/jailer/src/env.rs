@@ -43,8 +43,13 @@ const PID_FILE_EXTENSION: &str = ".pid";
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 /// Filesystem magic of hugetlbfs, where a memfd created with `MFD_HUGETLB` lives.
 const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
-const REQUIRED_ROOT_SEALS: libc::c_int =
+const REQUIRED_IMAGE_SEALS: libc::c_int =
     libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+/// Permission bits that grant write access to an image, none of which a regular one may carry.
+const IMAGE_WRITE_MODE_BITS: libc::mode_t = libc::S_IWUSR | libc::S_IWGRP | libc::S_IWOTH;
+/// Bits that change the meaning of an inode beyond its permissions. A block device image is
+/// neither a program to gain privileges from nor a directory, so all three are refused.
+const IMAGE_SPECIAL_MODE_BITS: libc::mode_t = libc::S_ISUID | libc::S_ISGID | libc::S_ISVTX;
 
 fn dup2(old_fd: RawFd, new_fd: RawFd) -> Result<(), JailerError> {
     // SAFETY: both arguments are descriptor numbers and the return code is checked.
@@ -390,19 +395,19 @@ impl Env {
         fs::write(&procs, id().to_string()).map_err(|err| JailerError::CgroupJoin(procs, err))
     }
 
-    /// Hands Firecracker the userfaultfd device as [`UFFD_FILENO`], the sealed root image as
-    /// [`ROOT_FILENO`] and, when the caller passes one, the sealed bootstrap image as
+    /// Hands Firecracker the userfaultfd device as [`UFFD_FILENO`], the root image as
+    /// [`ROOT_FILENO`] and, when the caller passes one, the bootstrap image as
     /// [`BOOTSTRAP_FILENO`]. Every passed descriptor is moved clear of the reserved slots first,
     /// because the caller is free to pass them in at any number.
     fn install_inherited_fds(&self) -> Result<(), JailerError> {
         let uffd_device = open_userfaultfd_device()?;
 
-        validate_image_fd("--root-fd", self.root_fd)?;
+        validate_image_fd("--root-fd", self.root_fd, self.uid())?;
         let root_fd = move_off_reserved_fds(self.root_fd)?;
 
         let bootstrap_fd = match self.bootstrap_fd {
             Some(fd) => {
-                validate_image_fd("--bootstrap-fd", fd)?;
+                validate_image_fd("--bootstrap-fd", fd, self.uid())?;
                 Some(move_off_reserved_fds(fd)?)
             }
             None => None,
@@ -556,14 +561,29 @@ impl Env {
     }
 }
 
-/// Checks that `fd` is a descriptor the sandbox is contracted to pass: a sealed, read-only,
-/// non-empty memfd holding a block device image. The image itself is never read here.
-fn validate_image_fd(flag: &'static str, fd: RawFd) -> Result<(), JailerError> {
+/// Checks that `fd` is a descriptor the supervisor is contracted to pass: a readable, read-only,
+/// non-empty regular file holding a block device image whose bytes the jail cannot change. The
+/// image itself is never read here.
+///
+/// Two kinds of descriptor satisfy that contract, told apart by whether the inode answers
+/// `F_GET_SEALS`:
+///
+/// * A sealed memfd proves immutability in the kernel. The seals hold for every descriptor to the
+///   inode, so no process changes the bytes, and no process needs to be trusted not to.
+/// * A regular file cannot prove that much. Byte stability of a regular image is the
+///   responsibility of the node or cache owner that published it, and that responsibility is not
+///   transferred to the jailer by any check below. What the jailer does prove is the part it owns:
+///   the confined process cannot obtain write access to the inode, neither through the inherited
+///   descriptor, nor by chmod'ing a file it owns, nor through a setuid or setgid transition. None
+///   of that holds for a jail that keeps uid 0, which is why that jail is refused this arm.
+fn validate_image_fd(flag: &'static str, fd: RawFd, jail_uid: u32) -> Result<(), JailerError> {
     // SAFETY: `F_GETFL` writes nothing and the return code is checked.
     let flags = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GETFL) })
         .into_result()
         .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
-    if flags & libc::O_ACCMODE != libc::O_RDONLY {
+    // An `O_PATH` descriptor reports an access mode of `O_RDONLY` while referring to the inode
+    // without granting any read at all, so it is rejected explicitly.
+    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
         return Err(JailerError::ImageFdNotReadOnly(flag));
     }
 
@@ -575,28 +595,44 @@ fn validate_image_fd(flag: &'static str, fd: RawFd) -> Result<(), JailerError> {
     // SAFETY: `fstat` returned success, so it initialized the whole struct.
     let stat = unsafe { stat.assume_init() };
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(JailerError::ImageFdNotMemfd(flag));
+        return Err(JailerError::ImageFdNotRegularFile(flag));
     }
     if stat.st_size == 0 {
         return Err(JailerError::ImageFdEmpty(flag));
     }
 
-    // Only shmem and hugetlbfs descriptors answer `F_GET_SEALS`; anything else fails with EINVAL.
+    // Every shmem and hugetlbfs inode answers `F_GET_SEALS`, memfd or not, and every other
+    // filesystem fails it with EINVAL. That is what selects the arm: an image on tmpfs or
+    // hugetlbfs is held to the sealed memfd contract even when it was created as an ordinary
+    // file, so a plain tmpfs file is refused for the seals it does not carry.
     // SAFETY: `F_GET_SEALS` writes nothing and the return code is checked.
-    let seals = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GET_SEALS) })
-        .into_result()
-        .map_err(|err| match err.raw_os_error() {
-            Some(libc::EINVAL) => JailerError::ImageFdNotMemfd(flag),
-            _ => JailerError::ImageFdInspect(flag, err),
-        })?;
+    match SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GET_SEALS) }).into_result() {
+        Ok(seals) => validate_sealed_image(flag, fd, seals),
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+            validate_unwritable_image(flag, &stat, jail_uid)
+        }
+        Err(err) => Err(JailerError::ImageFdInspect(flag, err)),
+    }
+}
+
+/// Holds an image on a sealing filesystem to the memfd contract: the seals that make the bytes
+/// unchangeable for every holder of the inode, plus the identity of the two filesystems a memfd
+/// can live on.
+fn validate_sealed_image(
+    flag: &'static str,
+    fd: RawFd,
+    seals: libc::c_int,
+) -> Result<(), JailerError> {
     // Seals only ever remove abilities, and a kernel with vm.memfd_noexec enabled adds
     // F_SEAL_EXEC by itself, so anything beyond the required set is accepted.
-    if seals & REQUIRED_ROOT_SEALS != REQUIRED_ROOT_SEALS {
+    if seals & REQUIRED_IMAGE_SEALS != REQUIRED_IMAGE_SEALS {
         return Err(JailerError::ImageFdNotSealed(flag));
     }
 
     // A memfd lives on the internal shmem mount or on hugetlbfs and nowhere else. Together with
     // the seals above this proves identity without procfs, which no jail is required to have.
+    // Anything else that answers `F_GET_SEALS`, such as a file on a mounted tmpfs, reaches here
+    // and is refused unless it carries the same seals.
     let mut fs_stat = MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: `fs_stat` is a valid, aligned, sufficiently sized allocation for a `libc::statfs`.
     SyscallReturnCode(unsafe { libc::fstatfs(fd, fs_stat.as_mut_ptr()) })
@@ -608,7 +644,36 @@ fn validate_image_fd(flag: &'static str, fd: RawFd) -> Result<(), JailerError> {
     // widened to a type that holds either representation exactly.
     let magic = i128::from(fs_stat.f_type);
     if magic != i128::from(TMPFS_MAGIC) && magic != i128::from(HUGETLBFS_MAGIC) {
-        return Err(JailerError::ImageFdNotMemfd(flag));
+        return Err(JailerError::ImageFdSealedNotShmem(flag));
+    }
+
+    Ok(())
+}
+
+/// Holds an ordinary regular image to the property the jailer can enforce on it: the jailed uid
+/// has no path to write access. That property only exists below root. A jail that keeps uid 0
+/// keeps `CAP_DAC_OVERRIDE` and `CAP_FOWNER`, which defeat both the permission bits and the
+/// ownership of the inode, so uid 0 is held to the sealed memfd arm instead. Below root, write
+/// permission for anyone is refused outright rather than reasoned about, the setuid, setgid and
+/// sticky bits are refused because an image is not a program and not a directory, and an image
+/// the jail owns is refused because ownership carries the right to chmod it writable after this
+/// check.
+fn validate_unwritable_image(
+    flag: &'static str,
+    stat: &libc::stat,
+    jail_uid: u32,
+) -> Result<(), JailerError> {
+    if jail_uid == 0 {
+        return Err(JailerError::ImageFdRegularFileAtRootUid(flag));
+    }
+    if stat.st_mode & IMAGE_WRITE_MODE_BITS != 0 {
+        return Err(JailerError::ImageFdWritablePermissions(flag));
+    }
+    if stat.st_mode & IMAGE_SPECIAL_MODE_BITS != 0 {
+        return Err(JailerError::ImageFdSpecialModeBits(flag));
+    }
+    if stat.st_uid == jail_uid {
+        return Err(JailerError::ImageFdOwnedByJailUid(flag));
     }
 
     Ok(())
@@ -738,17 +803,115 @@ mod tests {
         ));
     }
 
+    /// A jail uid that is never the uid the test process runs as, so an image the test creates is
+    /// owned by someone other than the jail, and never root, which the regular arm refuses.
+    fn other_uid() -> u32 {
+        match own_uid() {
+            0 => 1,
+            uid => uid.wrapping_add(1),
+        }
+    }
+
+    fn own_uid() -> u32 {
+        unsafe { libc::getuid() }
+    }
+
+    /// The uid an image is given to when the ownership check is under test. It is the uid the test
+    /// runs as, unless that is root, which is refused before ownership is ever looked at.
+    fn jail_owner_uid() -> u32 {
+        match own_uid() {
+            0 => NOBODY_UID,
+            uid => uid,
+        }
+    }
+
+    const NOBODY_UID: u32 = 65534;
+
+    /// Whether an inode created in `dir` answers `F_GET_SEALS`, which is what decides the arm of
+    /// the contract an image there is held to.
+    fn seals_inodes(dir: &Path) -> bool {
+        let cstr = CString::new(dir.to_str().unwrap()).unwrap();
+        let mut fs_stat = MaybeUninit::<libc::statfs>::uninit();
+        assert_eq!(
+            unsafe { libc::statfs(cstr.as_ptr(), fs_stat.as_mut_ptr()) },
+            0,
+            "statfs {}: {}",
+            dir.display(),
+            io::Error::last_os_error()
+        );
+        let magic = i128::from(unsafe { fs_stat.assume_init() }.f_type);
+        magic == i128::from(TMPFS_MAGIC) || magic == i128::from(HUGETLBFS_MAGIC)
+    }
+
+    /// Directory the regular test images are created in. Every shmem inode answers `F_GET_SEALS`,
+    /// so a file on tmpfs is held to the sealed memfd arm and can never exercise the regular one.
+    /// `/tmp` is tmpfs on most hosts, so the image goes next to the test binary in the build tree,
+    /// falling back to the source tree for a build tree that is itself tmpfs.
+    fn regular_image_dir() -> PathBuf {
+        let build_tree = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        let source_tree = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        [build_tree, source_tree]
+            .into_iter()
+            .find(|dir| !seals_inodes(dir))
+            .expect("every candidate directory seals its inodes, so no regular image can be built")
+    }
+
+    /// Creates a regular file holding `size` bytes with `mode` as its final permissions, and
+    /// returns an `O_RDONLY` descriptor to it. The file is owned by the uid the test runs as.
+    fn regular_image(mode: u32, size: u64) -> RawFd {
+        regular_image_opened(mode, size, libc::O_RDONLY, None)
+    }
+
+    /// Creates a regular image belonging to `owner`. Only a test running as root can give an image
+    /// away, which is the only case where the uid the test runs as will not do.
+    fn regular_image_owned_by(owner: u32, mode: u32, size: u64) -> RawFd {
+        regular_image_opened(mode, size, libc::O_RDONLY, Some(owner))
+    }
+
+    fn regular_image_opened(
+        mode: u32,
+        size: u64,
+        open_flags: libc::c_int,
+        owner: Option<u32>,
+    ) -> RawFd {
+        let path = regular_image_dir().join(format!(
+            "jailer-image-{}",
+            vmm_sys_util::rand::rand_alphanumerics(8)
+                .into_string()
+                .unwrap()
+        ));
+        let file = File::create(&path).unwrap();
+        file.set_len(size).unwrap();
+        if let Some(owner) = owner {
+            fchown(&file, Some(owner), None).unwrap();
+        }
+        drop(file);
+        // Permissions are set last: `File::create` obeys the umask, and a mode without a write
+        // bit would stop the size from being set.
+        fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+
+        let cstr = CString::new(path.to_str().unwrap()).unwrap();
+        let fd = unsafe { libc::open(cstr.as_ptr(), open_flags | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "{}", io::Error::last_os_error());
+        fs::remove_file(&path).unwrap();
+        fd
+    }
+
     /// The bootstrap image is held to the same contract as the root image, reported under its own
     /// flag name so a caller can tell which descriptor it got wrong.
     #[test]
     fn test_validate_bootstrap_fd_holds_the_root_contract() {
-        let sealed = memfd(4096, REQUIRED_ROOT_SEALS);
+        let sealed = memfd(4096, REQUIRED_IMAGE_SEALS);
         let read_only = reopen_read_only(sealed);
-        validate_image_fd("--bootstrap-fd", read_only).unwrap();
+        validate_image_fd("--bootstrap-fd", read_only, other_uid()).unwrap();
         close(read_only).unwrap();
 
         assert!(matches!(
-            validate_image_fd("--bootstrap-fd", sealed),
+            validate_image_fd("--bootstrap-fd", sealed, other_uid()),
             Err(JailerError::ImageFdNotReadOnly("--bootstrap-fd"))
         ));
         close(sealed).unwrap();
@@ -756,16 +919,16 @@ mod tests {
         let unsealed = memfd(4096, libc::F_SEAL_WRITE);
         let read_only = reopen_read_only(unsealed);
         assert!(matches!(
-            validate_image_fd("--bootstrap-fd", read_only),
+            validate_image_fd("--bootstrap-fd", read_only, other_uid()),
             Err(JailerError::ImageFdNotSealed("--bootstrap-fd"))
         ));
         close(read_only).unwrap();
         close(unsealed).unwrap();
 
-        let empty = memfd(0, REQUIRED_ROOT_SEALS);
+        let empty = memfd(0, REQUIRED_IMAGE_SEALS);
         let read_only = reopen_read_only(empty);
         assert!(matches!(
-            validate_image_fd("--bootstrap-fd", read_only),
+            validate_image_fd("--bootstrap-fd", read_only, other_uid()),
             Err(JailerError::ImageFdEmpty("--bootstrap-fd"))
         ));
         close(read_only).unwrap();
@@ -774,19 +937,28 @@ mod tests {
         let mut pipe = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         assert!(matches!(
-            validate_image_fd("--bootstrap-fd", pipe[0]),
-            Err(JailerError::ImageFdNotMemfd("--bootstrap-fd"))
+            validate_image_fd("--bootstrap-fd", pipe[0], other_uid()),
+            Err(JailerError::ImageFdNotRegularFile("--bootstrap-fd"))
         ));
         close(pipe[0]).unwrap();
         close(pipe[1]).unwrap();
+
+        let owner = jail_owner_uid();
+        let regular = regular_image_owned_by(owner, 0o400, 4096);
+        validate_image_fd("--bootstrap-fd", regular, other_uid()).unwrap();
+        assert!(matches!(
+            validate_image_fd("--bootstrap-fd", regular, owner),
+            Err(JailerError::ImageFdOwnedByJailUid("--bootstrap-fd"))
+        ));
+        close(regular).unwrap();
     }
 
     #[test]
     fn test_validate_root_fd_accepts_sealed_read_only_memfd() {
-        let fd = memfd(4096, REQUIRED_ROOT_SEALS);
+        let fd = memfd(4096, REQUIRED_IMAGE_SEALS);
         let read_only = reopen_read_only(fd);
 
-        validate_image_fd("--root-fd", read_only).unwrap();
+        validate_image_fd("--root-fd", read_only, other_uid()).unwrap();
 
         close(fd).unwrap();
         close(read_only).unwrap();
@@ -794,10 +966,10 @@ mod tests {
 
     #[test]
     fn test_validate_root_fd_rejects_writable_memfd() {
-        let fd = memfd(4096, REQUIRED_ROOT_SEALS);
+        let fd = memfd(4096, REQUIRED_IMAGE_SEALS);
 
         assert!(matches!(
-            validate_image_fd("--root-fd", fd),
+            validate_image_fd("--root-fd", fd, other_uid()),
             Err(JailerError::ImageFdNotReadOnly("--root-fd"))
         ));
 
@@ -810,7 +982,7 @@ mod tests {
         let read_only = reopen_read_only(fd);
 
         assert!(matches!(
-            validate_image_fd("--root-fd", read_only),
+            validate_image_fd("--root-fd", read_only, other_uid()),
             Err(JailerError::ImageFdNotSealed("--root-fd"))
         ));
 
@@ -820,11 +992,11 @@ mod tests {
 
     #[test]
     fn test_validate_root_fd_rejects_empty_memfd() {
-        let fd = memfd(0, REQUIRED_ROOT_SEALS);
+        let fd = memfd(0, REQUIRED_IMAGE_SEALS);
         let read_only = reopen_read_only(fd);
 
         assert!(matches!(
-            validate_image_fd("--root-fd", read_only),
+            validate_image_fd("--root-fd", read_only, other_uid()),
             Err(JailerError::ImageFdEmpty("--root-fd"))
         ));
 
@@ -833,16 +1005,142 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_root_fd_rejects_non_memfd() {
+    fn test_validate_root_fd_rejects_non_regular_fd() {
         let mut pipe = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
 
         assert!(matches!(
-            validate_image_fd("--root-fd", pipe[0]),
-            Err(JailerError::ImageFdNotMemfd("--root-fd"))
+            validate_image_fd("--root-fd", pipe[0], other_uid()),
+            Err(JailerError::ImageFdNotRegularFile("--root-fd"))
         ));
 
         close(pipe[0]).unwrap();
         close(pipe[1]).unwrap();
+    }
+
+    /// A content-addressed image shared by every microVM on the node is an ordinary read-only
+    /// regular file, not a memfd, and no per-jail copy of it is made.
+    #[test]
+    fn test_validate_root_fd_accepts_read_only_regular_file() {
+        let fd = regular_image(0o400, 4096);
+
+        validate_image_fd("--root-fd", fd, other_uid()).unwrap();
+
+        close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_validate_root_fd_rejects_empty_regular_file() {
+        let fd = regular_image(0o400, 0);
+
+        assert!(matches!(
+            validate_image_fd("--root-fd", fd, other_uid()),
+            Err(JailerError::ImageFdEmpty("--root-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_validate_root_fd_rejects_writable_regular_fd() {
+        let fd = regular_image_opened(0o600, 4096, libc::O_RDWR, None);
+
+        assert!(matches!(
+            validate_image_fd("--root-fd", fd, other_uid()),
+            Err(JailerError::ImageFdNotReadOnly("--root-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    /// An `O_PATH` descriptor reports an access mode of `O_RDONLY` without granting a read, so the
+    /// access mode alone must not decide the question.
+    #[test]
+    fn test_validate_root_fd_rejects_o_path_fd() {
+        let fd = regular_image_opened(0o400, 4096, libc::O_PATH, None);
+
+        assert!(matches!(
+            validate_image_fd("--root-fd", fd, other_uid()),
+            Err(JailerError::ImageFdNotReadOnly("--root-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    /// A write bit means some uid can change the bytes under the running guest. Which uid it is
+    /// does not matter, because the jail is never the arbiter of who that uid is.
+    #[test]
+    fn test_validate_root_fd_rejects_regular_file_write_mode_bits() {
+        for mode in [0o600, 0o460, 0o406] {
+            let fd = regular_image(mode, 4096);
+
+            assert!(
+                matches!(
+                    validate_image_fd("--root-fd", fd, other_uid()),
+                    Err(JailerError::ImageFdWritablePermissions("--root-fd"))
+                ),
+                "mode {mode:o} was accepted"
+            );
+
+            close(fd).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_validate_root_fd_rejects_regular_file_special_mode_bits() {
+        for mode in [0o4400, 0o2400, 0o1400] {
+            let fd = regular_image(mode, 4096);
+
+            assert!(
+                matches!(
+                    validate_image_fd("--root-fd", fd, other_uid()),
+                    Err(JailerError::ImageFdSpecialModeBits("--root-fd"))
+                ),
+                "mode {mode:o} was accepted"
+            );
+
+            close(fd).unwrap();
+        }
+    }
+
+    /// Ownership carries the right to chmod, so an image the jailed uid owns is one it can make
+    /// writable the moment it starts running.
+    #[test]
+    fn test_validate_root_fd_rejects_regular_file_owned_by_jail_uid() {
+        let owner = jail_owner_uid();
+        let fd = regular_image_owned_by(owner, 0o400, 4096);
+
+        assert!(matches!(
+            validate_image_fd("--root-fd", fd, owner),
+            Err(JailerError::ImageFdOwnedByJailUid("--root-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    /// A jail that keeps uid 0 keeps `CAP_DAC_OVERRIDE` and `CAP_FOWNER`, so neither the missing
+    /// write bits nor foreign ownership stop it from writing the image. Only a seal does.
+    #[test]
+    fn test_validate_root_fd_rejects_regular_file_for_a_root_jail() {
+        let fd = regular_image(0o400, 4096);
+
+        assert!(matches!(
+            validate_image_fd("--root-fd", fd, 0),
+            Err(JailerError::ImageFdRegularFileAtRootUid("--root-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    /// The seals hold against every uid, root included, so uid 0 keeps the memfd arm.
+    #[test]
+    fn test_validate_root_fd_accepts_sealed_memfd_for_a_root_jail() {
+        let fd = memfd(4096, REQUIRED_IMAGE_SEALS);
+        let read_only = reopen_read_only(fd);
+
+        validate_image_fd("--root-fd", read_only, 0).unwrap();
+
+        close(fd).unwrap();
+        close(read_only).unwrap();
     }
 }

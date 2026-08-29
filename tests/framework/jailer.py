@@ -54,12 +54,12 @@ class JailerContext:
         the jailer's fields with some default values. Each field can be
         further adjusted by each test even with None values.
 
-        `root_fd` is the number of the descriptor holding the sealed root block
-        device image. The process launching the jailer must let the child
+        `root_fd` is the number of the descriptor holding the read-only root
+        block device image. The process launching the jailer must let the child
         inherit it, since the jailer renumbers it for the exec'd Firecracker.
 
-        `bootstrap_fd` is the number of the descriptor holding the sealed
-        read-only bootstrap block device image.
+        `bootstrap_fd` is the number of the descriptor holding the read-only
+        bootstrap block device image.
 
         `cgroup_join` is the absolute cgroupfs path of a pre-created leaf
         cgroup. The jailer only writes its pid there; it creates no cgroup.

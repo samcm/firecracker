@@ -13,6 +13,7 @@ talk to a real Firecracker over that channel.
 
 import ctypes
 import fcntl
+import hashlib
 import os
 import select
 import shutil
@@ -263,6 +264,58 @@ def memfd_from_file(name, path, *, seals=ROOT_SEALS, read_only=True):
 def seals_of(fd):
     """Return the seal mask of a descriptor."""
     return fcntl.fcntl(fd, F_GET_SEALS)
+
+
+def seals_files(directory):
+    """Whether an inode created in `directory` answers `F_GET_SEALS`.
+
+    Every shmem and hugetlbfs inode answers it, memfd or not, so an image published on tmpfs is
+    held to the jailer's sealed-memfd arm and can never exercise its regular-file arm.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    probe = directory / f".seal-probe-{os.getpid()}"
+    fd = os.open(probe, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        seals_of(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+        probe.unlink()
+
+
+_PUBLISHED_IMAGES = {}
+
+
+def publish_image(base, source, *, mode=0o400):
+    """Publish `source` under `base` as one shared read-only regular file and return its path.
+
+    The jailer accepts a regular image so a node can keep one content-addressed copy and hand the
+    same inode to every microVM, so the file is named after its digest and written once. A second
+    caller with the same bytes gets the same path, never a second copy.
+    """
+    base = Path(base)
+    key = (str(base), str(source), mode)
+    published = _PUBLISHED_IMAGES.get(key)
+    if published is not None and published.exists():
+        return published
+
+    digest = hashlib.sha256()
+    with open(source, "rb") as image:
+        for chunk in iter(lambda: image.read(8 << 20), b""):
+            digest.update(chunk)
+    published = base / "images" / f"{digest.hexdigest()}.img"
+    published.parent.mkdir(parents=True, exist_ok=True)
+    if not published.exists():
+        # The copy is staged and renamed so a reader never sees a half-written image.
+        staged = published.with_name(f"{published.name}.{os.getpid()}.staged")
+        shutil.copyfile(source, staged)
+        os.chmod(staged, mode)
+        os.replace(staged, published)
+    _PUBLISHED_IMAGES[key] = published
+    return published
 
 
 class DirtyBitmap:
@@ -799,7 +852,8 @@ class Pagemaster:
     def frame(self, msg, request_id, body=b"", fd_count=0):
         """The exact datagram one command is carried by, so a retry can repeat it byte for byte."""
         return (
-            HEADER.pack(MAGIC, VERSION, int(msg), request_id, len(body), fd_count, 0) + body
+            HEADER.pack(MAGIC, VERSION, int(msg), request_id, len(body), fd_count, 0)
+            + body
         )
 
     def exchange(self, payload, fds=(), timeout=30):
@@ -898,6 +952,7 @@ class FarplaneMicrovm:
         self.proc = None
         self.wrapper = None
         self.root_fd = None
+        self.root_image_path = None
         self.bootstrap_fd = None
         self.api = None
         self.pagemaster = None
@@ -969,6 +1024,40 @@ class FarplaneMicrovm:
                 "bootstrap", size, seals=seals, read_only=read_only
             )
         return self.bootstrap_fd
+
+    def open_root_image_file(self):
+        """Open the node's published root image, the other descriptor the jailer accepts for fd 4.
+
+        One content-addressed read-only regular file serves every microVM on the node, so nothing
+        is copied into a jail and one page cache serves every guest. The published path is kept in
+        `root_image_path` so a test can prove the jail holds that exact inode.
+        """
+        assert self.rootfs is not None, "the jailer requires a root image"
+        self.root_image_path = publish_image(self.chroot_base, self.rootfs)
+        self.root_fd = os.open(
+            self.root_image_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        return self.root_fd
+
+    def open_private_image_file(
+        self, descriptor, *, mode=0o400, owner=None, open_flags=os.O_RDONLY
+    ):
+        """Open a regular image this microVM alone uses and return its descriptor.
+
+        `mode`, `owner` and `open_flags` exist so a test can offer the jailer a regular image that
+        breaks one property of the image descriptor contract. The image is private because the
+        published node image must stay usable by every other microVM.
+        """
+        self.chroot_base.mkdir(parents=True, exist_ok=True)
+        path = self.chroot_base / f"{self.microvm_id}-{descriptor}-image.img"
+        with open(path, "wb") as image:
+            image.write(bytes(PAGE_SIZE))
+        if owner is not None:
+            os.chown(path, owner, -1)
+        os.chmod(path, mode)
+        fd = os.open(path, open_flags | os.O_CLOEXEC | os.O_NOFOLLOW)
+        setattr(self, f"{descriptor}_fd", fd)
+        return fd
 
     # -------------------------------------------------------------------- launch
 

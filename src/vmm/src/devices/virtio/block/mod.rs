@@ -22,12 +22,12 @@ pub enum CacheType {
     Writeback,
 }
 
-/// Number the jailer inherits the sealed read-only root image at. It renumbers the memfd to this
-/// descriptor on every launch, so it is where a restored root drive finds its backing store.
+/// Number the jailer inherits the read-only root image at. It renumbers the descriptor to this
+/// number on every launch, so it is where a restored root drive finds its backing store.
 pub const ROOT_DESCRIPTOR_FILENO: RawFd = 4;
 
-/// Number the jailer inherits the sealed read-only bootstrap image at when the supervisor passes
-/// one. The drive it backs is never the root device.
+/// Number the jailer inherits the read-only bootstrap image at when the supervisor passes one.
+/// The drive it backs is never the root device.
 pub const BOOTSTRAP_DESCRIPTOR_FILENO: RawFd = 5;
 
 /// Errors the block device can trigger.
