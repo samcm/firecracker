@@ -155,7 +155,13 @@ if [ "$AUTHORITATIVE" = "true" ]; then
     # an echo.
     SOURCE_SNAPSHOT=$(mktemp -d "${TMPDIR:-/tmp}/firecracker-authoritative-XXXXXX")
     trap 'rm -rf "$SOURCE_SNAPSHOT"' EXIT
-    git archive --format=tar "$HEAD_COMMIT" | tar -x -C "$SOURCE_SNAPSHOT"
+    # `-m` is what makes the extraction actually get compiled. `git archive` stamps every file
+    # with the commit's date, and cargo reads a source older than an existing artifact as one that
+    # artifact already covers: without it a target directory holding binaries from this checkout
+    # is served back untouched, and the extraction is compiled only for the crates whose outputs
+    # are missing. Current mtimes rebuild every workspace crate from the extraction and leave the
+    # registry dependencies cached, since nothing touches their sources.
+    git archive --format=tar "$HEAD_COMMIT" | tar -xm -C "$SOURCE_SNAPSHOT"
     GIT_METADATA_DIR=$(git rev-parse --absolute-git-dir)
     BUILD_ENV=("GIT_DIR=$GIT_METADATA_DIR" "GIT_WORK_TREE=$SOURCE_SNAPSHOT")
     MANIFEST_OPTS="--manifest-path $SOURCE_SNAPSHOT/Cargo.toml"
