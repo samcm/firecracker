@@ -591,6 +591,41 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Retires KVM's initial all-ones dirty state on every registered slot and re-arms write
+    /// protection, without touching the host accumulator.
+    ///
+    /// `KVM_DIRTY_LOG_INITIALLY_SET` makes a new slot start fully dirty so that the first clear
+    /// can protect pages a userspace loader, rather than KVM, populated. A VM restored from a
+    /// checkpoint has no such pages: its memory arrives already committed by
+    /// [`KvmVm::restore_memory_regions`]. Leaving the initial state in place would make the first
+    /// harvest report the whole geometry, so the restored VM's first fork would recapture the
+    /// entire resident checkpoint instead of the writes that followed the restore.
+    ///
+    /// The host accumulator is deliberately left alone. Host-side writes that follow this call
+    /// (device restore, VMGenID) are tracked there and belong to the first harvest; only KVM's
+    /// initial state is retired here.
+    pub fn baseline_dirty_log(&self) -> Result<(), VmError> {
+        let page_size = host_page_size();
+        for region in self.guest_memory().iter() {
+            let pages = u64_to_usize(region.len()).div_ceil(page_size);
+            let words = vec![u64::MAX; pages.div_ceil(64)];
+            let clear = kvm_clear_dirty_log {
+                slot: region.slot,
+                num_pages: u32::try_from(pages).map_err(|_| VmError::DirtyBitmapShape)?,
+                first_page: 0,
+                __bindgen_anon_1: kvm_bindings::kvm_clear_dirty_log__bindgen_ty_1 {
+                    dirty_bitmap: words.as_ptr().cast_mut().cast(),
+                },
+            };
+            // SAFETY: the ioctl reads `clear`, whose bitmap covers exactly this slot's pages.
+            let ret = unsafe { ioctl_with_ref(self.fd(), KVM_CLEAR_DIRTY_LOG(), &clear) };
+            if ret != 0 {
+                return Err(VmError::ClearDirtyLog(errno::Error::last()));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns a previously snapshotted bitmap to the accumulator, so the next snapshot reports it.
     pub fn union_dirty_log(&self, bits: &[Vec<u64>]) {
         let page_size = host_page_size();
@@ -793,6 +828,50 @@ pub(crate) mod tests {
         for region in vm.guest_memory().iter() {
             assert!(region.bitmap().unwrap().dirty_at(0));
         }
+    }
+
+    /// A restored VM's baseline retires KVM's initially-set state and nothing else.
+    #[test]
+    fn test_baseline_retires_only_the_initial_kvm_bitmap() {
+        let page_size = host_page_size();
+        let mut vm = setup_vm();
+        vm.register_memory_regions(crate::test_utils::multi_region_mem_raw(&[
+            (GuestAddress(0), 4 * page_size),
+            (GuestAddress(0x10_0000), 2 * page_size),
+        ]))
+        .unwrap();
+
+        let set_pages = |vm: &KvmVm| -> Vec<Vec<usize>> {
+            let snapshot = vm.snapshot_dirty_log().unwrap();
+            vm.guest_memory()
+                .iter()
+                .zip(&snapshot)
+                .map(|(region, words)| {
+                    let pages = u64_to_usize(region.len()).div_ceil(page_size);
+                    (0..pages)
+                        .filter(|page| words[page / 64] & (1 << (page % 64)) != 0)
+                        .collect()
+                })
+                .collect()
+        };
+
+        // KVM_DIRTY_LOG_INITIALLY_SET: every page of every freshly registered slot starts dirty.
+        assert_eq!(set_pages(&vm), vec![vec![0, 1, 2, 3], vec![0, 1]]);
+
+        vm.baseline_dirty_log().unwrap();
+        assert_eq!(set_pages(&vm), vec![Vec::<usize>::new(), Vec::new()]);
+
+        // The host accumulator is a separate channel, and the writes it holds happen after the
+        // slots are committed. A baseline that swallowed them would drop device-restore writes.
+        let second_page = GuestAddress(u64::try_from(page_size).unwrap());
+        vm.guest_memory().mark_dirty(second_page, page_size);
+        vm.baseline_dirty_log().unwrap();
+        assert_eq!(set_pages(&vm), vec![vec![1], Vec::new()]);
+
+        // And a harvest still retires them, so the baseline did not make the log write-only.
+        let snapshot = vm.snapshot_dirty_log().unwrap();
+        vm.clear_dirty_log(&snapshot).unwrap();
+        assert_eq!(set_pages(&vm), vec![Vec::<usize>::new(), Vec::new()]);
     }
 
     #[test]

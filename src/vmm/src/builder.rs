@@ -419,6 +419,13 @@ pub fn build_microvm_from_snapshot(
     vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
         .map_err(StartMicrovmError::KvmVm)?;
 
+    // The slots are committed, so KVM's initially-set state now describes nothing this VM did.
+    // Retire it before anything writes guest memory, so this VM's first harvest reports only
+    // post-restore writes. Placed before the vCPU state restore on purpose: the guest pages KVM
+    // writes on its behalf (kvmclock, steal time) have to survive into that harvest, as do the
+    // device-restore and VMGenID writes, which the host accumulator tracks independently.
+    vm.baseline_dirty_log().map_err(StartMicrovmError::KvmVm)?;
+
     #[cfg(target_arch = "x86_64")]
     {
         // Scale TSC to match, extract the TSC freq from the state if specified
