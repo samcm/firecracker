@@ -189,10 +189,10 @@ jobs:
           guarded_cargo_test 20 -p vmm --lib vstate::farplane::capture
           guarded_cargo_test 13 -p vmm --lib vstate::farplane::backend
           guarded_cargo_test 13 -p vmm --lib vstate::farplane::protocol
-          guarded_cargo_test 21 -p vmm --lib devices::virtio::vsock::device
+          guarded_cargo_test 23 -p vmm --lib devices::virtio::vsock::device
           guarded_cargo_test 15 -p vmm --lib devices::virtio::vsock::event_handler
           guarded_cargo_test 12 -p vmm --lib devices::virtio::vsock::persist
-          guarded_cargo_test 11 -p vmm --lib snapshot::
+          guarded_cargo_test 12 -p vmm --lib snapshot::
           guarded_cargo_test 25 -p vmm --test farplane_channel
           guarded_cargo_test 1 -p firecracker --bin firecracker api_server_adapter
           # One image-alias test briefly redirects stderr, so the jailer crate runs
@@ -202,7 +202,7 @@ jobs:
           # Pin the whole family as well as its three Farplane-specific modules, so
           # deleting a muxer, packet, or connection-state test cannot hide in the
           # still-large aggregate.
-          guarded_cargo_test 85 -p vmm --lib devices::virtio::vsock -- --test-threads=1
+          guarded_cargo_test 87 -p vmm --lib devices::virtio::vsock -- --test-threads=1
 
           if guarded_cargo_test 1 -p vmm --lib vstate::farplane::this_filter_matches_nothing; then
             echo "::error::the guard accepted a filter that selects no tests"
@@ -215,6 +215,53 @@ jobs:
             exit 1
           fi
           echo "the guard rejected a suite below its floor, as it must"
+
+      # `tools/devtool` mounts the sources dir and nothing else, so git metadata living outside it
+      # reaches the container only through the mounts `git_metadata_mounts` resolves. Without them
+      # the firecracker build script reads no commit and reports `unknown`, and an authoritative
+      # build has no revision to bind its artifacts to. This lane is itself a normal clone, so the
+      # layouts that need a mount are built here rather than waited for.
+      - name: "Container git metadata mounts follow the checkout layout"
+        run: |
+          set -euo pipefail
+          source tools/functions
+          work=$(mktemp -d)
+          author=(-c user.email=ci@local -c user.name=ci)
+
+          git init -q "$work/normal"
+          git -C "$work/normal" "${author[@]}" commit -q --allow-empty -m init
+          if [ -n "$(git_metadata_mounts "$work/normal")" ]; then
+            echo "::error::a normal clone needs no mount: its metadata is inside the sources dir"
+            git_metadata_mounts "$work/normal"
+            exit 1
+          fi
+
+          # A linked worktree's `.git` is a file naming a directory under the main checkout, which
+          # is what a container that mounts only the worktree cannot open.
+          git -C "$work/normal" worktree add -q "$work/linked"
+          common=$(cd "$work/normal/.git" && pwd -P)
+          got=$(git_metadata_mounts "$work/linked" | tr '\n' ' ')
+          if [ "$got" != "--volume $common:$common:ro,z " ]; then
+            echo "::error::a linked worktree must mount $common read-only at its own path, got: $got"
+            exit 1
+          fi
+
+          # `git clone --separate-git-dir` does the same to a normal clone.
+          git init -q --separate-git-dir "$work/elsewhere.git" "$work/split"
+          git -C "$work/split" "${author[@]}" commit -q --allow-empty -m init
+          external=$(cd "$work/elsewhere.git" && pwd -P)
+          got=$(git_metadata_mounts "$work/split" | tr '\n' ' ')
+          if [ "$got" != "--volume $external:$external:ro,z " ]; then
+            echo "::error::a separate git dir must be mounted once at $external, got: $got"
+            exit 1
+          fi
+
+          mkdir "$work/not-a-checkout"
+          if [ -n "$(git_metadata_mounts "$work/not-a-checkout")" ]; then
+            echo "::error::a tree with no git checkout must need no mount"
+            exit 1
+          fi
+          echo "the mounts follow the checkout layout, read-only and at the paths git opens"
 
       - name: "Clippy over the crates the fork changes"
         run: |
@@ -491,6 +538,22 @@ jobs:
             fi
           done
           echo "PROVENANCE names HEAD, the pinned builder and every artifact hash"
+
+          # A file naming a commit binds nothing unless the bytes beside it agree, so the artifact
+          # is asked directly. `release.sh` refuses to write a PROVENANCE the binary contradicts;
+          # this is the same equality checked from the other side, on the artifact this lane keeps,
+          # and it is what catches a build script whose commit went stale.
+          reported=$("$out/firecracker" --version | sed -n 's/^commit //p')
+          recorded=$(sed -n 's/^commit //p' "$out/PROVENANCE")
+          if [ "$reported" != "$head" ]; then
+            echo "::error::the built firecracker reports commit '$reported', not HEAD ($head)"
+            exit 1
+          fi
+          if [ "$reported" != "$recorded" ]; then
+            echo "::error::firecracker reports commit '$reported', PROVENANCE records '$recorded'"
+            exit 1
+          fi
+          echo "the artifact reports the commit PROVENANCE records ($reported)"
 
       # A commit that does not describe the tree is the failure this mode exists to catch, so
       # the refusal is identified rather than assumed: any nonzero exit would also be produced
