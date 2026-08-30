@@ -54,9 +54,10 @@ where
             return used_queues;
         }
 
-        // A guest that kicks a data queue may have refilled the event queue without the device
-        // seeing a notification for it, so this is a retry point for a reset the device owes.
-        self.retry_owed_transport_reset();
+        // A guest that kicks a data queue may have supplied the event queue with a descriptor for
+        // a reset the device owes, or answered one it published, without the device seeing a
+        // notification for either.
+        used_queues.extend(self.advance_transport_reset());
 
         if let Err(err) = self.queue_events[RXQ_INDEX].read() {
             error!("Failed to get vsock rx queue event: {:?}", err);
@@ -78,14 +79,15 @@ where
             return used_queues;
         }
 
-        self.retry_owed_transport_reset();
+        used_queues.extend(self.advance_transport_reset());
 
         if let Err(err) = self.queue_events[TXQ_INDEX].read() {
             error!("Failed to get vsock tx queue event: {:?}", err);
             METRICS.tx_queue_event_fails.inc();
         } else {
-            if self.process_tx().unwrap() {
-                used_queues.push(TXQ_INDEX.try_into().unwrap());
+            let txq: u16 = TXQ_INDEX.try_into().unwrap();
+            if self.process_tx().unwrap() && !used_queues.contains(&txq) {
+                used_queues.push(txq);
             }
             METRICS.tx_queue_event_count.inc();
             // The backend may have queued up responses to the packets we sent during
@@ -106,43 +108,31 @@ where
             return used_queues;
         }
 
-        // The kick is the only evidence this device has that the guest touched the event queue, so
-        // it is read before anything is decided. A read that fails observed no guest action:
-        // settling a published reset on it would release data the guest never acknowledged, and
-        // publishing an owed one on it would answer a notification that was never given.
+        // The kick is drained because the eventfd is level triggered, and for nothing else. A
+        // token says the guest touched the event queue at some instant, never which of the
+        // device's writes it followed, so it settles nothing and publishes nothing. A read that
+        // failed observed no guest action at all, so there is nothing to look at the rings for.
         if let Err(err) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {:?}", err);
             METRICS.ev_queue_event_fails.inc();
             return used_queues;
         }
 
-        if self.transport_reset == TransportReset::Owed {
-            // The guest has put descriptors on the event queue, so the reset it is owed can be
-            // published now. Data stays gated: the kick just read carried the descriptor rather
-            // than an answer, and publication consumes any kick left in the eventfd so this one
-            // cannot return as the acknowledgement either.
-            if let Err(err) = self.send_transport_reset_event() {
-                error!("vsock: owed TRANSPORT_RESET still not published: {:?}", err);
-            }
+        // Publishes a reset the device owes, or settles a published one the guest has answered by
+        // advancing the event queue past the watermark, walking the TX descriptors that frees.
+        used_queues.extend(self.advance_transport_reset());
+
+        // A reset still outstanding keeps the gate shut. This kick was not the answer: either the
+        // event has only just been published, or the ring has not moved off the watermark. Nothing
+        // is re-armed and no wakeup is lost, because publication armed `avail_event` at exactly
+        // the watermark, so the advance that does answer produces its own kick.
+        if self.data_gated() {
             return used_queues;
         }
 
-        // A kick read while a reset is published is the guest's acknowledgement of it: the event
-        // it answers was published before this kick could exist. Clear the gate and drain what it
-        // held back. Assumes TRANSPORT_RESET is the only evq event we publish; new event types
-        // would need to disambiguate before clearing.
-        //
-        // TX is walked only when the gate actually held it: the TX notification consumed while
-        // the gate was shut is not repeated, so this walk is what processes those descriptors and
-        // re-arms `avail_event`.
-        let was_gated = self.acknowledge_transport_reset();
-        if was_gated {
-            match self.process_tx() {
-                Ok(true) => used_queues.push(TXQ_INDEX.try_into().unwrap()),
-                Ok(false) => {}
-                Err(err) => error!("vsock: process_tx after evq ack failed: {:?}", err),
-            }
-        }
+        // No reset is outstanding, so this is ordinary event queue activity. Assumes
+        // TRANSPORT_RESET is the only evq event we publish; new event types would need to
+        // disambiguate before clearing the gate above.
         if self.backend.has_pending_rx() {
             match self.process_rx() {
                 Ok(true) => used_queues.push(RXQ_INDEX.try_into().unwrap()),
@@ -279,7 +269,53 @@ mod tests {
 
     use super::super::*;
     use super::*;
-    use crate::devices::virtio::vsock::test_utils::{EventHandlerContext, TestContext};
+    use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
+    use crate::devices::virtio::vsock::test_utils::{
+        EVQ_PAYLOAD_GUEST_ADDR, EventHandlerContext, TestContext, published_ack_from,
+    };
+
+    /// A descriptor the guest made available while the device was publishing is inside the
+    /// watermark, so the kick that carried it answers nothing.
+    #[test]
+    fn test_a_descriptor_that_raced_the_publication_is_not_an_acknowledgement() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        // Two available event descriptors. The device publishes into the first; the second models
+        // the add that landed before the guest could have seen the used ring.
+        ctx.guest_evvq.dtable[0].set(EVQ_PAYLOAD_GUEST_ADDR, 4, VIRTQ_DESC_F_WRITE, 0);
+        ctx.guest_evvq.dtable[1].set(EVQ_PAYLOAD_GUEST_ADDR + 0x1000, 4, VIRTQ_DESC_F_WRITE, 0);
+        ctx.guest_evvq.avail.ring[0].set(0);
+        ctx.guest_evvq.avail.ring[1].set(1);
+        ctx.guest_evvq.avail.idx.set(2);
+        ctx.device.queues[EVQ_INDEX] = ctx.guest_evvq.create_queue();
+
+        ctx.device.send_transport_reset_event().unwrap();
+
+        assert_eq!(
+            published_ack_from(&ctx.device),
+            2,
+            "the watermark must cover the descriptor that raced the publication"
+        );
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+
+        // The kick that carried the raced descriptor settles nothing, on any path.
+        ctx.device.backend.set_pending_rx(true);
+        let used = ctx.signal_evq_event();
+        assert!(used.is_empty());
+        assert_eq!(published_ack_from(&ctx.device), 2);
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+        ctx.device.prepare_save();
+        assert_eq!(published_ack_from(&ctx.device), 2);
+
+        // The refill of the consumed head advances past the watermark, and that is the answer.
+        ctx.guest_refills_evq(2);
+        let used = ctx.signal_evq_event();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Settled);
+        assert!(used.contains(&RXQ_INDEX.try_into().unwrap()));
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
+    }
 
     #[test]
     fn test_txq_event() {
@@ -428,7 +464,7 @@ mod tests {
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.transport_reset = TransportReset::Published;
+        ctx.device.transport_reset = TransportReset::Published { ack_from: 0 };
         ctx.device.backend.set_pending_rx(true);
 
         let used = ctx.device.notify_backend(EventSet::IN).unwrap();
@@ -444,12 +480,15 @@ mod tests {
 
         ctx.device.backend.set_pending_rx(true);
 
+        // The driver refills the head the device consumed. That advance past the watermark is the
+        // acknowledgement; the kick beside it only wakes the handler.
+        ctx.guest_refills_evq(0);
         let used = ctx.signal_evq_event();
 
         assert_eq!(
             ctx.device.transport_reset,
             TransportReset::Settled,
-            "the guest's evq kick acknowledges the published reset"
+            "the guest's refill of the event queue acknowledges the published reset"
         );
         assert!(
             used.contains(&RXQ_INDEX.try_into().unwrap()),
@@ -470,7 +509,7 @@ mod tests {
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.transport_reset = TransportReset::Published;
+        ctx.device.transport_reset = TransportReset::Published { ack_from: 0 };
         ctx.device.backend.set_pending_rx(true);
 
         ctx.signal_rxq_event();
@@ -494,7 +533,7 @@ mod tests {
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.transport_reset = TransportReset::Published;
+        ctx.device.transport_reset = TransportReset::Published { ack_from: 0 };
         ctx.device.backend.set_pending_rx(true);
 
         ctx.signal_txq_event();
@@ -514,6 +553,7 @@ mod tests {
             "RX vq must stay empty during txq drain while gated"
         );
 
+        ctx.guest_refills_evq(0);
         let used = ctx.signal_evq_event();
 
         assert!(
@@ -541,7 +581,7 @@ mod tests {
 
         let used = ctx.signal_evq_event();
 
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(published_ack_from(&ctx.device), 1);
         assert_eq!(
             ctx.guest_evvq.used.idx.get(),
             1,
@@ -558,7 +598,8 @@ mod tests {
         );
         assert_eq!(ctx.guest_txvq.used.idx.get(), 0);
 
-        // Only now, with the reset in the guest's hands, does its next kick release data.
+        // Only now, with the reset in the guest's hands, does its refill release data.
+        ctx.guest_refills_evq(1);
         let used = ctx.signal_evq_event();
 
         assert_eq!(ctx.device.transport_reset, TransportReset::Settled);
@@ -574,15 +615,16 @@ mod tests {
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.transport_reset = TransportReset::Published;
+        ctx.device.transport_reset = TransportReset::Published { ack_from: 0 };
         ctx.device.backend.set_pending_rx(false);
 
+        ctx.guest_refills_evq(0);
         ctx.signal_evq_event();
 
         assert_eq!(
             ctx.device.transport_reset,
             TransportReset::Settled,
-            "the gate must clear on acknowledgement regardless of RX backlog"
+            "the gate must clear on the refill regardless of RX backlog"
         );
         assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
     }
@@ -598,7 +640,7 @@ mod tests {
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.transport_reset = TransportReset::Published;
+        ctx.device.transport_reset = TransportReset::Published { ack_from: 0 };
         ctx.device.backend.set_pending_rx(true);
 
         let metric_before = METRICS.ev_queue_event_fails.count();
@@ -606,9 +648,9 @@ mod tests {
 
         assert_eq!(metric_before + 1, METRICS.ev_queue_event_fails.count());
         assert_eq!(
-            ctx.device.transport_reset,
-            TransportReset::Published,
-            "a failed eventfd read is not an acknowledgement"
+            published_ack_from(&ctx.device),
+            0,
+            "a failed eventfd read observes no ring progress either"
         );
         assert!(used.is_empty());
         assert_eq!(
@@ -636,15 +678,15 @@ mod tests {
 
         ctx.signal_txq_event();
 
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(published_ack_from(&ctx.device), 1);
         assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
 
         let used = ctx.device.handle_evq_event(EventSet::IN);
 
         assert_eq!(
-            ctx.device.transport_reset,
-            TransportReset::Published,
-            "the kick the retry consumed must not come back as the acknowledgement"
+            published_ack_from(&ctx.device),
+            1,
+            "a kick with no ring progress behind it is not the acknowledgement"
         );
         assert!(used.is_empty());
         assert_eq!(
@@ -662,7 +704,7 @@ mod tests {
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.transport_reset = TransportReset::Published;
+        ctx.device.transport_reset = TransportReset::Published { ack_from: 0 };
         ctx.device.backend.set_pending_rx(true);
 
         let progressed = ctx.device.process_rx().unwrap();
@@ -943,7 +985,7 @@ mod tests {
         let device = vsock.lock().unwrap();
         assert_eq!(
             device.transport_reset,
-            TransportReset::Published,
+            TransportReset::Published { ack_from: 1 },
             "the kick that carried the descriptor must not acknowledge the reset it carried"
         );
         assert_eq!(

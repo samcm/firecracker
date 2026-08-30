@@ -41,7 +41,7 @@ pub use crate::snapshot::persist::Persist;
 /// The major version was raised for the farplane fork: `VsockFrontendState` carries the
 /// transport-reset gate, and bitcode requires exact types, so a snapshot of the previous layout
 /// cannot be read. It is refused by the version check rather than decoded into something else.
-pub const SNAPSHOT_VERSION: Version = Version::new(11, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
 #[cfg(target_arch = "x86_64")]
 const SNAPSHOT_MAGIC_ID: u64 = 0x0710_1984_8664_0000u64;
@@ -281,12 +281,12 @@ mod tests {
             snapshot.header.feature_identity,
             crate::vstate::farplane::FEATURE_IDENTITY
         );
-        assert_eq!(snapshot.header.feature_identity, "farplane/2");
+        assert_eq!(snapshot.header.feature_identity, "farplane/3");
 
         snapshot.save(&mut buf).unwrap();
 
         let loaded = Snapshot::<MicrovmState>::load(&mut buf.as_slice()).unwrap();
-        assert_eq!(loaded.header.feature_identity, "farplane/2");
+        assert_eq!(loaded.header.feature_identity, "farplane/3");
     }
 
     /// A warm image baked by an older identity is refused before its state is used: the capture
@@ -302,7 +302,7 @@ mod tests {
         match err {
             SnapshotError::IncompatibleFeatureIdentity { expected, found } => {
                 assert_eq!(found, "farplane/1");
-                assert_eq!(expected, "farplane/2");
+                assert_eq!(expected, "farplane/3");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -310,9 +310,10 @@ mod tests {
 
     /// The vsock frontend layout changed with this fork, and bitcode requires exact types: the
     /// format version says so rather than leaving an old snapshot to decode into something else.
+    /// It moved again when the published `TRANSPORT_RESET` gained its acknowledgement watermark.
     #[test]
     fn the_format_version_records_the_layout_change() {
-        assert_eq!(SNAPSHOT_VERSION, Version::new(11, 0, 0));
+        assert_eq!(SNAPSHOT_VERSION, Version::new(12, 0, 0));
 
         let mut snapshot = Snapshot::new(MicrovmState::default());
         snapshot.header.version = Version::new(10, 0, 0);

@@ -29,7 +29,7 @@ pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this protocol, quiesce semantics and vmstate format. A warm image
 /// baked by another identity is refused rather than restored: the capture command order and the
 /// vmstate the epoch produces are part of what this string names.
-pub const FEATURE_IDENTITY: &str = "farplane/2";
+pub const FEATURE_IDENTITY: &str = "farplane/3";
 /// Size of one extent table record.
 pub const EXTENT_RECORD_LEN: usize = 32;
 /// Size of one region record.
@@ -877,6 +877,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/2");
+        assert_eq!(FEATURE_IDENTITY, "farplane/3");
     }
 }

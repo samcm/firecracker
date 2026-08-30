@@ -15,7 +15,7 @@ use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::devices::virtio::test_utils::{VirtQueue as GuestQ, default_interrupt};
 use crate::devices::virtio::transport::VirtioInterrupt;
-use crate::devices::virtio::vsock::device::{EVQ_INDEX, RXQ_INDEX, TXQ_INDEX};
+use crate::devices::virtio::vsock::device::{EVQ_INDEX, RXQ_INDEX, TXQ_INDEX, TransportReset};
 use crate::devices::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
 use crate::devices::virtio::vsock::{
     Vsock, VsockBackend, VsockChannel, VsockEpollListener, VsockError,
@@ -245,6 +245,18 @@ pub fn read_packet_data(pkt: &VsockPacketTx, how_much: u32) -> Vec<u8> {
     pkt.write_from_offset_to(&mut buf.as_mut_slice(), 0, how_much)
         .unwrap();
     buf
+}
+
+/// The watermark a published `TRANSPORT_RESET` carries, for tests that assert the state a device
+/// reached and the index it will accept as the guest's answer.
+pub fn published_ack_from<B>(device: &Vsock<B>) -> u16
+where
+    B: VsockBackend + std::fmt::Debug,
+{
+    match device.transport_reset {
+        TransportReset::Published { ack_from } => ack_from,
+        other => panic!("expected a published TRANSPORT_RESET, found {other:?}"),
+    }
 }
 
 impl<B> Vsock<B>

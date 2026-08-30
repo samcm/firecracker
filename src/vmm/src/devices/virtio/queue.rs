@@ -646,17 +646,28 @@ impl Queue {
     }
 
     /// Arm `avail_event` at the current `avail.idx` so the driver's next
-    /// publish produces a notification. Unlike [`Self::try_enable_notification`],
-    /// does not require the queue to be drained and does not recheck
-    /// `avail.idx`; only correct when the driver does not add to the avail
-    /// ring until it has observed our used-ring update.
-    pub fn enable_notification(&mut self) {
+    /// publish produces a notification, and return the index it armed at.
+    /// Unlike [`Self::try_enable_notification`], does not require the queue to
+    /// be drained and does not recheck `avail.idx`; only correct when the
+    /// driver does not add to the avail ring until it has observed our
+    /// used-ring update.
+    ///
+    /// The returned index is the one `avail_event` holds. A caller using it as
+    /// a watermark therefore cannot arm at one index and compare against
+    /// another, so every driver advance past the watermark is both unsuppressed
+    /// and detectable.
+    pub fn enable_notification(&mut self) -> u16 {
+        let idx = self.avail_ring_idx_get();
         if !self.uses_notif_suppression {
-            return;
+            // `avail_event` is not part of the ring layout the driver negotiated, so it is not
+            // written here. Without EVENT_IDX the driver notifies unconditionally, which is
+            // what a watermark needs anyway.
+            return idx;
         }
 
-        self.used_ring_avail_event_set(self.avail_ring_idx_get());
+        self.used_ring_avail_event_set(idx);
         fence(Ordering::Release);
+        idx
     }
 
     /// Check if we need to kick the guest.

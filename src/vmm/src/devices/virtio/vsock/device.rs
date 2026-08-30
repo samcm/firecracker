@@ -75,8 +75,10 @@ pub enum TransportReset {
     /// A reset is owed to the guest, and the event queue had no descriptor to publish it into.
     /// Data is gated until a descriptor arrives and the event is published.
     Owed,
-    /// The reset is in the guest's event queue. Data is gated until the guest acknowledges it.
-    Published,
+    /// The reset is in the guest's event queue. Data is gated until the guest answers it by
+    /// advancing the event queue's `avail.idx` off `ack_from`, the index the publication armed
+    /// `avail_event` at once the used ring was visible.
+    Published { ack_from: u16 },
 }
 
 /// Structure representing the vsock device.
@@ -299,9 +301,11 @@ where
     /// the reset owed rather than dropped, with the event queue notification armed, and guest data
     /// stays gated until the event is published and acknowledged.
     ///
-    /// Publication also consumes whatever kick the event queue's eventfd holds. That kick is what
-    /// made the descriptor available; it is not an answer to the event written into it, and only a
-    /// later kick is.
+    /// Publication records an acknowledgement watermark: the event queue's `avail.idx` as it
+    /// stood once the used ring became visible. Only the guest advancing past that watermark
+    /// settles the reset. Kicks are not evidence, and none is consumed here: an eventfd token
+    /// records that the guest touched the queue at some instant, never which of the device's
+    /// writes it followed.
     pub fn send_transport_reset_event(&mut self) -> Result<(), DeviceError> {
         // `pop_or_enable_notification` arms `avail_event` and rechecks the ring as one step, so a
         // descriptor the guest publishes concurrently either carries the reset now or produces the
@@ -324,20 +328,6 @@ where
             }
         };
 
-        // Both readers of this eventfd settle a published reset on a successful read: the event
-        // queue's handler, which the descriptor-arrival kick may already have woken, and
-        // `prepare_save()`. So that kick is consumed here, before the used ring advances. The
-        // guest cannot have answered an event it has not been shown, so nothing read here can be
-        // an acknowledgement, and every kick left for those readers is a later one.
-        match self.queue_events[EVQ_INDEX].read() {
-            Ok(_) => {}
-            Err(err) if err.raw_os_error() == Some(libc::EAGAIN) => {}
-            Err(err) => error!(
-                "vsock: could not consume the event queue kick before publishing the reset: {:?}",
-                err
-            ),
-        }
-
         // This is safe since we checked in the caller function that the device is activated.
         let mem = &self.device_state.active_state().unwrap().mem;
         let event_len = u32::try_from(size_of::<u32>()).expect("the event length fits in u32");
@@ -355,11 +345,16 @@ where
         }
         queue.advance_used_ring_idx();
 
-        // Arm the notification so the driver's refill of the consumed head is not suppressed by
-        // EVENT_IDX: that refill is also the acknowledgement this device waits for. The driver
-        // cannot refill before it has seen this used-ring update, which is what makes arming
-        // without a recheck correct here.
-        queue.enable_notification();
+        // Arm `avail_event` at the current `avail.idx` and take that same index as the
+        // acknowledgement watermark. One index for both is load-bearing. The driver's refill of
+        // the consumed head advances `avail.idx` past the armed value, so EVENT_IDX cannot
+        // suppress it, and that advance is exactly what `reset_ack_observed` looks for; arming
+        // and comparing at different indices would let a suppressed refill go unnoticed.
+        //
+        // Reading it here, after the used ring is visible, puts every descriptor the guest made
+        // available before the publication inside the watermark, where it cannot be mistaken for
+        // an answer to an event the guest had not been shown.
+        let ack_from = queue.enable_notification();
 
         if let Err(err) = write {
             // The zero-length used element returns the unusable descriptor. Notify the driver so
@@ -369,7 +364,7 @@ where
             return Err(err);
         }
 
-        self.transport_reset = TransportReset::Published;
+        self.transport_reset = TransportReset::Published { ack_from };
         METRICS.transport_reset_published.inc();
 
         // NOTE: kick() will be called on resume and it will trigger the interrupt again. As calling
@@ -390,7 +385,7 @@ where
     /// gated for as long as that holds.
     fn owe_transport_reset(&mut self) {
         match self.transport_reset {
-            TransportReset::Published => {}
+            TransportReset::Published { .. } => {}
             TransportReset::Owed => METRICS.transport_reset_stuck.inc(),
             TransportReset::Settled => {
                 self.transport_reset = TransportReset::Owed;
@@ -399,25 +394,78 @@ where
         }
     }
 
-    /// Publishes a reset the device owes the guest, if it owes one.
+    /// Makes whatever progress the rings allow on an outstanding reset, and reports the queues a
+    /// notification is owed for.
     ///
-    /// Guest activity on the data queues is a retry point: the event queue may hold a descriptor
-    /// the device has no notification for, and data stays gated until the reset is published.
-    pub(crate) fn retry_owed_transport_reset(&mut self) {
-        if !self.device_state.is_activated() || self.transport_reset != TransportReset::Owed {
-            return;
+    /// Two things can be outstanding. A reset the device owes needs a descriptor on the event
+    /// queue, which the guest may have supplied without the device seeing a notification for it. A
+    /// reset already published needs the guest's answer, which is ring progress and can reach the
+    /// device without a kick it could attribute to it. Guest activity on any queue is therefore a
+    /// point to read the rings again, so the gate never outlives the evidence that clears it.
+    pub(crate) fn advance_transport_reset(&mut self) -> Vec<u16> {
+        let mut used_queues = Vec::new();
+        if !self.device_state.is_activated() {
+            return used_queues;
         }
-        if let Err(err) = self.send_transport_reset_event() {
-            warn!("vsock: transport reset still owed to the guest: {:?}", err);
+
+        match self.transport_reset {
+            TransportReset::Owed => {
+                if let Err(err) = self.send_transport_reset_event() {
+                    warn!("vsock: transport reset still owed to the guest: {:?}", err);
+                }
+            }
+            TransportReset::Published { .. } if self.reset_ack_observed() => {
+                let was_gated = self.acknowledge_transport_reset();
+                // The TX notification the guest gave while the gate held is not repeated, so this
+                // walk is what processes those descriptors and re-arms `avail_event`.
+                if was_gated {
+                    match self.process_tx() {
+                        Ok(true) => used_queues.push(TXQ_INDEX.try_into().unwrap()),
+                        Ok(false) => {}
+                        Err(err) => error!("vsock: process_tx after reset ack failed: {:?}", err),
+                    }
+                }
+            }
+            _ => {}
         }
+
+        used_queues
+    }
+
+    /// Whether the guest has answered a published `TRANSPORT_RESET`.
+    ///
+    /// The answer is guest-visible ring progress and nothing else: the event queue's `avail.idx`
+    /// has moved off the watermark the publication recorded. An eventfd read cannot serve here. A
+    /// kick is a level the guest can raise at any instant, including before the event it appears
+    /// to answer existed, so a token proves no ordering. An `avail.idx` past the watermark does:
+    /// the watermark was read after the used ring became visible, so every descriptor the guest
+    /// made available beforehand is inside it.
+    ///
+    /// Inequality rather than ordering is enough. The device pops nothing from the event queue
+    /// while it waits, so the driver can add at most `size` entries before it stalls; `avail.idx`
+    /// cannot wrap the whole `u16` range back onto the watermark.
+    ///
+    /// This reads that the driver added something, not what it added. On the event queue the two
+    /// coincide: the driver adds there only to refill a buffer the device consumed, and this reset
+    /// is the only event the device ever publishes.
+    pub(crate) fn reset_ack_observed(&self) -> bool {
+        // Ring pointers are only valid once the guest has activated the device, and a device
+        // restored with a published reset has not activated yet.
+        if !self.device_state.is_activated() {
+            return false;
+        }
+        let TransportReset::Published { ack_from } = self.transport_reset else {
+            return false;
+        };
+        self.queues[EVQ_INDEX].avail_ring_idx_get() != ack_from
     }
 
     /// Applies the guest's acknowledgement of a published `TRANSPORT_RESET`, and reports whether
     /// the gate it cleared was holding data back.
     ///
-    /// Two paths observe that acknowledgement: the event handler, which serves the guest's kick of
-    /// the event queue, and `prepare_save`, which finds such a kick unserved in the event queue's
-    /// eventfd. Both have to leave the same device behind, so the transition lives here.
+    /// Two paths observe that acknowledgement: [`Vsock::advance_transport_reset`], which the queue
+    /// handlers run, and `prepare_save`, which finds it in the ring after event dispatch has
+    /// closed. Both have to leave the same device behind, so the transition lives here.
     ///
     /// A caller told the gate was shut owes the TX queue a walk: the notification the guest gave
     /// while the gate held is not repeated.
@@ -435,16 +483,17 @@ where
     /// keeps its connections, its event queue and its data flow, so an active device that owes
     /// nothing serializes the debt without incurring it.
     ///
-    /// A reset already published is serialized as published: that event is in the guest memory the
-    /// snapshot captures, and a state claiming it was merely owed would publish a second event for
-    /// the same fact, consuming another descriptor and outliving the single acknowledgement that
-    /// clears the gate.
+    /// A reset already published is serialized as published, watermark and all: that event is in
+    /// the guest memory the snapshot captures, along with the event queue the watermark indexes,
+    /// so the restored device waits for the same advance this one was waiting for. A state
+    /// claiming the reset was merely owed would publish a second event for the same fact,
+    /// consuming another descriptor and outliving the single acknowledgement that clears the gate.
     ///
     /// A device the guest never activated owes nothing: it has no connections to reset, and a
     /// restore must not invent a gate that only a published reset could ever clear.
     pub(crate) fn snapshot_transport_reset(&self) -> TransportReset {
         match self.transport_reset {
-            TransportReset::Published => TransportReset::Published,
+            published @ TransportReset::Published { .. } => published,
             TransportReset::Owed => TransportReset::Owed,
             TransportReset::Settled if self.device_state.is_activated() => TransportReset::Owed,
             TransportReset::Settled => TransportReset::Settled,
@@ -594,7 +643,7 @@ where
             //
             // TX is not replayed here: it is gated until the acknowledgement, and the
             // acknowledgement path walks it.
-            TransportReset::Published => {
+            TransportReset::Published { .. } => {
                 info!(
                     "[{:?}:{}] signaling event queue",
                     self.device_type(),
@@ -634,48 +683,34 @@ where
     /// Collects an acknowledgement the guest has already given, so the serialized state does not
     /// wait for it twice.
     ///
-    /// Only the event handler turns the guest's event queue kick into the acknowledgement of a
-    /// published reset, and that kick can arrive when no handler will run: Farplane's capture
-    /// closes event dispatch before it pauses the vCPUs, so a guest that refills the event queue
-    /// in between leaves its kick in the eventfd. That eventfd does not reach the restored VM,
-    /// whose eventfds are fresh, and the used ring a `Published` restore signals is the one the
-    /// guest has already consumed: the restored guest would never be asked again, would never
-    /// answer, and both of its directions would stay gated for the rest of its life. The pending
-    /// kick is read here instead and the acknowledgement applied before serialization, which makes
-    /// the snapshot carry a reset the restored VM publishes for itself.
+    /// The guest can answer a published reset when no handler will run: Farplane's capture closes
+    /// event dispatch before it pauses the vCPUs, so a guest that refills the event queue in
+    /// between leaves only the ring behind. Serializing that reset as still published would make
+    /// the restored VM signal a used ring its guest has already consumed: it would never be asked
+    /// again, never answer, and both of its directions would stay gated for the rest of its life.
     ///
-    /// Only a published reset is read for. An owed one has no acknowledgement to collect, and
-    /// publishing it here would push an event into a source that keeps running. The TX descriptors
-    /// the gate held are not walked here either: `kick()` replays their notification, on this
-    /// source when it resumes and on the restored VM once its own reset is acknowledged.
+    /// The evidence is the ring and never the eventfd. A token found here could have been raised
+    /// before the event was published, and the kick carrying a genuine refill can be lost to
+    /// EVENT_IDX suppression, so a token both over- and under-reports. The watermark
+    /// [`Vsock::reset_ack_observed`] compares answers both cases, and it needs no read that could
+    /// consume a wakeup this device still owes itself.
     ///
-    /// A kick found here is an acknowledgement and not the descriptor arrival that preceded the
-    /// event: publication consumes the event queue's pending kick, so the kick that carried the
-    /// descriptor is gone by the time the reset is `Published`.
+    /// Only a published reset has a watermark to check. An owed one has no acknowledgement to
+    /// collect, and publishing it here would push an event into a source that keeps running. The
+    /// TX descriptors the gate held are not walked here either: `kick()` replays their
+    /// notification, on this source when it resumes and on the restored VM once its own reset is
+    /// acknowledged.
     fn prepare_save(&mut self) {
-        if !self.is_activated() || self.transport_reset != TransportReset::Published {
+        if !self.reset_ack_observed() {
             return;
         }
 
-        match self.queue_events[EVQ_INDEX].read() {
-            Ok(_) => {
-                self.acknowledge_transport_reset();
-                info!(
-                    "[{:?}:{}] collected the guest's transport reset acknowledgement while saving",
-                    self.device_type(),
-                    self.id()
-                );
-            }
-            // Nothing to collect, so the reset stays published: the event is in the guest memory
-            // the snapshot captures and the restored guest still owes the answer.
-            Err(err) if err.raw_os_error() == Some(libc::EAGAIN) => {}
-            Err(err) => error!(
-                "[{:?}:{}] could not read the event queue eventfd while saving: {:?}",
-                self.device_type(),
-                self.id(),
-                err
-            ),
-        }
+        self.acknowledge_transport_reset();
+        info!(
+            "[{:?}:{}] collected the guest's transport reset acknowledgement while saving",
+            self.device_type(),
+            self.id()
+        );
     }
 }
 
@@ -686,7 +721,9 @@ mod tests {
     use super::*;
     use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::vsock::defs::uapi;
-    use crate::devices::virtio::vsock::test_utils::{EVQ_PAYLOAD_GUEST_ADDR, TestContext};
+    use crate::devices::virtio::vsock::test_utils::{
+        EVQ_PAYLOAD_GUEST_ADDR, TestContext, published_ack_from,
+    };
     use crate::snapshot::Persist;
     use crate::vstate::memory::GuestAddress;
 
@@ -774,8 +811,12 @@ mod tests {
         ctx.device.send_transport_reset_event().unwrap();
 
         assert_eq!(
-            ctx.device.transport_reset,
-            TransportReset::Published,
+            published_ack_from(&ctx.device),
+            1,
+            "the watermark must be the avail index the guest had reached at publication"
+        );
+        assert!(
+            ctx.device.data_gated(),
             "TRANSPORT_RESET emission must gate guest data until the guest acknowledges it"
         );
         assert_eq!(
@@ -831,11 +872,11 @@ mod tests {
     }
 
     #[test]
-    fn test_publication_consumes_the_descriptor_arrival_kick() {
-        // The kick that carries a descriptor onto the event queue is not the guest's answer to
-        // the event published into it. Publication consumes that kick, so neither the event
-        // queue's handler nor the capture can find it later and settle a reset the guest has not
-        // yet seen.
+    fn test_a_kick_that_predates_the_publication_settles_nothing() {
+        // The kick that carries a descriptor onto the event queue is not the guest's answer to the
+        // event published into it, and neither is a kick the guest raised for any other reason
+        // before the event existed. Only ring progress past the publication's watermark answers,
+        // so a token left in the eventfd settles nothing on any path that reads one.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
@@ -845,14 +886,27 @@ mod tests {
         ctx.publish_evq_descriptor();
         ctx.device.queue_events[EVQ_INDEX].write(1).unwrap();
 
-        // A data-queue kick retries the owed reset before any event-queue handler runs.
-        ctx.device.retry_owed_transport_reset();
+        // A data-queue kick publishes the owed reset before any event-queue handler runs, and
+        // leaves the arrival kick where it was: a token is not evidence of anything.
+        ctx.device.advance_transport_reset();
 
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(published_ack_from(&ctx.device), 1);
         assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
-        ctx.device.queue_events[EVQ_INDEX]
-            .read()
-            .expect_err("the descriptor-arrival kick must not outlive the publication");
+
+        // The event queue's handler serves that stale token, and must not settle on it.
+        let used = ctx.device.handle_evq_event(EventSet::IN);
+        assert!(used.is_empty());
+        assert_eq!(published_ack_from(&ctx.device), 1);
+        assert!(ctx.device.data_gated());
+
+        // Nor may a capture: the ring has not moved off the watermark.
+        ctx.device.prepare_save();
+        assert_eq!(published_ack_from(&ctx.device), 1);
+
+        // The guest's refill of the consumed head is the answer, and it needs no token at all.
+        ctx.guest_refills_evq(1);
+        ctx.device.prepare_save();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Settled);
     }
 
     #[test]
@@ -930,10 +984,10 @@ mod tests {
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.transport_reset = TransportReset::Published;
+        ctx.device.transport_reset = TransportReset::Published { ack_from: 0 };
         ctx.device.kick();
 
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(published_ack_from(&ctx.device), 0);
 
         ctx.device.backend.set_pending_rx(true);
         assert!(!ctx.device.process_rx().unwrap());
@@ -954,7 +1008,7 @@ mod tests {
         ctx.device.transport_reset = TransportReset::Owed;
         ctx.device.kick();
 
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(published_ack_from(&ctx.device), 1);
         assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
         // The TX queue is not replayed while the reset is unacknowledged.
         ctx.device.queue_events[TXQ_INDEX].read().unwrap_err();
@@ -1055,12 +1109,16 @@ mod tests {
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
         ctx.publish_evq_descriptor();
 
-        ctx.device.transport_reset = TransportReset::Published;
+        ctx.device.transport_reset = TransportReset::Published { ack_from: 1 };
 
         let state = ctx.device.save();
 
-        assert_eq!(state.transport_reset, TransportReset::Published);
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(
+            state.transport_reset,
+            TransportReset::Published { ack_from: 1 },
+            "the serialized reset must carry the watermark the restored device waits on"
+        );
+        assert_eq!(published_ack_from(&ctx.device), 1);
         assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
     }
 
@@ -1073,11 +1131,12 @@ mod tests {
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
         ctx.publish_evq_descriptor();
 
-        ctx.device.transport_reset = TransportReset::Published;
+        let published = TransportReset::Published { ack_from: 1 };
+        ctx.device.transport_reset = published;
 
-        assert_eq!(ctx.device.save().transport_reset, TransportReset::Published);
-        assert_eq!(ctx.device.save().transport_reset, TransportReset::Published);
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(ctx.device.save().transport_reset, published);
+        assert_eq!(ctx.device.save().transport_reset, published);
+        assert_eq!(ctx.device.transport_reset, published);
         assert_eq!(
             ctx.guest_evvq.used.idx.get(),
             0,
@@ -1092,7 +1151,7 @@ mod tests {
             err,
             DeviceError::VsockError(VsockError::EmptyQueue)
         ));
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(ctx.device.transport_reset, published);
         assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
     }
 
@@ -1113,7 +1172,7 @@ mod tests {
 
         // A retry that runs out of descriptors keeps the debt and reports it.
         let stuck_before = METRICS.transport_reset_stuck.count();
-        ctx.device.retry_owed_transport_reset();
+        ctx.device.advance_transport_reset();
         assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
         assert!(
             METRICS.transport_reset_stuck.count() > stuck_before,
@@ -1149,7 +1208,16 @@ mod tests {
         ctx.guest_refills_evq(0);
         let used = ctx.signal_evq_event();
 
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(published_ack_from(&ctx.device), 1);
+        assert_eq!(
+            ctx.guest_evvq.used.event.get(),
+            1,
+            "avail_event must be armed at the same index the watermark records"
+        );
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Published { ack_from: 1 }
+        );
         assert_eq!(
             ctx.guest_evvq.used.idx.get(),
             1,
@@ -1187,8 +1255,8 @@ mod tests {
         ctx.signal_rxq_event();
 
         assert_eq!(
-            ctx.device.transport_reset,
-            TransportReset::Published,
+            published_ack_from(&ctx.device),
+            1,
             "a data-queue kick must retry the owed reset"
         );
         assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
@@ -1224,15 +1292,15 @@ mod tests {
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.transport_reset = TransportReset::Published;
+        ctx.device.transport_reset = TransportReset::Published { ack_from: 0 };
         ctx.device.backend.set_pending_rx(true);
 
         let used = ctx.device.handle_evq_event(EventSet::OUT);
 
         assert!(used.is_empty());
         assert_eq!(
-            ctx.device.transport_reset,
-            TransportReset::Published,
+            published_ack_from(&ctx.device),
+            0,
             "non-IN evset must not clear the gate"
         );
         assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
