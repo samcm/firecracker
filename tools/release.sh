@@ -122,6 +122,26 @@ if [ "$PROFILE" = "release" ]; then
     CARGO_OPTS+=" --release"
 fi
 
+# An authoritative build is one whose artifacts a deployment can bind to a source revision. It
+# refuses anything that breaks that binding: a tree carrying changes no commit names, a
+# dependency set the lock file does not fix, or a builder image named by a mutable tag.
+#
+# Ordinary development builds are untouched. The point is not to make every build reproducible,
+# it is to make the reproducible ones say so.
+AUTHORITATIVE=${FC_AUTHORITATIVE:-false}
+if [ "$AUTHORITATIVE" = "true" ]; then
+    if [ -z "${DEVCTR_IMAGE_DIGEST:-}" ] && [[ "${FC_DEVCTR_IMAGE:-}" != *"@sha256:"* ]]; then
+        die "authoritative build requires DEVCTR_IMAGE_DIGEST: a mutable builder tag leaves the toolchain unpinned"
+    fi
+    HEAD_COMMIT=$(git rev-parse HEAD)
+    DIRT=$(git status --porcelain --untracked-files=all)
+    if [ -n "$DIRT" ]; then
+        echo "$DIRT"
+        die "authoritative build refuses a tree with modified or untracked files: no commit names these bytes"
+    fi
+    CARGO_OPTS+=" --locked"
+fi
+
 # Every name here must be a bin target of the workspace: release mode strips each one and
 # a release copies each one out by name.
 ARTIFACTS=(firecracker jailer seccompiler-bin cpu-template-helper)
@@ -142,6 +162,26 @@ if [ "$PROFILE" = "release" ]; then
     for file in "${ARTIFACTS[@]}"; do
         strip-and-split-debuginfo "$CARGO_TARGET_DIR/$file"
     done
+fi
+
+# The artifact hashes are what actually bind the bytes a deployment runs to the commit and the
+# builder that produced them. The commit each binary reports through `--version` is the runtime
+# cross-check against this file.
+if [ "$AUTHORITATIVE" = "true" ]; then
+    PROVENANCE="$CARGO_TARGET_DIR/PROVENANCE"
+    {
+        echo "commit $HEAD_COMMIT"
+        echo "version $VERSION"
+        echo "toolchain $RUST_TOOLCHAIN"
+        echo "target $CARGO_TARGET"
+        echo "profile $PROFILE"
+        echo "devctr ${DEVCTR_IMAGE_DIGEST:-${FC_DEVCTR_IMAGE:-unknown}}"
+        for file in "${ARTIFACTS[@]}"; do
+            sha256sum "$CARGO_TARGET_DIR/$file" | awk -v n="$file" '{ print "sha256 " n " " $1 }'
+        done
+    } > "$PROVENANCE"
+    say "Provenance written to $PROVENANCE"
+    cat "$PROVENANCE"
 fi
 
 say "Binaries placed under $CARGO_TARGET_DIR"

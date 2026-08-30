@@ -55,6 +55,12 @@ const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
     env!("CARGO_PKG_VERSION")
 };
 
+/// Commit the build script found in the source tree this binary was compiled from, suffixed
+/// `-dirty` when that tree carried modified or untracked files, or `unknown` when there was no
+/// git checkout to read. It binds a deployed image back to a source revision without trusting the
+/// filename it was deployed under.
+const BUILD_COMMIT: &str = env!("FIRECRACKER_BUILD_COMMIT");
+
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 enum MainError {
     /// Failed to set the logger: {0}
@@ -284,14 +290,16 @@ fn main_exec() -> Result<(), MainError> {
     let arguments = arg_parser.arguments();
 
     if arguments.flag_present("help") {
-        println!("Firecracker v{}\n", FIRECRACKER_VERSION);
+        println!("Firecracker v{FIRECRACKER_VERSION}\n");
         println!("{}", arg_parser.formatted_help());
         return Ok(());
     }
 
     if arguments.flag_present("version") {
-        println!("Firecracker v{}\n", FIRECRACKER_VERSION);
+        println!("Firecracker v{FIRECRACKER_VERSION}\n");
         println!("{}", vmm::vstate::farplane::FEATURE_IDENTITY);
+        // A line of its own, because the version line is parsed for the version alone.
+        println!("commit {BUILD_COMMIT}");
         return Ok(());
     }
 
@@ -336,7 +344,7 @@ fn main_exec() -> Result<(), MainError> {
             module,
         })
         .map_err(MainError::LoggerInitialization)?;
-    info_unrestricted!("Running Firecracker v{FIRECRACKER_VERSION}");
+    info_unrestricted!("Running Firecracker v{FIRECRACKER_VERSION} ({BUILD_COMMIT})");
 
     #[cfg(feature = "fuzzing")]
     warn_unrestricted!(

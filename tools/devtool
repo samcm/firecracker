@@ -70,10 +70,20 @@ DEVCTR_IMAGE_NO_TAG="public.ecr.aws/firecracker/fcuvm"
 # Development container tag
 DEVCTR_IMAGE_TAG=${DEVCTR_IMAGE_TAG:-v90}
 
+
 # Development container image (name:tag)
 # This should be updated whenever we upgrade the development container.
 # (Yet another step on our way to reproducible builds.)
-DEVCTR_IMAGE="${DEVCTR_IMAGE_NO_TAG}:${DEVCTR_IMAGE_TAG}"
+#
+# A tag is mutable, so it names a builder that can change under a fixed source revision. Setting
+# DEVCTR_IMAGE_DIGEST pins the image by content instead, and an authoritative build requires it:
+# the toolchain comes from this container, so an unpinned builder leaves the artifacts
+# unreproducible no matter how clean the source tree is.
+if [ -n "${DEVCTR_IMAGE_DIGEST:-}" ]; then
+    DEVCTR_IMAGE="${DEVCTR_IMAGE_NO_TAG}@${DEVCTR_IMAGE_DIGEST}"
+else
+    DEVCTR_IMAGE="${DEVCTR_IMAGE_NO_TAG}:${DEVCTR_IMAGE_TAG}"
+fi
 
 # Full path to the Firecracker tools dir on the host.
 FC_TOOLS_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -529,6 +539,7 @@ cmd_build() {
     # By default, we'll build the debug binaries.
     profile="debug"
     libc="musl"
+    authoritative=false
 
 
     # Parse any command line args.
@@ -538,6 +549,7 @@ cmd_build() {
             "--debug")      { profile="debug";      } ;;
             "--release")    { profile="release";    } ;;
             "--rev")       { shift; revision=$1; } ;;
+            "--authoritative") { authoritative=true; } ;;
             "--ssh-keys")
                 shift
                 [[ -z "$1" ]] && \
@@ -593,13 +605,18 @@ cmd_build() {
     # Run the cargo build process inside the container.
     # We don't need any special privileges for the build phase, so we run the
     # container as the current user/group.
+    #
+    # `FC_AUTHORITATIVE` reaches release.sh through the environment rather than through a flag,
+    # because `--rev` builds a clone of another commit and an authoritative build of a clone is
+    # not a build of this tree.
     run_devctr \
         --privileged \
         --workdir "$workdir" \
+        --env FC_AUTHORITATIVE="$authoritative" \
+        --env FC_DEVCTR_IMAGE="$DEVCTR_IMAGE" \
         ${extra_args} \
         -- \
         ./tools/release.sh --libc $libc --profile $profile
-    ret=$?
 
     # Running as root would have created some root-owned files under the build
     # dir. Let's fix that.

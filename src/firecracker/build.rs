@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::Path;
+use std::process::Command;
 
 const ADVANCED_BINARY_FILTER_FILE_NAME: &str = "seccomp_filter.bpf";
 
@@ -53,4 +54,42 @@ fn main() {
     let out_path = format!("{}/{}", out_dir, ADVANCED_BINARY_FILTER_FILE_NAME);
     seccompiler::compile_bpf(&seccomp_json_path, &target_arch, &out_path, false, false)
         .expect("Cannot compile seccomp filters");
+
+    emit_build_commit();
+}
+
+/// Emits `FIRECRACKER_BUILD_COMMIT` for the binary to report at runtime.
+///
+/// A commit alone does not describe a build: a tree with uncommitted or untracked files compiles
+/// into something no commit names, so that case is reported as `-dirty` rather than as the commit
+/// it is not. A source tree with no git checkout at all reports `unknown`; refusing to build there
+/// would break vendored and archive builds, and the authoritative release mode is what rejects an
+/// unidentified tree.
+fn emit_build_commit() {
+    // `.git` is a directory in a normal clone and a file naming another directory in a linked
+    // worktree, so the paths to watch are asked for rather than assumed.
+    for name in ["HEAD", "index"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", name]) {
+            println!("cargo::rerun-if-changed={path}");
+        }
+    }
+
+    let commit = git(&["rev-parse", "HEAD"]);
+    let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+    let value = match (commit, status) {
+        (Some(commit), Some(status)) if status.is_empty() => commit,
+        (Some(commit), Some(_)) => format!("{commit}-dirty"),
+        // A readable HEAD with an unreadable work tree says nothing trustworthy about the bytes
+        // being compiled, so it is not reported as that commit.
+        _ => "unknown".to_string(),
+    };
+    println!("cargo::rustc-env=FIRECRACKER_BUILD_COMMIT={value}");
+}
+
+fn git(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
 }
