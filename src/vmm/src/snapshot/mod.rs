@@ -39,8 +39,11 @@ pub use crate::snapshot::persist::Persist;
 /// Version of the snapshot format produced and accepted by this crate.
 ///
 /// The major version was raised for the farplane fork: `VsockFrontendState` carries the
-/// transport-reset gate, and bitcode requires exact types, so a snapshot of the previous layout
-/// cannot be read. It is refused by the version check rather than decoded into something else.
+/// transport-reset gate and its acknowledgement watermark. The version is what a build of this
+/// same layout compares before it uses the state; a snapshot of a *different* layout never
+/// reaches that check, because the version is encoded inside the structure and bitcode requires
+/// exact types, so decoding fails first. Either way the state is refused rather than decoded into
+/// something else, and neither path reports a foreign layout's version.
 pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
 #[cfg(target_arch = "x86_64")]
@@ -309,11 +312,12 @@ mod tests {
         }
     }
 
-    /// The vsock frontend layout changed with this fork, and bitcode requires exact types: the
-    /// format version says so rather than leaving an old snapshot to decode into something else.
-    /// It moved again when the published `TRANSPORT_RESET` gained its acknowledgement watermark.
+    /// The version this fork produces, and what the version check is for: an image whose state
+    /// this build can decode, carrying a version it does not accept, is refused before that state
+    /// is used. The header here is the only foreign thing about the image, which is what isolates
+    /// the check.
     #[test]
-    fn the_format_version_records_the_layout_change() {
+    fn the_format_version_refuses_a_decodable_image_of_another_version() {
         assert_eq!(SNAPSHOT_VERSION, Version::new(12, 0, 0));
 
         let mut snapshot = Snapshot::new(MicrovmState::default());
@@ -325,6 +329,55 @@ mod tests {
             Snapshot::<MicrovmState>::load(&mut buf.as_slice()),
             Err(SnapshotError::InvalidFormatVersion(version)) if version == Version::new(10, 0, 0)
         ));
+    }
+
+    /// A warm image of an older layout, such as one from before the transport-reset gate entered
+    /// `VsockFrontendState`, is not what the version check refuses. bitcode is positional and
+    /// requires exact types, and the version sits inside the encoded structure, so the decode
+    /// fails before any header field is available. The refusal is what the fork needs, and this
+    /// records the shape of it: no version is reported for such an image, by `load` or by
+    /// `firecracker --describe-snapshot`.
+    ///
+    /// The stand-in below is a foreign layout rather than a reconstruction of a specific older
+    /// one: this build has no older `MicrovmState` to instantiate, and the behaviour under test
+    /// belongs to every layout that is not this build's.
+    #[test]
+    fn a_snapshot_of_a_foreign_layout_is_refused_without_a_version() {
+        #[derive(Serialize)]
+        struct ForeignLayout {
+            header: SnapshotHdr,
+            data: (u64, String),
+        }
+
+        let image = bitcode::serialize(&ForeignLayout {
+            header: SnapshotHdr {
+                magic: SNAPSHOT_MAGIC_ID,
+                version: Version::new(11, 0, 0),
+                feature_identity: "farplane/2".to_string(),
+            },
+            data: (7, "state this build cannot decode".to_string()),
+        })
+        .unwrap();
+
+        assert!(
+            matches!(
+                Snapshot::<MicrovmState>::load_without_crc_check(&image),
+                Err(SnapshotError::Bitcode(_))
+            ),
+            "a foreign layout must be refused outright rather than decoded"
+        );
+
+        // What `--describe-snapshot` reads. The trailing eight bytes are where a snapshot file
+        // carries its CRC, which this reader splits off before decoding.
+        let mut file = image;
+        file.extend_from_slice(&[0u8; 8]);
+        assert!(
+            matches!(
+                get_format_version(&mut std::io::Cursor::new(&file)),
+                Err(SnapshotError::Bitcode(_))
+            ),
+            "the version of a foreign layout is not reportable, and must not be invented"
+        );
     }
 
     #[test]
