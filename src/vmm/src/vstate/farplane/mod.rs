@@ -10,7 +10,7 @@ pub mod dispatch;
 /// Wire format of the pagemaster memory channel.
 pub mod protocol;
 
-pub use backend::{BackendError, BackendState, FarplaneBackend, FarplaneState};
+pub use backend::{BackendError, BackendState, FarplaneBackend, FarplaneState, set_source_commit};
 pub use capture::CaptureService;
 pub use dispatch::{dispatch_slice, gate, outside_capture_epoch};
 pub use protocol::{

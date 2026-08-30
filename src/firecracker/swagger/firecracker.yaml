@@ -812,6 +812,7 @@ definitions:
       - vcpus
       - capture_buffers_armed
       - feature_identity
+      - source_commit
     properties:
       backend_state:
         description:
@@ -844,6 +845,13 @@ definitions:
         type: string
         enum:
           - "farplane/3"
+      source_commit:
+        description:
+          Commit of the source tree this binary was built from, the same value
+          `firecracker --version` reports. Suffixed `-dirty` when that tree carried
+          modified or untracked files, and `unknown` when there was no git checkout
+          to read.
+        type: string
 
 
   Logger:

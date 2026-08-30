@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import struct
 import time
 import uuid
@@ -1275,6 +1276,7 @@ def test_instance_info_reports_the_farplane_state_sequence(farplane_factory):
     assert cold["vcpus"] == "not_started"
     assert cold["capture_buffers_armed"] is False
     assert cold["feature_identity"] == fp.FEATURE_IDENTITY
+    assert cold["source_commit"], "GET / reported no source commit"
 
     vm.configure()
     vm.start()
@@ -1285,6 +1287,7 @@ def test_instance_info_reports_the_farplane_state_sequence(farplane_factory):
     assert running["backend_state"] == "ready"
     assert running["vcpus"] == "running"
     assert running["capture_buffers_armed"] is False
+    assert running["source_commit"] == cold["source_commit"]
 
     pagemaster.capture_buffers()
     assert vm.farplane_state()["capture_buffers_armed"] is True
@@ -1298,3 +1301,32 @@ def test_instance_info_reports_the_farplane_state_sequence(farplane_factory):
     resumed = vm.farplane_state()
     assert resumed["backend_state"] == "ready"
     assert resumed["capture_buffers_armed"] is False
+    # Every observation resamples the backend, and the provenance of the running binary is not
+    # something a state change can move.
+    assert resumed["source_commit"] == cold["source_commit"]
+
+
+def test_the_state_api_reports_the_binarys_own_source_commit(farplane_factory):
+    """`GET /` names the commit this binary was built from, exactly as `--version` reports it."""
+    vm = farplane_factory()
+    version = utils.check_output(f"{vm.fc_binary} --version").stdout
+    reported = [
+        line.removeprefix("commit ").strip()
+        for line in version.splitlines()
+        if line.startswith("commit ")
+    ]
+    assert (
+        len(reported) == 1
+    ), f"--version printed {len(reported)} commit lines:\n{version}"
+
+    # The description is answered before any memory channel exists, so the provenance is readable
+    # without one.
+    vm.spawn()
+
+    source_commit = vm.farplane_state()["source_commit"]
+    assert source_commit, "GET / reported an empty source commit"
+    assert source_commit == reported[0], "the state API and --version disagree"
+    # An authoritative build compiles an extraction of a clean commit and the release gate requires
+    # exactly that commit. A development tree may carry changes no commit names, or no checkout at
+    # all, and the build script says so rather than naming a commit the bytes do not carry.
+    assert re.fullmatch(r"[0-9a-f]{40}(-dirty)?|unknown", source_commit), source_commit

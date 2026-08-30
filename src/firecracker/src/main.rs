@@ -133,6 +133,10 @@ fn main_exec() -> Result<(), MainError> {
     // Initialize the logger.
     LOGGER.init().map_err(MainError::SetLogger)?;
 
+    // Published before anything can observe the instance description, so that the runtime state
+    // API reports the same provenance as `--version` for the whole life of the process.
+    vmm::vstate::farplane::set_source_commit(BUILD_COMMIT);
+
     // First call to this function updates the value to current
     // host page size.
     _ = host_page_size();

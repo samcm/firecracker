@@ -7,8 +7,8 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_ulong;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use userfaultfd::{RegisterMode, Uffd};
 use userfaultfd_sys::{
@@ -72,6 +72,11 @@ static STATE: AtomicU8 = AtomicU8::new(BackendState::AwaitingPlan as u8);
 static CAPTURE_BUFFERS_ARMED: AtomicBool = AtomicBool::new(false);
 static SOCKET_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 static CHANNEL: Mutex<Option<MemoryChannel>> = Mutex::new(None);
+static SOURCE_COMMIT: OnceLock<&'static str> = OnceLock::new();
+
+/// Reported when no executable published its build commit, which is every process that is not the
+/// Firecracker binary.
+const UNPUBLISHED_SOURCE_COMMIT: &str = "unknown";
 
 /// Lifecycle of the composite guest-memory backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +145,8 @@ pub struct FarplaneState {
     pub capture_buffers_armed: bool,
     /// Compatibility identity of this binary's memory protocol.
     pub feature_identity: String,
+    /// Commit of the source tree this binary was built from.
+    pub source_commit: String,
 }
 
 impl Default for FarplaneState {
@@ -161,6 +168,7 @@ impl FarplaneState {
             vcpus: vcpus.to_string(),
             capture_buffers_armed: CAPTURE_BUFFERS_ARMED.load(Ordering::Acquire),
             feature_identity: protocol::FEATURE_IDENTITY.to_string(),
+            source_commit: source_commit().to_string(),
         }
     }
 }
@@ -256,6 +264,29 @@ impl FarplaneBackend {
 /// Marks the capture buffers armed or disarmed for the instance description.
 pub fn set_capture_buffers_armed(armed: bool) {
     CAPTURE_BUFFERS_ARMED.store(armed, Ordering::Release);
+}
+
+/// Publishes the commit of the source tree this executable was built from.
+///
+/// The value is discovered once, at build time, by the build script of the binary crate, and the
+/// executable hands it over here so that the runtime state API reports exactly what
+/// `firecracker --version` reports. The library cannot derive it: it is a property of the whole
+/// artifact, and a second discovery would be free to disagree with the first. Publishing is
+/// once-only, so the value an observer reads cannot change under it.
+pub fn set_source_commit(commit: &'static str) {
+    let published = SOURCE_COMMIT.get_or_init(|| commit);
+    assert_eq!(
+        *published, commit,
+        "the source commit was already published as a different value"
+    );
+}
+
+/// The published source commit, or `unknown` when nothing published one.
+pub fn source_commit() -> &'static str {
+    SOURCE_COMMIT
+        .get()
+        .copied()
+        .unwrap_or(UNPUBLISHED_SOURCE_COMMIT)
 }
 
 /// Exact size of one harvested dirty bitmap: per region, `ceil(pages / 64)` words of 64 bits,
@@ -1018,6 +1049,7 @@ mod tests {
     use std::ffi::CStr;
 
     use super::*;
+    use crate::vmm_config::instance_info::InstanceInfo;
 
     fn plan(regions: &[RegionRecord], extent_count: u32) -> BackingPlanBody {
         BackingPlanBody {
@@ -1430,5 +1462,48 @@ mod tests {
             validate_canonical(&plan(&regions, 2), &extents, &[page]),
             Err(ErrorCode::BadExtent)
         );
+    }
+
+    #[test]
+    fn the_published_source_commit_reaches_the_state_api_and_survives_observation() {
+        const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+        set_source_commit(COMMIT);
+        assert_eq!(source_commit(), COMMIT);
+
+        let json = serde_json::to_value(FarplaneState::observe()).unwrap();
+        assert_eq!(
+            json.get("source_commit").and_then(|value| value.as_str()),
+            Some(COMMIT),
+            "GET / has to carry the source commit: {json}"
+        );
+
+        // A description published earlier carries a stale copy of everything. Observation refreshes
+        // the dynamic fields and re-reads the provenance from the publisher, so the answer is the
+        // built commit rather than whatever the description was published with.
+        InstanceInfo {
+            id: "source-commit".to_string(),
+            state: VmState::NotStarted,
+            vmm_version: "0.0.0".to_string(),
+            app_name: "Firecracker".to_string(),
+            farplane: FarplaneState {
+                backend_state: "stale".to_string(),
+                vcpus: "stale".to_string(),
+                capture_buffers_armed: !CAPTURE_BUFFERS_ARMED.load(Ordering::Acquire),
+                feature_identity: "stale".to_string(),
+                source_commit: "stale".to_string(),
+            },
+        }
+        .publish();
+
+        let observed = InstanceInfo::observe().unwrap().farplane;
+        assert_eq!(observed.source_commit, COMMIT);
+        assert_eq!(observed.backend_state, BackendState::load().as_str());
+        assert_ne!(observed.vcpus, "stale");
+        assert_eq!(
+            observed.capture_buffers_armed,
+            FarplaneState::observe().capture_buffers_armed
+        );
+        assert_eq!(observed.feature_identity, protocol::FEATURE_IDENTITY);
     }
 }
