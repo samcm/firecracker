@@ -1076,8 +1076,8 @@ mod tests {
                 unsafe { libc::pwrite(writable, content.as_ptr().cast(), content.len(), 0) };
             assert_eq!(written, libc::ssize_t::try_from(content.len()).unwrap());
         }
-        // SAFETY: sealing an owned memfd only restricts what it permits.
         assert_eq!(
+            // SAFETY: sealing an owned memfd only restricts what it permits.
             unsafe { libc::fcntl(writable, libc::F_ADD_SEALS, REQUIRED_VMSTATE_SEALS) },
             0
         );
@@ -1152,7 +1152,7 @@ mod tests {
 
         let exact = finalized_vmstate(&bytes);
         assert_eq!(validate_vmstate_fd(exact.as_raw_fd()), Ok(()));
-        assert!(parse_vmstate(&exact).is_ok());
+        parse_vmstate(&exact).unwrap();
 
         let padded = finalized_vmstate(&[bytes.as_slice(), &[0]].concat());
         assert!(matches!(
