@@ -843,7 +843,7 @@ definitions:
           and vmstate format.
         type: string
         enum:
-          - "farplane/2"
+          - "farplane/3"
 
 
   Logger:

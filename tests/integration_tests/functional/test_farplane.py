@@ -133,7 +133,10 @@ def wait_for_block_read(vm, drive_id, *, timeout=60):
 
     def block_reads():
         vm.api.actions.put(action_type="FlushMetrics")
-        text = (vm.chroot / "fc.ndjson").read_text(encoding="utf-8")
+        metrics_path = vm.chroot / "fc.ndjson"
+        if not metrics_path.exists():
+            return 0
+        text = metrics_path.read_text(encoding="utf-8")
         reads = 0
         for line in text.splitlines():
             if not line.strip():
