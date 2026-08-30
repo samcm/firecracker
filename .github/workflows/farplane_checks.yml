@@ -170,9 +170,9 @@ jobs:
           guarded_cargo_test 20 -p vmm --lib vstate::farplane::capture
           guarded_cargo_test 13 -p vmm --lib vstate::farplane::backend
           guarded_cargo_test 13 -p vmm --lib vstate::farplane::protocol
-          guarded_cargo_test 14 -p vmm --lib devices::virtio::vsock::device
-          guarded_cargo_test 12 -p vmm --lib devices::virtio::vsock::event_handler
-          guarded_cargo_test 10 -p vmm --lib devices::virtio::vsock::persist
+          guarded_cargo_test 15 -p vmm --lib devices::virtio::vsock::device
+          guarded_cargo_test 14 -p vmm --lib devices::virtio::vsock::event_handler
+          guarded_cargo_test 11 -p vmm --lib devices::virtio::vsock::persist
           guarded_cargo_test 11 -p vmm --lib snapshot::
           guarded_cargo_test 25 -p vmm --test farplane_channel
           guarded_cargo_test 1 -p firecracker --bin firecracker api_server_adapter
@@ -183,7 +183,7 @@ jobs:
           # Pin the whole family as well as its three Farplane-specific modules, so
           # deleting a muxer, packet, or connection-state test cannot hide in the
           # still-large aggregate.
-          guarded_cargo_test 79 -p vmm --lib devices::virtio::vsock -- --test-threads=1
+          guarded_cargo_test 83 -p vmm --lib devices::virtio::vsock -- --test-threads=1
 
           if guarded_cargo_test 1 -p vmm --lib vstate::farplane::this_filter_matches_nothing; then
             echo "::error::the guard accepted a filter that selects no tests"
@@ -339,10 +339,15 @@ jobs:
       # The build script accepts the directory (it checks for the file, not its contents), so
       # the failure comes from the link. The target directory is populated by the step above,
       # so only what depends on the changed variable is rebuilt.
+      #
+      # A nonzero exit alone would also be produced by a container that failed to start or a
+      # compile error, so the expected failure is identified rather than assumed: the log must
+      # name the supplied archive and must fail at the link step. Anything else exits with the
+      # build's own status as an unrelated breakage instead of greening this assertion.
       - name: "The release link consumes the supplied library and no other"
         run: |
           set -euo pipefail
-          broken=$(mktemp -d)
+          broken=$(cd "$(mktemp -d)" && pwd -P)
           chmod 0755 "$broken"
           echo "not an archive" > "$broken/libseccomp.a"
           status=0
@@ -358,7 +363,49 @@ jobs:
             echo "::error::the build script refused the directory, so the link was never reached"
             exit 1
           fi
+          if ! grep -qF "$broken/libseccomp.a" broken-build.log; then
+            echo "::error::nothing in the failed build named $broken/libseccomp.a, so the failure"
+            echo "::error::was not the linker rejecting the library the caller supplied"
+            exit "$status"
+          fi
+          if ! grep -qF "error: linking with" broken-build.log; then
+            echo "::error::the build failed before the link, so it says nothing about which"
+            echo "::error::libseccomp the release links"
+            exit "$status"
+          fi
           echo "the release build failed on the unusable supplied library, as it must"
+
+      # The other half of the same question, and the failure a broken devtool produces: the
+      # supplied directory reaches the build only through the explicit `--volume` and `--env`
+      # that `run_devctr` adds (tools/devtool:349-355), and a build that stopped receiving
+      # either would take the build script's /usr/local/lib default, link the container's own
+      # copy and succeed. A directory holding no library makes that fallback visible, because
+      # the build script asserts the supplied directory holds one (src/seccompiler/build.rs:30).
+      #
+      # So the release must fail here, and fail with that refusal naming this directory: a
+      # success means the release linked a libseccomp the caller never supplied, and a failure
+      # without the refusal is an unrelated breakage rather than the provenance proof.
+      - name: "The release refuses a supplied directory that holds no libseccomp"
+        run: |
+          set -euo pipefail
+          empty=$(cd "$(mktemp -d)" && pwd -P)
+          chmod 0755 "$empty"
+          status=0
+          LIBSECCOMP_LIB_PATH="$empty" \
+            ./tools/devtool -y build --release --libc musl > empty-build.log 2>&1 || status=$?
+          tail -40 empty-build.log
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the release build succeeded with no libseccomp in $empty, so it linked"
+            echo "::error::a library the caller did not supply"
+            exit 1
+          fi
+          if ! grep -qF \
+            "$empty, which holds neither libseccomp.a nor libseccomp.so" empty-build.log; then
+            echo "::error::the release build failed without refusing $empty, so the failure was"
+            echo "::error::something other than the missing caller-supplied library"
+            exit "$status"
+          fi
+          echo "the release refused a supplied directory that holds no libseccomp, as it must"
 
       # Restore the good library, so the artifacts the assertions below read are the ones the
       # first build produced rather than a half-finished failed build.

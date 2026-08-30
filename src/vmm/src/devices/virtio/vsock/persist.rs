@@ -554,4 +554,40 @@ pub(crate) mod tests {
             "the kick belongs to the source's event handler, not to the capture"
         );
     }
+
+    /// The capture must not take the descriptor-arrival kick for the guest's answer.
+    ///
+    /// A data-queue kick can publish an owed reset before any event-queue handler runs, which
+    /// leaves the kick that carried the descriptor unserved unless the publication consumes it. A
+    /// capture that read it as an acknowledgement would serialize a settled device, and the
+    /// restored VM would publish a second event for a reset its guest has already been given but
+    /// never answered.
+    #[test]
+    fn test_save_does_not_take_a_descriptor_arrival_kick_for_an_acknowledgement() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.device.transport_reset = TransportReset::Owed;
+
+        // The guest refills the event queue and kicks it, and a data-queue kick publishes the
+        // owed reset before the event queue's handler gets to run.
+        ctx.publish_evq_descriptor();
+        ctx.device.queue_events[EVQ_INDEX].write(1).unwrap();
+        ctx.signal_rxq_event();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+
+        ctx.device.prepare_save();
+
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Published,
+            "the kick that carried the descriptor is not an acknowledgement of the event in it"
+        );
+        assert_eq!(
+            ctx.device.save().transport_reset,
+            TransportReset::Published,
+            "the restored guest still owes the answer to the event in its event queue"
+        );
+    }
 }

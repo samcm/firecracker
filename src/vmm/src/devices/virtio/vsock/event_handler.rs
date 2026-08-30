@@ -106,23 +106,31 @@ where
             return used_queues;
         }
 
+        // The kick is the only evidence this device has that the guest touched the event queue, so
+        // it is read before anything is decided. A read that fails observed no guest action:
+        // settling a published reset on it would release data the guest never acknowledged, and
+        // publishing an owed one on it would answer a notification that was never given.
         if let Err(err) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {:?}", err);
             METRICS.ev_queue_event_fails.inc();
+            return used_queues;
         }
 
         if self.transport_reset == TransportReset::Owed {
             // The guest has put descriptors on the event queue, so the reset it is owed can be
-            // published now. Data stays gated: this event is not its acknowledgement.
+            // published now. Data stays gated: the kick just read carried the descriptor rather
+            // than an answer, and publication consumes any kick left in the eventfd so this one
+            // cannot return as the acknowledgement either.
             if let Err(err) = self.send_transport_reset_event() {
                 error!("vsock: owed TRANSPORT_RESET still not published: {:?}", err);
             }
             return used_queues;
         }
 
-        // Guest's evq kick = TRANSPORT_RESET ack. Clear the gate and drain what it held back.
-        // Assumes TRANSPORT_RESET is the only evq event we publish; new event types would need to
-        // disambiguate before clearing.
+        // A kick read while a reset is published is the guest's acknowledgement of it: the event
+        // it answers was published before this kick could exist. Clear the gate and drain what it
+        // held back. Assumes TRANSPORT_RESET is the only evq event we publish; new event types
+        // would need to disambiguate before clearing.
         //
         // TX is walked only when the gate actually held it: the TX notification consumed while
         // the gate was shut is not repeated, so this walk is what processes those descriptors and
@@ -581,25 +589,70 @@ mod tests {
 
     #[test]
     fn test_evq_event_logs_eventfd_read_failure() {
-        // Driving handle_evq_event without writing to the eventfd first triggers the
-        // EAGAIN read error branch. The gate must still be cleared so the device can
-        // recover.
+        // Driving handle_evq_event without writing to the eventfd first triggers the EAGAIN read
+        // error branch. No guest kick was observed, so the published reset stays published and
+        // data stays gated: a settle here would release data on an acknowledgement the guest
+        // never gave. A same-batch retry that publishes and consumes the kick leaves exactly this
+        // state behind for the event queue's already-ready callback.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
         ctx.device.transport_reset = TransportReset::Published;
-        ctx.device.backend.set_pending_rx(false);
+        ctx.device.backend.set_pending_rx(true);
 
         let metric_before = METRICS.ev_queue_event_fails.count();
-        ctx.device.handle_evq_event(EventSet::IN);
+        let used = ctx.device.handle_evq_event(EventSet::IN);
 
         assert_eq!(metric_before + 1, METRICS.ev_queue_event_fails.count());
         assert_eq!(
             ctx.device.transport_reset,
-            TransportReset::Settled,
-            "the gate must clear even when the eventfd read errors"
+            TransportReset::Published,
+            "a failed eventfd read is not an acknowledgement"
         );
+        assert!(used.is_empty());
+        assert_eq!(
+            ctx.guest_rxvq.used.idx.get(),
+            0,
+            "data must stay gated when no guest kick was read"
+        );
+        assert_eq!(ctx.guest_txvq.used.idx.get(), 0);
+    }
+
+    #[test]
+    fn test_txq_retry_then_evq_readiness_keeps_the_reset_published() {
+        // The TX side of the same epoll batch. The guest's event-queue kick carried the
+        // descriptor, a TX kick published the reset into it, and the event-queue callback that
+        // the very same kick made ready runs afterwards. It must leave the reset published: the
+        // guest has not answered an event it was only just given.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        ctx.device.transport_reset = TransportReset::Owed;
+        ctx.device.backend.set_pending_rx(true);
+        ctx.publish_evq_descriptor();
+        ctx.device.queue_events[EVQ_INDEX].write(1).unwrap();
+
+        ctx.signal_txq_event();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+
+        let used = ctx.device.handle_evq_event(EventSet::IN);
+
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Published,
+            "the kick the retry consumed must not come back as the acknowledgement"
+        );
+        assert!(used.is_empty());
+        assert_eq!(
+            ctx.guest_txvq.used.idx.get(),
+            0,
+            "TX must stay gated until the guest answers the published reset"
+        );
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
     }
 
     #[test]
@@ -833,5 +886,80 @@ mod tests {
             assert_eq!(guest_rxvq.used.idx.get(), 1);
             assert_eq!(guest_txvq.used.idx.get(), 1);
         }
+    }
+
+    /// A reset published from one callback is not acknowledged by another in the same batch.
+    ///
+    /// The guest refills the event queue, kicks it, and kicks a data queue. Both eventfds are
+    /// ready before the event manager dispatches, so both callbacks run whatever either does to
+    /// the other's fd. Whichever runs first publishes the owed reset; the other must leave it
+    /// published, because the guest has had no chance to answer an event it was only just given.
+    #[test]
+    fn test_same_batch_retry_and_evq_readiness_keeps_the_reset_published() {
+        let mut event_manager = EventManager::new().unwrap();
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+
+        ctx.device.transport_reset = TransportReset::Owed;
+        ctx.device.backend.set_pending_rx(true);
+        // The guest puts a descriptor on the event queue: the reset can be published into it.
+        ctx.publish_evq_descriptor();
+
+        let EventHandlerContext {
+            device,
+            guest_rxvq,
+            guest_txvq,
+            guest_evvq,
+        } = ctx;
+
+        let vsock = Arc::new(Mutex::new(device));
+        let _id = event_manager.add_subscriber(vsock.clone());
+        vsock
+            .lock()
+            .unwrap()
+            .activate(test_ctx.mem.clone(), test_ctx.interrupt.clone())
+            .unwrap();
+        // Processing the activate event is what registers the queue eventfds.
+        assert_eq!(event_manager.run_with_timeout(50).unwrap(), 1);
+
+        {
+            let device = vsock.lock().unwrap();
+            device.queue_events[RXQ_INDEX].write(1).unwrap();
+            device.queue_events[EVQ_INDEX].write(1).unwrap();
+        }
+
+        let mut dispatched = 0;
+        for _ in 0..3 {
+            dispatched += event_manager.run_with_timeout(50).unwrap();
+            if dispatched >= 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            dispatched, 2,
+            "both the data-queue kick and the event-queue kick must reach a callback"
+        );
+
+        let device = vsock.lock().unwrap();
+        assert_eq!(
+            device.transport_reset,
+            TransportReset::Published,
+            "the kick that carried the descriptor must not acknowledge the reset it carried"
+        );
+        assert_eq!(
+            guest_evvq.used.idx.get(),
+            1,
+            "exactly one reset must be published into the descriptor the guest left"
+        );
+        assert_eq!(
+            guest_rxvq.used.idx.get(),
+            0,
+            "RX must stay gated until the guest answers the published reset"
+        );
+        assert_eq!(
+            guest_txvq.used.idx.get(),
+            0,
+            "TX must stay gated until the guest answers the published reset"
+        );
     }
 }

@@ -297,17 +297,17 @@ where
     /// Publication needs an available descriptor on the event queue. A queue that has none leaves
     /// the reset owed rather than dropped, with the event queue notification armed, and guest data
     /// stays gated until the event is published and acknowledged.
+    ///
+    /// Publication also consumes whatever kick the event queue's eventfd holds. That kick is what
+    /// made the descriptor available; it is not an answer to the event written into it, and only a
+    /// later kick is.
     pub fn send_transport_reset_event(&mut self) -> Result<(), DeviceError> {
-        // This is safe since we checked in the caller function that the device is activated.
-        let mem = &self.device_state.active_state().unwrap().mem;
-
-        let queue = &mut self.queues[EVQ_INDEX];
         // `pop_or_enable_notification` arms `avail_event` and rechecks the ring as one step, so a
         // descriptor the guest publishes concurrently either carries the reset now or produces the
         // notification that carries it later. A bare `enable_notification` loses that race: it
         // arms at an avail index the guest has already passed, and EVENT_IDX does not repeat the
         // notification the guest has already given, so the reset would never be published.
-        let head = match queue.pop_or_enable_notification() {
+        let head = match self.queues[EVQ_INDEX].pop_or_enable_notification() {
             Ok(Some(head)) => head,
             Ok(None) => {
                 self.owe_transport_reset();
@@ -323,9 +323,26 @@ where
             }
         };
 
+        // Both readers of this eventfd settle a published reset on a successful read: the event
+        // queue's handler, which the descriptor-arrival kick may already have woken, and
+        // `prepare_save()`. So that kick is consumed here, before the used ring advances. The
+        // guest cannot have answered an event it has not been shown, so nothing read here can be
+        // an acknowledgement, and every kick left for those readers is a later one.
+        match self.queue_events[EVQ_INDEX].read() {
+            Ok(_) => {}
+            Err(err) if err.raw_os_error() == Some(libc::EAGAIN) => {}
+            Err(err) => error!(
+                "vsock: could not consume the event queue kick before publishing the reset: {:?}",
+                err
+            ),
+        }
+
+        // This is safe since we checked in the caller function that the device is activated.
+        let mem = &self.device_state.active_state().unwrap().mem;
         mem.write_obj::<u32>(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, head.addr)
             .unwrap_or_else(|err| error!("Failed to write virtio vsock reset event: {:?}", err));
 
+        let queue = &mut self.queues[EVQ_INDEX];
         queue.add_used(head.index, head.len).unwrap_or_else(|err| {
             error!("Failed to add used descriptor {}: {}", head.index, err);
         });
@@ -616,6 +633,10 @@ where
     /// publishing it here would push an event into a source that keeps running. The TX descriptors
     /// the gate held are not walked here either: `kick()` replays their notification, on this
     /// source when it resumes and on the restored VM once its own reset is acknowledged.
+    ///
+    /// A kick found here is an acknowledgement and not the descriptor arrival that preceded the
+    /// event: publication consumes the event queue's pending kick, so the kick that carried the
+    /// descriptor is gone by the time the reset is `Published`.
     fn prepare_save(&mut self) {
         if !self.is_activated() || self.transport_reset != TransportReset::Published {
             return;
@@ -754,6 +775,31 @@ mod tests {
             .read_slice(&mut buf, GuestAddress(EVQ_PAYLOAD_GUEST_ADDR))
             .unwrap();
         assert_eq!(u32::from_le_bytes(buf), VIRTIO_VSOCK_EVENT_TRANSPORT_RESET);
+    }
+
+    #[test]
+    fn test_publication_consumes_the_descriptor_arrival_kick() {
+        // The kick that carries a descriptor onto the event queue is not the guest's answer to
+        // the event published into it. Publication consumes that kick, so neither the event
+        // queue's handler nor the capture can find it later and settle a reset the guest has not
+        // yet seen.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        ctx.device.transport_reset = TransportReset::Owed;
+        // The guest refills the event queue and kicks it.
+        ctx.publish_evq_descriptor();
+        ctx.device.queue_events[EVQ_INDEX].write(1).unwrap();
+
+        // A data-queue kick retries the owed reset before any event-queue handler runs.
+        ctx.device.retry_owed_transport_reset();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        ctx.device.queue_events[EVQ_INDEX]
+            .read()
+            .expect_err("the descriptor-arrival kick must not outlive the publication");
     }
 
     #[test]
