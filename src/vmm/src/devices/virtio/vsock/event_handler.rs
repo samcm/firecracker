@@ -127,8 +127,7 @@ where
         // TX is walked only when the gate actually held it: the TX notification consumed while
         // the gate was shut is not repeated, so this walk is what processes those descriptors and
         // re-arms `avail_event`.
-        let was_gated = self.data_gated();
-        self.transport_reset = TransportReset::Settled;
+        let was_gated = self.acknowledge_transport_reset();
         if was_gated {
             match self.process_tx() {
                 Ok(true) => used_queues.push(TXQ_INDEX.try_into().unwrap()),

@@ -676,6 +676,52 @@ fn validate_unwritable_image(
         return Err(JailerError::ImageFdOwnedByJailUid(flag));
     }
 
+    reject_writable_stream_aliases(flag, stat)
+}
+
+/// Refuses a regular image that a descriptor surviving the exec also holds open for writing.
+///
+/// The checks above prove the jail cannot obtain write access through the inherited image
+/// descriptor itself, nor through the permissions or the ownership of the inode. A second open file
+/// description on the same inode is neither of those: it carries its own access mode, granted
+/// before this process narrowed anything, and `fstat` on the image says nothing about it.
+///
+/// The standard streams are the whole set of descriptors that reach Firecracker without the jailer
+/// choosing what they refer to: `close_inherited_fds` keeps them so the jailed process can log,
+/// [`UFFD_FILENO`] is a device the jailer opens itself, and [`ROOT_FILENO`] and
+/// [`BOOTSTRAP_FILENO`] are overwritten by the images it places there or closed with the rest. So a
+/// caller that points a standard stream at the image inode with an access mode that includes
+/// writing is the one way a writable alias survives into the jail, and that is refused here.
+fn reject_writable_stream_aliases(
+    flag: &'static str,
+    stat: &libc::stat,
+) -> Result<(), JailerError> {
+    for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+        let mut alias = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `alias` is a valid, aligned, sufficiently sized allocation for a `libc::stat`.
+        match SyscallReturnCode(unsafe { libc::fstat(fd, alias.as_mut_ptr()) }).into_empty_result()
+        {
+            Ok(()) => {}
+            // A standard stream the caller left closed refers to no inode, so it aliases nothing.
+            Err(err) if err.raw_os_error() == Some(libc::EBADF) => continue,
+            Err(err) => return Err(JailerError::ImageFdInspect(flag, err)),
+        }
+        // SAFETY: `fstat` returned success, so it initialized the whole struct.
+        let alias = unsafe { alias.assume_init() };
+        if alias.st_dev != stat.st_dev || alias.st_ino != stat.st_ino {
+            continue;
+        }
+
+        // SAFETY: `F_GETFL` writes nothing and the return code is checked.
+        let flags = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GETFL) })
+            .into_result()
+            .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
+        // An `O_PATH` descriptor grants no access at all, whatever access mode it reports.
+        if flags & libc::O_PATH == 0 && flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return Err(JailerError::ImageFdWritableStreamAlias(flag, fd));
+        }
+    }
+
     Ok(())
 }
 
@@ -1142,5 +1188,64 @@ mod tests {
 
         close(fd).unwrap();
         close(read_only).unwrap();
+    }
+
+    /// Creates a regular image and returns a read-only descriptor to it alongside a writable one on
+    /// the same inode. The writable descriptor is opened before the permissions are narrowed,
+    /// which is how a caller comes to hold one for an image no permission bit says is writable.
+    fn regular_image_with_writable_alias(size: u64) -> (RawFd, RawFd) {
+        let path = regular_image_dir().join(format!(
+            "jailer-image-{}",
+            vmm_sys_util::rand::rand_alphanumerics(8)
+                .into_string()
+                .unwrap()
+        ));
+        let file = File::create(&path).unwrap();
+        file.set_len(size).unwrap();
+        drop(file);
+
+        let cstr = CString::new(path.to_str().unwrap()).unwrap();
+        let writable = unsafe { libc::open(cstr.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        assert!(writable >= 0, "{}", io::Error::last_os_error());
+        fs::set_permissions(&path, Permissions::from_mode(0o400)).unwrap();
+        let read_only = unsafe { libc::open(cstr.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(read_only >= 0, "{}", io::Error::last_os_error());
+        fs::remove_file(&path).unwrap();
+        (read_only, writable)
+    }
+
+    /// The inherited image descriptor is not the only way the jail reaches the inode. The standard
+    /// streams survive `close_range`, so a writable one aimed at the image is a writable alias the
+    /// image's own access mode, permissions and ownership all look innocent of.
+    #[test]
+    fn test_validate_root_fd_rejects_a_writable_standard_stream_alias() {
+        let (read_only, writable) = regular_image_with_writable_alias(4096);
+
+        // Firecracker's stderr is the alias, as the caller would have left it. The test process
+        // needs its own back, so it is parked on a descriptor of its own for the one call.
+        let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved_stderr >= 0, "{}", io::Error::last_os_error());
+        dup2(writable, libc::STDERR_FILENO).unwrap();
+        let verdict = validate_image_fd("--root-fd", read_only, other_uid());
+        dup2(saved_stderr, libc::STDERR_FILENO).unwrap();
+        close(saved_stderr).unwrap();
+
+        assert!(
+            matches!(
+                verdict,
+                Err(JailerError::ImageFdWritableStreamAlias(
+                    "--root-fd",
+                    libc::STDERR_FILENO
+                ))
+            ),
+            "a writable stderr alias of the image was accepted: {verdict:?}"
+        );
+
+        // The same image with no alias behind it is the contract the supervisor is held to, so the
+        // check must not refuse it.
+        validate_image_fd("--root-fd", read_only, other_uid()).unwrap();
+
+        close(read_only).unwrap();
+        close(writable).unwrap();
     }
 }

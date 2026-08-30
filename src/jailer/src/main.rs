@@ -121,6 +121,8 @@ pub enum JailerError {
     ImageFdSpecialModeBits(&'static str),
     #[error("{0} must not have any write permission bit set")]
     ImageFdWritablePermissions(&'static str),
+    #[error("{0} shares an inode with fd {1}, which is open for writing and survives the exec")]
+    ImageFdWritableStreamAlias(&'static str, libc::c_int),
     #[error("Failed to change current directory: {0}")]
     SetCurrentDir(io::Error),
     #[error("Failed to join network namespace: netns: {0}")]

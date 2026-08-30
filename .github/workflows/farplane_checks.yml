@@ -55,6 +55,11 @@ jobs:
       # supplied directory when there is one, /usr/local/lib when there is none, and a
       # refusal when the supplied directory holds no library. The script uses nothing but
       # std, so it compiles and runs on its own.
+      #
+      # This is unit coverage of the build script's own logic. It says nothing about the
+      # shipped build: it runs the script directly, outside devtool and its container. The
+      # provenance of the libseccomp the released binaries link is proved in
+      # `aarch64_musl_build`.
       - name: "The seccompiler link search follows LIBSECCOMP_LIB_PATH"
         run: |
           set -euo pipefail
@@ -92,6 +97,10 @@ jobs:
       # library. Rustc consumes a successful linker's stdout, so `-Wl,-t` never reaches the
       # cargo log. The map is a durable linker output instead. A single build job prevents
       # dependency linkers from racing to overwrite it before the final binary is linked.
+      #
+      # This is a debug GNU host build of one workspace binary, driven by cargo directly.
+      # It proves the build script's directives are honoured by a linker; it is not the
+      # path a release takes, and it is not evidence about one.
       - name: "The seccompiler binary links the supplied libseccomp"
         run: |
           set -euo pipefail
@@ -270,21 +279,87 @@ jobs:
             exit 1
           fi
 
-      # A caller-supplied library is a host path. Populate one from the development
-      # container, then build through devtool with that path set. The build can see it only
-      # when run_devctr mounts and forwards the directory; seccompiler's build script then
-      # refuses an empty or wrong mount before linking.
-      - name: "Prepare a caller-supplied libseccomp"
+      # The library a release supplies is a host path outside the checkout. The repository is
+      # mounted into the dev container at /firecracker, not at its host path, so a directory
+      # under the runner's temporary space reaches the build through nothing but the explicit
+      # `--volume` and `--env` that `run_devctr` adds for LIBSECCOMP_LIB_PATH
+      # (tools/devtool:349-355). The container is the only place the library exists, so it is
+      # staged into the checkout first and moved out on the host.
+      - name: "Prepare a caller-supplied libseccomp outside the checkout"
         run: |
           set -euo pipefail
-          mkdir -p build/libseccomp-provenance
-          ./tools/devtool -y sh \
-            'cp /usr/local/lib/libseccomp.a build/libseccomp-provenance/libseccomp.a'
+          ./tools/devtool -y sh 'cp /usr/local/lib/libseccomp.a build/libseccomp-staged.a'
+          private=$(mktemp -d)
+          mv build/libseccomp-staged.a "$private/libseccomp.a"
+          chmod 0755 "$private"
+          echo "LIBSECCOMP_PRIVATE_DIR=$private" >> "$GITHUB_ENV"
+          echo "staged the caller-supplied libseccomp in $private"
 
       - name: "Build the musl binaries the fork ships"
         run: |
           set -euo pipefail
-          LIBSECCOMP_LIB_PATH="$PWD/build/libseccomp-provenance" \
+          LIBSECCOMP_LIB_PATH="$LIBSECCOMP_PRIVATE_DIR" \
+            ./tools/devtool -y build --release --libc musl
+
+      # What consumes libseccomp in a release is a host artifact: `seccompiler` is a build
+      # dependency of `firecracker` (src/firecracker/Cargo.toml), so the directives
+      # `src/seccompiler/build.rs` prints are applied when cargo links firecracker's build
+      # script for the host. Cargo records that script's own emitted directives next to it,
+      # and the recorded search path is the one the release used: a devtool that stopped
+      # forwarding the variable would leave the build script on its /usr/local/lib default
+      # and record that instead, while a devtool that stopped mounting the directory would
+      # fail the build script's own existence assertion.
+      - name: "The release build script searched the supplied directory"
+        run: |
+          set -euo pipefail
+          recorded=$(grep -rlF "cargo::rustc-link-search=native=$LIBSECCOMP_PRIVATE_DIR" \
+            build/cargo_target/release/build/*/output || true)
+          if [ -z "$recorded" ]; then
+            echo "::error::no release build script recorded a link search of $LIBSECCOMP_PRIVATE_DIR"
+            grep -rhF "cargo::rustc-link-search=native=" \
+              build/cargo_target/release/build/*/output || true
+            exit 1
+          fi
+          echo "the release build recorded the supplied search path in:"
+          echo "$recorded"
+
+      # The recorded directive is where the choice is made, not proof the linker took it: the
+      # linker searches its own default directories, which hold the container's copy, after
+      # every explicit `-L`. So repeat the production command with the supplied directory
+      # holding an unusable archive. The build must fail. A build that succeeds linked a
+      # libseccomp the caller did not supply, which is the whole failure this lane exists to
+      # catch, and it is also what a devtool that stopped forwarding the variable would do.
+      #
+      # The build script accepts the directory (it checks for the file, not its contents), so
+      # the failure comes from the link. The target directory is populated by the step above,
+      # so only what depends on the changed variable is rebuilt.
+      - name: "The release link consumes the supplied library and no other"
+        run: |
+          set -euo pipefail
+          broken=$(mktemp -d)
+          chmod 0755 "$broken"
+          echo "not an archive" > "$broken/libseccomp.a"
+          status=0
+          LIBSECCOMP_LIB_PATH="$broken" \
+            ./tools/devtool -y build --release --libc musl > broken-build.log 2>&1 || status=$?
+          tail -40 broken-build.log
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the release build succeeded with an unusable libseccomp in $broken, so"
+            echo "::error::the linker resolved -lseccomp somewhere the caller did not supply"
+            exit 1
+          fi
+          if grep -qF "holds neither libseccomp.a nor libseccomp.so" broken-build.log; then
+            echo "::error::the build script refused the directory, so the link was never reached"
+            exit 1
+          fi
+          echo "the release build failed on the unusable supplied library, as it must"
+
+      # Restore the good library, so the artifacts the assertions below read are the ones the
+      # first build produced rather than a half-finished failed build.
+      - name: "Rebuild the musl binaries with the supplied libseccomp"
+        run: |
+          set -euo pipefail
+          LIBSECCOMP_LIB_PATH="$LIBSECCOMP_PRIVATE_DIR" \
             ./tools/devtool -y build --release --libc musl
 
       # `release.sh` names the output directory after the target triple

@@ -380,6 +380,21 @@ where
         }
     }
 
+    /// Applies the guest's acknowledgement of a published `TRANSPORT_RESET`, and reports whether
+    /// the gate it cleared was holding data back.
+    ///
+    /// Two paths observe that acknowledgement: the event handler, which serves the guest's kick of
+    /// the event queue, and `prepare_save`, which finds such a kick unserved in the event queue's
+    /// eventfd. Both have to leave the same device behind, so the transition lives here.
+    ///
+    /// A caller told the gate was shut owes the TX queue a walk: the notification the guest gave
+    /// while the gate held is not repeated.
+    pub(crate) fn acknowledge_transport_reset(&mut self) -> bool {
+        let was_gated = self.data_gated();
+        self.transport_reset = TransportReset::Settled;
+        was_gated
+    }
+
     /// The reset obligation a snapshot of this device carries.
     ///
     /// A `TRANSPORT_RESET` belongs to the VM restored from the serialized state, not to the one
@@ -581,6 +596,49 @@ where
                     );
                 }
             }
+        }
+    }
+
+    /// Collects an acknowledgement the guest has already given, so the serialized state does not
+    /// wait for it twice.
+    ///
+    /// Only the event handler turns the guest's event queue kick into the acknowledgement of a
+    /// published reset, and that kick can arrive when no handler will run: Farplane's capture
+    /// closes event dispatch before it pauses the vCPUs, so a guest that refills the event queue
+    /// in between leaves its kick in the eventfd. That eventfd does not reach the restored VM,
+    /// whose eventfds are fresh, and the used ring a `Published` restore signals is the one the
+    /// guest has already consumed: the restored guest would never be asked again, would never
+    /// answer, and both of its directions would stay gated for the rest of its life. The pending
+    /// kick is read here instead and the acknowledgement applied before serialization, which makes
+    /// the snapshot carry a reset the restored VM publishes for itself.
+    ///
+    /// Only a published reset is read for. An owed one has no acknowledgement to collect, and
+    /// publishing it here would push an event into a source that keeps running. The TX descriptors
+    /// the gate held are not walked here either: `kick()` replays their notification, on this
+    /// source when it resumes and on the restored VM once its own reset is acknowledged.
+    fn prepare_save(&mut self) {
+        if !self.is_activated() || self.transport_reset != TransportReset::Published {
+            return;
+        }
+
+        match self.queue_events[EVQ_INDEX].read() {
+            Ok(_) => {
+                self.acknowledge_transport_reset();
+                info!(
+                    "[{:?}:{}] collected the guest's transport reset acknowledgement while saving",
+                    self.device_type(),
+                    self.id()
+                );
+            }
+            // Nothing to collect, so the reset stays published: the event is in the guest memory
+            // the snapshot captures and the restored guest still owes the answer.
+            Err(err) if err.raw_os_error() == Some(libc::EAGAIN) => {}
+            Err(err) => error!(
+                "[{:?}:{}] could not read the event queue eventfd while saving: {:?}",
+                self.device_type(),
+                self.id(),
+                err
+            ),
         }
     }
 }

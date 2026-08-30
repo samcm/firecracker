@@ -128,7 +128,7 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::device::AVAIL_FEATURES;
+    use super::device::{AVAIL_FEATURES, EVQ_INDEX};
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::test_utils::default_interrupt;
@@ -440,5 +440,118 @@ pub(crate) mod tests {
 
         assert_eq!(ctx.device.transport_reset, TransportReset::Settled);
         assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
+    }
+
+    /// The acknowledgement a guest gives after event dispatch has stopped is not lost.
+    ///
+    /// Farplane's capture closes dispatch before it pauses the vCPUs, so the kick that answers a
+    /// published reset can land in an eventfd no handler will ever read. The restored VM gets fresh
+    /// eventfds and a used ring its guest has already consumed, so a snapshot that recorded
+    /// `Published` would ask for an answer that can no longer be given and gate that guest for the
+    /// rest of its life.
+    #[test]
+    fn test_save_collects_an_acknowledgement_left_in_the_eventfd() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.device.transport_reset = TransportReset::Published;
+
+        // The guest refills the event queue and kicks it. No handler runs, so the kick stays in
+        // the eventfd, exactly as a capture that closed dispatch first leaves it.
+        ctx.publish_evq_descriptor();
+        ctx.device.queue_events[EVQ_INDEX].write(1).unwrap();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+
+        ctx.device.prepare_save();
+
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Settled,
+            "the acknowledgement waiting in the eventfd must be collected before serialization"
+        );
+
+        let state = VsockState {
+            backend: ctx.device.backend().save(),
+            frontend: ctx.device.save(),
+        };
+        assert_eq!(
+            state.frontend.transport_reset,
+            TransportReset::Owed,
+            "an answered reset is not inherited; the child owes one of its own"
+        );
+
+        let bytes = bitcode::serialize(&state).unwrap();
+        let wire: VsockState = bitcode::deserialize(&bytes).unwrap();
+        ctx.device = Vsock::restore(
+            VsockConstructorArgs {
+                mem: test_ctx.mem.clone(),
+                backend: TestBackend::new(),
+            },
+            &wire.frontend,
+        )
+        .unwrap();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.device.backend.set_pending_rx(true);
+
+        // The child publishes one fresh reset into the descriptor its guest left, and nothing
+        // crosses until that reset is answered.
+        ctx.device.kick();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+
+        // The child's guest answers, and both directions open.
+        ctx.signal_evq_event();
+        assert_eq!(ctx.device.transport_reset, TransportReset::Settled);
+        assert!(!ctx.device.data_gated());
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
+    }
+
+    /// A published reset the guest has not answered stays published: the event is in the guest
+    /// memory the snapshot captures, and reading an empty eventfd is not an acknowledgement.
+    #[test]
+    fn test_save_keeps_a_reset_the_guest_has_not_answered() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.device.transport_reset = TransportReset::Published;
+
+        ctx.device.prepare_save();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
+        assert_eq!(
+            ctx.device.save().transport_reset,
+            TransportReset::Published,
+            "the guest of the restored VM still owes the answer"
+        );
+    }
+
+    /// An owed reset has no acknowledgement to collect, and the capture must not publish one into
+    /// a source that keeps running: the source's own connections are still there.
+    #[test]
+    fn test_save_does_not_publish_an_owed_reset_into_the_source() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.device.transport_reset = TransportReset::Owed;
+
+        // A descriptor and a kick the source's guest left behind, which a publish would consume.
+        ctx.publish_evq_descriptor();
+        ctx.device.queue_events[EVQ_INDEX].write(1).unwrap();
+
+        ctx.device.prepare_save();
+
+        assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            0,
+            "the source's event queue must be left untouched by the capture"
+        );
+        assert_eq!(ctx.device.save().transport_reset, TransportReset::Owed);
+        assert_eq!(
+            ctx.device.queue_events[EVQ_INDEX].read().unwrap(),
+            1,
+            "the kick belongs to the source's event handler, not to the capture"
+        );
     }
 }
