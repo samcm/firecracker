@@ -66,12 +66,47 @@ fn main() {
 /// would break vendored and archive builds, and the authoritative release mode is what rejects an
 /// unidentified tree.
 fn emit_build_commit() {
+    // A build script that names any watched path is watched for those paths alone, so everything
+    // that can change the value below has to be named here.
+    //
     // `.git` is a directory in a normal clone and a file naming another directory in a linked
-    // worktree, so the paths to watch are asked for rather than assumed.
-    for name in ["HEAD", "index"] {
-        if let Some(path) = git(&["rev-parse", "--git-path", name]) {
-            println!("cargo::rerun-if-changed={path}");
+    // worktree, so the metadata paths are asked for rather than assumed. The ref HEAD names is
+    // resolved and watched as well: a commit lands in that ref, or in `packed-refs` once the refs
+    // are packed, and leaves `HEAD` itself untouched, so watching `HEAD` alone follows branch
+    // switches and misses commits. A detached HEAD carries the commit in `HEAD` and has no ref to
+    // resolve.
+    let mut metadata: Vec<String> = ["HEAD", "index", "packed-refs"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    if let Some(head_ref) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
+        metadata.push(head_ref);
+    }
+    for name in &metadata {
+        // A path that does not exist yet is not watched: cargo would rerun this script on every
+        // build. Refs move between their loose file and `packed-refs`, and either move edits a
+        // path that does exist.
+        match git(&["rev-parse", "--git-path", name]) {
+            Some(path) if Path::new(&path).exists() => {
+                println!("cargo::rerun-if-changed={path}")
+            }
+            _ => {}
         }
+    }
+
+    // The `-dirty` suffix is a property of the work tree rather than of the metadata above, so the
+    // sources are watched too: cargo compares directory trees recursively, so an edit, an addition
+    // or a removal under any of these reruns this script. It is a development-build convenience
+    // and not the guarantee: a tree can be dirtied outside these paths. `tools/release.sh`
+    // compiles an authoritative build from an extraction of the commit, where the work tree cannot
+    // change at all, and requires the built binary to report that commit before it records it.
+    for path in [
+        "../../src",
+        "../../resources",
+        "../../Cargo.toml",
+        "../../Cargo.lock",
+    ] {
+        println!("cargo::rerun-if-changed={path}");
     }
 
     let commit = git(&["rev-parse", "HEAD"]);
