@@ -117,6 +117,21 @@ owns: the confined process cannot obtain write access to the inode, neither
 through the inherited descriptor, nor by `chmod`-ing a file it owns, nor through
 a setuid or setgid transition.
 
+### Deployment obligation of a shared regular image
+
+The ownership check above is against one uid: the `--uid` of the jail being
+built. An image owned by a *different* jail's uid passes it. A supervisor that
+hands one regular image to several microVMs therefore owes two things the jailer
+cannot check.
+
+- Publish the image under a uid that is no jail's `--uid`, and keep every
+  directory on the path to it owned by that uid and unwritable by any jail uid.
+  A jail that owns the image, or any directory leading to it, can make the bytes
+  writable again after the launch it was checked for.
+- Give each jail its own `--uid`. Jails that share a uid can write each other's
+  images and jail roots, so they are one trust domain no matter how many jails
+  there are, and an image published for one of them is writable by all of them.
+
 ## Jailer Operation
 
 After starting, the Jailer goes through the following operations:

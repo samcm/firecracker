@@ -5,6 +5,7 @@
 
 # pylint: disable=too-many-lines
 
+import errno
 import hashlib
 import json
 import os
@@ -58,6 +59,9 @@ def farplane_factory(
 
     for vm in built:
         vm.kill()
+    # A regular image has to be staged outside the tmpfs session root, so it is removed here
+    # rather than left in the build or source tree the run staged it in.
+    fp.unpublish_images()
 
 
 def boot(vm, *, vcpu_count=1, mem_size_mib=MEM_SIZE_MIB, fc_args=(), **pm_kwargs):
@@ -704,22 +708,9 @@ def test_parent_death_kills_firecracker(farplane_factory):
     )
 
 
-def require_regular_image_filesystem(vm):
-    """Skip when the session directory seals its inodes.
-
-    A file there answers `F_GET_SEALS`, so the jailer holds it to the sealed-memfd arm of the
-    image descriptor contract and the regular-file arm is unreachable.
-    """
-    if fp.seals_files(vm.chroot_base):
-        pytest.skip(
-            f"{vm.chroot_base} seals its inodes, so a regular image is never accepted"
-        )
-
-
 def test_root_drive_is_served_from_a_shared_read_only_regular_file(farplane_factory):
     """One published image file backs several microVMs, with no per-jail copy of it."""
     first = farplane_factory("shared-image-a")
-    require_regular_image_filesystem(first)
     second = farplane_factory("shared-image-b")
 
     first.open_root_image_file()
@@ -733,6 +724,18 @@ def test_root_drive_is_served_from_a_shared_read_only_regular_file(farplane_fact
     assert (
         published.st_uid != first.uid
     ), "the published image is owned by the jailed uid"
+
+    # The arm of the image descriptor contract is selected by whether the inode answers
+    # `F_GET_SEALS`. An image that answers it is held to the sealed memfd arm however it was
+    # created, so it is only on a filesystem that refuses the call that this test covers the
+    # regular-file arm at all.
+    staging = os.stat(fp.regular_image_dir())
+    assert (
+        published.st_dev == staging.st_dev
+    ), "the published image left the filesystem that was probed for seals"
+    with pytest.raises(OSError) as sealing:
+        fp.seals_of(first.root_fd)
+    assert sealing.value.errno == errno.EINVAL, str(sealing.value)
 
     pagemaster = boot(first)
     boot(second)
@@ -934,10 +937,9 @@ def test_jailer_refuses_a_bad_block_fd(farplane_factory, descriptor, flaw, expec
             "regular_jail_owned": {"owner": vm.uid},
             "regular_o_path": {"open_flags": os.O_PATH},
         }
-        if flaw != "regular_o_path":
-            # Mode and ownership are the regular-file arm of the contract, which is only reached
-            # off a sealing filesystem. The access mode is checked before either arm.
-            require_regular_image_filesystem(vm)
+        # Mode and ownership belong to the regular-file arm of the contract, which is reached only
+        # off a sealing filesystem: `open_private_image_file` stages the image where an inode
+        # refuses `F_GET_SEALS`, or fails. The access mode is checked before either arm.
         block_fd = vm.open_private_image_file(descriptor, **flaws[flaw])
     elif flaw == "writable":
         block_fd = open_memfd(size=PAGE, read_only=False)

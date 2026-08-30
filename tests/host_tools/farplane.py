@@ -25,6 +25,7 @@ import time
 from array import array
 from collections import namedtuple
 from enum import IntEnum
+from functools import cache
 from pathlib import Path
 
 from framework.http_api import Api
@@ -286,18 +287,57 @@ def seals_files(directory):
         probe.unlink()
 
 
+_REGULAR_IMAGE_SUBDIR = "farplane-images"
+
+
+@cache
+def regular_image_dir():
+    """The directory an ordinary regular image is staged in: the first candidate that seals no
+    inode.
+
+    The session root is tmpfs under `tools/devtool` (`--tmpfs /srv`), so an image published beside
+    the jails answers `F_GET_SEALS` and is held to the sealed-memfd arm of the image descriptor
+    contract, never reaching its regular-file arm. The candidates are the two directories the dev
+    container binds from the host, so an inode created in either carries the host filesystem's
+    answer to that call.
+
+    Raises when every candidate seals its inodes. Skipping instead would take the jailer's
+    regular-file arm out of the run without failing it.
+    """
+    # `framework.defs` reads the test artifacts as it is imported, and the cross-language wire
+    # tests import this module on a runner that has none, so these paths are resolved on use.
+    from framework import defs  # pylint: disable=import-outside-toplevel
+
+    rejected = []
+    for candidate in (defs.LOCAL_BUILD_PATH, defs.FC_WORKSPACE_DIR):
+        if not candidate.is_dir():
+            rejected.append(f"{candidate}: absent")
+        elif seals_files(candidate):
+            rejected.append(f"{candidate}: seals its inodes")
+        else:
+            # A new directory always lands on its parent's filesystem, so the answer the candidate
+            # gave is the answer an image staged here gets.
+            staging = candidate / _REGULAR_IMAGE_SUBDIR
+            staging.mkdir(parents=True, exist_ok=True)
+            return staging
+
+    raise RuntimeError(
+        "no directory this suite can write holds unsealed inodes, so the jailer's regular image"
+        f" arm cannot be exercised: {'; '.join(rejected)}"
+    )
+
+
 _PUBLISHED_IMAGES = {}
 
 
-def publish_image(base, source, *, mode=0o400):
-    """Publish `source` under `base` as one shared read-only regular file and return its path.
+def publish_image(source, *, mode=0o400):
+    """Publish `source` as one shared read-only regular file and return its path.
 
     The jailer accepts a regular image so a node can keep one content-addressed copy and hand the
     same inode to every microVM, so the file is named after its digest and written once. A second
     caller with the same bytes gets the same path, never a second copy.
     """
-    base = Path(base)
-    key = (str(base), str(source), mode)
+    key = (str(source), mode)
     published = _PUBLISHED_IMAGES.get(key)
     if published is not None and published.exists():
         return published
@@ -306,8 +346,7 @@ def publish_image(base, source, *, mode=0o400):
     with open(source, "rb") as image:
         for chunk in iter(lambda: image.read(8 << 20), b""):
             digest.update(chunk)
-    published = base / "images" / f"{digest.hexdigest()}.img"
-    published.parent.mkdir(parents=True, exist_ok=True)
+    published = regular_image_dir() / f"{digest.hexdigest()}.img"
     if not published.exists():
         # The copy is staged and renamed so a reader never sees a half-written image.
         staged = published.with_name(f"{published.name}.{os.getpid()}.staged")
@@ -316,6 +355,13 @@ def publish_image(base, source, *, mode=0o400):
         os.replace(staged, published)
     _PUBLISHED_IMAGES[key] = published
     return published
+
+
+def unpublish_images():
+    """Remove the images this session published from the source or build tree it staged them in."""
+    for published in _PUBLISHED_IMAGES.values():
+        published.unlink(missing_ok=True)
+    _PUBLISHED_IMAGES.clear()
 
 
 class DirtyBitmap:
@@ -1033,7 +1079,7 @@ class FarplaneMicrovm:
         `root_image_path` so a test can prove the jail holds that exact inode.
         """
         assert self.rootfs is not None, "the jailer requires a root image"
-        self.root_image_path = publish_image(self.chroot_base, self.rootfs)
+        self.root_image_path = publish_image(self.rootfs)
         self.root_fd = os.open(
             self.root_image_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         )
@@ -1047,15 +1093,21 @@ class FarplaneMicrovm:
         `mode`, `owner` and `open_flags` exist so a test can offer the jailer a regular image that
         breaks one property of the image descriptor contract. The image is private because the
         published node image must stay usable by every other microVM.
+
+        The name is removed once the descriptor is open: the jailer validates the inode behind the
+        descriptor it inherits and never resolves a path, so nothing is left in the tree the image
+        had to be staged in.
         """
-        self.chroot_base.mkdir(parents=True, exist_ok=True)
-        path = self.chroot_base / f"{self.microvm_id}-{descriptor}-image.img"
+        path = regular_image_dir() / f"{self.microvm_id}-{descriptor}-image.img"
         with open(path, "wb") as image:
             image.write(bytes(PAGE_SIZE))
         if owner is not None:
             os.chown(path, owner, -1)
         os.chmod(path, mode)
-        fd = os.open(path, open_flags | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            fd = os.open(path, open_flags | os.O_CLOEXEC | os.O_NOFOLLOW)
+        finally:
+            path.unlink()
         setattr(self, f"{descriptor}_fd", fd)
         return fd
 
