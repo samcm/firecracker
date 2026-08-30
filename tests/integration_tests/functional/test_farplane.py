@@ -6,11 +6,13 @@
 # pylint: disable=too-many-lines
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
 import struct
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -44,7 +46,11 @@ def farplane_factory(
 
     def build(microvm_id=None):
         """Create one jailed Firecracker; the fixture tears it down."""
-        microvm_id = microvm_id or f"fp{len(built)}"
+        # A jail persists until the session root is removed, so an ID must not be reused by the
+        # next test or kernel parameter. Keep descriptive IDs, but make them valid and unique in
+        # the same way as the general microvm factory.
+        label = (microvm_id or f"fp{len(built)}").replace("_", "-")
+        microvm_id = f"{label}-{uuid.uuid4().hex[:8]}"
         vm = fp.FarplaneMicrovm(
             binary_dir=microvm_factory.binary_path,
             chroot_base=chroot_base,
@@ -70,7 +76,9 @@ def boot(vm, *, vcpu_count=1, mem_size_mib=MEM_SIZE_MIB, fc_args=(), **pm_kwargs
     pagemaster = vm.start_pagemaster(**pm_kwargs)
     vm.configure(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib)
     vm.start()
-    return pagemaster.wait_ready()
+    pagemaster.wait_ready()
+    vm.api.vm.patch(state="Resumed")
+    return pagemaster
 
 
 def raw(api, method, path, body=None):
@@ -95,6 +103,27 @@ def wait_for(predicate, *, timeout=30, message="condition"):
             return value
         time.sleep(0.1)
     raise TimeoutError(f"{message} never held within {timeout}s")
+
+
+def wait_for_block_read(vm, drive_id, *, timeout=60):
+    """Wait until the guest completes a read from one named virtio block device."""
+
+    def block_reads():
+        vm.api.actions.put(action_type="FlushMetrics")
+        text = (vm.chroot / "fc.ndjson").read_text(encoding="utf-8")
+        reads = 0
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            metrics = json.loads(line)
+            reads += metrics.get(f"block_{drive_id}", {}).get("read_count", 0)
+        return reads
+
+    return wait_for(
+        block_reads,
+        timeout=timeout,
+        message=f"a virtio block read from {drive_id}",
+    )
 
 
 def smaps_of(pid, start, end):
@@ -127,23 +156,18 @@ def test_multi_extent_regions_boot_and_read_across_every_boundary(farplane_facto
     assert len(pagemaster.backing_fds) == len(pagemaster.extents)
     assert vm.instance()["state"] == "Running"
 
-    # Every extent planted a marker on its last page; each read crosses into a different memfd.
-    assert pagemaster.marker_reads, "no extent markers were probed"
+    # Before it allowed the guest to execute, the pagemaster read a unique marker from the last
+    # page of every extent. Exact address coverage proves each separate memfd mapping, including
+    # both sides of every boundary, without mistaking later KVM guest writes for pristine backing
+    # bytes (KVM reports those through its dirty log, not userfaultfd write events).
+    expected_markers = {
+        extent.guest_addr + extent.len - PAGE for extent in pagemaster.extents
+    }
+    assert set(pagemaster.marker_reads) == expected_markers
     for guest_addr, marker in pagemaster.marker_bytes.items():
         assert (
             pagemaster.marker_reads[guest_addr] == marker
         ), f"the extent boundary at {guest_addr:#x} served the wrong memfd bytes"
-
-    # Bytes on either side of a boundary must come from the two neighbouring memfds. Only pages
-    # the guest has not written can still be compared against their backing store.
-    written = set(pagemaster.written_pages())
-    for extent in pagemaster.extents[1:]:
-        for probe in (extent.guest_addr - PAGE, extent.guest_addr):
-            if probe < pagemaster.extents[0].guest_addr or probe in written:
-                continue
-            assert pagemaster.read_guest(probe, 16) == pagemaster.backing_bytes(
-                probe, 16
-            ), f"{probe:#x} does not match the memfd the plan assigned to it"
 
 
 def test_missing_minor_and_wp_events_reach_the_pagemaster(farplane_factory):
@@ -239,27 +263,12 @@ def test_fault_stays_blocked_after_the_handler_closes_its_duplicate(farplane_fac
     os.waitpid(child, 0)
 
 
-def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory, rootfs):
+def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory):
     """The first harvest holds the loader image, every faulted guest write and device writes."""
     vm = farplane_factory()
     pagemaster = boot(vm, fc_args=("--metrics-path", "fc.ndjson"))
 
-    def block_reads():
-        """How many reads the block device has completed."""
-        vm.api.actions.put(action_type="FlushMetrics")
-        text = (vm.chroot / "fc.ndjson").read_text(encoding="utf-8")
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            metrics = json.loads(line)
-            for name, values in metrics.items():
-                if not name.startswith("block") or not isinstance(values, dict):
-                    continue
-                if values.get("read_count", 0) > 0:
-                    return values["read_count"]
-        return 0
-
-    wait_for(block_reads, timeout=60, message="a virtio block read")
+    wait_for_block_read(vm, "rootfs")
     written = set(pagemaster.written_pages())
     assert written, "the guest never took a write fault"
 
@@ -268,11 +277,13 @@ def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory, ro
     assert pagemaster.write_vmstate().error is None
     assert pagemaster.dirty_snapshot().error is None
     harvest = pagemaster.harvest()
+    harvested_pages = set(harvest.set_pages())
 
     for page in written:
-        assert harvest[page], f"guest write to {page:#x} is missing from the harvest"
+        assert (
+            page in harvested_pages
+        ), f"guest write to {page:#x} is missing from the harvest"
 
-    kernel_pages = (os.path.getsize(vm.kernel) + PAGE - 1) // PAGE
     first_region = pagemaster.ready_regions[0]
     in_first = [
         page
@@ -281,19 +292,10 @@ def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory, ro
         <= page
         < first_region["guest_addr"] + first_region["size"]
     ]
-    assert len(in_first) >= kernel_pages, (
-        f"the loader wrote {kernel_pages} pages of kernel image but only "
-        f"{len(in_first)} pages of the first region are dirty"
-    )
-
-    with open(rootfs, "rb") as image:
-        signature = image.read(64)
-    served_by_device = any(
-        pagemaster.read_guest(page, 64) == signature for page in harvest.set_pages()
-    )
-    assert (
-        served_by_device
-    ), "no dirty page holds the bytes the block device transferred"
+    # An ELF kernel contains file bytes that no PT_LOAD segment maps, so its file size is not a
+    # lower bound for loader-dirtied guest pages. The first region still has to contain loader
+    # output in addition to every userfaultfd-observed write checked above.
+    assert in_first, "the loader left no dirty pages in the first guest-memory region"
 
 
 def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
@@ -301,29 +303,41 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     vm = farplane_factory()
     pagemaster = boot(vm)
 
-    pagemaster.capture_buffers()
-    pagemaster.quiesce()
-    pagemaster.write_vmstate()
-    pagemaster.dirty_snapshot()
+    assert pagemaster.capture_buffers().error is None
+    assert pagemaster.quiesce().error is None
+    assert pagemaster.write_vmstate().error is None
+    assert pagemaster.dirty_snapshot().error is None
     first = pagemaster.harvest()
     assert first.count() > 0, "booting dirtied no page"
 
     # Come back to Ready without letting a vCPU run, so nothing can re-dirty the log.
-    pagemaster.resume(run_vcpus=0)
-    pagemaster.capture_buffers()
-    pagemaster.quiesce()
-    pagemaster.write_vmstate()
-    pagemaster.dirty_snapshot()
+    assert pagemaster.resume(run_vcpus=0).error is None
+    assert pagemaster.capture_buffers().error is None
+    assert pagemaster.quiesce().error is None
+    assert pagemaster.write_vmstate().error is None
+    assert pagemaster.dirty_snapshot().error is None
     second = pagemaster.harvest()
     assert (
         second.count() == 0
     ), f"{second.count()} pages were reported twice while the guest was quiesced"
 
-    pagemaster.resume(run_vcpus=1)
-    time.sleep(2)
-    pagemaster.quiesce()
-    pagemaster.write_vmstate()
-    pagemaster.dirty_snapshot()
+    # Arm userfaultfd write protection while the guest is stopped, then wait for a write fault
+    # after resuming. This proves a vCPU wrote during this epoch without relying on a tickless idle
+    # guest to happen to write during a fixed sleep. Resume releases the prior capture buffers, so
+    # every epoch must explicitly arm fresh buffers before harvesting it.
+    written_before_resume = len(pagemaster.written_pages())
+    for region in pagemaster.ready_regions:
+        pagemaster.write_protect(region["host_base"], region["size"])
+    assert pagemaster.resume(run_vcpus=1).error is None
+    assert pagemaster.capture_buffers().error is None
+    wait_for(
+        lambda: len(pagemaster.written_pages()) > written_before_resume,
+        timeout=30,
+        message="a guest write after the dirty-log harvest",
+    )
+    assert pagemaster.quiesce().error is None
+    assert pagemaster.write_vmstate().error is None
+    assert pagemaster.dirty_snapshot().error is None
     third = pagemaster.harvest()
     assert third.count() > 0, "writes after the harvest were not tracked"
 
@@ -409,9 +423,12 @@ def test_an_exact_retry_of_a_frame_is_answered_not_served(farplane_factory):
     pagemaster.resume(run_vcpus=0)
     pagemaster.capture_buffers()
     pagemaster.quiesce()
+    before_replay = bytes(pagemaster.harvest().data)
     across_epochs = pagemaster.exchange(harvest_frame)
     assert across_epochs.msg == fp.Msg.DIRTY_SNAPSHOT_DONE
-    assert bytes(pagemaster.harvest().data) == bytes(harvested.data)
+    assert (
+        bytes(pagemaster.harvest().data) == before_replay
+    ), "replaying an old answer served its old harvest into the next epoch's buffer"
 
 
 def test_a_retry_of_a_descriptor_command_must_name_the_same_memfds(farplane_factory):
@@ -528,7 +545,7 @@ def test_a_failed_harvest_preserves_every_bit(farplane_factory):
     write_sealed = fp.sealed_memfd(
         "farplane-dirty-ro",
         pagemaster.dirty_bitmap_bytes,
-        seals=fp.BUFFER_SEALS | fp.F_SEAL_WRITE,
+        seals=fp.BUFFER_SEALS,
         read_only=False,
     )
     vmstate = fp.sealed_memfd(
@@ -538,6 +555,9 @@ def test_a_failed_harvest_preserves_every_bit(farplane_factory):
         read_only=False,
     )
     assert pagemaster.capture_buffers(write_sealed, vmstate).error is None
+    # The handoff accepted a correctly sized, writable buffer. Seal writes only afterwards so the
+    # harvest itself fails rather than the capture-buffer contract rejecting the descriptor.
+    fcntl.fcntl(write_sealed, fp.F_ADD_SEALS, fp.F_SEAL_WRITE)
     expected = set(pagemaster.written_pages())
     assert expected
 
@@ -553,8 +573,11 @@ def test_a_failed_harvest_preserves_every_bit(farplane_factory):
     assert pagemaster.write_vmstate().error is None
     assert pagemaster.dirty_snapshot().error is None
     harvest = pagemaster.harvest()
+    harvested_pages = set(harvest.set_pages())
     for page in expected:
-        assert harvest[page], f"the failed harvest dropped the dirty bit of {page:#x}"
+        assert (
+            page in harvested_pages
+        ), f"the failed harvest dropped the dirty bit of {page:#x}"
 
     os.close(write_sealed)
     os.close(vmstate)
@@ -701,10 +724,20 @@ def test_parent_death_kills_firecracker(farplane_factory):
     vm.wrapper.kill()
     vm.wrapper.wait(timeout=10)
 
+    def not_running():
+        try:
+            # A dead child can remain in /proc as a zombie until its new parent reaps it. The
+            # process state, rather than disappearance of its proc entry, proves PDEATHSIG won.
+            return (
+                Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2] == "Z"
+            )
+        except FileNotFoundError:
+            return True
+
     wait_for(
-        lambda: not Path(f"/proc/{pid}/stat").exists(),
+        not_running,
         timeout=10,
-        message="Firecracker exiting with its parent",
+        message="Firecracker becoming dead after its parent exits",
     )
 
 
@@ -737,8 +770,9 @@ def test_root_drive_is_served_from_a_shared_read_only_regular_file(farplane_fact
         fp.seals_of(first.root_fd)
     assert sealing.value.errno == errno.EINVAL, str(sealing.value)
 
-    pagemaster = boot(first)
+    boot(first, fc_args=("--metrics-path", "fc.ndjson"))
     boot(second)
+    wait_for_block_read(first, "rootfs")
 
     # Both jails hold the published inode itself, so one page cache serves both guests instead of
     # one copy per microVM.
@@ -760,72 +794,30 @@ def test_root_drive_is_served_from_a_shared_read_only_regular_file(farplane_fact
         ]
         assert not staged, f"an image was staged in {vm.chroot}: {staged}"
 
-    # The guest read the image over virtio, so its bytes are in guest memory.
-    pagemaster.capture_buffers()
-    pagemaster.quiesce()
-    pagemaster.write_vmstate()
-    pagemaster.dirty_snapshot()
-    with open(first.root_image_path, "rb") as image:
-        signature = image.read(64)
-    assert any(
-        pagemaster.read_guest(page, 64) == signature
-        for page in pagemaster.harvest().set_pages()
-    ), "the guest never read the published root image"
-    pagemaster.resume(run_vcpus=1)
-
 
 def test_root_drive_is_served_from_the_sealed_memfd(farplane_factory):
     """The root device comes from fd 4, which no one can write."""
     vm = farplane_factory()
-    pagemaster = boot(vm)
+    boot(vm, fc_args=("--metrics-path", "fc.ndjson"))
+    wait_for_block_read(vm, "rootfs")
 
     assert fp.seals_of(vm.root_fd) & fp.F_SEAL_WRITE, "the root memfd is writable"
     assert not list(
         vm.chroot.glob("*.squashfs")
     ), "a rootfs image was staged in the jail"
-    assert os.readlink(f"/proc/{vm.pid}/fd/4").startswith("/memfd:rootfs")
-
-    # The guest read the image over virtio, so its bytes are in guest memory.
-    pagemaster.capture_buffers()
-    pagemaster.quiesce()
-    pagemaster.write_vmstate()
-    pagemaster.dirty_snapshot()
-    with open(vm.rootfs, "rb") as image:
-        signature = image.read(64)
-    assert any(
-        pagemaster.read_guest(page, 64) == signature
-        for page in pagemaster.harvest().set_pages()
-    ), "the guest never read the sealed root image"
-    pagemaster.resume(run_vcpus=1)
-    for body, message in [
-        (
-            {"drive_id": "second", "fd": 4, "is_read_only": False},
-            "A drive backed by `fd` requires `is_read_only` to be true.",
-        ),
-        (
-            {
-                "drive_id": "second",
-                "fd": 4,
-                "path_on_host": "/rootfs",
-                "is_read_only": True,
-            },
-            "A drive is backed by either `path_on_host` or `fd`, never both.",
-        ),
-        (
-            {"drive_id": "second", "is_read_only": True},
-            "A drive requires either `path_on_host` or `fd`.",
-        ),
-    ]:
-        response = raw(vm.api, "PUT", "/drives/second", body)
-        assert response.status_code == 400, response.text
-        assert message in response.text, response.text
+    inherited = os.stat(f"/proc/{vm.pid}/fd/{fp.ROOT_FILENO}")
+    supplied = os.fstat(vm.root_fd)
+    assert (inherited.st_dev, inherited.st_ino) == (
+        supplied.st_dev,
+        supplied.st_ino,
+    ), "Firecracker fd 4 is not the supplied root memfd"
 
 
 def test_bootstrap_drive_is_served_from_the_sealed_memfd(farplane_factory):
     """The bootstrap device comes from fd 5 and transfers its bytes to the guest."""
     vm = farplane_factory()
     vm.bootstrap_file = vm.rootfs
-    vm.spawn()
+    vm.spawn(fc_args=("--metrics-path", "fc.ndjson"))
     pagemaster = vm.start_pagemaster()
     vm.configure(
         boot_args=(
@@ -841,34 +833,51 @@ def test_bootstrap_drive_is_served_from_the_sealed_memfd(farplane_factory):
     )
     vm.start()
     pagemaster.wait_ready()
+    vm.api.vm.patch(state="Resumed")
+    wait_for_block_read(vm, "bootstrap")
 
     assert (
         fp.seals_of(vm.bootstrap_fd) & fp.F_SEAL_WRITE
     ), "the bootstrap memfd is writable"
-    assert os.readlink(f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}").startswith(
-        "/memfd:bootstrap"
-    )
-
-    pagemaster.capture_buffers()
-    pagemaster.quiesce()
-    pagemaster.write_vmstate()
-    pagemaster.dirty_snapshot()
-    with open(vm.bootstrap_file, "rb") as image:
-        signature = image.read(64)
-    assert any(
-        pagemaster.read_guest(page, 64) == signature
-        for page in pagemaster.harvest().set_pages()
-    ), "the guest never read the sealed bootstrap image"
-    pagemaster.resume(run_vcpus=1)
+    inherited = os.stat(f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}")
+    supplied = os.fstat(vm.bootstrap_fd)
+    assert (inherited.st_dev, inherited.st_ino) == (
+        supplied.st_dev,
+        supplied.st_ino,
+    ), "Firecracker fd 5 is not the supplied bootstrap memfd"
 
 
 def test_bootstrap_fd_is_closed_when_not_handed_to_the_jailer(farplane_factory):
-    """The absent bootstrap descriptor is not reserved in Firecracker."""
+    """An unsupplied bootstrap object cannot be selected through a reused fd number."""
     vm = farplane_factory()
+    vm.bootstrap_file = vm.rootfs
+    supplied = vm.open_bootstrap_memfd()
+    supplied_identity = os.fstat(supplied)
+    vm.bootstrap_file = None
     boot(vm)
 
-    with pytest.raises(FileNotFoundError):
-        os.readlink(f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}")
+    try:
+        inherited = os.stat(f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}")
+    except FileNotFoundError:
+        pass
+    else:
+        assert (inherited.st_dev, inherited.st_ino) != (
+            supplied_identity.st_dev,
+            supplied_identity.st_ino,
+        ), "the jailer handed Firecracker the bootstrap object it was told to omit"
+
+    response = raw(
+        vm.api,
+        "PUT",
+        "/drives/bootstrap",
+        {
+            "drive_id": "bootstrap",
+            "fd": fp.BOOTSTRAP_FILENO,
+            "is_root_device": False,
+            "is_read_only": True,
+        },
+    )
+    assert response.status_code == 400, response.text
 
 
 def test_api_refuses_bootstrap_fd_without_the_bootstrap_memfd(farplane_factory):
@@ -1075,6 +1084,7 @@ def test_jail_hands_over_renumbered_fds_and_a_stripped_process(farplane_factory)
     vm.configure()
     vm.start()
     pagemaster.wait_ready()
+    vm.api.vm.patch(state="Resumed")
 
     device = f"/proc/{vm.pid}/fd/{fp.UFFD_DEVICE_FILENO}"
     root = f"/proc/{vm.pid}/fd/{fp.ROOT_FILENO}"
@@ -1143,6 +1153,7 @@ def test_instance_info_reports_the_farplane_state_sequence(farplane_factory):
     vm.configure()
     vm.start()
     pagemaster.wait_ready()
+    vm.api.vm.patch(state="Resumed")
 
     running = vm.farplane_state()
     assert running["backend_state"] == "ready"

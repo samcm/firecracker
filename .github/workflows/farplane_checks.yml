@@ -36,7 +36,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup component add clippy
 
-      # `src/seccompiler/build.rs` emits `cargo::rustc-link-lib=seccomp`, so anything that
+      # `src/seccompiler/build.rs` emits `cargo::rustc-link-lib=static=seccomp`, so anything that
       # links the seccompiler library needs libseccomp present at link time. Here that is
       # the `firecracker` build script, which compiles the seccomp policies through
       # seccompiler as a library: without the package its link ends in `unable to find
@@ -73,7 +73,7 @@ jobs:
           echo "$supplied"
           grep -qxF "cargo::rerun-if-env-changed=LIBSECCOMP_LIB_PATH" <<<"$supplied"
           grep -qxF "cargo::rustc-link-search=native=$private" <<<"$supplied"
-          grep -qxF "cargo::rustc-link-lib=seccomp" <<<"$supplied"
+          grep -qxF "cargo::rustc-link-lib=static=seccomp" <<<"$supplied"
           if grep -qF "/usr/local/lib" <<<"$supplied"; then
             echo "::error::the supplied path did not replace the default link search path"
             exit 1
@@ -82,6 +82,15 @@ jobs:
           default=$(env -u LIBSECCOMP_LIB_PATH "$work/build-script")
           echo "$default"
           grep -qxF "cargo::rustc-link-search=native=/usr/local/lib" <<<"$default"
+          grep -qxF "cargo::rustc-link-lib=static=seccomp" <<<"$default"
+
+          shared_only="$work/shared-only"
+          mkdir "$shared_only"
+          : > "$shared_only/libseccomp.so"
+          if LIBSECCOMP_LIB_PATH="$shared_only" "$work/build-script"; then
+            echo "::error::the build script accepted a shared-only supplied library"
+            exit 1
+          fi
 
           holds_nothing="$work/holds-nothing"
           mkdir "$holds_nothing"
@@ -105,12 +114,18 @@ jobs:
         run: |
           set -euo pipefail
           private=$(mktemp -d)
-          supplied=$(cc -print-file-name=libseccomp.so)
-          if [ "$supplied" = libseccomp.so ] || [ ! -f "$supplied" ]; then
-            echo "::error::the installed libseccomp development package exposed no linkable library"
+          supplied=$(cc -print-file-name=libseccomp.a)
+          shared=$(cc -print-file-name=libseccomp.so)
+          if [ "$supplied" = libseccomp.a ] || [ ! -f "$supplied" ]; then
+            echo "::error::the installed libseccomp development package exposed no static library"
             exit 1
           fi
-          cp -L "$supplied" "$private/libseccomp.so"
+          cp -L "$supplied" "$private/libseccomp.a"
+          if [ "$shared" = libseccomp.so ] || [ ! -f "$shared" ]; then
+            echo "::error::the installed libseccomp development package exposed no shared-library decoy"
+            exit 1
+          fi
+          cp -L "$shared" "$private/libseccomp.so"
 
           target=$(mktemp -d)
           map=$(mktemp)
@@ -119,9 +134,13 @@ jobs:
             CARGO_BUILD_JOBS=1 \
             RUSTFLAGS="-C link-arg=-Wl,-Map=$map" \
             cargo build -p seccompiler --bin seccompiler-bin -vv
-          grep -qxF "LOAD $private/libseccomp.so" "$map"
+          grep -qF "$private/libseccomp.a" "$map"
+          if grep -qF "$private/libseccomp.so" "$map"; then
+            echo "::error::the linker selected the shared library beside the supplied archive"
+            exit 1
+          fi
           test -x "$target/debug/seccompiler-bin"
-          echo "the linker opened $private/libseccomp.so"
+          echo "the linker opened $private/libseccomp.a"
 
       # `cargo test <filter>` exits 0 when the filter selects nothing, and a sum taken over
       # several modules stays green when one of them stops existing.
@@ -359,7 +378,7 @@ jobs:
             echo "::error::the linker resolved -lseccomp somewhere the caller did not supply"
             exit 1
           fi
-          if grep -qF "holds neither libseccomp.a nor libseccomp.so" broken-build.log; then
+          if grep -qF "holds no libseccomp.a" broken-build.log; then
             echo "::error::the build script refused the directory, so the link was never reached"
             exit 1
           fi
@@ -400,7 +419,7 @@ jobs:
             exit 1
           fi
           if ! grep -qF \
-            "$empty, which holds neither libseccomp.a nor libseccomp.so" empty-build.log; then
+            "$empty, which holds no libseccomp.a" empty-build.log; then
             echo "::error::the release build failed without refusing $empty, so the failure was"
             echo "::error::something other than the missing caller-supplied library"
             exit "$status"

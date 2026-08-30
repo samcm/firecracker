@@ -13,6 +13,7 @@ source "$TOOLS_DIR/functions"
 # place
 say "Create TMPDIR in /srv"
 export TMPDIR=/srv/tmp
+rm -rf "$TMPDIR" /srv/fctest-* /srv/jailer
 mkdir -pv $TMPDIR
 
 # Some of the security tests need this (test_jail.py)
@@ -35,9 +36,31 @@ if [ "${FC_TEST_SKIP_ARTIFACT_COPY:-}" = "1" ]; then
   mkdir -p /srv/test_artifacts
   say "Skipping artifact copy (FC_TEST_SKIP_ARTIFACT_COPY=1)"
 elif [ -f build/current_artifacts ]; then
-  say "Copy artifacts to /srv/test_artifacts, so hardlinks work"
-  rm -rf /srv/test_artifacts/*
-  cp -rvfL $(cat build/current_artifacts)/. /srv/test_artifacts/
+  artifact_fingerprint() {
+    # A jailer may hardlink a kernel and chown that shared inode to its sandbox uid, so ownership
+    # is expected to drift. Shape, mode, size and nanosecond mtime still reject missing, replaced,
+    # written or chmodded cache entries without rereading every multi-gigabyte image.
+    find -L "$1" -mindepth 1 \
+      -printf '%P\0%y\0%s\0%m\0%T@\0' \
+      | LC_ALL=C sort -z \
+      | sha256sum \
+      | cut -d' ' -f1
+  }
+  artifact_source=$(readlink -f "$(cat build/current_artifacts)")
+  artifact_stamp=/srv/.firecracker-artifacts-source
+  source_fingerprint=$(artifact_fingerprint "$artifact_source")
+  staged_fingerprint=$(artifact_fingerprint /srv/test_artifacts 2>/dev/null || true)
+  if [ -f "$artifact_stamp" ] \
+      && [ "$(cat "$artifact_stamp")" = "$artifact_source" ] \
+      && [ "$staged_fingerprint" = "$source_fingerprint" ]; then
+    say "Reuse artifacts already staged in /srv/test_artifacts"
+  else
+    say "Copy artifacts to /srv/test_artifacts, so hardlinks work"
+    rm -rf /srv/test_artifacts
+    mkdir -p /srv/test_artifacts
+    cp -aL "$artifact_source"/. /srv/test_artifacts/
+    printf '%s\n' "$artifact_source" > "$artifact_stamp"
+  fi
 else
   # The directory must exist for pytest to function
   mkdir -p /srv/test_artifacts

@@ -211,7 +211,12 @@ impl EventHandlerContext<'_> {
     /// it refills the event queue, and what any test that exercises `send_transport_reset_event`
     /// needs.
     pub fn publish_evq_descriptor(&mut self) {
-        self.guest_evvq.dtable[0].set(EVQ_PAYLOAD_GUEST_ADDR, 4, VIRTQ_DESC_F_WRITE, 0);
+        self.publish_evq_descriptor_with(EVQ_PAYLOAD_GUEST_ADDR, 4, VIRTQ_DESC_F_WRITE);
+    }
+
+    /// Publishes one event descriptor with caller-selected fields for negative device tests.
+    pub fn publish_evq_descriptor_with(&mut self, addr: u64, len: u32, flags: u16) {
+        self.guest_evvq.dtable[0].set(addr, len, flags, 0);
         self.guest_evvq.avail.ring[0].set(0);
         self.guest_evvq.avail.idx.set(1);
         self.device.queues[EVQ_INDEX] = self.guest_evvq.create_queue();

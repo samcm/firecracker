@@ -13,9 +13,7 @@ const LIB_PATH_ENV: &str = "LIBSECCOMP_LIB_PATH";
 const DEFAULT_LIB_PATH: &str = "/usr/local/lib";
 
 fn holds_libseccomp(dir: &Path) -> bool {
-    ["libseccomp.a", "libseccomp.so"]
-        .iter()
-        .any(|name| dir.join(name).exists())
+    dir.join("libseccomp.a").is_file()
 }
 
 fn main() {
@@ -29,7 +27,7 @@ fn main() {
             // and links successfully. Refuse that instead of linking something unintended.
             assert!(
                 holds_libseccomp(&path),
-                "{LIB_PATH_ENV} is {}, which holds neither libseccomp.a nor libseccomp.so",
+                "{LIB_PATH_ENV} is {}, which holds no libseccomp.a",
                 path.display()
             );
             path
@@ -39,5 +37,5 @@ fn main() {
     };
 
     println!("cargo::rustc-link-search=native={}", lib_path.display());
-    println!("cargo::rustc-link-lib=seccomp");
+    println!("cargo::rustc-link-lib=static=seccomp");
 }

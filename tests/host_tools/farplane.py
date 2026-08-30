@@ -20,6 +20,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 from array import array
@@ -330,14 +331,14 @@ def regular_image_dir():
 _PUBLISHED_IMAGES = {}
 
 
-def publish_image(source, *, mode=0o400):
+def publish_image(source):
     """Publish `source` as one shared read-only regular file and return its path.
 
     The jailer accepts a regular image so a node can keep one content-addressed copy and hand the
     same inode to every microVM, so the file is named after its digest and written once. A second
     caller with the same bytes gets the same path, never a second copy.
     """
-    key = (str(source), mode)
+    key = str(source)
     published = _PUBLISHED_IMAGES.get(key)
     if published is not None and published.exists():
         return published
@@ -349,10 +350,19 @@ def publish_image(source, *, mode=0o400):
     published = regular_image_dir() / f"{digest.hexdigest()}.img"
     if not published.exists():
         # The copy is staged and renamed so a reader never sees a half-written image.
-        staged = published.with_name(f"{published.name}.{os.getpid()}.staged")
-        shutil.copyfile(source, staged)
-        os.chmod(staged, mode)
-        os.replace(staged, published)
+        with tempfile.NamedTemporaryFile(
+            dir=published.parent,
+            prefix=f"{published.name}.",
+            suffix=".staged",
+            delete=False,
+        ) as image:
+            staged = Path(image.name)
+        try:
+            shutil.copyfile(source, staged)
+            os.chmod(staged, 0o400)
+            os.replace(staged, published)
+        finally:
+            staged.unlink(missing_ok=True)
     _PUBLISHED_IMAGES[key] = published
     return published
 
@@ -433,12 +443,14 @@ class Pagemaster:
         single_memfd=False,
         markers=True,
         vmstate_capacity=16 << 20,
+        listener_uid=None,
     ):
         self.socket_path = Path(socket_path)
         self.splits = splits
         self.single_memfd = single_memfd
         self.markers = markers
         self.vmstate_capacity = vmstate_capacity
+        self.listener_uid = listener_uid
 
         # Backing descriptors, either supplied by the caller (so two guests share them) or built
         # once the hello tells us the guest geometry.
@@ -477,9 +489,20 @@ class Pagemaster:
 
     def start(self):
         """Bind the channel and handle the handshake in the background."""
+        # `tools/devtool test` runs pytest as root because the jailer needs privileges, then the
+        # jailer drops Firecracker to its sandbox uid. UNIX listener credentials are captured at
+        # listen time, so briefly use that uid to model the separate unprivileged pagemaster
+        # process used in production. Firecracker rejects a channel owned by any other uid.
+        original_euid = os.geteuid()
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         self._listener.bind(str(self.socket_path))
-        self._listener.listen(1)
+        try:
+            if self.listener_uid is not None:
+                os.seteuid(self.listener_uid)
+            self._listener.listen(1)
+        finally:
+            if os.geteuid() != original_euid:
+                os.seteuid(original_euid)
         os.chmod(self.socket_path, 0o777)
         self._handshake_thread = threading.Thread(
             target=self._handshake, name="pagemaster-handshake", daemon=True
@@ -1254,6 +1277,7 @@ class FarplaneMicrovm:
 
     def start_pagemaster(self, **kwargs):
         """Bind the memory channel inside the jail and start serving it."""
+        kwargs.setdefault("listener_uid", self.uid)
         self.pagemaster = Pagemaster(self.socket_path, **kwargs)
         self.pagemaster.start()
         return self.pagemaster

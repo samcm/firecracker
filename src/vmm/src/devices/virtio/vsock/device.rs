@@ -21,6 +21,7 @@
 //! - a backend FD.
 
 use std::fmt::Debug;
+use std::mem::size_of;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -339,13 +340,19 @@ where
 
         // This is safe since we checked in the caller function that the device is activated.
         let mem = &self.device_state.active_state().unwrap().mem;
-        mem.write_obj::<u32>(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, head.addr)
-            .unwrap_or_else(|err| error!("Failed to write virtio vsock reset event: {:?}", err));
+        let event_len = u32::try_from(size_of::<u32>()).expect("the event length fits in u32");
+        let write = if !head.is_write_only() || head.len < event_len {
+            Err(DeviceError::MalformedDescriptor)
+        } else {
+            mem.write_obj::<u32>(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, head.addr)
+                .map_err(|err| DeviceError::VsockError(VsockError::GuestMemoryMmap(err)))
+        };
 
         let queue = &mut self.queues[EVQ_INDEX];
-        queue.add_used(head.index, head.len).unwrap_or_else(|err| {
-            error!("Failed to add used descriptor {}: {}", head.index, err);
-        });
+        if let Err(err) = queue.add_used(head.index, if write.is_ok() { event_len } else { 0 }) {
+            self.owe_transport_reset();
+            return Err(err.into());
+        }
         queue.advance_used_ring_idx();
 
         // Arm the notification so the driver's refill of the consumed head is not suppressed by
@@ -353,6 +360,14 @@ where
         // cannot refill before it has seen this used-ring update, which is what makes arming
         // without a recheck correct here.
         queue.enable_notification();
+
+        if let Err(err) = write {
+            // The zero-length used element returns the unusable descriptor. Notify the driver so
+            // it can replace it; the next kick retries the reset that remains owed.
+            self.owe_transport_reset();
+            self.signal_used_queue(EVQ_INDEX)?;
+            return Err(err);
+        }
 
         self.transport_reset = TransportReset::Published;
         METRICS.transport_reset_published.inc();
@@ -669,6 +684,7 @@ mod tests {
     use vmm_sys_util::epoll::EventSet;
 
     use super::*;
+    use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::vsock::defs::uapi;
     use crate::devices::virtio::vsock::test_utils::{EVQ_PAYLOAD_GUEST_ADDR, TestContext};
     use crate::snapshot::Persist;
@@ -775,6 +791,43 @@ mod tests {
             .read_slice(&mut buf, GuestAddress(EVQ_PAYLOAD_GUEST_ADDR))
             .unwrap();
         assert_eq!(u32::from_le_bytes(buf), VIRTIO_VSOCK_EVENT_TRANSPORT_RESET);
+        assert_eq!(ctx.guest_evvq.used.ring[0].get().len, 4);
+    }
+
+    #[test]
+    fn test_malformed_event_descriptors_leave_the_reset_owed() {
+        let cases = [
+            (EVQ_PAYLOAD_GUEST_ADDR, 4, 0, "read-only"),
+            (EVQ_PAYLOAD_GUEST_ADDR, 3, VIRTQ_DESC_F_WRITE, "short"),
+            (1 << 40, 4, VIRTQ_DESC_F_WRITE, "unmapped"),
+        ];
+
+        for (addr, len, flags, name) in cases {
+            let test_ctx = TestContext::new();
+            let mut ctx = test_ctx.create_event_handler_context();
+            ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+            ctx.publish_evq_descriptor_with(addr, len, flags);
+
+            ctx.device
+                .send_transport_reset_event()
+                .expect_err("a malformed event descriptor must be rejected");
+
+            assert_eq!(
+                ctx.device.transport_reset,
+                TransportReset::Owed,
+                "{name} descriptor made an undelivered reset acknowledgeable"
+            );
+            assert_eq!(
+                ctx.guest_evvq.used.idx.get(),
+                1,
+                "{name} descriptor was not returned"
+            );
+            assert_eq!(
+                ctx.guest_evvq.used.ring[0].get().len,
+                0,
+                "{name} descriptor reported reset bytes that were not delivered"
+            );
+        }
     }
 
     #[test]

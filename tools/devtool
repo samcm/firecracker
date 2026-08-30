@@ -341,6 +341,17 @@ run_devctr() {
         fi
     done
 
+    # Integration tests normally use a fresh tmpfs for /srv. A developer iterating on a focused
+    # test can instead keep the session filesystem between devtool invocations; tools/test.sh
+    # clears the per-run scratch tree while retaining its staged CI artifacts. The path is resolved
+    # on the host because Docker, not the development container, owns this mount.
+    srv_args=("--tmpfs" "/srv:exec,dev,size=32G")
+    if [[ -n ${FC_TEST_SRV_DIR:-} ]]; then
+        mkdir -p "$FC_TEST_SRV_DIR"
+        test_srv_dir=$(cd "$FC_TEST_SRV_DIR" && pwd -P)
+        srv_args=("--volume" "$test_srv_dir:/srv:z")
+    fi
+
     # A release can pin the libseccomp it links. The build runs in the dev
     # container, so forwarding only the variable would name a host path the
     # container cannot see. Mount the resolved directory at the same path and
@@ -363,7 +374,7 @@ run_devctr() {
         --volume "$FC_ROOT_DIR:$CTR_FC_ROOT_DIR:z" \
         --volume "$FC_ROOT_DIR/build/cargo_registry:/usr/local/rust/registry:z" \
         --volume "$FC_ROOT_DIR/build/cargo_git_registry:/usr/local/rust/git:z" \
-        --tmpfs /srv:exec,dev,size=32G \
+        "${srv_args[@]}" \
         -v /boot:/boot \
         --env PYTHONDONTWRITEBYTECODE=1 \
         "$DEVCTR_IMAGE" "${ctr_args[@]}"
@@ -827,6 +838,12 @@ setup_kvm() {
         refcount=$(get_kvm_refcount "$vendor_mod")
         if [[ "$refcount" -gt 0 ]]; then
             say_warn "KVM module $vendor_mod is in use (refcount=$refcount), skipping reload"
+        elif [[ -c /dev/kvm ]] && { ! command -v modprobe >/dev/null || [[ ! -d /lib/modules/$kernel_version ]]; }; then
+            # A container can receive a working /dev/kvm without the host's module tree. The
+            # Linux 6.1 reload above is an optional boot-time performance tweak, not a functional
+            # precondition, so use the loaded module rather than making every KVM test impossible.
+            # A missing device still takes the reload path and fails closed below.
+            say_warn "KVM is available but host module management is unavailable; skipping the optional reload"
         else
             echo "Reloading KVM modules"
             if upgrade_to_exclusive_kvm_lock; then
