@@ -81,6 +81,29 @@ def boot(vm, *, vcpu_count=1, mem_size_mib=MEM_SIZE_MIB, fc_args=(), **pm_kwargs
     return pagemaster
 
 
+def restore(vm, parent, *, splits=1, resume_vm=False):
+    """Restore a second Firecracker over the parent's checkpoint.
+
+    The parent's backing descriptors *are* the checkpoint bytes once a capture epoch has closed,
+    and the parent's vmstate buffer holds the serialized state, so both are handed to the child's
+    memory channel. A restore hello states no geometry, so the plan tiles the regions the parent
+    reported, which is what the vmstate names.
+    """
+    vm.spawn()
+    pagemaster = vm.start_pagemaster(
+        splits=splits,
+        markers=False,
+        shared_memfds=parent.backing_fds,
+        restore_regions=[
+            (region["guest_addr"], region["size"]) for region in parent.ready_regions
+        ],
+        vmstate_image=parent.vmstate_fd,
+    )
+    vm.load_snapshot(resume_vm=resume_vm)
+    pagemaster.wait_ready()
+    return pagemaster
+
+
 def raw(api, method, path, body=None):
     """Issue a request without the swagger client so status codes stay visible."""
     return api.session.request(method, api.endpoint + path, json=body)
@@ -279,23 +302,21 @@ def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory):
     harvest = pagemaster.harvest()
     harvested_pages = set(harvest.set_pages())
 
-    for page in written:
-        assert (
-            page in harvested_pages
-        ), f"guest write to {page:#x} is missing from the harvest"
-
-    first_region = pagemaster.ready_regions[0]
-    in_first = [
-        page
-        for page in harvest.set_pages()
-        if first_region["guest_addr"]
-        <= page
-        < first_region["guest_addr"] + first_region["size"]
-    ]
-    # An ELF kernel contains file bytes that no PT_LOAD segment maps, so its file size is not a
-    # lower bound for loader-dirtied guest pages. The first region still has to contain loader
-    # output in addition to every userfaultfd-observed write checked above.
-    assert in_first, "the loader left no dirty pages in the first guest-memory region"
+    all_pages = {
+        region["guest_addr"] + offset
+        for region in pagemaster.ready_regions
+        for offset in range(0, region["size"], PAGE)
+    }
+    # `KVM_DIRTY_LOG_INITIALLY_SET` makes every slot of a booted VM start fully dirty, so the
+    # loader image, every faulted guest write and every device write are all in the first capture.
+    # Asserted as equality in both directions: a subset check over an all-ones bitmap is
+    # satisfied by construction and proves nothing about what the harvest tracks.
+    assert harvested_pages == all_pages, (
+        "the first harvest of a booted VM must be exactly the whole geometry: "
+        f"{len(all_pages - harvested_pages)} pages of a region missing, "
+        f"{len(harvested_pages - all_pages)} pages outside every region"
+    )
+    assert written <= harvested_pages
 
 
 def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
@@ -308,7 +329,14 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     assert pagemaster.write_vmstate().error is None
     assert pagemaster.dirty_snapshot().error is None
     first = pagemaster.harvest()
-    assert first.count() > 0, "booting dirtied no page"
+    all_pages = {
+        region["guest_addr"] + offset
+        for region in pagemaster.ready_regions
+        for offset in range(0, region["size"], PAGE)
+    }
+    assert (
+        set(first.set_pages()) == all_pages
+    ), "the first epoch of a boot is the whole geometry"
 
     # Come back to Ready without letting a vCPU run, so nothing can re-dirty the log.
     assert pagemaster.resume(run_vcpus=0).error is None
@@ -325,13 +353,13 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     # after resuming. This proves a vCPU wrote during this epoch without relying on a tickless idle
     # guest to happen to write during a fixed sleep. Resume releases the prior capture buffers, so
     # every epoch must explicitly arm fresh buffers before harvesting it.
-    written_before_resume = len(pagemaster.written_pages())
+    written_before_resume = set(pagemaster.written_pages())
     for region in pagemaster.ready_regions:
         pagemaster.write_protect(region["host_base"], region["size"])
     assert pagemaster.resume(run_vcpus=1).error is None
     assert pagemaster.capture_buffers().error is None
     wait_for(
-        lambda: len(pagemaster.written_pages()) > written_before_resume,
+        lambda: len(pagemaster.written_pages()) > len(written_before_resume),
         timeout=30,
         message="a guest write after the dirty-log harvest",
     )
@@ -339,7 +367,88 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     assert pagemaster.write_vmstate().error is None
     assert pagemaster.dirty_snapshot().error is None
     third = pagemaster.harvest()
-    assert third.count() > 0, "writes after the harvest were not tracked"
+    third_pages = set(third.set_pages())
+    new_writes = set(pagemaster.written_pages()) - written_before_resume
+    assert new_writes, "the wait returned without a new write fault"
+    assert (
+        new_writes <= third_pages
+    ), f"{sorted(new_writes - third_pages)} were written this epoch and not reported"
+    # Independent of the writes above. An epoch reporting the whole geometry satisfies any subset
+    # check, so the epoch has to be strictly smaller than the geometry to carry any information.
+    assert len(third_pages) < len(all_pages), (
+        "the third epoch reported every page of every region, so the harvest is reporting the "
+        "geometry rather than the writes"
+    )
+
+
+def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
+    """A restored VM's first epoch holds the restore's writes, not the whole geometry."""
+    parent_vm = farplane_factory("restore-parent")
+    parent = boot(parent_vm)
+    wait_for_block_read(parent_vm, "rootfs")
+
+    # Close a capture epoch on the parent. Its backing descriptors now hold the checkpoint bytes
+    # and its vmstate buffer holds the serialized state, which together are what a fork restores
+    # from. It stays quiesced, so those bytes cannot move under the child.
+    assert parent.capture_buffers().error is None
+    assert parent.quiesce().error is None
+    assert parent.write_vmstate().error is None
+    assert parent.dirty_snapshot().error is None
+    assert parent.harvest().count() > 0
+
+    child_vm = farplane_factory("restore-child")
+    child = restore(child_vm, parent)
+
+    all_pages = {
+        region["guest_addr"] + offset
+        for region in child.ready_regions
+        for offset in range(0, region["size"], PAGE)
+    }
+    assert len(all_pages) == len(
+        {
+            region["guest_addr"] + offset
+            for region in parent.ready_regions
+            for offset in range(0, region["size"], PAGE)
+        }
+    ), "the restored VM was given a different geometry from its parent"
+
+    # The child's vCPUs have not started, so everything this epoch reports was written by the
+    # restore itself: the vCPU state KVM applied and the devices the restore rebuilt.
+    assert child.capture_buffers().error is None
+    assert child.quiesce().error is None
+    assert child.write_vmstate().error is None
+    assert child.dirty_snapshot().error is None
+    first_pages = set(child.harvest().set_pages())
+
+    assert first_pages, "the restore wrote no guest page at all"
+    assert len(first_pages) < len(all_pages), (
+        f"the restored VM's first harvest reported {len(first_pages)} of {len(all_pages)} pages, "
+        "so it inherited KVM's initially-set bitmap instead of retiring it"
+    )
+
+    # The baseline re-armed write protection rather than disabling tracking, so the next epoch
+    # still reports what the guest writes once its vCPUs run.
+    written_before = set(child.written_pages())
+    for region in child.ready_regions:
+        child.write_protect(region["host_base"], region["size"])
+    assert child.resume(run_vcpus=0).error is None
+    child_vm.api.vm.patch(state="Resumed")
+    assert child.capture_buffers().error is None
+    wait_for(
+        lambda: len(child.written_pages()) > len(written_before),
+        timeout=30,
+        message="a guest write after the restored VM's dirty-log baseline",
+    )
+    assert child.quiesce().error is None
+    assert child.write_vmstate().error is None
+    assert child.dirty_snapshot().error is None
+    second_pages = set(child.harvest().set_pages())
+    new_writes = set(child.written_pages()) - written_before
+    assert new_writes, "the wait returned without a new write fault"
+    assert (
+        new_writes <= second_pages
+    ), f"{sorted(new_writes - second_pages)} were written this epoch and not reported"
+    assert len(second_pages) < len(all_pages)
 
 
 def test_a_repeated_capture_command_replays_its_answer(farplane_factory):

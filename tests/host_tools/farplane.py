@@ -57,7 +57,7 @@ ARCH_X86_64 = 1
 ARCH_AARCH64 = 2
 MODE_BOOT = 1
 MODE_RESTORE = 2
-
+# `BackingPlanBody::FLAG_VMSTATE`: a vmstate descriptor rides on the `backing_plan` frame.
 BACKING_PLAN_VMSTATE_FLAG = 1
 
 
@@ -444,6 +444,8 @@ class Pagemaster:
         markers=True,
         vmstate_capacity=16 << 20,
         listener_uid=None,
+        restore_regions=None,
+        vmstate_image=None,
     ):
         self.socket_path = Path(socket_path)
         self.splits = splits
@@ -456,6 +458,16 @@ class Pagemaster:
         # once the hello tells us the guest geometry.
         self.backing_fds = list(shared_memfds) if shared_memfds else []
         self.owns_backing = not shared_memfds
+
+        # A restore hello states no geometry: the plan has to tile the regions the vmstate names,
+        # which is the parent's `ready_regions`. `vmstate_image` is the descriptor holding the
+        # parent's serialized vmstate, and it rides on the `backing_plan` frame.
+        self.restore_regions = (
+            [(int(addr), int(size)) for addr, size in restore_regions]
+            if restore_regions
+            else []
+        )
+        self.vmstate_image = vmstate_image
         self.extents = []
         self.marker_bytes = {}
 
@@ -569,6 +581,17 @@ class Pagemaster:
                 "mode": mode,
             }
             self.fc_pid = pid
+
+            if mode == MODE_RESTORE:
+                if regions:
+                    raise ChannelViolation(
+                        f"a restore hello states its geometry in the vmstate, got {regions}"
+                    )
+                if not self.restore_regions or self.vmstate_image is None:
+                    raise ChannelViolation(
+                        "a restore session needs restore_regions and a vmstate_image"
+                    )
+                regions = self.restore_regions
             self.regions = regions
 
             self._build_plan()
@@ -578,11 +601,17 @@ class Pagemaster:
                 struct.pack("<I", len(self.backing_fds)),
                 self.backing_fds,
             )
-            plan = BACKING_PLAN.pack(os.getpid(), len(regions), len(self.extents), 0)
-            for addr, size in regions:
+            flags = BACKING_PLAN_VMSTATE_FLAG if mode == MODE_RESTORE else 0
+            plan = BACKING_PLAN.pack(
+                os.getpid(), len(self.regions), len(self.extents), flags
+            )
+            for addr, size in self.regions:
                 plan += REGION.pack(addr, size)
             table = self._extent_table_fd()
-            self._send(Msg.BACKING_PLAN, self._next_id(), plan, [table])
+            plan_fds = [table]
+            if mode == MODE_RESTORE:
+                plan_fds.append(self.vmstate_image)
+            self._send(Msg.BACKING_PLAN, self._next_id(), plan, plan_fds)
             os.close(table)
 
             header, body, fds = self._recv()
@@ -992,6 +1021,8 @@ class Pagemaster:
 class FarplaneMicrovm:
     """A jailed Firecracker whose guest memory comes from a `Pagemaster`."""
 
+    # pylint: disable=too-many-public-methods
+
     SOCKET_NAME = "farplane.sock"
 
     def __init__(
@@ -1304,6 +1335,15 @@ class FarplaneMicrovm:
     def start(self):
         """Send InstanceStart."""
         return self.api.actions.put(action_type="InstanceStart")
+
+    def load_snapshot(self, *, resume_vm=False):
+        """Restore from the vmstate and guest memory the memory channel hands over.
+
+        There is no snapshot path: the plan carries both the backing descriptors and the vmstate
+        descriptor, so this only tells Firecracker to take the restore path and whether to start
+        the vCPUs afterwards.
+        """
+        return self.api.snapshot_load.put(resume_vm=resume_vm)
 
     def instance(self):
         """The `GET /` document."""
