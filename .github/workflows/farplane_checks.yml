@@ -334,8 +334,10 @@ jobs:
     name: aarch64 musl build of firecracker and jailer
     runs-on: ubuntu-24.04-arm
     # Bounds the build once a runner picks the job up, so a broken label or a stuck
-    # container build ends instead of holding the lane.
-    timeout-minutes: 90
+    # container build ends instead of holding the lane. The authoritative step compiles every
+    # workspace crate a second time, from its extraction of the commit, so this lane holds two
+    # full builds and the partial ones between them.
+    timeout-minutes: 120
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
