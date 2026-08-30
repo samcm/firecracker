@@ -540,6 +540,7 @@ cmd_build() {
     profile="debug"
     libc="musl"
     authoritative=false
+    ret=0
 
 
     # Parse any command line args.
@@ -617,6 +618,7 @@ cmd_build() {
         ${extra_args} \
         -- \
         ./tools/release.sh --libc $libc --profile $profile
+    ret=$?
 
     # Running as root would have created some root-owned files under the build
     # dir. Let's fix that.
