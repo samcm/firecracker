@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
@@ -541,7 +542,7 @@ impl KvmVm {
                 if words.len() != pages.div_ceil(64) {
                     return Err(VmError::DirtyBitmapShape);
                 }
-                if let Some(host_writes) = region.inner.bitmap().as_ref() {
+                if let Some(host_writes) = region.inner.deref().bitmap().as_ref() {
                     if host_writes.len() != pages || host_writes.byte_size() != len {
                         return Err(VmError::DirtyBitmapShape);
                     }
