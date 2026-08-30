@@ -83,6 +83,48 @@ get_user_confirmation() {
     return 1
 }
 
+###########################
+# Container mount helpers #
+###########################
+
+# Print the `docker run --volume` arguments a container needs in order to read a checkout's git
+# metadata, one argument per line, and nothing when that metadata is already inside the checkout.
+#
+# `.git` is a directory in a normal clone, a file naming an external directory in a linked
+# worktree, and can name one in a normal clone too (`git clone --separate-git-dir`). A container
+# that mounts the sources dir alone sees such a pointer without its target: the firecracker build
+# script then reads no commit, and an authoritative build has no revision to bind its artifacts
+# to. The target is mounted at the same absolute path the pointer names, because that path is what
+# git inside the container opens, and read-only, because everything there is read and nothing may
+# be written.
+#
+# Usage: git_metadata_mounts <checkout-dir>
+git_metadata_mounts() {
+    local checkout="$1"
+    local root git_dir common_dir dir
+    local dirs=()
+
+    root=$(cd "$checkout" 2>/dev/null && pwd -P) || return 0
+    # A source tree that is not a git checkout at all needs nothing mounted.
+    git_dir=$(git -C "$root" rev-parse --absolute-git-dir 2>/dev/null) || return 0
+    common_dir=$(cd "$root" && cd "$(git rev-parse --git-common-dir)" && pwd -P) || return 0
+
+    dirs+=("$common_dir")
+    # A linked worktree keeps its own metadata under the common dir, and a normal clone's git dir
+    # is the common dir, so one mount usually covers both. Docker refuses a repeated mount point.
+    if [[ "$git_dir" != "$common_dir" && "$git_dir" != "$common_dir"/* ]]; then
+        dirs+=("$git_dir")
+    fi
+
+    for dir in "${dirs[@]}"; do
+        # Already visible through the sources mount.
+        if [[ "$dir" = "$root" || "$dir" = "$root"/* ]]; then
+            continue
+        fi
+        printf -- '--volume\n%s:%s:ro,z\n' "$dir" "$dir"
+    done
+}
+
 #######################################
 # Release automation common functions #
 #######################################

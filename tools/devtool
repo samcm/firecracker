@@ -375,6 +375,15 @@ run_devctr() {
         docker_args+=("--env" "LIBSECCOMP_LIB_PATH=$libseccomp_dir")
     fi
 
+    # Git metadata can live outside the sources dir, and only the sources dir is mounted. The
+    # firecracker build script reads the commit through git, and `tools/release.sh` refuses an
+    # authoritative build of a tree no commit names, so a container that cannot resolve a linked
+    # worktree's `.git` pointer silently loses the revision the artifacts are bound to.
+    git_args=()
+    while IFS= read -r git_mount_arg; do
+        [[ -n "$git_mount_arg" ]] && git_args+=("$git_mount_arg")
+    done < <(git_metadata_mounts "$FC_ROOT_DIR")
+
     # Finally, run the dev container
     # Use 'z' on the --volume parameter for docker to automatically relabel the
     # content and allow sharing between containers.
@@ -384,6 +393,7 @@ run_devctr() {
         --volume "$FC_ROOT_DIR:$CTR_FC_ROOT_DIR:z" \
         --volume "$FC_ROOT_DIR/build/cargo_registry:/usr/local/rust/registry:z" \
         --volume "$FC_ROOT_DIR/build/cargo_git_registry:/usr/local/rust/git:z" \
+        ${git_args[@]+"${git_args[@]}"} \
         "${srv_args[@]}" \
         -v /boot:/boot \
         --env PYTHONDONTWRITEBYTECODE=1 \
