@@ -36,7 +36,7 @@ use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_config::{VIRTIO_F_IN_ORDER, VIRTIO_F_VERSION_1};
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use crate::devices::virtio::queue::{InvalidAvailIdx, Queue as VirtQueue};
+use crate::devices::virtio::queue::{ArmedNotification, InvalidAvailIdx, Queue as VirtQueue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::devices::virtio::vsock::VsockError;
 use crate::devices::virtio::vsock::metrics::METRICS;
@@ -354,18 +354,29 @@ where
         // Reading it here, after the used ring is visible, puts every descriptor the guest made
         // available before the publication inside the watermark, where it cannot be mistaken for
         // an answer to an event the guest had not been shown.
-        let ack_from = queue.enable_notification();
+        let armed = queue.enable_notification();
 
         if let Err(err) = write {
             // The zero-length used element returns the unusable descriptor. Notify the driver so
-            // it can replace it; the next kick retries the reset that remains owed.
+            // it can replace it; the next kick retries the reset that remains owed. The
+            // replacement descriptor may already be in the ring, and its notification lost, so
+            // this path needs the wakeup too: it is what runs the retry.
             self.owe_transport_reset();
+            self.wake_evq_for_raced_progress(armed);
             self.signal_used_queue(EVQ_INDEX)?;
             return Err(err);
         }
 
-        self.transport_reset = TransportReset::Published { ack_from };
+        self.transport_reset = TransportReset::Published {
+            ack_from: armed.watermark,
+        };
         METRICS.transport_reset_published.inc();
+
+        // The published state is stored before the wakeup is scheduled, because the handler the
+        // wakeup runs settles the reset it finds in `transport_reset` from the ring. A wakeup
+        // scheduled first could be served by a handler that sees no reset to settle and drops the
+        // only evidence of the guest's advance.
+        self.wake_evq_for_raced_progress(armed);
 
         // NOTE: kick() will be called on resume and it will trigger the interrupt again. As calling
         // it multiple times should not cause any harm, it would be safer to call it here as well
@@ -374,6 +385,32 @@ where
         self.signal_used_queue(EVQ_INDEX)?;
 
         Ok(())
+    }
+
+    /// Schedules an event queue wakeup for driver ring progress that raced the arming of
+    /// `avail_event`.
+    ///
+    /// Progress made inside that window can arrive with no notification at all: EVENT_IDX lets the
+    /// driver decide against notifying by comparing its advance against an `avail_event` it read
+    /// before the arming store. The device therefore owes itself the wakeup, and only in that
+    /// case: outside the window the driver's own notification is guaranteed to come.
+    ///
+    /// The token is a wakeup and nothing else. It runs the handler, which reads the rings and
+    /// decides there; a token raised for progress that turns out not to be the acknowledgement
+    /// costs one handler pass and settles nothing.
+    fn wake_evq_for_raced_progress(&self, armed: ArmedNotification) {
+        if !armed.raced {
+            return;
+        }
+
+        if let Err(err) = self.queue_events[EVQ_INDEX].write(1) {
+            METRICS.ev_queue_event_fails.inc();
+            error!(
+                "vsock: failed to schedule the event queue wakeup the driver's progress needs: \
+                 {:?}",
+                err
+            );
+        }
     }
 
     /// Records that the guest is owed a reset the device could not publish.
@@ -719,7 +756,7 @@ mod tests {
     use vmm_sys_util::epoll::EventSet;
 
     use super::*;
-    use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
+    use crate::devices::virtio::queue::{VIRTQ_DESC_F_WRITE, arm_window};
     use crate::devices::virtio::vsock::defs::uapi;
     use crate::devices::virtio::vsock::test_utils::{
         EVQ_PAYLOAD_GUEST_ADDR, TestContext, published_ack_from,
@@ -833,6 +870,78 @@ mod tests {
             .unwrap();
         assert_eq!(u32::from_le_bytes(buf), VIRTIO_VSOCK_EVENT_TRANSPORT_RESET);
         assert_eq!(ctx.guest_evvq.used.ring[0].get().len, 4);
+    }
+
+    /// The window between arming `avail_event` and rechecking `avail.idx` is where EVENT_IDX can
+    /// swallow a notification: the driver advances `avail.idx`, reads an `avail_event` from before
+    /// the arming store, and decides it owes no kick. The publication rechecks, finds that
+    /// progress, and schedules the wakeup the driver did not send.
+    ///
+    /// The refill runs inside that window on the production path, and `handle_evq_event` is
+    /// entered with no token written by this test, so it can only proceed on a token the device
+    /// scheduled itself.
+    #[test]
+    fn test_a_refill_racing_the_arming_reaches_the_handler_without_a_driver_kick() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.publish_evq_descriptor();
+        // Arming, rechecking and the suppression they answer exist only under EVENT_IDX.
+        ctx.device.queues[EVQ_INDEX].enable_notif_suppression();
+
+        // The driver's refill of the head this publication is about to consume.
+        let mem = test_ctx.mem.clone();
+        let refilled_slot = ctx.guest_evvq.avail.ring[1].location;
+        let avail_idx = ctx.guest_evvq.avail.idx.location;
+        arm_window::install(Box::new(move || {
+            mem.write_obj::<u16>(0, refilled_slot).unwrap();
+            mem.write_obj::<u16>(2, avail_idx).unwrap();
+        }));
+
+        ctx.device.send_transport_reset_event().unwrap();
+        arm_window::clear();
+
+        assert_eq!(
+            published_ack_from(&ctx.device),
+            1,
+            "the watermark is the index the arming published, not the one the refill reached"
+        );
+        assert_eq!(
+            ctx.guest_evvq.avail.idx.get(),
+            2,
+            "the refill inside the window must be in the ring the settlement reads"
+        );
+
+        ctx.device.handle_evq_event(EventSet::IN);
+
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Settled,
+            "an acknowledgement that raced the arming must still settle the reset"
+        );
+        assert!(!ctx.device.data_gated());
+    }
+
+    /// The device owes itself a wakeup only for progress that raced the arming. Anything the
+    /// driver adds afterwards crosses an `avail_event` it can no longer read as unarmed, so its
+    /// own notification arrives. A token written unconditionally would instead run the
+    /// settlement path on a ring that holds no answer, and would make the test above pass
+    /// whether the recheck existed or not.
+    #[test]
+    fn test_a_publication_the_driver_did_not_race_schedules_no_wakeup() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.publish_evq_descriptor();
+        ctx.device.queues[EVQ_INDEX].enable_notif_suppression();
+
+        ctx.device.send_transport_reset_event().unwrap();
+
+        ctx.device.queue_events[EVQ_INDEX]
+            .read()
+            .expect_err("a publication no driver raced scheduled a wakeup nothing needs");
+        assert_eq!(published_ack_from(&ctx.device), 1);
+        assert!(ctx.device.data_gated());
     }
 
     #[test]

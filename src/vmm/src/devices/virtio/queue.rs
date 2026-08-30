@@ -56,6 +56,20 @@ pub struct InvalidAvailIdx {
     reported_len: u16,
 }
 
+/// The result of arming `avail_event`, from [`Queue::enable_notification`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArmedNotification {
+    /// The `avail.idx` value `avail_event` was armed at. The driver's next added descriptor
+    /// advances `avail.idx` past it, so a device waiting for driver progress can use it as a
+    /// watermark.
+    pub watermark: u16,
+    /// The driver advanced `avail.idx` past `watermark` while the arming was in progress, so it
+    /// may have made its notification decision against the `avail_event` from before the arming
+    /// and suppressed the notification. The progress is real and already visible; no notification
+    /// carrying it is owed by the driver.
+    pub raced: bool,
+}
+
 /// A virtio descriptor constraints with C representative.
 /// Taken from Virtio spec:
 /// https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-430008
@@ -645,29 +659,45 @@ impl Queue {
         self.uses_notif_suppression = true;
     }
 
-    /// Arm `avail_event` at the current `avail.idx` so the driver's next
-    /// publish produces a notification, and return the index it armed at.
-    /// Unlike [`Self::try_enable_notification`], does not require the queue to
-    /// be drained and does not recheck `avail.idx`; only correct when the
-    /// driver does not add to the avail ring until it has observed our
-    /// used-ring update.
+    /// Arm `avail_event` at the current `avail.idx` so the driver's next publish produces a
+    /// notification, and report both the index armed at and whether the driver had already moved
+    /// past it by the time the arming completed.
     ///
-    /// The returned index is the one `avail_event` holds. A caller using it as
-    /// a watermark therefore cannot arm at one index and compare against
-    /// another, so every driver advance past the watermark is both unsuppressed
-    /// and detectable.
-    pub fn enable_notification(&mut self) -> u16 {
-        let idx = self.avail_ring_idx_get();
+    /// Unlike [`Self::try_enable_notification`], this does not require the queue to be drained:
+    /// the index armed at is whatever `avail.idx` reads, descriptors pending or not.
+    ///
+    /// The reported watermark is the index `avail_event` holds, so a caller cannot arm at one
+    /// index and compare against another, and every driver advance past it is detectable.
+    pub fn enable_notification(&mut self) -> ArmedNotification {
+        let watermark = self.avail_ring_idx_get();
         if !self.uses_notif_suppression {
             // `avail_event` is not part of the ring layout the driver negotiated, so it is not
-            // written here. Without EVENT_IDX the driver notifies unconditionally, which is
-            // what a watermark needs anyway.
-            return idx;
+            // written here. Without EVENT_IDX the driver notifies unconditionally, so no advance
+            // can be suppressed and there is no race to report.
+            return ArmedNotification {
+                watermark,
+                raced: false,
+            };
         }
 
-        self.used_ring_avail_event_set(idx);
-        fence(Ordering::Release);
-        idx
+        self.used_ring_avail_event_set(watermark);
+
+        #[cfg(test)]
+        arm_window::run();
+
+        // Arm, then recheck: the sequence EVENT_IDX requires of a device that waits for an
+        // advance rather than for a notification. The driver publishes `avail.idx` and then reads
+        // `avail_event` with a full barrier in between, so with this fence at least one side sees
+        // the other. Either the driver reads the armed watermark and notifies, or the reload below
+        // sees the advance the driver made against an `avail_event` from before the arming, which
+        // is an advance whose notification EVENT_IDX may have suppressed. Arming without the
+        // recheck lets both sides miss: the advance arrives with no notification at all.
+        fence(Ordering::SeqCst);
+
+        ArmedNotification {
+            watermark,
+            raced: self.avail_ring_idx_get() != watermark,
+        }
     }
 
     /// Check if we need to kick the guest.
@@ -706,6 +736,41 @@ impl Queue {
         self.next_used = Wrapping(0);
         self.num_added = Wrapping(0);
         self.uses_notif_suppression = false;
+    }
+}
+
+/// The window inside [`Queue::enable_notification`] between arming `avail_event` and rechecking
+/// `avail.idx`, opened for tests.
+///
+/// A driver advance that lands there is the one EVENT_IDX can leave without a notification, and
+/// the only interleaving the recheck exists for. A test drives it by installing the driver's
+/// advance as the hook, which runs on the production path in the position a concurrent driver
+/// would occupy.
+#[cfg(test)]
+pub mod arm_window {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` the next times a queue on this thread arms `avail_event`, until [`clear`].
+    pub fn install(hook: Box<dyn FnMut()>) {
+        HOOK.with_borrow_mut(|slot| *slot = Some(hook));
+    }
+
+    /// Stops running the installed hook. A test that installed one must call this before its
+    /// captured state goes away, since the hook outlives the queue that ran it.
+    pub fn clear() {
+        HOOK.with_borrow_mut(|slot| *slot = None);
+    }
+
+    pub(super) fn run() {
+        HOOK.with_borrow_mut(|slot| {
+            if let Some(hook) = slot.as_mut() {
+                hook();
+            }
+        });
     }
 }
 
