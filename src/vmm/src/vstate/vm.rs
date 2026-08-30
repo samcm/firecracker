@@ -542,10 +542,15 @@ impl KvmVm {
                     return Err(VmError::DirtyBitmapShape);
                 }
                 if let Some(host_writes) = region.bitmap() {
-                    for page in 0..pages {
-                        if host_writes.dirty_at(page * page_size) {
-                            words[page / 64] |= 1 << (page % 64);
-                        }
+                    if host_writes.len() != pages || host_writes.byte_size() != len {
+                        return Err(VmError::DirtyBitmapShape);
+                    }
+                    let host_words = (*host_writes).clone().get_and_reset();
+                    if host_words.len() != words.len() {
+                        return Err(VmError::DirtyBitmapShape);
+                    }
+                    for (word, host_word) in words.iter_mut().zip(host_words) {
+                        *word |= host_word;
                     }
                 }
                 Ok(words)
@@ -555,27 +560,31 @@ impl KvmVm {
 
     /// Retires the bits of a snapshot: KVM re-protects them and the host accumulator is reset.
     ///
-    /// KVM drops a slot's bits as it clears them, so the accumulator takes the whole snapshot over
-    /// first and is only reset once every slot cleared: a failure part way through leaves every
-    /// reported bit for the next harvest.
+    /// KVM drops a slot's bits as it clears them. If a later slot fails, the complete snapshot is
+    /// returned to the host accumulator; on success, the host accumulator is reset only after
+    /// every slot cleared. Either outcome leaves every reported bit owned exactly once.
     pub fn clear_dirty_log(&self, snapshot: &[Vec<u64>]) -> Result<(), VmError> {
         let page_size = host_page_size();
         if snapshot.len() != self.guest_memory().num_regions() {
             return Err(VmError::DirtyBitmapShape);
         }
-        for (region, words) in self.guest_memory().iter().zip(snapshot) {
-            let pages = u64_to_usize(region.len()).div_ceil(page_size);
-            if words.len() != pages.div_ceil(64) {
-                return Err(VmError::DirtyBitmapShape);
-            }
-        }
+        let page_counts = self
+            .guest_memory()
+            .iter()
+            .zip(snapshot)
+            .map(|(region, words)| {
+                let pages = u64_to_usize(region.len()).div_ceil(page_size);
+                if words.len() != pages.div_ceil(64) {
+                    return Err(VmError::DirtyBitmapShape);
+                }
+                u32::try_from(pages).map_err(|_| VmError::DirtyBitmapShape)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        self.union_dirty_log(snapshot);
-        for (region, words) in self.guest_memory().iter().zip(snapshot) {
-            let pages = u64_to_usize(region.len()).div_ceil(page_size);
+        for ((region, words), pages) in self.guest_memory().iter().zip(snapshot).zip(page_counts) {
             let clear = kvm_clear_dirty_log {
                 slot: region.slot,
-                num_pages: u32::try_from(pages).map_err(|_| VmError::DirtyBitmapShape)?,
+                num_pages: pages,
                 first_page: 0,
                 __bindgen_anon_1: kvm_bindings::kvm_clear_dirty_log__bindgen_ty_1 {
                     dirty_bitmap: words.as_ptr().cast_mut().cast(),
@@ -584,7 +593,12 @@ impl KvmVm {
             // SAFETY: the ioctl reads `clear`, whose bitmap covers exactly this slot's pages.
             let ret = unsafe { ioctl_with_ref(self.fd(), KVM_CLEAR_DIRTY_LOG(), &clear) };
             if ret != 0 {
-                return Err(VmError::ClearDirtyLog(errno::Error::last()));
+                let err = errno::Error::last();
+                // A previous slot may already be clear. Preserve the complete report in the host
+                // accumulator so the next harvest repeats every bit rather than losing that
+                // slot's part of the snapshot.
+                self.union_dirty_log(snapshot);
+                return Err(VmError::ClearDirtyLog(err));
             }
         }
         self.guest_memory().reset_dirty();
@@ -777,6 +791,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_snapshot_dirty_log_merges_host_words_without_resetting_them() {
+        let page_size = host_page_size();
+        let mut vm = setup_vm();
+        vm.register_memory_regions(crate::test_utils::multi_region_mem_raw(&[
+            (GuestAddress(0), 65 * page_size),
+            (GuestAddress(0x10_0000), 2 * page_size),
+        ]))
+        .unwrap();
+        vm.baseline_dirty_log().unwrap();
+
+        let dirty_pages = [vec![0, 63, 64], vec![1]];
+        for (region, pages) in vm.guest_memory().iter().zip(&dirty_pages) {
+            let bitmap = region.bitmap().unwrap();
+            for page in pages {
+                bitmap.mark_dirty(page * page_size, 1);
+            }
+        }
+
+        let snapshot = vm.snapshot_dirty_log().unwrap();
+        for ((region, words), dirty) in vm.guest_memory().iter().zip(&snapshot).zip(&dirty_pages) {
+            let pages = u64_to_usize(region.len()).div_ceil(page_size);
+            for page in 0..pages {
+                let want = dirty.contains(&page);
+                assert_eq!(words[page / 64] & (1 << (page % 64)) != 0, want);
+                assert_eq!(region.bitmap().unwrap().dirty_at(page * page_size), want);
+            }
+        }
+    }
+
+    #[test]
     fn test_register_memory_regions() {
         let mut vm = setup_vm();
 
@@ -800,16 +844,20 @@ pub(crate) mod tests {
         let page_size = host_page_size();
         let mut vm = setup_vm();
         vm.register_memory_regions(crate::test_utils::multi_region_mem_raw(&[
-            (GuestAddress(0), page_size),
-            (GuestAddress(0x1_0000), page_size),
+            (GuestAddress(0), 65 * page_size),
+            (GuestAddress(0x10_0000), 65 * page_size),
         ]))
         .unwrap();
 
         vm.guest_memory().mark_dirty(GuestAddress(0), page_size);
         vm.guest_memory()
-            .mark_dirty(GuestAddress(0x1_0000), page_size);
+            .mark_dirty(GuestAddress(0x10_0000), page_size);
         let snapshot = vm.snapshot_dirty_log().unwrap();
-        assert!(snapshot.iter().all(|words| words[0] & 1 == 1));
+        assert!(
+            snapshot
+                .iter()
+                .all(|words| { words[0] == u64::MAX && words[1] & 1 == 1 && words[1] & !1 == 0 })
+        );
 
         // Emptying the accumulator leaves the snapshot as the only record of those bits, so the
         // assertion below holds exactly when the clear took them over before touching KVM.
@@ -826,7 +874,9 @@ pub(crate) mod tests {
             Err(VmError::ClearDirtyLog(_))
         ));
         for region in vm.guest_memory().iter() {
-            assert!(region.bitmap().unwrap().dirty_at(0));
+            for page in 0..65 {
+                assert!(region.bitmap().unwrap().dirty_at(page * page_size));
+            }
         }
     }
 
