@@ -417,6 +417,28 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     finally:
         os.close(vmstate_image)
 
+    # The child's plan tiles its parent's memfds, and the folios of those are already in the page
+    # cache, so a first touch of one is a minor fault and not a missing fault. The child plants no
+    # markers of its own: the bytes it has to serve are the ones the descriptors already carry.
+    # Resolving such a fault with a zero page would both lose the checkpoint bytes and fail
+    # outright, leaving the faulting Firecracker thread stranded, so this reads the parent's
+    # marker back through the child's mapping and compares it against the memfd itself.
+    assert not child.markers
+    marker_addr = sorted(parent.marker_bytes)[0]
+    backing = child.backing_bytes(marker_addr, PAGE)
+    assert backing.startswith(
+        parent.marker_bytes[marker_addr]
+    ), "the marker page is not backed"
+    assert backing.strip(
+        b"\0"
+    ), "the backing page is all zeroes, so a zero-fill is undetectable"
+    assert child.read_guest(marker_addr, PAGE) == backing
+    assert any(
+        flags & fp.UFFD_PAGEFAULT_FLAG_MINOR for _, flags in list(child.faults)
+    ), "the restored guest took no minor fault over its parent's memfds"
+    assert child.fault_error() is None
+    assert child.serving_faults(), "the fault service stopped resolving faults"
+
     all_pages = {
         region["guest_addr"] + offset
         for region in child.ready_regions

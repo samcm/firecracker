@@ -492,6 +492,7 @@ class Pagemaster:
         self._handshake_error = None
         self._handshake_thread = None
         self._fault_thread = None
+        self._fault_error = None
         self._serving = threading.Event()
         self._lock = threading.Lock()
         self.dirty_fd = None
@@ -719,6 +720,15 @@ class Pagemaster:
         )
         self._fault_thread.start()
 
+    def serving_faults(self):
+        """Whether the userfaultfd service is still resolving faults."""
+        return self._fault_thread is not None and self._fault_thread.is_alive()
+
+    def fault_error(self):
+        """The failure that stopped the fault service, or `None` while it is healthy."""
+        with self._lock:
+            return self._fault_error
+
     def _serve_faults(self):
         poller = select.poll()
         poller.register(self.uffd, select.POLLIN)
@@ -737,14 +747,23 @@ class Pagemaster:
             host_page = address & ~(PAGE_SIZE - 1)
             with self._lock:
                 self.faults.append((host_page, flags))
+            # The kernel states which fault it delivered, and each kind has exactly one
+            # resolution. A minor fault means the backing folio is already in the page cache and
+            # only the mapping is absent, so the contents are what the guest has to see; zeroing
+            # it would both lose those bytes and fail, because the folio exists. A missing fault
+            # means there is no folio at all, which for a hole is a zero page.
             try:
                 if flags & UFFD_PAGEFAULT_FLAG_WP:
                     self.write_protect(host_page, PAGE_SIZE, protect=False)
-                elif self.guest_addr(host_page) in self.marker_bytes:
+                elif flags & UFFD_PAGEFAULT_FLAG_MINOR:
                     self._uffdio_continue(host_page)
                 else:
                     self._uffdio_zeropage(host_page)
-            except OSError:
+            except OSError as exc:
+                # Returning leaves every later fault unresolved, which blocks the faulting
+                # Firecracker thread for good. Record why, so that the hang names its cause.
+                with self._lock:
+                    self._fault_error = exc
                 return
 
     def _uffdio_zeropage(self, page):
