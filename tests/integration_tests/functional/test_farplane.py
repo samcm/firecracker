@@ -71,9 +71,17 @@ def farplane_factory(
     fp.unpublish_images()
 
 
-def boot(vm, *, vcpu_count=1, mem_size_mib=MEM_SIZE_MIB, fc_args=(), **pm_kwargs):
+def boot(
+    vm,
+    *,
+    vcpu_count=1,
+    mem_size_mib=MEM_SIZE_MIB,
+    fc_args=(),
+    serial_input=False,
+    **pm_kwargs,
+):
     """Launch the jail, serve the memory channel and start the guest."""
-    vm.spawn(fc_args=fc_args)
+    vm.spawn(fc_args=fc_args, serial_input=serial_input)
     pagemaster = vm.start_pagemaster(**pm_kwargs)
     vm.configure(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib)
     vm.start()
@@ -82,19 +90,28 @@ def boot(vm, *, vcpu_count=1, mem_size_mib=MEM_SIZE_MIB, fc_args=(), **pm_kwargs
     return pagemaster
 
 
-def restore(vm, parent, vmstate_image, *, splits=1, resume_vm=False):
+def restore(
+    vm,
+    parent,
+    vmstate_image,
+    backing_fds,
+    *,
+    splits=1,
+    resume_vm=False,
+    serial_input=False,
+):
     """Restore a second Firecracker over the parent's checkpoint.
 
-    The parent's backing descriptors *are* the checkpoint bytes once a capture epoch has closed,
-    while `vmstate_image` is the exact-sized immutable artifact finalized from the capture buffer.
-    Both are handed to the child's memory channel. A restore hello states no geometry, so the plan
-    tiles the regions the parent reported, which is what the vmstate names.
+    `backing_fds` is the newly materialized sparse immutable checkpoint generation, while
+    `vmstate_image` is the exact-sized immutable artifact finalized from the capture buffer. Both
+    are handed to the child's memory channel. A restore hello states no geometry, so the plan tiles
+    the regions the parent reported, which is what the vmstate names.
     """
-    vm.spawn()
+    vm.spawn(serial_input=serial_input)
     pagemaster = vm.start_pagemaster(
         splits=splits,
         markers=False,
-        shared_memfds=parent.backing_fds,
+        shared_memfds=backing_fds,
         restore_regions=[
             (region["guest_addr"], region["size"]) for region in parent.ready_regions
         ],
@@ -127,6 +144,15 @@ def wait_for(predicate, *, timeout=30, message="condition"):
             return value
         time.sleep(0.1)
     raise TimeoutError(f"{message} never held within {timeout}s")
+
+
+def wait_for_shell_prompt(vm):
+    """Wait until the test image's root shell owns the serial console."""
+    return wait_for(
+        lambda: re.search(r"(?:\[root@[^\r\n]+\]|[\w.-]+:~)#\s*$", vm.stdio_text()),
+        timeout=60,
+        message="the guest's root shell prompt",
+    )
 
 
 def wait_for_block_read(vm, drive_id, *, timeout=60):
@@ -326,7 +352,8 @@ def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory):
 def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     """Harvesting clears the log, so the next epoch reports nothing until the guest writes."""
     vm = farplane_factory()
-    pagemaster = boot(vm)
+    pagemaster = boot(vm, serial_input=True)
+    wait_for_shell_prompt(vm)
 
     assert pagemaster.capture_buffers().error is None
     assert pagemaster.quiesce().error is None
@@ -353,30 +380,45 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
         second.count() == 0
     ), f"{second.count()} pages were reported twice while the guest was quiesced"
 
-    # Arm userfaultfd write protection while the guest is stopped, then wait for a write fault
-    # after resuming. This proves a vCPU wrote during this epoch without relying on a tickless idle
-    # guest to happen to write during a fixed sleep. Resume releases the prior capture buffers, so
-    # every epoch must explicitly arm fresh buffers before harvesting it.
-    written_before_resume = set(pagemaster.written_pages())
-    for region in pagemaster.ready_regions:
-        pagemaster.write_protect(region["host_base"], region["size"])
+    # Arm userfaultfd write protection on present pages while the guest is stopped, mirroring the
+    # runs production derives from present content instead of manufacturing WP markers over absent
+    # PTEs. Then wait for a write fault after resuming. This proves a vCPU wrote during this epoch
+    # without relying on a tickless idle guest to happen to write during a fixed sleep. Resume
+    # releases the prior capture buffers, so every epoch must explicitly arm fresh buffers before
+    # harvesting it.
+    writes_cursor = len(pagemaster.written_pages())
+    for page in pagemaster.faulted_pages():
+        pagemaster.protect_guest(page)
     assert pagemaster.resume(run_vcpus=1).error is None
     assert pagemaster.capture_buffers().error is None
+    command_marker = f"farplane-epoch-{uuid.uuid4().hex}"
+    vm.serial_input(f"echo {command_marker}\n")
     wait_for(
-        lambda: len(pagemaster.written_pages()) > len(written_before_resume),
+        lambda: command_marker in vm.stdio_text(),
+        timeout=30,
+        message="the guest serial command",
+    )
+    wait_for(
+        lambda: len(pagemaster.written_pages()) > writes_cursor,
         timeout=30,
         message="a guest write after the dirty-log harvest",
     )
     assert pagemaster.quiesce().error is None
+    writes_end = len(pagemaster.written_pages())
     assert pagemaster.write_vmstate().error is None
     assert pagemaster.dirty_snapshot().error is None
     third = pagemaster.harvest()
     third_pages = set(third.set_pages())
-    new_writes = set(pagemaster.written_pages()) - written_before_resume
+    new_writes = set(pagemaster.written_pages()[writes_cursor:writes_end])
     assert new_writes, "the wait returned without a new write fault"
-    assert (
-        new_writes <= third_pages
-    ), f"{sorted(new_writes - third_pages)} were written this epoch and not reported"
+    # The command response proves the vCPU executed. userfaultfd also sees writes made by
+    # Firecracker's device-emulation threads, while KVM's dirty log is specifically a vCPU log;
+    # require their observed pages to intersect rather than misclassifying every host write as a
+    # KVM omission.
+    assert new_writes & third_pages, (
+        "the guest command completed, but none of the write-protected pages were reported by "
+        "KVM's dirty log"
+    )
     # Independent of the writes above. An epoch reporting the whole geometry satisfies any subset
     # check, so the epoch has to be strictly smaller than the geometry to carry any information.
     assert len(third_pages) < len(all_pages), (
@@ -388,12 +430,26 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
 def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     """A restored VM's first epoch holds the restore's writes, not the whole geometry."""
     parent_vm = farplane_factory("restore-parent")
-    parent = boot(parent_vm, fc_args=("--metrics-path", "fc.ndjson"))
+    parent = boot(
+        parent_vm,
+        fc_args=("--metrics-path", "fc.ndjson"),
+        serial_input=True,
+    )
     wait_for_block_read(parent_vm, "rootfs")
+    wait_for_shell_prompt(parent_vm)
+    loop_marker = f"farplane-loop-{uuid.uuid4().hex}"
+    parent_vm.serial_input(
+        f"(i=0; while :; do i=$((i + 1)); done) & echo {loop_marker}\n"
+    )
+    wait_for(
+        lambda: loop_marker in parent_vm.stdio_text(),
+        timeout=30,
+        message="the guest write loop",
+    )
 
-    # Close a capture epoch on the parent. Its backing descriptors now hold the checkpoint bytes
-    # and its vmstate buffer holds the serialized state. It stays quiesced, so those bytes cannot
-    # move while the exact-sized immutable restore image is finalized.
+    # Close a capture epoch on the parent. Firecracker's private mapping contains the checkpoint
+    # bytes; the original boot descriptors do not. The parent stays quiesced while both private
+    # guest memory and the serialized vmstate are published as exact immutable restore inputs.
     assert parent.capture_buffers().error is None
     assert parent.quiesce().error is None
     written = parent.write_vmstate()
@@ -410,29 +466,33 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     assert fcntl.fcntl(vmstate_image, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
     assert parent.dirty_snapshot().error is None
     assert parent.harvest().count() > 0
+    sample_addr = sorted(parent.marker_bytes)[0]
+    checkpoint_sample = parent.read_guest(sample_addr, PAGE)
+    assert checkpoint_sample.strip(b"\0"), "the checkpoint sample page is all zeroes"
+    checkpoint_fds = parent.materialize_checkpoint_backing()
+    for checkpoint_fd in checkpoint_fds:
+        assert fp.seals_of(checkpoint_fd) == fp.ROOT_SEALS | fp.F_SEAL_FUTURE_WRITE
+        assert fcntl.fcntl(checkpoint_fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
 
     child_vm = farplane_factory("restore-child")
     try:
-        child = restore(child_vm, parent, vmstate_image)
+        child = restore(child_vm, parent, vmstate_image, checkpoint_fds)
     finally:
         os.close(vmstate_image)
+        for checkpoint_fd in checkpoint_fds:
+            os.close(checkpoint_fd)
 
-    # The child's plan tiles its parent's memfds, and the folios of those are already in the page
-    # cache, so a first touch of one is a minor fault and not a missing fault. The child plants no
-    # markers of its own: the bytes it has to serve are the ones the descriptors already carry.
-    # Resolving such a fault with a zero page would both lose the checkpoint bytes and fail
-    # outright, leaving the faulting Firecracker thread stranded, so this reads the parent's
-    # marker back through the child's mapping and compares it against the memfd itself.
+    # The child's plan tiles the immutable checkpoint generation, and its content folios are
+    # already in the page cache, so a first touch of one is a minor fault and not a missing fault.
+    # The child plants no markers of its own: the bytes it has to serve are the ones the
+    # descriptors already carry. The guest may have overwritten the original boot marker before
+    # capture, so the authority is the parent's frozen bytes rather than its bootstrap value.
+    # Resolving this fault with a zero page would lose the checkpoint content and fail outright,
+    # leaving the faulting Firecracker thread stranded.
     assert not child.markers
-    marker_addr = sorted(parent.marker_bytes)[0]
-    backing = child.backing_bytes(marker_addr, PAGE)
-    assert backing.startswith(
-        parent.marker_bytes[marker_addr]
-    ), "the marker page is not backed"
-    assert backing.strip(
-        b"\0"
-    ), "the backing page is all zeroes, so a zero-fill is undetectable"
-    assert child.read_guest(marker_addr, PAGE) == backing
+    backing = child.backing_bytes(sample_addr, PAGE)
+    assert backing == checkpoint_sample
+    assert child.read_guest(sample_addr, PAGE) == backing
     assert any(
         flags & fp.UFFD_PAGEFAULT_FLAG_MINOR for _, flags in list(child.faults)
     ), "the restored guest took no minor fault over its parent's memfds"
@@ -466,28 +526,38 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
         "so it inherited KVM's initially-set bitmap instead of retiring it"
     )
 
-    # The baseline re-armed write protection rather than disabling tracking, so the next epoch
-    # still reports what the guest writes once its vCPUs run.
-    written_before = set(child.written_pages())
-    for region in child.ready_regions:
-        child.write_protect(region["host_base"], region["size"])
+    # The baseline re-armed dirty logging rather than disabling tracking. Protect only the pages
+    # KVM proved present during restore; other checkpoint content first-touches through minor
+    # faults without artificial WP markers over absent PTEs.
+    writes_cursor = len(child.written_pages())
+    for page in first_pages:
+        child.protect_guest(page)
     assert child.resume(run_vcpus=0).error is None
     child_vm.api.vm.patch(state="Resumed")
     assert child.capture_buffers().error is None
+
+    def restored_guest_wrote():
+        if error := child.fault_error():
+            raise error
+        return len(child.written_pages()) > writes_cursor
+
     wait_for(
-        lambda: len(child.written_pages()) > len(written_before),
+        restored_guest_wrote,
         timeout=30,
         message="a guest write after the restored VM's dirty-log baseline",
     )
+    assert child.fault_error() is None
     assert child.quiesce().error is None
+    writes_end = len(child.written_pages())
     assert child.write_vmstate().error is None
     assert child.dirty_snapshot().error is None
     second_pages = set(child.harvest().set_pages())
-    new_writes = set(child.written_pages()) - written_before
+    new_writes = set(child.written_pages()[writes_cursor:writes_end])
     assert new_writes, "the wait returned without a new write fault"
-    assert (
-        new_writes <= second_pages
-    ), f"{sorted(new_writes - second_pages)} were written this epoch and not reported"
+    assert new_writes & second_pages, (
+        "the restored guest's write loop ran, but none of its write-protected pages were reported "
+        "by KVM's dirty log"
+    )
     assert len(second_pages) < len(all_pages)
 
 

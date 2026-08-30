@@ -454,10 +454,10 @@ class Pagemaster:
         self.vmstate_capacity = vmstate_capacity
         self.listener_uid = listener_uid
 
-        # Backing descriptors, either supplied by the caller (so two guests share them) or built
-        # once the hello tells us the guest geometry.
-        self.backing_fds = list(shared_memfds) if shared_memfds else []
-        self.owns_backing = not shared_memfds
+        # Backing descriptors, either duplicated from the caller (so two guests share their
+        # inodes without sharing descriptor ownership) or built once the hello tells us the guest
+        # geometry.
+        self.backing_fds = [os.dup(fd) for fd in shared_memfds or []]
 
         # A restore hello states no geometry: the plan has to tile the regions the vmstate names,
         # which is the parent's `ready_regions`. `vmstate_image` is the descriptor holding the
@@ -482,6 +482,7 @@ class Pagemaster:
         self.fc_pid = None
 
         self.faults = []
+        self.resolved_faults = []
         self.errors = []
         self.marker_reads = {}
 
@@ -538,7 +539,7 @@ class Pagemaster:
                 sock.close()
         self._sock = None
         self._listener = None
-        for fd in list(self.backing_fds) if self.owns_backing else []:
+        for fd in self.backing_fds:
             os.close(fd)
         self.backing_fds = []
         for fd in (self.dirty_fd, self.vmstate_fd):
@@ -637,7 +638,7 @@ class Pagemaster:
         """Allocate the backing memfds and compile a canonical extent table."""
         if self.single_memfd:
             total = sum(size for _, size in self.regions)
-            if self.owns_backing and not self.backing_fds:
+            if not self.backing_fds:
                 # One all-hole sparse memfd tiling every region back to back.
                 self.backing_fds = [sealed_memfd("farplane-sparse", total)]
             offset = 0
@@ -646,7 +647,7 @@ class Pagemaster:
                 offset += size
             return
 
-        build = self.owns_backing and not self.backing_fds
+        build = not self.backing_fds
         fd_index = 0
         for addr, size in self.regions:
             pages = size // PAGE_SIZE
@@ -765,6 +766,8 @@ class Pagemaster:
                 with self._lock:
                     self._fault_error = exc
                 return
+            with self._lock:
+                self.resolved_faults.append((host_page, flags))
 
     def _uffdio_zeropage(self, page):
         arg = _UffdioZeropage(range=_UffdioRange(start=page, len=PAGE_SIZE), mode=0)
@@ -778,9 +781,10 @@ class Pagemaster:
 
     def write_protect(self, host_addr, length, *, protect=True):
         """Arm or clear write protection on a host range of the guest mapping."""
+        mode = UFFDIO_WRITEPROTECT_MODE_WP if protect else 0
         arg = _UffdioWriteprotect(
             range=_UffdioRange(start=host_addr, len=length),
-            mode=UFFDIO_WRITEPROTECT_MODE_WP if protect else 0,
+            mode=mode,
         )
         if _libc.ioctl(self.uffd, UFFDIO_WRITEPROTECT, ctypes.byref(arg)) != 0:
             raise _errno_error(f"UFFDIO_WRITEPROTECT at {host_addr:#x}")
@@ -790,10 +794,10 @@ class Pagemaster:
         self.write_protect(self.host_addr(guest_addr), length, protect=True)
 
     def written_pages(self):
-        """Guest pages for which a write fault was observed."""
+        """Guest pages whose observed write fault was successfully resolved."""
         pages = []
         with self._lock:
-            for host, flags in self.faults:
+            for host, flags in self.resolved_faults:
                 if flags & UFFD_PAGEFAULT_FLAG_WRITE:
                     pages.append(self.guest_addr(host))
         return pages
@@ -867,6 +871,43 @@ class Pagemaster:
                 offset = extent.fd_offset + (guest_addr - extent.guest_addr)
                 return os.pread(self.backing_fds[extent.fd_index], length, offset)
         raise KeyError(f"{guest_addr:#x} is not covered by the plan")
+
+    def materialize_checkpoint_backing(self):
+        """Publish the quiesced guest bytes as sparse, immutable backing memfds.
+
+        Firecracker maps the input descriptors privately, so guest writes never modify them. The
+        production pagemaster publishes those private pages into a new sparse generation before a
+        restore or fork. This harness does the same full logical materialization: zero pages remain
+        holes and every content page is copied into the descriptor the restored VM will map.
+        """
+        checkpoint_fds = []
+        try:
+            for extent in self.extents:
+                checkpoint_fds.append(self._materialize_checkpoint_extent(extent))
+            return checkpoint_fds
+        except Exception:
+            for fd in checkpoint_fds:
+                os.close(fd)
+            raise
+
+    def _materialize_checkpoint_extent(self, extent):
+        """Copy one guest extent into a sparse, finally sealed memfd."""
+        fd = _memfd_create(f"farplane-checkpoint-{extent.guest_addr:#x}")
+        try:
+            os.ftruncate(fd, extent.len)
+            zero = bytes(PAGE_SIZE)
+            chunk_size = 1 << 20
+            for chunk_offset in range(0, extent.len, chunk_size):
+                length = min(chunk_size, extent.len - chunk_offset)
+                content = self.read_guest(extent.guest_addr + chunk_offset, length)
+                for page_offset in range(0, length, PAGE_SIZE):
+                    page = content[page_offset : page_offset + PAGE_SIZE]
+                    if page != zero:
+                        os.pwrite(fd, page, chunk_offset + page_offset)
+            fcntl.fcntl(fd, F_ADD_SEALS, ROOT_SEALS | F_SEAL_FUTURE_WRITE)
+            return os.open(f"/proc/self/fd/{fd}", os.O_RDONLY)
+        finally:
+            os.close(fd)
 
     # ------------------------------------------------------------ capture cycle
 
@@ -1239,6 +1280,7 @@ class FarplaneMicrovm:
         resource_limits=(),
         fc_args=(),
         via_wrapper=False,
+        serial_input=False,
         wait=True,
     ):
         """Launch the jailer, which execs into Firecracker."""
@@ -1272,7 +1314,7 @@ class FarplaneMicrovm:
             quoted = " ".join(f"'{arg}'" for arg in argv)
             self.wrapper = subprocess.Popen(
                 ["/bin/sh", "-c", f"{quoted} & wait"],
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if serial_input else subprocess.DEVNULL,
                 stdout=stdio,
                 stderr=stdio,
                 pass_fds=pass_fds,
@@ -1281,7 +1323,7 @@ class FarplaneMicrovm:
         else:
             self.proc = subprocess.Popen(
                 argv,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if serial_input else subprocess.DEVNULL,
                 stdout=stdio,
                 stderr=stdio,
                 pass_fds=pass_fds,
@@ -1291,6 +1333,13 @@ class FarplaneMicrovm:
         if wait:
             self.wait_api()
         return self
+
+    def serial_input(self, text):
+        """Send text to the guest's serial console through Firecracker's stdin."""
+        process = self.proc if self.proc is not None else self.wrapper
+        assert process is not None and process.stdin is not None
+        process.stdin.write(text.encode())
+        process.stdin.flush()
 
     def wait_api(self, timeout=30):
         """Wait for the API socket, then attach a client."""
