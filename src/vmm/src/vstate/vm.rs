@@ -541,11 +541,11 @@ impl KvmVm {
                 if words.len() != pages.div_ceil(64) {
                     return Err(VmError::DirtyBitmapShape);
                 }
-                if let Some(host_writes) = region.bitmap() {
+                if let Some(host_writes) = region.inner.bitmap().as_ref() {
                     if host_writes.len() != pages || host_writes.byte_size() != len {
                         return Err(VmError::DirtyBitmapShape);
                     }
-                    let host_words = (*host_writes).clone().get_and_reset();
+                    let host_words = host_writes.clone().get_and_reset();
                     if host_words.len() != words.len() {
                         return Err(VmError::DirtyBitmapShape);
                     }
