@@ -52,6 +52,9 @@ const REQUIRED_BACKING_SEALS: i32 =
     libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_FUTURE_WRITE;
 /// Seals a capture buffer must carry: it is written, but its size is fixed.
 const REQUIRED_BUFFER_SEALS: i32 = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+/// Seals a finalized vmstate image must carry before it can be restored.
+const REQUIRED_VMSTATE_SEALS: i32 =
+    libc::F_SEAL_SEAL | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_WRITE;
 /// Userfaultfd features the deployment kernel must provide for shmem-backed guest memory. Guest
 /// extents are file mappings, so write protection over them needs the shmem write-protect feature
 /// as well as write-protect fault reporting.
@@ -62,7 +65,8 @@ const REQUIRED_UFFD_FEATURES: u64 = UFFD_FEATURE_PAGEFAULT_FLAG_WP
 
 /// Upper bound Firecracker guarantees for a serialized vmstate of its device set, reported so
 /// pagemaster preallocates the capture buffer before the source is frozen.
-pub const VMSTATE_CAPACITY_BYTES: u64 = 16 << 20;
+pub const VMSTATE_CAPACITY_BYTES: u64 =
+    crate::snapshot::SNAPSHOT_DESERIALIZATION_BYTES_LIMIT as u64;
 
 static STATE: AtomicU8 = AtomicU8::new(BackendState::AwaitingPlan as u8);
 static CAPTURE_BUFFERS_ARMED: AtomicBool = AtomicBool::new(false);
@@ -377,6 +381,10 @@ fn commit_plan(
         reject(&sock, &incoming, ErrorCode::TooManyExtents);
         return Err(BackendError::Plan(ErrorCode::TooManyExtents));
     }
+    if let Err(code) = validate_vmstate_presence(mode, plan.has_vmstate()) {
+        reject(&sock, &incoming, ErrorCode::PlanNotCanonical);
+        return Err(BackendError::Plan(code));
+    }
     let expected_fds = 1 + usize::from(plan.has_vmstate());
     if incoming.fds.len() != expected_fds {
         reject(&sock, &incoming, ErrorCode::PlanNotCanonical);
@@ -648,6 +656,37 @@ fn validate_backing_fd(fd: RawFd) -> Result<u64, ErrorCode> {
     Ok(stat.st_size.cast_unsigned())
 }
 
+/// Requires exactly restore plans, and no boot plans, to carry a vmstate image.
+fn validate_vmstate_presence(mode: Mode, has_vmstate: bool) -> Result<(), ErrorCode> {
+    (has_vmstate == matches!(mode, Mode::Restore))
+        .then_some(())
+        .ok_or(ErrorCode::PlanNotCanonical)
+}
+
+/// Validates a finalized vmstate descriptor before parsing bytes from it.
+fn validate_vmstate_fd(fd: RawFd) -> Result<(), ErrorCode> {
+    let seals = memfd_seals(fd).ok_or(ErrorCode::FdNotMemfd)?;
+    let stat = fstat(fd).ok_or(ErrorCode::FdNotMemfd)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(ErrorCode::FdNotMemfd);
+    }
+    // SAFETY: `F_GETFL` only reads descriptor flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(ErrorCode::FdNotMemfd);
+    }
+    if flags & libc::O_ACCMODE != libc::O_RDONLY {
+        return Err(ErrorCode::FdWritable);
+    }
+    if seals & REQUIRED_VMSTATE_SEALS != REQUIRED_VMSTATE_SEALS {
+        return Err(ErrorCode::FdNotSealed);
+    }
+    if stat.st_size <= 0 || stat.st_size.cast_unsigned() > VMSTATE_CAPACITY_BYTES {
+        return Err(ErrorCode::VmstateParseFailed);
+    }
+    Ok(())
+}
+
 /// Reads the seals of a descriptor, or `None` if it does not support sealing.
 fn seals(fd: RawFd) -> Option<i32> {
     // SAFETY: `F_GET_SEALS` only reads descriptor state.
@@ -695,11 +734,10 @@ fn read_extent_table(fd: &OwnedFd, count: u32) -> Result<Vec<ExtentRecord>, Erro
 
 /// Parses the vmstate handed over with a restore plan.
 fn parse_vmstate(fd: &OwnedFd) -> Result<MicrovmState, ErrorCode> {
+    validate_vmstate_fd(fd.as_raw_fd())?;
     let mut file = File::from(fd.try_clone().map_err(|_| ErrorCode::VmstateParseFailed)?);
-    // The vmstate always starts at offset zero, and a descriptor a live source
-    // wrote through arrives with that source's own offset: the writer seeks to
-    // the start and leaves the cursor past the bytes it wrote. Reading is
-    // absolute so a forked child parses the same buffer its parent produced.
+    // The finalized image is exact-sized, and the snapshot CRC is at its EOF. Reading from offset
+    // zero through that intrinsic boundary rejects both truncated and appended images.
     file.seek(SeekFrom::Start(0))
         .map_err(|_| ErrorCode::VmstateParseFailed)?;
     Snapshot::<MicrovmState>::load(&mut file)
@@ -1027,6 +1065,32 @@ mod tests {
         fd
     }
 
+    fn finalized_vmstate(content: &[u8]) -> OwnedFd {
+        let writable = memfd(
+            c"farplane-final-vmstate",
+            libc::off_t::try_from(content.len()).unwrap(),
+        );
+        if !content.is_empty() {
+            // SAFETY: `content` is readable for its full length and the memfd has that capacity.
+            let written =
+                unsafe { libc::pwrite(writable, content.as_ptr().cast(), content.len(), 0) };
+            assert_eq!(written, libc::ssize_t::try_from(content.len()).unwrap());
+        }
+        // SAFETY: sealing an owned memfd only restricts what it permits.
+        assert_eq!(
+            unsafe { libc::fcntl(writable, libc::F_ADD_SEALS, REQUIRED_VMSTATE_SEALS) },
+            0
+        );
+        let path = std::ffi::CString::new(format!("/proc/self/fd/{writable}")).unwrap();
+        // SAFETY: `path` is NUL-terminated and opening it allocates a new descriptor.
+        let readonly = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(readonly >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: the read-only descriptor now owns the inode; the writable descriptor is unused.
+        unsafe { libc::close(writable) };
+        // SAFETY: `readonly` was just opened and is not owned by anything else.
+        unsafe { OwnedFd::from_raw_fd(readonly) }
+    }
+
     #[test]
     fn dirty_bitmap_size_is_one_word_per_64_pages_per_region() {
         let page = page();
@@ -1063,6 +1127,53 @@ mod tests {
 
         // SAFETY: `buffer` is owned by this test and no longer used.
         unsafe { libc::close(buffer) };
+    }
+
+    #[test]
+    fn vmstate_presence_matches_the_launch_mode() {
+        assert_eq!(validate_vmstate_presence(Mode::Boot, false), Ok(()));
+        assert_eq!(validate_vmstate_presence(Mode::Restore, true), Ok(()));
+        assert_eq!(
+            validate_vmstate_presence(Mode::Boot, true),
+            Err(ErrorCode::PlanNotCanonical)
+        );
+        assert_eq!(
+            validate_vmstate_presence(Mode::Restore, false),
+            Err(ErrorCode::PlanNotCanonical)
+        );
+    }
+
+    #[test]
+    fn vmstate_must_be_an_exact_immutable_image() {
+        let mut bytes = Vec::new();
+        Snapshot::new(MicrovmState::default())
+            .save(&mut bytes)
+            .unwrap();
+
+        let exact = finalized_vmstate(&bytes);
+        assert_eq!(validate_vmstate_fd(exact.as_raw_fd()), Ok(()));
+        assert!(parse_vmstate(&exact).is_ok());
+
+        let padded = finalized_vmstate(&[bytes.as_slice(), &[0]].concat());
+        assert!(matches!(
+            parse_vmstate(&padded),
+            Err(ErrorCode::VmstateParseFailed)
+        ));
+        let truncated = finalized_vmstate(&bytes[..bytes.len() - 1]);
+        assert!(matches!(
+            parse_vmstate(&truncated),
+            Err(ErrorCode::VmstateParseFailed)
+        ));
+        let empty = finalized_vmstate(&[]);
+        assert_eq!(
+            validate_vmstate_fd(empty.as_raw_fd()),
+            Err(ErrorCode::VmstateParseFailed)
+        );
+
+        let mutable = memfd(c"farplane-mutable-vmstate", 4096);
+        assert_eq!(validate_vmstate_fd(mutable), Err(ErrorCode::FdWritable));
+        // SAFETY: `mutable` is owned by this test and no longer used.
+        unsafe { libc::close(mutable) };
     }
 
     /// The bytes of `backend_ready` are the seam with pagemaster: the region count leads the body,

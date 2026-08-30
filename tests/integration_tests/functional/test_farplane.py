@@ -81,13 +81,13 @@ def boot(vm, *, vcpu_count=1, mem_size_mib=MEM_SIZE_MIB, fc_args=(), **pm_kwargs
     return pagemaster
 
 
-def restore(vm, parent, *, splits=1, resume_vm=False):
+def restore(vm, parent, vmstate_image, *, splits=1, resume_vm=False):
     """Restore a second Firecracker over the parent's checkpoint.
 
     The parent's backing descriptors *are* the checkpoint bytes once a capture epoch has closed,
-    and the parent's vmstate buffer holds the serialized state, so both are handed to the child's
-    memory channel. A restore hello states no geometry, so the plan tiles the regions the parent
-    reported, which is what the vmstate names.
+    while `vmstate_image` is the exact-sized immutable artifact finalized from the capture buffer.
+    Both are handed to the child's memory channel. A restore hello states no geometry, so the plan
+    tiles the regions the parent reported, which is what the vmstate names.
     """
     vm.spawn()
     pagemaster = vm.start_pagemaster(
@@ -97,7 +97,7 @@ def restore(vm, parent, *, splits=1, resume_vm=False):
         restore_regions=[
             (region["guest_addr"], region["size"]) for region in parent.ready_regions
         ],
-        vmstate_image=parent.vmstate_fd,
+        vmstate_image=vmstate_image,
     )
     vm.load_snapshot(resume_vm=resume_vm)
     pagemaster.wait_ready()
@@ -391,16 +391,30 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     wait_for_block_read(parent_vm, "rootfs")
 
     # Close a capture epoch on the parent. Its backing descriptors now hold the checkpoint bytes
-    # and its vmstate buffer holds the serialized state, which together are what a fork restores
-    # from. It stays quiesced, so those bytes cannot move under the child.
+    # and its vmstate buffer holds the serialized state. It stays quiesced, so those bytes cannot
+    # move while the exact-sized immutable restore image is finalized.
     assert parent.capture_buffers().error is None
     assert parent.quiesce().error is None
-    assert parent.write_vmstate().error is None
+    written = parent.write_vmstate()
+    assert written.error is None
+    (vmstate_length,) = struct.unpack("<Q", written.body)
+    vmstate_image = fp.sealed_memfd(
+        "farplane-vmstate-image",
+        vmstate_length,
+        content=parent.vmstate(vmstate_length),
+        seals=fp.ROOT_SEALS,
+    )
+    assert os.fstat(vmstate_image).st_size == vmstate_length
+    assert fp.seals_of(vmstate_image) == fp.ROOT_SEALS
+    assert fcntl.fcntl(vmstate_image, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
     assert parent.dirty_snapshot().error is None
     assert parent.harvest().count() > 0
 
     child_vm = farplane_factory("restore-child")
-    child = restore(child_vm, parent)
+    try:
+        child = restore(child_vm, parent, vmstate_image)
+    finally:
+        os.close(vmstate_image)
 
     all_pages = {
         region["guest_addr"] + offset

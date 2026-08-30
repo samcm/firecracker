@@ -49,10 +49,11 @@ const SNAPSHOT_MAGIC_ID: u64 = 0x0710_1984_8664_0000u64;
 #[cfg(target_arch = "aarch64")]
 const SNAPSHOT_MAGIC_ID: u64 = 0x0710_1984_AAAA_0000u64;
 
-/// Maximum size in bytes for snapshot deserialization to prevent DOS attacks.
-/// Snapshots contain VM state which can be large, but we set a reasonable upper bound.
-/// This limit is 10MB which should be sufficient for any legitimate snapshot.
-const SNAPSHOT_DESERIALIZATION_BYTES_LIMIT: usize = 10_000_000;
+/// Maximum size in bytes for snapshot serialization and deserialization.
+///
+/// Farplane advertises this same bound as its capture-buffer capacity. Keeping one limit means
+/// every vmstate Firecracker can produce is also one it can restore.
+pub const SNAPSHOT_DESERIALIZATION_BYTES_LIMIT: usize = 16 << 20;
 
 /// Error definitions for the Snapshot API.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
