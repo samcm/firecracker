@@ -387,7 +387,7 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
 def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     """A restored VM's first epoch holds the restore's writes, not the whole geometry."""
     parent_vm = farplane_factory("restore-parent")
-    parent = boot(parent_vm)
+    parent = boot(parent_vm, fc_args=("--metrics-path", "fc.ndjson"))
     wait_for_block_read(parent_vm, "rootfs")
 
     # Close a capture epoch on the parent. Its backing descriptors now hold the checkpoint bytes
