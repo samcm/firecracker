@@ -189,9 +189,9 @@ jobs:
           guarded_cargo_test 20 -p vmm --lib vstate::farplane::capture
           guarded_cargo_test 13 -p vmm --lib vstate::farplane::backend
           guarded_cargo_test 13 -p vmm --lib vstate::farplane::protocol
-          guarded_cargo_test 15 -p vmm --lib devices::virtio::vsock::device
-          guarded_cargo_test 14 -p vmm --lib devices::virtio::vsock::event_handler
-          guarded_cargo_test 11 -p vmm --lib devices::virtio::vsock::persist
+          guarded_cargo_test 21 -p vmm --lib devices::virtio::vsock::device
+          guarded_cargo_test 15 -p vmm --lib devices::virtio::vsock::event_handler
+          guarded_cargo_test 12 -p vmm --lib devices::virtio::vsock::persist
           guarded_cargo_test 11 -p vmm --lib snapshot::
           guarded_cargo_test 25 -p vmm --test farplane_channel
           guarded_cargo_test 1 -p firecracker --bin firecracker api_server_adapter
@@ -202,7 +202,7 @@ jobs:
           # Pin the whole family as well as its three Farplane-specific modules, so
           # deleting a muxer, packet, or connection-state test cannot hide in the
           # still-large aggregate.
-          guarded_cargo_test 83 -p vmm --lib devices::virtio::vsock -- --test-threads=1
+          guarded_cargo_test 85 -p vmm --lib devices::virtio::vsock -- --test-threads=1
 
           if guarded_cargo_test 1 -p vmm --lib vstate::farplane::this_filter_matches_nothing; then
             echo "::error::the guard accepted a filter that selects no tests"
@@ -459,6 +459,84 @@ jobs:
             esac
           done
 
+      # The provenance a deployment reads has to name this commit and the bytes it will run, or
+      # it binds nothing. Both halves are asserted: the good build's file must agree with
+      # `git rev-parse HEAD` and with the artifacts' own hashes, and the same command must
+      # refuse a tree that no commit describes.
+      - name: "An authoritative build binds its artifacts to a clean lock commit"
+        run: |
+          set -euo pipefail
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' \
+            public.ecr.aws/firecracker/fcuvm:v90 | cut -d@ -f2)
+          echo "pinning the builder at $digest"
+          DEVCTR_IMAGE_DIGEST="$digest" LIBSECCOMP_LIB_PATH="$LIBSECCOMP_PRIVATE_DIR" \
+            ./tools/devtool -y build --release --libc musl --authoritative
+
+          out=build/cargo_target/aarch64-unknown-linux-musl/release
+          cat "$out/PROVENANCE"
+          head=$(git rev-parse HEAD)
+          if ! grep -qx "commit $head" "$out/PROVENANCE"; then
+            echo "::error::PROVENANCE does not name HEAD ($head)"
+            exit 1
+          fi
+          if ! grep -qF "$digest" "$out/PROVENANCE"; then
+            echo "::error::PROVENANCE does not name the pinned builder digest"
+            exit 1
+          fi
+          for binary in firecracker jailer seccompiler-bin cpu-template-helper; do
+            actual=$(sha256sum "$out/$binary" | cut -d' ' -f1)
+            if ! grep -qx "sha256 $binary $actual" "$out/PROVENANCE"; then
+              echo "::error::PROVENANCE does not match the $binary that was built ($actual)"
+              exit 1
+            fi
+          done
+          echo "PROVENANCE names HEAD, the pinned builder and every artifact hash"
+
+      # A commit that does not describe the tree is the failure this mode exists to catch, so
+      # the refusal is identified rather than assumed: any nonzero exit would also be produced
+      # by a container that failed to start.
+      - name: "An authoritative build refuses a tree no commit names"
+        run: |
+          set -euo pipefail
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' \
+            public.ecr.aws/firecracker/fcuvm:v90 | cut -d@ -f2)
+          echo "// touched by CI" >> src/firecracker/src/main.rs
+          status=0
+          DEVCTR_IMAGE_DIGEST="$digest" LIBSECCOMP_LIB_PATH="$LIBSECCOMP_PRIVATE_DIR" \
+            ./tools/devtool -y build --release --libc musl --authoritative \
+            > dirty-build.log 2>&1 || status=$?
+          git checkout -- src/firecracker/src/main.rs
+          tail -20 dirty-build.log
+          if [ "$status" -eq 0 ]; then
+            echo "::error::an authoritative build accepted a modified tree"
+            exit 1
+          fi
+          if ! grep -qF "refuses a tree with modified or untracked files" dirty-build.log; then
+            echo "::error::the build failed for some other reason than the dirty tree"
+            exit "$status"
+          fi
+          echo "the authoritative build refused a modified tree, as it must"
+
+      # An unpinned builder leaves the toolchain, and therefore the artifacts, unfixed even
+      # under a clean commit.
+      - name: "An authoritative build refuses a mutable builder tag"
+        run: |
+          set -euo pipefail
+          status=0
+          LIBSECCOMP_LIB_PATH="$LIBSECCOMP_PRIVATE_DIR" \
+            ./tools/devtool -y build --release --libc musl --authoritative \
+            > untagged-build.log 2>&1 || status=$?
+          tail -20 untagged-build.log
+          if [ "$status" -eq 0 ]; then
+            echo "::error::an authoritative build accepted a mutable builder tag"
+            exit 1
+          fi
+          if ! grep -qF "requires DEVCTR_IMAGE_DIGEST" untagged-build.log; then
+            echo "::error::the build failed for some other reason than the unpinned builder"
+            exit "$status"
+          fi
+          echo "the authoritative build refused an unpinned builder, as it must"
+
   # `devtool checkbuild` runs clippy over every workspace target for the requested
   # architecture against the *GNU* triple, which devtool hardcodes for cross builds
   # because musl does not cross-compile cleanly (tools/devtool:1249-1250). It type-checks
@@ -555,6 +633,22 @@ jobs:
             echo "::error::this host cannot run the functional farplane tests; missing:$missing"
             exit 1
           fi
+
+      # `vstate::vm` covers the dirty-log ioctl sequence itself: the initially-set contract, the
+      # restore baseline that retires it and the accumulator the baseline must not touch. Every
+      # test in it opens /dev/kvm, so this is the only lane that can run it.
+      - name: "The KVM-backed vm state suite, guarded by a floor"
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test -p vmm --lib vstate::vm 2>&1 | tee "$log"
+          passed=$(sed -n 's/^test result: [A-Za-z]*\. \([0-9][0-9]*\) passed;.*/\1/p' "$log" \
+            | awk '{ total += $1 } END { print total + 0 }')
+          if [ "$passed" -lt 15 ]; then
+            echo "::error::the vstate::vm suite executed $passed tests, fewer than the required 15"
+            exit 1
+          fi
+          echo "the vstate::vm suite executed $passed tests, the floor is 15"
 
       - name: "Build the binaries the functional tests drive"
         run: ./tools/devtool -y build --release
