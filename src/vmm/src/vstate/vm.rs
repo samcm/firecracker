@@ -12,9 +12,10 @@ use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
 use kvm_bindings::{
-    KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2, KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE,
-    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID, KvmIrqRouting,
-    kvm_clear_dirty_log, kvm_enable_cap, kvm_irq_routing_entry, kvm_userspace_memory_region,
+    KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2, KVM_DIRTY_LOG_INITIALLY_SET,
+    KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI,
+    KVM_MSI_VALID_DEVID, KvmIrqRouting, kvm_clear_dirty_log, kvm_enable_cap, kvm_irq_routing_entry,
+    kvm_userspace_memory_region,
 };
 use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
@@ -189,12 +190,14 @@ impl KvmVm {
         };
 
         // Manual protection makes a harvest a snapshot-then-clear: reading the log neither clears
-        // nor re-protects, so a capture reports each epoch exactly once.
+        // nor re-protects, so a capture reports each epoch exactly once. New slots start fully
+        // dirty so the first clear re-protects even pages that the userspace loader, rather than
+        // KVM, populated. Otherwise those pages are clean in KVM and cannot be armed by a clear.
         let mut cap = kvm_enable_cap {
             cap: KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
             ..Default::default()
         };
-        cap.args[0] = u64::from(KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE);
+        cap.args[0] = u64::from(KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE | KVM_DIRTY_LOG_INITIALLY_SET);
         // SAFETY: the ioctl reads `cap`, which is a fully initialized capability request.
         let ret = unsafe { ioctl_with_ref(&fd, KVM_ENABLE_CAP(), &cap) };
         if ret != 0 {
