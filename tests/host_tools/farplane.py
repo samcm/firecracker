@@ -1284,6 +1284,9 @@ class FarplaneMicrovm:
         wait=True,
     ):
         """Launch the jailer, which execs into Firecracker."""
+        assert not (
+            via_wrapper and serial_input
+        ), "the shell wrapper cannot forward stdin to Firecracker"
         if root_fd == -1:
             root_fd = (
                 self.root_fd if self.root_fd is not None else self.open_root_memfd()

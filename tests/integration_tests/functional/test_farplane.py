@@ -411,10 +411,10 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     third_pages = set(third.set_pages())
     new_writes = set(pagemaster.written_pages()[writes_cursor:writes_end])
     assert new_writes, "the wait returned without a new write fault"
-    # The command response proves the vCPU executed. userfaultfd also sees writes made by
-    # Firecracker's device-emulation threads, while KVM's dirty log is specifically a vCPU log;
-    # require their observed pages to intersect rather than misclassifying every host write as a
-    # KVM omission.
+    # Quiesce can stop the vCPU after a write-protection fault is resolved but before the faulting
+    # instruction retires. That write then belongs to the next dirty-log epoch even though
+    # userfaultfd observed its resolution in this one, so require the two observations to overlap
+    # rather than requiring every resolved fault to have retired.
     assert new_writes & third_pages, (
         "the guest command completed, but none of the write-protected pages were reported by "
         "KVM's dirty log"
@@ -554,6 +554,8 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     second_pages = set(child.harvest().set_pages())
     new_writes = set(child.written_pages()[writes_cursor:writes_end])
     assert new_writes, "the wait returned without a new write fault"
+    # A resolved write-protection fault can retire in the next dirty-log epoch if quiesce stops the
+    # vCPU between fault resolution and instruction retirement.
     assert new_writes & second_pages, (
         "the restored guest's write loop ran, but none of its write-protected pages were reported "
         "by KVM's dirty log"
