@@ -628,14 +628,18 @@ For reference, the C code used in our tests is available
 
 The vsock device is reset across snapshot/restore to avoid inconsistent state
 between device and driver leading to breakage
-([#2218](https://github.com/firecracker-microvm/firecracker/issues/2218)). This
-is done by sending a `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET` event to the guest
-driver during `SnapshotCreate`
-([#2562](https://github.com/firecracker-microvm/firecracker/pull/2562)). On
-`SnapshotResume`, when the VM becomes active again, the vsock driver closes all
-existing connections. Existing listen sockets still remain active, but their CID
-is updated to reflect the current `guest_cid`. More details about this event can
-be found in the official Virtio document
+([#2218](https://github.com/firecracker-microvm/firecracker/issues/2218)). The
+reset is an obligation of the VM restored from the snapshot, not of the VM the
+snapshot was taken of: the restored device gets a fresh backend, so none of the
+connections its guest believes in exist. The snapshot therefore records that a
+`VIRTIO_VSOCK_EVENT_TRANSPORT_RESET` is owed, and the restored device publishes
+that event into its guest's event queue when the VM becomes active again
+([#2562](https://github.com/firecracker-microvm/firecracker/pull/2562)). Guest
+data is gated in both directions until the guest acknowledges the event. On
+receiving it the vsock driver closes all existing connections. Existing listen
+sockets still remain active, but their CID is updated to reflect the current
+`guest_cid`. More details about this event can be found in the official Virtio
+document
 [here](https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-4080006).
 
 ## VMGenID device limitation

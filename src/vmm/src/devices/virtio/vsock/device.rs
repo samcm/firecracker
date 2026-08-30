@@ -379,6 +379,30 @@ where
             warn!("vsock: transport reset still owed to the guest: {:?}", err);
         }
     }
+
+    /// The reset obligation a snapshot of this device carries.
+    ///
+    /// A `TRANSPORT_RESET` belongs to the VM restored from the serialized state, not to the one
+    /// being saved. The restored device's backend is fresh, so every connection its guest believes
+    /// in is gone and it owes the guest a reset before any data crosses. The device being saved
+    /// keeps its connections, its event queue and its data flow, so an active device that owes
+    /// nothing serializes the debt without incurring it.
+    ///
+    /// A reset already published is serialized as published: that event is in the guest memory the
+    /// snapshot captures, and a state claiming it was merely owed would publish a second event for
+    /// the same fact, consuming another descriptor and outliving the single acknowledgement that
+    /// clears the gate.
+    ///
+    /// A device the guest never activated owes nothing: it has no connections to reset, and a
+    /// restore must not invent a gate that only a published reset could ever clear.
+    pub(crate) fn snapshot_transport_reset(&self) -> TransportReset {
+        match self.transport_reset {
+            TransportReset::Published => TransportReset::Published,
+            TransportReset::Owed => TransportReset::Owed,
+            TransportReset::Settled if self.device_state.is_activated() => TransportReset::Owed,
+            TransportReset::Settled => TransportReset::Settled,
+        }
+    }
 }
 
 impl<B> VirtioDevice for Vsock<B>
@@ -496,8 +520,9 @@ where
         }
 
         match self.transport_reset {
-            // The snapshot could not publish the reset: the event queue held no descriptor. Try
-            // again now, and if it is still empty the notification armed by the failure brings the
+            // The snapshot recorded a reset this VM owes its guest: the connections the guest
+            // believes in belonged to a backend this device does not have. Publish it now, and if
+            // the event queue holds no descriptor the notification armed by the failure brings the
             // device back when the guest refills the queue. Data stays gated until the reset is
             // published and acknowledged, so the guest cannot use connections the host has lost.
             TransportReset::Owed => {
@@ -514,10 +539,11 @@ where
             // Vsock has a complicated protocol that isn't resilient to any packet loss,
             // so for Vsock we don't support connection persistence through snapshot. Any
             // in-flight packets or events are simply lost and Vsock is restored 'empty'.
-            // We signal the event queue to make the guest process the
-            // `TRANSPORT_RESET_EVENT` event we sent during snapshot creation. (We signal
-            // it host->guest rather than writing its eventfd, which would invoke the
-            // guest's acknowledgement path and clear the gate prematurely.)
+            // The reset was already in the guest's event queue when the snapshot was taken,
+            // and the guest had not answered it yet. We signal the event queue to make the
+            // guest process it. (We signal it host->guest rather than writing its eventfd,
+            // which would invoke the guest's acknowledgement path and clear the gate
+            // prematurely.)
             //
             // TX is not replayed here: it is gated until the acknowledgement, and the
             // acknowledgement path walks it.
@@ -557,27 +583,6 @@ where
             }
         }
     }
-
-    fn prepare_save(&mut self) {
-        if !self.is_activated() {
-            return;
-        }
-
-        // A reset the guest has not answered yet covers this snapshot too: the connections it is
-        // about are already gone. Publishing a second event would consume another descriptor for
-        // the same fact, and a repeated capture that found the event queue empty would downgrade a
-        // published reset to an owed one, dropping the event the guest can still answer.
-        if self.data_gated() {
-            return;
-        }
-
-        // Reset the guest's connections: the backend ones do not survive the snapshot. A reset
-        // that cannot be published is recorded as owed rather than dropped, so the restored
-        // device publishes it before it lets any guest data cross.
-        if let Err(err) = self.send_transport_reset_event() {
-            warn!("Failed to send reset transport event: {:?}", err);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -587,6 +592,7 @@ mod tests {
     use super::*;
     use crate::devices::virtio::vsock::defs::uapi;
     use crate::devices::virtio::vsock::test_utils::{EVQ_PAYLOAD_GUEST_ADDR, TestContext};
+    use crate::snapshot::Persist;
     use crate::vstate::memory::GuestAddress;
 
     #[test]
@@ -831,95 +837,125 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_save_emits_transport_reset_when_active() {
-        // The snapshot path goes through prepare_save -> send_transport_reset_event.
-        // Both the evq publication and the gate must be observable afterwards.
+    fn test_save_owes_the_restored_device_a_reset_and_leaves_the_source_alone() {
+        // The reset belongs to the VM restored from the serialized state: its backend connections
+        // do not exist. The device being saved keeps its connections, so the capture must not
+        // publish an event into its guest's event queue, even though a descriptor is there for one.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
         ctx.publish_evq_descriptor();
 
-        ctx.device.prepare_save();
+        let state = ctx.device.save();
 
-        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
-        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        assert_eq!(
+            state.transport_reset,
+            TransportReset::Owed,
+            "the restored device owes the guest a reset for the connections it does not have"
+        );
+        assert_eq!(
+            ctx.device.transport_reset,
+            TransportReset::Settled,
+            "saving must not gate the source's data"
+        );
+        assert!(!ctx.device.data_gated());
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            0,
+            "saving must not write the source guest's event queue"
+        );
+
+        // The source keeps delivering after the capture.
+        ctx.device.backend.set_pending_rx(true);
+        assert!(ctx.device.process_rx().unwrap());
     }
 
     #[test]
-    fn test_prepare_save_owes_the_reset_it_cannot_publish() {
-        // An empty event queue at snapshot time is what used to lose the reset: the error was
-        // logged and the state said nothing was outstanding.
+    fn test_save_passes_an_owed_reset_through() {
+        // A source that already owes its guest a reset serializes that debt, and the capture is
+        // not a publication attempt: the descriptor stays where the guest put it.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.publish_evq_descriptor();
 
-        ctx.device.prepare_save();
+        ctx.device.transport_reset = TransportReset::Owed;
 
+        let state = ctx.device.save();
+
+        assert_eq!(state.transport_reset, TransportReset::Owed);
         assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
         assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
     }
 
     #[test]
-    fn test_repeated_capture_keeps_a_published_reset_published() {
-        // Descriptor exhaustion across two captures. The first capture publishes into the only
-        // descriptor the guest provided; the second finds the event queue empty. The published
-        // reset must survive: it is the event the guest can still answer, and downgrading it to
-        // owed would drop it and leave data gated on an acknowledgement of nothing.
+    fn test_save_passes_a_published_reset_through() {
+        // The event is already in the guest memory the snapshot captures, so the serialized state
+        // has to agree with it: the restored device waits for the acknowledgement instead of
+        // publishing a second event for the same reset.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
         ctx.publish_evq_descriptor();
 
-        ctx.device.prepare_save();
+        ctx.device.transport_reset = TransportReset::Published;
+
+        let state = ctx.device.save();
+
+        assert_eq!(state.transport_reset, TransportReset::Published);
         assert_eq!(ctx.device.transport_reset, TransportReset::Published);
-        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
+    }
 
-        // Second capture, no new descriptor: the reset already outstanding covers it.
-        ctx.device.prepare_save();
+    #[test]
+    fn test_repeated_capture_keeps_a_published_reset_published() {
+        // A capture consumes no event-queue descriptor, so repeating one cannot exhaust the queue
+        // and downgrade the published reset. It stays the single event the guest can answer.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        ctx.publish_evq_descriptor();
 
-        assert_eq!(
-            ctx.device.transport_reset,
-            TransportReset::Published,
-            "a repeated capture must not downgrade a published reset"
-        );
+        ctx.device.transport_reset = TransportReset::Published;
+
+        assert_eq!(ctx.device.save().transport_reset, TransportReset::Published);
+        assert_eq!(ctx.device.save().transport_reset, TransportReset::Published);
+        assert_eq!(ctx.device.transport_reset, TransportReset::Published);
         assert_eq!(
             ctx.guest_evvq.used.idx.get(),
-            1,
-            "a repeated capture must not publish a second event for the same reset"
+            0,
+            "no capture may publish an event for a reset already outstanding"
         );
 
         // Even a direct publication attempt that runs out of descriptors leaves the published
         // reset alone.
+        ctx.device.queues[EVQ_INDEX].pop().unwrap().unwrap();
         let err = ctx.device.send_transport_reset_event().unwrap_err();
         assert!(matches!(
             err,
             DeviceError::VsockError(VsockError::EmptyQueue)
         ));
         assert_eq!(ctx.device.transport_reset, TransportReset::Published);
-        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
     }
 
     #[test]
     fn test_repeated_capture_keeps_an_owed_reset_owed() {
-        // Both captures find the event queue empty. The debt stays exactly one debt, and the
-        // repeated failure is counted as a guest that is not answering.
+        // A capture records the debt and never attempts to publish it, so repeating one leaves the
+        // guest's empty event queue exactly as it found it.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.prepare_save();
-        assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
+        ctx.device.transport_reset = TransportReset::Owed;
 
-        let stuck_before = METRICS.transport_reset_stuck.count();
-        ctx.device.prepare_save();
+        assert_eq!(ctx.device.save().transport_reset, TransportReset::Owed);
+        assert_eq!(ctx.device.save().transport_reset, TransportReset::Owed);
         assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
-        assert_eq!(
-            METRICS.transport_reset_stuck.count(),
-            stuck_before,
-            "a repeated capture must not even attempt to publish while a reset is owed"
-        );
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
 
         // A retry that runs out of descriptors keeps the debt and reports it.
+        let stuck_before = METRICS.transport_reset_stuck.count();
         ctx.device.retry_owed_transport_reset();
         assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
         assert!(
@@ -941,7 +977,9 @@ mod tests {
         // `avail_event` is only ever written by the notification-suppression path.
         ctx.guest_evvq.used.event.set(0xffff);
 
-        ctx.device.prepare_save();
+        // The restored device owes the reset, and its guest has not refilled the event queue.
+        ctx.device.transport_reset = TransportReset::Owed;
+        ctx.device.kick();
 
         assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
         assert_eq!(
@@ -983,7 +1021,8 @@ mod tests {
             .ack_features_by_page(0, 1 << VIRTIO_RING_F_EVENT_IDX);
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-        ctx.device.prepare_save();
+        ctx.device.transport_reset = TransportReset::Owed;
+        ctx.device.kick();
         assert_eq!(ctx.device.transport_reset, TransportReset::Owed);
 
         // The descriptor appears with no event-queue kick behind it.
@@ -999,13 +1038,15 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_save_inactive_is_a_noop() {
-        let mut ctx = TestContext::new();
+    fn test_save_of_an_inactive_device_owes_nothing() {
+        // A device the guest never brought up has no connections to reset, and a restore must not
+        // invent a gate: only a published reset can ever be acknowledged.
+        let ctx = TestContext::new();
         assert!(!ctx.device.is_activated());
 
-        // Must not panic, must not gate data.
-        ctx.device.prepare_save();
+        let state = ctx.device.save();
 
+        assert_eq!(state.transport_reset, TransportReset::Settled);
         assert_eq!(ctx.device.transport_reset, TransportReset::Settled);
     }
 

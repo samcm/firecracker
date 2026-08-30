@@ -30,11 +30,11 @@ struct CaptureBuffers {
 /// How far through one capture epoch the commands that produce a checkpoint have got.
 ///
 /// The vmstate has to be serialized before the dirty accumulator is harvested. Serialization
-/// calls `prepare_save()` on every device, and a device may write guest memory there: virtio-vsock
-/// publishes a `TRANSPORT_RESET` event into the guest's event queue. A harvest that ran first
-/// would report a bitmap that predates those writes, so pagemaster would copy pages the restored
-/// vmstate no longer agrees with. The order is a property of the epoch, not of one command, so it
-/// is tracked here and enforced for both directions.
+/// calls `prepare_save()` on every device, and a device may write guest memory there: virtio-net
+/// hands the guest its deferred RX frame, which advances the used ring the guest reads. A harvest
+/// that ran first would report a bitmap that predates those writes, so pagemaster would copy pages
+/// the restored vmstate no longer agrees with. The order is a property of the epoch, not of one
+/// command, so it is tracked here and enforced for both directions.
 ///
 /// The phase also makes a repeated command a replay rather than a second effect. A reply lost on
 /// the way back to pagemaster is answered by a retry, and a retry that redid the work would
