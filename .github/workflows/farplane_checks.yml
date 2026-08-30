@@ -637,6 +637,10 @@ jobs:
       # `vstate::vm` covers the dirty-log ioctl sequence itself: the initially-set contract, the
       # restore baseline that retires it and the accumulator the baseline must not touch. Every
       # test in it opens /dev/kvm, so this is the only lane that can run it.
+      #
+      # The floor is the count both architectures execute. The module holds fourteen
+      # architecture-independent tests and one x86_64-only test, so a floor of fifteen would fail
+      # on aarch64 for no reason.
       - name: "The KVM-backed vm state suite, guarded by a floor"
         run: |
           set -euo pipefail
@@ -644,11 +648,11 @@ jobs:
           cargo test -p vmm --lib vstate::vm 2>&1 | tee "$log"
           passed=$(sed -n 's/^test result: [A-Za-z]*\. \([0-9][0-9]*\) passed;.*/\1/p' "$log" \
             | awk '{ total += $1 } END { print total + 0 }')
-          if [ "$passed" -lt 15 ]; then
-            echo "::error::the vstate::vm suite executed $passed tests, fewer than the required 15"
+          if [ "$passed" -lt 14 ]; then
+            echo "::error::the vstate::vm suite executed $passed tests, fewer than the required 14"
             exit 1
           fi
-          echo "the vstate::vm suite executed $passed tests, the floor is 15"
+          echo "the vstate::vm suite executed $passed tests, the floor is 14"
 
       - name: "Build the binaries the functional tests drive"
         run: ./tools/devtool -y build --release
