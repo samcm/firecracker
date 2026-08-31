@@ -568,10 +568,10 @@ impl KvmVm {
             if words.len() != pages.div_ceil(64) {
                 return Err(VmError::DirtyBitmapShape);
             }
-            if let Some(host_writes) = region.inner.deref().bitmap().as_ref() {
-                if host_writes.len() != pages || host_writes.byte_size() != len {
-                    return Err(VmError::DirtyBitmapShape);
-                }
+            if let Some(host_writes) = region.inner.deref().bitmap().as_ref()
+                && (host_writes.len() != pages || host_writes.byte_size() != len)
+            {
+                return Err(VmError::DirtyBitmapShape);
             }
             match pending.get(&region.slot) {
                 Some(returned) if returned.len() != words.len() => {
