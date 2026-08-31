@@ -657,16 +657,19 @@ impl CaptureService {
         match self.read_bitmap(&mut file) {
             Ok(bits) => {
                 let vmm = self.vmm.lock().expect("Poisoned lock");
-                match vmm.kvm_vm() {
-                    Some(kvm_vm) => kvm_vm.union_dirty_log(&bits),
-                    None => {
-                        drop(vmm);
-                        return self.reject(
-                            request_id,
-                            ErrorCode::DirtyHarvestFailed,
-                            MsgType::DirtyUnion,
-                        );
-                    }
+                let unioned = match vmm.kvm_vm() {
+                    Some(kvm_vm) => kvm_vm.union_dirty_log(&bits).map_err(|err| {
+                        error!("Farplane capture could not return the dirty bits: {err}");
+                    }),
+                    None => Err(()),
+                };
+                if unioned.is_err() {
+                    drop(vmm);
+                    return self.reject(
+                        request_id,
+                        ErrorCode::DirtyHarvestFailed,
+                        MsgType::DirtyUnion,
+                    );
                 }
                 drop(vmm);
                 self.order.unioned();

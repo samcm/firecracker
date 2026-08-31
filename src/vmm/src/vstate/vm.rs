@@ -34,8 +34,8 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    Bitmap, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
-    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
+    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
+    GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -92,6 +92,10 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
+    /// Dirty bits handed back by [`KvmVm::union_dirty_log`], keyed by kvm slot and shaped like
+    /// the owning region's bitmap. Word-level so a rollback of a mostly-dirty multi-gigabyte
+    /// bitmap costs one pass over the words rather than one atomic operation per page.
+    pending_dirty_union: Mutex<HashMap<u32, Vec<u64>>>,
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -218,6 +222,7 @@ impl KvmVm {
             kvm,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
+            pending_dirty_union: Mutex::new(HashMap::new()),
         })
     }
 
@@ -458,9 +463,22 @@ impl KvmVm {
             .insert_region(Arc::clone(&region))?;
 
         self.set_user_memory_region(region.as_ref().into())?;
+        let words = u64_to_usize(region.len())
+            .div_ceil(host_page_size())
+            .div_ceil(64);
+        self.pending_dirty_union()
+            .insert(region.slot, vec![0u64; words]);
         self.common.guest_memory = new_guest_memory;
 
         Ok(())
+    }
+
+    /// Locks the accumulator holding the dirty bits returned by [`KvmVm::union_dirty_log`].
+    fn pending_dirty_union(&self) -> MutexGuard<'_, HashMap<u32, Vec<u64>>> {
+        self.common
+            .pending_dirty_union
+            .lock()
+            .expect("Poisoned lock")
     }
 
     /// Register a list of new memory regions to this [`KvmVm`].
@@ -528,42 +546,68 @@ impl KvmVm {
     /// Snapshots the dirty accumulator of every guest region, in ascending guest address order.
     /// Under manual protection `KVM_GET_DIRTY_LOG` neither clears nor re-protects, so the bits
     /// stay set until [`KvmVm::clear_dirty_log`] retires them.
+    ///
+    /// A region's report is the union of KVM's log, the host write accumulator, and the bits a
+    /// previous harvest returned through [`KvmVm::union_dirty_log`]. Host bits are moved into the
+    /// pending accumulator as they are read, so snapshotting retires no evidence:
+    /// [`KvmVm::clear_dirty_log`] owns that commit after the report is durably handed to the caller.
     pub fn snapshot_dirty_log(&self) -> Result<Vec<Vec<u64>>, VmError> {
         let page_size = host_page_size();
-        self.guest_memory()
-            .iter()
-            .map(|region| {
-                let len = u64_to_usize(region.len());
-                let mut words = self
-                    .fd()
-                    .get_dirty_log(region.slot, len)
-                    .map_err(VmError::GetDirtyLog)?;
-                let pages = len.div_ceil(page_size);
-                if words.len() != pages.div_ceil(64) {
+        let mut pending = self.pending_dirty_union();
+        let mut harvest = Vec::with_capacity(self.guest_memory().num_regions());
+
+        // Read and validate every KVM bitmap before draining a host accumulator. A late KVM or
+        // geometry failure therefore leaves all host-owned evidence untouched.
+        for region in self.guest_memory().iter() {
+            let len = u64_to_usize(region.len());
+            let words = self
+                .fd()
+                .get_dirty_log(region.slot, len)
+                .map_err(VmError::GetDirtyLog)?;
+            let pages = len.div_ceil(page_size);
+            if words.len() != pages.div_ceil(64) {
+                return Err(VmError::DirtyBitmapShape);
+            }
+            if let Some(host_writes) = region.inner.deref().bitmap().as_ref() {
+                if host_writes.len() != pages || host_writes.byte_size() != len {
                     return Err(VmError::DirtyBitmapShape);
                 }
-                if let Some(host_writes) = region.inner.deref().bitmap().as_ref() {
-                    if host_writes.len() != pages || host_writes.byte_size() != len {
-                        return Err(VmError::DirtyBitmapShape);
-                    }
-                    let host_words = host_writes.clone().get_and_reset();
-                    if host_words.len() != words.len() {
-                        return Err(VmError::DirtyBitmapShape);
-                    }
-                    for (word, host_word) in words.iter_mut().zip(host_words) {
-                        *word |= host_word;
-                    }
+            }
+            match pending.get(&region.slot) {
+                Some(returned) if returned.len() != words.len() => {
+                    return Err(VmError::DirtyBitmapShape);
                 }
-                Ok(words)
-            })
-            .collect()
+                Some(_) => {}
+                None => {}
+            }
+            harvest.push(words);
+        }
+
+        for (region, words) in self.guest_memory().iter().zip(&mut harvest) {
+            let returned = pending
+                .entry(region.slot)
+                .or_insert_with(|| vec![0u64; words.len()]);
+            if let Some(host_writes) = region.inner.deref().bitmap().as_ref() {
+                let host_words = host_writes.clone().get_and_reset();
+                if host_words.len() != words.len() {
+                    return Err(VmError::DirtyBitmapShape);
+                }
+                for (returned_word, host_word) in returned.iter_mut().zip(host_words) {
+                    *returned_word |= host_word;
+                }
+            }
+            for (word, returned_word) in words.iter_mut().zip(returned) {
+                *word |= *returned_word;
+            }
+        }
+        Ok(harvest)
     }
 
     /// Retires the bits of a snapshot: KVM re-protects them and the host accumulator is reset.
     ///
     /// KVM drops a slot's bits as it clears them. If a later slot fails, the complete snapshot is
-    /// returned to the host accumulator; on success, the host accumulator is reset only after
-    /// every slot cleared. Either outcome leaves every reported bit owned exactly once.
+    /// returned to the pending-union accumulator; on success, the host accumulator is reset only
+    /// after every slot cleared. Either outcome leaves every reported bit owned exactly once.
     pub fn clear_dirty_log(&self, snapshot: &[Vec<u64>]) -> Result<(), VmError> {
         let page_size = host_page_size();
         if snapshot.len() != self.guest_memory().num_regions() {
@@ -582,6 +626,19 @@ impl KvmVm {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Keep the returned bits until every KVM slot has accepted the clear. A failed bitmap
+        // write or flush between snapshot and this call therefore changes nothing, and a clear
+        // failure keeps one complete retryable report without returning to per-page atomics.
+        let mut pending = self.pending_dirty_union();
+        for (region, words) in self.guest_memory().iter().zip(snapshot) {
+            if pending
+                .get(&region.slot)
+                .is_some_and(|acc| acc.len() != words.len())
+            {
+                return Err(VmError::DirtyBitmapShape);
+            }
+        }
+
         for ((region, words), pages) in self.guest_memory().iter().zip(snapshot).zip(page_counts) {
             let clear = kvm_clear_dirty_log {
                 slot: region.slot,
@@ -595,14 +652,27 @@ impl KvmVm {
             let ret = unsafe { ioctl_with_ref(self.fd(), KVM_CLEAR_DIRTY_LOG(), &clear) };
             if ret != 0 {
                 let err = errno::Error::last();
-                // A previous slot may already be clear. Preserve the complete report in the host
-                // accumulator so the next harvest repeats every bit rather than losing that
-                // slot's part of the snapshot.
-                self.union_dirty_log(snapshot);
+                // A previous slot may already be clear. Preserve the complete report so the next
+                // harvest repeats every bit rather than losing that slot's part of the snapshot.
+                for (reported_region, reported_words) in self.guest_memory().iter().zip(snapshot) {
+                    let accumulated = pending
+                        .entry(reported_region.slot)
+                        .or_insert_with(|| vec![0u64; reported_words.len()]);
+                    for (dst, src) in accumulated.iter_mut().zip(reported_words) {
+                        *dst |= *src;
+                    }
+                }
                 return Err(VmError::ClearDirtyLog(err));
             }
         }
         self.guest_memory().reset_dirty();
+        for (region, reported) in self.guest_memory().iter().zip(snapshot) {
+            if let Some(returned) = pending.get_mut(&region.slot) {
+                for (returned_word, reported_word) in returned.iter_mut().zip(reported) {
+                    *returned_word &= !*reported_word;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -642,19 +712,40 @@ impl KvmVm {
     }
 
     /// Returns a previously snapshotted bitmap to the accumulator, so the next snapshot reports it.
-    pub fn union_dirty_log(&self, bits: &[Vec<u64>]) {
+    ///
+    /// The bits land in the pending-union accumulator, which
+    /// [`KvmVm::snapshot_dirty_log`] reports until [`KvmVm::clear_dirty_log`] retires them.
+    /// Repeated unions accumulate exactly, and a rollback of a mostly-dirty bitmap costs one pass
+    /// over its words. A geometry that does not match the registered regions is rejected before
+    /// any word is touched, so a rejected union leaves ownership of the reported bits with the
+    /// caller.
+    pub fn union_dirty_log(&self, bits: &[Vec<u64>]) -> Result<(), VmError> {
         let page_size = host_page_size();
+        if bits.len() != self.guest_memory().num_regions() {
+            return Err(VmError::DirtyBitmapShape);
+        }
+        let mut pending = self.pending_dirty_union();
         for (region, words) in self.guest_memory().iter().zip(bits) {
-            let Some(host_writes) = region.bitmap() else {
-                continue;
-            };
-            let pages = u64_to_usize(region.len()).div_ceil(page_size);
-            for page in 0..pages {
-                if words[page / 64] & (1 << (page % 64)) != 0 {
-                    host_writes.mark_dirty(page * page_size, 1);
-                }
+            let expected = u64_to_usize(region.len()).div_ceil(page_size).div_ceil(64);
+            if words.len() != expected {
+                return Err(VmError::DirtyBitmapShape);
+            }
+            if pending
+                .get(&region.slot)
+                .is_some_and(|acc| acc.len() != expected)
+            {
+                return Err(VmError::DirtyBitmapShape);
             }
         }
+        for (region, words) in self.guest_memory().iter().zip(bits) {
+            let accumulated = pending
+                .entry(region.slot)
+                .or_insert_with(|| vec![0u64; words.len()]);
+            for (dst, src) in accumulated.iter_mut().zip(words) {
+                *dst |= *src;
+            }
+        }
+        Ok(())
     }
 
     /// Register a device IRQ
@@ -768,6 +859,7 @@ pub(crate) mod tests {
     use crate::test_utils::single_region_mem_raw;
     use crate::utils::mib_to_bytes;
     use crate::vstate::kvm::Kvm;
+    use crate::vstate::memory::Bitmap;
     use crate::vstate::memory::GuestRegionMmap;
 
     // Auxiliary function being used throughout the tests.
@@ -874,11 +966,131 @@ pub(crate) mod tests {
             vm.clear_dirty_log(&snapshot),
             Err(VmError::ClearDirtyLog(_))
         ));
-        for region in vm.guest_memory().iter() {
-            for page in 0..65 {
-                assert!(region.bitmap().unwrap().dirty_at(page * page_size));
-            }
+        // The bits live in the pending-union accumulator, word for word, rather than in the host
+        // bitmap the clear reset.
+        let pending = vm.pending_dirty_union();
+        for (region, words) in vm.guest_memory().iter().zip(&snapshot) {
+            assert_eq!(pending.get(&region.slot).unwrap(), words);
         }
+        drop(pending);
+
+        // Re-arm dirty logging on the second slot so the next harvest can read it. KVM cleared the
+        // first slot and the host accumulator was emptied, so the returned bits are the only
+        // record of that slot's pages.
+        let armed: &GuestRegionMmapExt = vm.guest_memory().iter().nth(1).unwrap();
+        vm.set_user_memory_region(kvm_userspace_memory_region::from(armed))
+            .unwrap();
+        let next = vm.snapshot_dirty_log().unwrap();
+        assert_eq!(next[0], snapshot[0]);
+    }
+
+    fn empty_snapshot(vm: &KvmVm) -> Vec<Vec<u64>> {
+        let page_size = host_page_size();
+        vm.guest_memory()
+            .iter()
+            .map(|region| vec![0u64; u64_to_usize(region.len()).div_ceil(page_size).div_ceil(64)])
+            .collect()
+    }
+
+    fn dirty_pages_of(vm: &KvmVm, snapshot: &[Vec<u64>]) -> Vec<Vec<usize>> {
+        let page_size = host_page_size();
+        vm.guest_memory()
+            .iter()
+            .zip(snapshot)
+            .map(|(region, words)| {
+                let pages = u64_to_usize(region.len()).div_ceil(page_size);
+                (0..pages)
+                    .filter(|page| words[page / 64] & (1 << (page % 64)) != 0)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A harvest reports the exact union of KVM's log, the host accumulator, and returned bits.
+    /// Only a successful clear retires those sources.
+    #[test]
+    fn test_snapshot_unions_kvm_host_and_returned_words() {
+        let page_size = host_page_size();
+        let mut vm = setup_vm();
+        vm.register_memory_regions(crate::test_utils::multi_region_mem_raw(&[
+            (GuestAddress(0), 65 * page_size),
+            (GuestAddress(0x10_0000), 2 * page_size),
+        ]))
+        .unwrap();
+        vm.baseline_dirty_log().unwrap();
+
+        let mut returned = empty_snapshot(&vm);
+        returned[0][1] |= 1;
+        returned[1][0] |= 1 << 1;
+        vm.union_dirty_log(&returned).unwrap();
+
+        vm.guest_memory().mark_dirty(GuestAddress(0), page_size);
+
+        let snapshot = vm.snapshot_dirty_log().unwrap();
+        assert_eq!(dirty_pages_of(&vm, &snapshot), vec![vec![0, 64], vec![1]]);
+
+        // Snapshotting alone retires nothing, so the returned words remain visible.
+        let next = vm.snapshot_dirty_log().unwrap();
+        assert_eq!(dirty_pages_of(&vm, &next), vec![vec![0, 64], vec![1]]);
+
+        vm.clear_dirty_log(&snapshot).unwrap();
+        let retired = vm.snapshot_dirty_log().unwrap();
+        assert!(retired.iter().flatten().all(|word| *word == 0));
+    }
+
+    /// Two unions accumulate: the harvest that follows reports every returned bit once.
+    #[test]
+    fn test_repeated_unions_accumulate() {
+        let page_size = host_page_size();
+        let mut vm = setup_vm();
+        vm.register_memory_regions(single_region_mem_raw(130 * page_size))
+            .unwrap();
+        vm.baseline_dirty_log().unwrap();
+
+        let mut first = empty_snapshot(&vm);
+        first[0][0] |= 1 << 3;
+        first[0][2] |= 1;
+        vm.union_dirty_log(&first).unwrap();
+
+        let mut second = empty_snapshot(&vm);
+        second[0][0] |= 1 << 3;
+        second[0][1] |= 1 << 5;
+        vm.union_dirty_log(&second).unwrap();
+
+        let snapshot = vm.snapshot_dirty_log().unwrap();
+        assert_eq!(dirty_pages_of(&vm, &snapshot), vec![vec![3, 69, 128]]);
+    }
+
+    /// A union whose geometry does not match the registered regions is rejected as a whole.
+    #[test]
+    fn test_union_rejects_a_mismatched_shape() {
+        let page_size = host_page_size();
+        let mut vm = setup_vm();
+        vm.register_memory_regions(crate::test_utils::multi_region_mem_raw(&[
+            (GuestAddress(0), 2 * page_size),
+            (GuestAddress(0x10_0000), 2 * page_size),
+        ]))
+        .unwrap();
+        vm.baseline_dirty_log().unwrap();
+
+        let mut short = empty_snapshot(&vm);
+        short.pop().unwrap();
+        assert!(matches!(
+            vm.union_dirty_log(&short),
+            Err(VmError::DirtyBitmapShape)
+        ));
+
+        // The first region's words are too wide. The second region's bit must not land either.
+        let mut wide = empty_snapshot(&vm);
+        wide[0].push(u64::MAX);
+        wide[1][0] |= 1;
+        assert!(matches!(
+            vm.union_dirty_log(&wide),
+            Err(VmError::DirtyBitmapShape)
+        ));
+
+        let snapshot = vm.snapshot_dirty_log().unwrap();
+        assert!(snapshot.iter().flatten().all(|word| *word == 0));
     }
 
     /// A restored VM's baseline retires KVM's initially-set state and nothing else.
