@@ -106,4 +106,3 @@ If the atomicity of the operation is guaranteed by using methods to make the
 microVM quiescence during the update sequence (for example pausing the microVM)
 the guest itself or block device can still become incosistent from in flight I/O
 requests in the guest that will be executed after it is resumed.
-

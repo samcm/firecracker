@@ -58,4 +58,3 @@ As examples of when to compare fingerprint files:
 - When bumping the kernel version up
 - When applying a microcode update (or launching a new host (e.g. AWS EC2 metal
   instance))
-
