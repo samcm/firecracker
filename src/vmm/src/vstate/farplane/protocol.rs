@@ -29,7 +29,7 @@ pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this protocol, quiesce semantics and vmstate format. A warm image
 /// baked by another identity is refused rather than restored: the capture command order and the
 /// vmstate the epoch produces are part of what this string names.
-pub const FEATURE_IDENTITY: &str = "farplane/3";
+pub const FEATURE_IDENTITY: &str = "farplane/4";
 /// Size of one extent table record.
 pub const EXTENT_RECORD_LEN: usize = 32;
 /// Size of one region record.
@@ -161,6 +161,12 @@ pub enum ErrorCode {
     /// A request identifier this connection already answered arrived with different contents, or
     /// too long ago to be answered from memory.
     RequestIdReused = 23,
+    /// The guest has no scratch drive, so it has no disk to clone.
+    NoScratchDrive = 24,
+    /// The disk clone destination is not a regular file opened read-write.
+    BadCloneDestination = 25,
+    /// The scratch disk could not be cloned into the armed destination.
+    DiskCloneFailed = 26,
 }
 
 /// Architecture Firecracker is running on.
@@ -851,6 +857,7 @@ mod tests {
         assert_eq!(ErrorCode::NoCaptureBuffers as u32, 17);
         assert_eq!(ErrorCode::PeercredMismatch as u32, 19);
         assert_eq!(ErrorCode::CaptureOrderViolation as u32, 22);
+        assert_eq!(ErrorCode::DiskCloneFailed as u32, 26);
     }
 
     /// The `hello` frame is the only place the feature identity crosses to pagemaster, so its
@@ -877,6 +884,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/3");
+        assert_eq!(FEATURE_IDENTITY, "farplane/4");
     }
 }

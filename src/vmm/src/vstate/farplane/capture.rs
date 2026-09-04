@@ -5,16 +5,18 @@ use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use utils::time::{ClockType, get_time_us};
 
 use super::backend::{
     BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, set_capture_buffers_armed,
-    validate_buffer_fd,
+    validate_buffer_fd, validate_clone_destination,
 };
 use super::dispatch;
 use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
 use crate::Vmm;
-use crate::logger::error;
+use crate::logger::{IncMetric, METRICS, error, info};
 use crate::persist::{MicrovmState, VmInfo};
 use crate::snapshot::Snapshot;
 use crate::utils::{u64_to_usize, usize_to_u64};
@@ -25,6 +27,8 @@ use crate::vmm_config::instance_info::VmState;
 struct CaptureBuffers {
     dirty: File,
     vmstate: File,
+    /// Inode the scratch disk is reflinked into inside the quiesce, when the sandbox has a disk.
+    disk_clone: Option<File>,
 }
 
 /// How far through one capture epoch the commands that produce a checkpoint have got.
@@ -413,14 +417,16 @@ impl CaptureService {
             return Err(ChannelError::Malformed);
         }
         let msg = incoming.header.msg();
-        let (body_len, fd_count) = match msg {
-            MsgType::CaptureBuffers => (0, 2),
-            MsgType::Quiesce | MsgType::DirtySnapshot | MsgType::WriteVmstate => (0, 0),
-            MsgType::DirtyUnion => (0, 1),
-            MsgType::Resume => (4, 0),
+        // `capture_buffers` carries the dirty bitmap and the vmstate buffer, and a third
+        // descriptor when the sandbox has a disk the quiesce has to clone.
+        let (body_len, fd_counts): (usize, &[usize]) = match msg {
+            MsgType::CaptureBuffers => (0, &[2, 3]),
+            MsgType::Quiesce | MsgType::DirtySnapshot | MsgType::WriteVmstate => (0, &[0]),
+            MsgType::DirtyUnion => (0, &[1]),
+            MsgType::Resume => (4, &[0]),
             _ => return Err(ChannelError::Malformed),
         };
-        if incoming.body.len() != body_len || incoming.fds.len() != fd_count {
+        if incoming.body.len() != body_len || !fd_counts.contains(&incoming.fds.len()) {
             return Err(ChannelError::Malformed);
         }
 
@@ -470,36 +476,57 @@ impl CaptureService {
         }
     }
 
-    /// Validates and arms the buffers of one capture epoch.
+    /// Validates and arms the buffers of one capture epoch, and the disk clone destination when
+    /// pagemaster sends one. A destination arrives only for a sandbox with a disk, so one sent
+    /// for a guest that has no scratch drive names a clone that could never be taken.
     fn arm_buffers(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
         if BackendState::load() != BackendState::Ready {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::CaptureBuffers);
         }
+        let mut fds = incoming.fds;
+        let destination = (fds.len() == 3).then(|| fds.remove(2));
         let [dirty, vmstate] =
-            <[_; 2]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+            <[_; 2]>::try_from(fds).map_err(|_| ChannelError::FdCountMismatch)?;
         if let Err(code) = validate_buffer_fd(dirty.as_raw_fd(), self.channel.dirty_bitmap_bytes) {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
         if let Err(code) = validate_buffer_fd(vmstate.as_raw_fd(), VMSTATE_CAPACITY_BYTES) {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
+        if let Some(destination) = &destination
+            && let Err(code) =
+                accept_clone_destination(destination.as_raw_fd(), self.scratch_descriptor())
+        {
+            return self.reject(request_id, code, MsgType::CaptureBuffers);
+        }
 
         self.buffers = Some(CaptureBuffers {
             dirty: File::from(dirty),
             vmstate: File::from(vmstate),
+            disk_clone: destination.map(File::from),
         });
         set_capture_buffers_armed(true);
         self.reply(request_id, MsgType::CaptureBuffersArmed, &[])
     }
 
-    /// Stops every guest-memory writer and enters the capture epoch.
+    /// Descriptor of the drive the armed destination is cloned from.
+    fn scratch_descriptor(&self) -> Option<RawFd> {
+        self.vmm.lock().expect("Poisoned lock").scratch_descriptor()
+    }
+
+    /// Stops every guest-memory writer, clones the scratch disk when a destination is armed, and
+    /// enters the capture epoch.
     ///
     /// The vCPUs are paused, asynchronous block IO is drained, and event dispatch is stopped for
     /// the whole epoch: every virtio device is a subscriber of its own, so a queue notification
     /// served between two capture commands would write device state or guest memory the
     /// checkpoint has already accounted for. Dispatch is only handed back by a successful
     /// `resume`, or by a `quiesce` that failed before the epoch opened.
+    ///
+    /// The clone is taken here because this is the only point at which the disk and the memory
+    /// are observed on one thread with no writer between them: every block writer has stopped
+    /// and no epoch has opened, so a clone that fails refuses the quiesce and seals nothing.
     fn quiesce(&mut self, request_id: u64) -> Result<(), ChannelError> {
         match BackendState::load() {
             BackendState::Ready => {}
@@ -524,22 +551,34 @@ impl CaptureService {
         if let Err(err) = vmm.drain_guest_memory_writers() {
             error!("Farplane quiesce could not stop every guest-memory writer: {err}");
             // The epoch never opened, so the source is handed back exactly as it was found and the
-            // backend stays `Ready`: pagemaster may arm the epoch again. A source that cannot be
-            // handed back is no longer describable, so the channel fails and the supervisor kills
-            // this process.
-            if were_running && let Err(err) = vmm.resume_vm() {
-                error!(
-                    "Farplane quiesce could not restart the vCPUs after the failed drain: {err}"
-                );
-                BackendState::fail();
-            }
-            drop(vmm);
-            // A backend that can no longer describe its source keeps dispatch stopped: the
-            // supervisor kills this process, and until it does no handler may write guest memory.
-            if BackendState::load() != BackendState::ChannelFailed {
-                dispatch::gate().open();
-            }
+            // backend stays `Ready`: pagemaster may arm the epoch again.
+            hand_back_source(vmm, were_running);
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
+        }
+
+        let destination = self
+            .buffers
+            .as_ref()
+            .and_then(|buffers| buffers.disk_clone.as_ref())
+            .map(|file| file.as_raw_fd());
+        if let Some(destination) = destination {
+            match vmm
+                .scratch_descriptor()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))
+                .and_then(|scratch| clone_scratch(destination, scratch))
+            {
+                Ok(elapsed_us) => {
+                    info!("Farplane quiesce cloned the scratch disk in {elapsed_us} us");
+                    METRICS.farplane.disk_clones.inc();
+                    METRICS.farplane.disk_clone_agg.record_us(elapsed_us);
+                }
+                Err(err) => {
+                    error!("Farplane quiesce could not clone the scratch disk: {err}");
+                    METRICS.farplane.disk_clone_failures.inc();
+                    hand_back_source(vmm, were_running);
+                    return self.reject(request_id, ErrorCode::DiskCloneFailed, MsgType::Quiesce);
+                }
+            }
         }
         drop(vmm);
 
@@ -764,6 +803,45 @@ impl CaptureService {
             body,
         )
     }
+}
+
+/// Decides whether an armed destination could hold a clone at all: it has to be a descriptor a
+/// reflink can land in, and the guest has to have a scratch drive to clone from.
+fn accept_clone_destination(destination: RawFd, scratch: Option<RawFd>) -> Result<(), ErrorCode> {
+    validate_clone_destination(destination)?;
+    if scratch.is_none() {
+        return Err(ErrorCode::NoScratchDrive);
+    }
+    Ok(())
+}
+
+/// Hands the source back exactly as `quiesce` found it, for a failure before the epoch opened.
+///
+/// A source that cannot be handed back is no longer describable, so the channel fails and the
+/// supervisor kills this process; until it does, dispatch stays stopped so no handler writes
+/// guest memory.
+fn hand_back_source(mut vmm: MutexGuard<'_, Vmm>, were_running: bool) {
+    if were_running && let Err(err) = vmm.resume_vm() {
+        error!("Farplane quiesce could not restart the vCPUs after the failure: {err}");
+        BackendState::fail();
+    }
+    drop(vmm);
+    if BackendState::load() != BackendState::ChannelFailed {
+        dispatch::gate().open();
+    }
+}
+
+/// Reflinks the scratch disk into `destination`, reporting how long the ioctl took in
+/// microseconds. `FICLONE` writes the source's dirty host pages back and then shares its extents,
+/// so the destination is the whole disk at this instant and no byte is copied.
+fn clone_scratch(destination: RawFd, scratch: RawFd) -> Result<u64, io::Error> {
+    let started = get_time_us(ClockType::Monotonic);
+    // SAFETY: both arguments are descriptors this process holds open, and the return code is
+    // checked.
+    if unsafe { libc::ioctl(destination, libc::FICLONE, scratch) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(get_time_us(ClockType::Monotonic) - started)
 }
 
 /// Snapshots the dirty accumulator, writes it out, and only then clears it.
@@ -1369,6 +1447,138 @@ mod tests {
             io::Error::last_os_error().raw_os_error(),
             Some(libc::EBADF),
             "a frame that was not served must not leak its descriptors"
+        );
+    }
+
+    /// Directory on a reflink filesystem the clone proofs need, or a skip reason.
+    fn reflink_dir() -> Option<std::path::PathBuf> {
+        match std::env::var_os("FARPLANE_TEST_XFS_DIR") {
+            Some(dir) => Some(std::path::PathBuf::from(dir)),
+            None => {
+                eprintln!(
+                    "skipping: FARPLANE_TEST_XFS_DIR must name a directory on an XFS filesystem \
+                     formatted with reflink=1, because FICLONE has no meaning without one"
+                );
+                None
+            }
+        }
+    }
+
+    /// A file of `content` under `dir`, opened read-write.
+    fn file_in(dir: &std::path::Path, name: &str, content: &[u8]) -> File {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.join(name))
+            .unwrap();
+        file.write_all(content).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    /// A destination is only worth arming for a guest that has a disk: a clone of nothing is a
+    /// clone that could never be taken, so it is refused while the source can still be resumed.
+    #[test]
+    fn an_armed_destination_is_refused_without_a_scratch_drive() {
+        let destination = TempFile::new().unwrap();
+        let fd = destination.as_file().as_raw_fd();
+
+        assert_eq!(
+            accept_clone_destination(fd, None),
+            Err(ErrorCode::NoScratchDrive)
+        );
+        assert_eq!(accept_clone_destination(fd, Some(5)), Ok(()));
+    }
+
+    /// A reflink lands in a regular file this thread can write, and in nothing else.
+    #[test]
+    fn a_clone_destination_must_be_a_regular_file_opened_read_write() {
+        let regular = TempFile::new().unwrap();
+        assert_eq!(
+            validate_clone_destination(regular.as_file().as_raw_fd()),
+            Ok(())
+        );
+
+        let read_only = std::fs::File::open(regular.as_path()).unwrap();
+        assert_eq!(
+            validate_clone_destination(read_only.as_raw_fd()),
+            Err(ErrorCode::BadCloneDestination),
+            "a read-only descriptor cannot receive a clone"
+        );
+
+        // SAFETY: the path is a NUL-terminated literal and the returned descriptor is owned here.
+        let path_fd = unsafe { libc::open(c"/".as_ptr(), libc::O_PATH) };
+        assert!(path_fd >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: `path_fd` was just opened and is not owned by anything else.
+        let path_fd = unsafe { OwnedFd::from_raw_fd(path_fd) };
+        assert_eq!(
+            validate_clone_destination(path_fd.as_raw_fd()),
+            Err(ErrorCode::BadCloneDestination),
+            "an O_PATH descriptor grants no access at all"
+        );
+
+        let device = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        assert_eq!(
+            validate_clone_destination(device.as_raw_fd()),
+            Err(ErrorCode::BadCloneDestination),
+            "a character device is not a file a reflink can share extents with"
+        );
+    }
+
+    /// The clone the quiesce takes: the destination holds the scratch's bytes when the ioctl
+    /// returns, and the duration it reports is what the freeze paid for it.
+    #[test]
+    fn the_scratch_clone_reproduces_the_disk_and_reports_its_duration() {
+        let Some(dir) = reflink_dir() else {
+            return;
+        };
+        let content = vec![0xa5u8; 1 << 20];
+        let scratch = file_in(&dir, "farplane-clone-source", &content);
+        let destination = file_in(&dir, "farplane-clone-destination", &[]);
+
+        match clone_scratch(destination.as_raw_fd(), scratch.as_raw_fd()) {
+            Ok(_) => {}
+            Err(err) if err.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                eprintln!(
+                    "skipping: {} is not on a filesystem that supports FICLONE, so the reflink \
+                     cannot be proven here",
+                    dir.display()
+                );
+                return;
+            }
+            Err(err) => panic!("the clone failed for a reason other than a missing reflink: {err}"),
+        }
+
+        assert_eq!(
+            std::fs::read(dir.join("farplane-clone-destination")).unwrap(),
+            content,
+            "the clone is not the disk the scratch held"
+        );
+    }
+
+    /// A clone the kernel refuses is reported as a failure carrying its errno, which is what the
+    /// quiesce answers `DiskCloneFailed` on. Only a regular file has extents to share, so a
+    /// character device as the source is refused on every filesystem.
+    #[test]
+    fn a_clone_the_kernel_refuses_is_reported_as_a_failure() {
+        let destination = TempFile::new().unwrap();
+        let device = std::fs::File::open("/dev/null").unwrap();
+
+        let err = clone_scratch(destination.as_file().as_raw_fd(), device.as_raw_fd())
+            .expect_err("a character device has no extents to clone");
+
+        assert!(
+            matches!(
+                err.raw_os_error(),
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY)
+            ),
+            "unexpected errno: {err}"
         );
     }
 }

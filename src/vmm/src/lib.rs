@@ -113,7 +113,7 @@ pub mod vstate;
 pub mod initrd;
 
 use std::io;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -485,6 +485,22 @@ impl Vmm {
                 .with_virtio_device(&drive, |block: &mut Block| block.drain_writes())??;
         }
         Ok(())
+    }
+
+    /// Descriptor of the drive backing the guest's scratch disk, which is the one block device
+    /// that is not the root. A guest configured without one has no disk to clone.
+    pub fn scratch_descriptor(&self) -> Option<RawFd> {
+        let mut scratch = None;
+        self.device_manager
+            .for_each_virtio_device(|device_type, device| {
+                if device_type == VirtioDeviceType::Block
+                    && let Some(block) = device.as_any().downcast_ref::<Block>()
+                    && !block.root_device()
+                {
+                    scratch = Some(block.config().fd);
+                }
+            });
+        scratch
     }
 }
 

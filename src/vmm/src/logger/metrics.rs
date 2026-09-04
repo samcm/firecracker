@@ -630,16 +630,8 @@ impl Drop for LatencyMetricsRecorder<'_> {
     /// and updates min/max/sum metrics.
     ///  self.start_time is recorded in new() and metrics are updated in drop
     fn drop(&mut self) {
-        let delta_us = get_time_us(ClockType::Monotonic) - self.start_time;
-        self.metric.sum_us.add(delta_us);
-        let min_us = self.metric.min_us.fetch();
-        let max_us = self.metric.max_us.fetch();
-        if (0 == min_us) || (min_us > delta_us) {
-            self.metric.min_us.store(delta_us);
-        }
-        if (0 == max_us) || (max_us < delta_us) {
-            self.metric.max_us.store(delta_us);
-        }
+        self.metric
+            .record_us(get_time_us(ClockType::Monotonic) - self.start_time);
     }
 }
 
@@ -671,6 +663,19 @@ impl LatencyAggregateMetrics {
     /// we have just `_m = metrics.record_latency_metrics()`
     pub fn record_latency_metrics(&self) -> LatencyMetricsRecorder<'_> {
         LatencyMetricsRecorder::new(self)
+    }
+
+    /// Records one already measured duration, in microseconds.
+    pub fn record_us(&self, delta_us: u64) {
+        self.sum_us.add(delta_us);
+        let min_us = self.min_us.fetch();
+        let max_us = self.max_us.fetch();
+        if (0 == min_us) || (min_us > delta_us) {
+            self.min_us.store(delta_us);
+        }
+        if (0 == max_us) || (max_us < delta_us) {
+            self.max_us.store(delta_us);
+        }
     }
 }
 
@@ -760,6 +765,27 @@ impl VmmMetrics {
     }
 }
 
+/// Metrics of the farplane capture channel.
+#[derive(Debug, Default, Serialize)]
+pub struct FarplaneMetrics {
+    /// Number of scratch disk reflinks taken inside a capture quiesce.
+    pub disk_clones: SharedIncMetric,
+    /// Provides Min/max/sum for the reflink of the scratch disk, which is part of the freeze.
+    pub disk_clone_agg: LatencyAggregateMetrics,
+    /// Number of scratch disk reflinks that failed and refused the quiesce.
+    pub disk_clone_failures: SharedIncMetric,
+}
+impl FarplaneMetrics {
+    /// Const default construction.
+    pub const fn new() -> Self {
+        Self {
+            disk_clones: SharedIncMetric::new(),
+            disk_clone_agg: LatencyAggregateMetrics::new(),
+            disk_clone_failures: SharedIncMetric::new(),
+        }
+    }
+}
+
 // The sole purpose of this struct is to produce an UTC timestamp when an instance is serialized.
 #[derive(Debug, Default)]
 struct SerializeToUtcTimestampMs;
@@ -813,6 +839,8 @@ pub struct FirecrackerMetrics {
     pub block_ser: BlockMetricsSerializeProxy,
     /// Metrics related to deprecated API calls.
     pub deprecated_api: DeprecatedApiMetrics,
+    /// Metrics related to the farplane capture channel.
+    pub farplane: FarplaneMetrics,
     /// Metrics related to API GET requests.
     pub get_api_requests: GetRequestsMetrics,
     #[serde(flatten)]
@@ -854,6 +882,7 @@ impl FirecrackerMetrics {
             api_server: ApiServerMetrics::new(),
             block_ser: BlockMetricsSerializeProxy {},
             deprecated_api: DeprecatedApiMetrics::new(),
+            farplane: FarplaneMetrics::new(),
             get_api_requests: GetRequestsMetrics::new(),
             legacy_dev_ser: LegacyDevMetricsSerializeProxy {},
             latencies_us: PerformanceMetrics::new(),

@@ -323,6 +323,27 @@ pub fn validate_buffer_fd(fd: RawFd, min_size: u64) -> Result<(), ErrorCode> {
     Ok(())
 }
 
+/// Validates the destination the scratch disk is reflinked into. A reflink lands on the
+/// filesystem the supervisor created the destination inode on, so the seals a capture buffer
+/// carries prove nothing here: what is proven is a regular file this thread can write.
+pub fn validate_clone_destination(fd: RawFd) -> Result<(), ErrorCode> {
+    let stat = fstat(fd).ok_or(ErrorCode::BadCloneDestination)?;
+    // SAFETY: `F_GETFL` only reads descriptor flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(ErrorCode::BadCloneDestination);
+    }
+    // An `O_PATH` descriptor reports an access mode of `O_RDONLY` while granting no access at
+    // all, so it is rejected before the access mode is read.
+    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE != libc::O_RDWR {
+        return Err(ErrorCode::BadCloneDestination);
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(ErrorCode::BadCloneDestination);
+    }
+    Ok(())
+}
+
 /// One guest region: a contiguous reservation tiled by extents of the plan.
 #[derive(Debug)]
 struct MappedRegion {
