@@ -6,7 +6,7 @@ use std::os::fd::RawFd;
 use serde::{Deserialize, Serialize};
 
 use super::virtio::persist::VirtioBlockState;
-use super::{BOOTSTRAP_DESCRIPTOR_FILENO, ROOT_DESCRIPTOR_FILENO};
+use super::{ROOT_DESCRIPTOR_FILENO, SCRATCH_DESCRIPTOR_FILENO};
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// Block device state.
@@ -33,11 +33,11 @@ pub struct BlockConstructorArgs {
 impl BlockConstructorArgs {
     /// Arguments for restoring a drive, backed by the descriptor the jailer inherited its image
     /// at: the root drive at [`ROOT_DESCRIPTOR_FILENO`], every other drive at
-    /// [`BOOTSTRAP_DESCRIPTOR_FILENO`]. A snapshot never records a path or a descriptor number.
+    /// [`SCRATCH_DESCRIPTOR_FILENO`]. A snapshot never records a path or a descriptor number.
     pub fn inherited(mem: GuestMemoryMmap, state: &BlockState) -> Self {
         let descriptor = match state {
             BlockState::Virtio(state) if state.root_device() => ROOT_DESCRIPTOR_FILENO,
-            BlockState::Virtio(_) => BOOTSTRAP_DESCRIPTOR_FILENO,
+            BlockState::Virtio(_) => SCRATCH_DESCRIPTOR_FILENO,
         };
         Self { mem, descriptor }
     }
@@ -50,6 +50,7 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::devices::virtio::block::device::Block;
     use crate::devices::virtio::block::virtio::device::FileEngineType;
     use crate::devices::virtio::block::virtio::test_utils::default_block_with_descriptor;
     use crate::devices::virtio::test_utils::default_mem;
@@ -62,7 +63,7 @@ mod tests {
 
         for (is_root_device, expected) in [
             (true, ROOT_DESCRIPTOR_FILENO),
-            (false, BOOTSTRAP_DESCRIPTOR_FILENO),
+            (false, SCRATCH_DESCRIPTOR_FILENO),
         ] {
             let block = default_block_with_descriptor(
                 image.as_file().as_raw_fd(),
@@ -74,5 +75,20 @@ mod tests {
             let args = BlockConstructorArgs::inherited(default_mem(), &state);
             assert_eq!(args.descriptor, expected);
         }
+    }
+
+    #[test]
+    fn test_restored_scratch_drive_is_writable() {
+        let image = TempFile::new().unwrap();
+        image.as_file().set_len(0x1000).unwrap();
+
+        let block =
+            default_block_with_descriptor(image.as_file().as_raw_fd(), false, FileEngineType::Sync);
+        let state = BlockState::Virtio(block.save());
+
+        // The scratch descriptor backs the restored drive, so the guest can write it.
+        let args = BlockConstructorArgs::inherited(default_mem(), &state);
+        let restored = Block::restore(args, &state).unwrap();
+        assert!(!restored.read_only());
     }
 }

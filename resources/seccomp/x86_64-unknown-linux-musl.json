@@ -511,6 +511,19 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Used to reflink the scratch disk into the armed destination during a capture",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074041865,
+                        "comment": "FICLONE"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "args": [
                     {
                         "index": 1,

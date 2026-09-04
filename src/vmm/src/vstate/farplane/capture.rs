@@ -5,16 +5,18 @@ use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use utils::time::{ClockType, get_time_us};
 
 use super::backend::{
     BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, set_capture_buffers_armed,
-    validate_buffer_fd,
+    validate_buffer_fd, validate_clone_destination,
 };
 use super::dispatch;
 use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
 use crate::Vmm;
-use crate::logger::error;
+use crate::logger::{IncMetric, METRICS, error, info};
 use crate::persist::{MicrovmState, VmInfo};
 use crate::snapshot::Snapshot;
 use crate::utils::{u64_to_usize, usize_to_u64};
@@ -25,6 +27,8 @@ use crate::vmm_config::instance_info::VmState;
 struct CaptureBuffers {
     dirty: File,
     vmstate: File,
+    /// Inode the scratch disk is reflinked into inside the quiesce, when the sandbox has a disk.
+    disk_clone: Option<File>,
 }
 
 /// How far through one capture epoch the commands that produce a checkpoint have got.
@@ -171,15 +175,13 @@ fn serve_dirty_snapshot(
     }
 }
 
-/// Stable identity of one descriptor a frame carried: which file it refers to, and how large that
-/// file is. Two descriptors duplicated from one memfd report the same identity; a descriptor of
-/// another memfd does not. Descriptor numbers are process-local and say nothing, so they are not
-/// part of it.
+/// Stable identity of one descriptor a frame carried: the file it refers to. Two descriptors
+/// duplicated from one file report the same identity; a descriptor of another file does not.
+/// Length is not part of it, because a clone destination grows between arming and the replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DescriptorIdentity {
     dev: libc::dev_t,
     ino: libc::ino_t,
-    size: libc::off_t,
 }
 
 /// Reads the identity of one received descriptor, or reports that it could not be proven.
@@ -193,7 +195,6 @@ fn descriptor_identity(fd: RawFd) -> Option<DescriptorIdentity> {
     Some(DescriptorIdentity {
         dev: stat.st_dev,
         ino: stat.st_ino,
-        size: stat.st_size,
     })
 }
 
@@ -413,14 +414,16 @@ impl CaptureService {
             return Err(ChannelError::Malformed);
         }
         let msg = incoming.header.msg();
-        let (body_len, fd_count) = match msg {
-            MsgType::CaptureBuffers => (0, 2),
-            MsgType::Quiesce | MsgType::DirtySnapshot | MsgType::WriteVmstate => (0, 0),
-            MsgType::DirtyUnion => (0, 1),
-            MsgType::Resume => (4, 0),
+        // `capture_buffers` carries the dirty bitmap and the vmstate buffer, and a third
+        // descriptor when the sandbox has a disk the quiesce has to clone.
+        let (body_len, fd_counts): (usize, &[usize]) = match msg {
+            MsgType::CaptureBuffers => (0, &[2, 3]),
+            MsgType::Quiesce | MsgType::DirtySnapshot | MsgType::WriteVmstate => (0, &[0]),
+            MsgType::DirtyUnion => (0, &[1]),
+            MsgType::Resume => (4, &[0]),
             _ => return Err(ChannelError::Malformed),
         };
-        if incoming.body.len() != body_len || incoming.fds.len() != fd_count {
+        if incoming.body.len() != body_len || !fd_counts.contains(&incoming.fds.len()) {
             return Err(ChannelError::Malformed);
         }
 
@@ -470,27 +473,43 @@ impl CaptureService {
         }
     }
 
-    /// Validates and arms the buffers of one capture epoch.
+    /// Validates and arms the buffers of one capture epoch, and the disk clone destination when
+    /// pagemaster sends one. A destination arrives only for a sandbox with a disk, so one sent
+    /// for a guest that has no scratch drive names a clone that could never be taken.
     fn arm_buffers(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
         if BackendState::load() != BackendState::Ready {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::CaptureBuffers);
         }
+        let mut fds = incoming.fds;
+        let destination = (fds.len() == 3).then(|| fds.remove(2));
         let [dirty, vmstate] =
-            <[_; 2]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+            <[_; 2]>::try_from(fds).map_err(|_| ChannelError::FdCountMismatch)?;
         if let Err(code) = validate_buffer_fd(dirty.as_raw_fd(), self.channel.dirty_bitmap_bytes) {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
         if let Err(code) = validate_buffer_fd(vmstate.as_raw_fd(), VMSTATE_CAPACITY_BYTES) {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
+        if let Some(destination) = &destination
+            && let Err(code) =
+                accept_clone_destination(destination.as_raw_fd(), self.scratch_descriptor())
+        {
+            return self.reject(request_id, code, MsgType::CaptureBuffers);
+        }
 
         self.buffers = Some(CaptureBuffers {
             dirty: File::from(dirty),
             vmstate: File::from(vmstate),
+            disk_clone: destination.map(File::from),
         });
         set_capture_buffers_armed(true);
         self.reply(request_id, MsgType::CaptureBuffersArmed, &[])
+    }
+
+    /// Descriptor of the drive the armed destination is cloned from.
+    fn scratch_descriptor(&self) -> Option<RawFd> {
+        self.vmm.lock().expect("Poisoned lock").scratch_descriptor()
     }
 
     /// Stops every guest-memory writer and enters the capture epoch.
@@ -500,6 +519,9 @@ impl CaptureService {
     /// served between two capture commands would write device state or guest memory the
     /// checkpoint has already accounted for. Dispatch is only handed back by a successful
     /// `resume`, or by a `quiesce` that failed before the epoch opened.
+    ///
+    /// An armed destination is cloned here, the one point where the disk and the memory are
+    /// observed on one thread with no writer between them.
     fn quiesce(&mut self, request_id: u64) -> Result<(), ChannelError> {
         match BackendState::load() {
             BackendState::Ready => {}
@@ -524,22 +546,34 @@ impl CaptureService {
         if let Err(err) = vmm.drain_guest_memory_writers() {
             error!("Farplane quiesce could not stop every guest-memory writer: {err}");
             // The epoch never opened, so the source is handed back exactly as it was found and the
-            // backend stays `Ready`: pagemaster may arm the epoch again. A source that cannot be
-            // handed back is no longer describable, so the channel fails and the supervisor kills
-            // this process.
-            if were_running && let Err(err) = vmm.resume_vm() {
-                error!(
-                    "Farplane quiesce could not restart the vCPUs after the failed drain: {err}"
-                );
-                BackendState::fail();
-            }
-            drop(vmm);
-            // A backend that can no longer describe its source keeps dispatch stopped: the
-            // supervisor kills this process, and until it does no handler may write guest memory.
-            if BackendState::load() != BackendState::ChannelFailed {
-                dispatch::gate().open();
-            }
+            // backend stays `Ready`: pagemaster may arm the epoch again.
+            hand_back_source(vmm, were_running);
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
+        }
+
+        let destination = self
+            .buffers
+            .as_ref()
+            .and_then(|buffers| buffers.disk_clone.as_ref())
+            .map(|file| file.as_raw_fd());
+        if let Some(destination) = destination {
+            match vmm
+                .scratch_descriptor()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))
+                .and_then(|scratch| clone_scratch(destination, scratch))
+            {
+                Ok(elapsed_us) => {
+                    info!("Farplane quiesce cloned the scratch disk in {elapsed_us} us");
+                    METRICS.farplane.disk_clones.inc();
+                    METRICS.farplane.disk_clone_agg.record_us(elapsed_us);
+                }
+                Err(err) => {
+                    error!("Farplane quiesce could not clone the scratch disk: {err}");
+                    METRICS.farplane.disk_clone_failures.inc();
+                    hand_back_source(vmm, were_running);
+                    return self.reject(request_id, ErrorCode::DiskCloneFailed, MsgType::Quiesce);
+                }
+            }
         }
         drop(vmm);
 
@@ -680,8 +714,9 @@ impl CaptureService {
     }
 
     /// Leaves the capture epoch, restarting the vCPUs when pagemaster asks for it, and hands event
-    /// dispatch back. The initial boot and restore acknowledgement is answered by the handshake
-    /// itself, so on this channel the command is only ever a capture exit.
+    /// dispatch back. The armed buffers go with it, the disk clone destination among them. The
+    /// initial boot and restore acknowledgement is answered by the handshake itself, so on this
+    /// channel the command is only ever a capture exit.
     fn resume(&mut self, request_id: u64, run_vcpus: u32) -> Result<(), ChannelError> {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Resume);
@@ -766,6 +801,43 @@ impl CaptureService {
     }
 }
 
+/// Decides whether an armed destination could hold a clone at all: it has to be a descriptor a
+/// reflink can land in, and the guest has to have a scratch drive to clone from.
+fn accept_clone_destination(destination: RawFd, scratch: Option<RawFd>) -> Result<(), ErrorCode> {
+    validate_clone_destination(destination)?;
+    if scratch.is_none() {
+        return Err(ErrorCode::NoScratchDrive);
+    }
+    Ok(())
+}
+
+/// Hands the source back exactly as `quiesce` found it, for a failure before the epoch opened. A
+/// source that cannot be handed back is no longer describable, so the channel fails and dispatch
+/// stays stopped until the supervisor kills this process.
+fn hand_back_source(mut vmm: MutexGuard<'_, Vmm>, were_running: bool) {
+    if were_running && let Err(err) = vmm.resume_vm() {
+        error!("Farplane quiesce could not restart the vCPUs after the failure: {err}");
+        BackendState::fail();
+    }
+    drop(vmm);
+    if BackendState::load() != BackendState::ChannelFailed {
+        dispatch::gate().open();
+    }
+}
+
+/// Reflinks the scratch disk into `destination`, reporting how long the ioctl took in
+/// microseconds. `FICLONE` writes the source's dirty host pages back and then shares its extents,
+/// so the destination is the whole disk at this instant and no byte is copied.
+fn clone_scratch(destination: RawFd, scratch: RawFd) -> Result<u64, io::Error> {
+    let started = get_time_us(ClockType::Monotonic);
+    // SAFETY: both arguments are descriptors this process holds open, and the return code is
+    // checked.
+    if unsafe { libc::ioctl(destination, libc::FICLONE, scratch) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(get_time_us(ClockType::Monotonic) - started)
+}
+
 /// Snapshots the dirty accumulator, writes it out, and only then clears it.
 fn harvest(vmm: &Mutex<Vmm>, dirty_bitmap_bytes: u64, buffer: &mut File) -> Result<(), ErrorCode> {
     let vmm = vmm.lock().expect("Poisoned lock");
@@ -841,534 +913,4 @@ impl Write for BoundedWriter<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::os::fd::FromRawFd;
-
-    use vmm_sys_util::tempfile::TempFile;
-
-    use super::*;
-
-    /// The advertised vmstate capacity is a bound, not a promise: a serialization that would pass
-    /// it fails instead of writing past what pagemaster reserved.
-    #[test]
-    fn the_vmstate_writer_stops_at_the_advertised_capacity() {
-        let mut file = TempFile::new().unwrap().into_file();
-        let mut writer = BoundedWriter {
-            inner: &mut file,
-            remaining: 8,
-        };
-
-        assert_eq!(writer.write(&[0u8; 6]).unwrap(), 6);
-        assert_eq!(
-            writer.write(&[0u8; 4]).unwrap_err().raw_os_error(),
-            Some(libc::EFBIG)
-        );
-        assert_eq!(writer.write(&[0u8; 2]).unwrap(), 2);
-        assert_eq!(writer.remaining, 0);
-    }
-
-    /// A counting stand-in for the effect a capture command performs, so a test can prove the
-    /// effect ran exactly once however many times the command arrives.
-    #[derive(Debug, Default)]
-    struct Effect {
-        runs: std::cell::Cell<u32>,
-    }
-
-    impl Effect {
-        /// Runs the effect, reporting `outcome`.
-        fn run<T>(&self, outcome: Result<T, ErrorCode>) -> Result<T, ErrorCode> {
-            self.runs.set(self.runs.get() + 1);
-            outcome
-        }
-    }
-
-    /// The order one epoch's commands may arrive in: the vmstate first, the harvest after it.
-    #[test]
-    fn the_capture_order_accepts_state_then_harvest() {
-        let mut order = EpochOrder::default();
-
-        assert_eq!(order.vmstate_step(), VmstateStep::Serialize);
-        order.vmstate_written(4096);
-        assert_eq!(order.harvest_step(), HarvestStep::Harvest);
-        order.harvested();
-
-        assert_eq!(order.phase, EpochPhase::Harvested);
-    }
-
-    /// A harvest ahead of the vmstate would report a bitmap that predates the guest-memory writes
-    /// `prepare_save()` performs, so it is refused with the order violation, not served.
-    #[test]
-    fn the_capture_order_refuses_a_harvest_before_the_vmstate() {
-        let mut order = EpochOrder::default();
-
-        assert_eq!(
-            order.harvest_step(),
-            HarvestStep::Refuse(ErrorCode::CaptureOrderViolation),
-            "a harvest must not precede the vmstate"
-        );
-        // The refusal changed nothing: the epoch still owes a vmstate, and the harvest that
-        // follows it is served.
-        assert_eq!(order.vmstate_step(), VmstateStep::Serialize);
-        order.vmstate_written(4096);
-        assert_eq!(order.harvest_step(), HarvestStep::Harvest);
-    }
-
-    /// Serializing after the harvest is the same violation seen from the other side: the writes
-    /// that serialization performs have no harvest left to report them.
-    #[test]
-    fn the_capture_order_refuses_a_vmstate_after_the_harvest() {
-        let mut order = EpochOrder::default();
-        order.vmstate_written(4096);
-        order.harvested();
-
-        assert_eq!(
-            order.vmstate_step(),
-            VmstateStep::Refuse(ErrorCode::CaptureOrderViolation)
-        );
-    }
-
-    /// A repeat of `dirty_snapshot` is a replay, not a second harvest: the accumulator no longer
-    /// holds the bits the armed bitmap does, so harvesting again would overwrite the only copy of
-    /// this epoch's dirty set with an empty one.
-    #[test]
-    fn a_repeated_harvest_replays_instead_of_clearing_the_bitmap() {
-        let mut order = EpochOrder::default();
-        order.vmstate_written(4096);
-        order.harvested();
-
-        assert_eq!(order.harvest_step(), HarvestStep::Replay);
-        // The replay is not a state change either: however many arrive, the epoch stays harvested.
-        assert_eq!(order.harvest_step(), HarvestStep::Replay);
-        assert_eq!(order.phase, EpochPhase::Harvested);
-    }
-
-    /// A repeat of `write_vmstate` replays the exact length the first one reported rather than
-    /// running `prepare_save()` again and leaving a different vmstate in the buffer.
-    #[test]
-    fn a_repeated_vmstate_replays_the_length_the_first_one_reported() {
-        let mut order = EpochOrder::default();
-
-        order.vmstate_written(12_345);
-
-        assert_eq!(order.vmstate_step(), VmstateStep::Replay(12_345));
-        assert_eq!(order.vmstate_step(), VmstateStep::Replay(12_345));
-        assert_eq!(order.harvest_step(), HarvestStep::Harvest);
-    }
-
-    /// A bitmap folded back into the accumulator is no longer in the armed bitmap, so the epoch
-    /// owes a harvest again: the next `dirty_snapshot` harvests rather than replaying.
-    #[test]
-    fn a_union_makes_the_next_harvest_run_again() {
-        let mut order = EpochOrder::default();
-        order.vmstate_written(4096);
-        order.harvested();
-
-        order.unioned();
-
-        assert_eq!(order.phase, EpochPhase::StateWritten);
-        assert_eq!(order.harvest_step(), HarvestStep::Harvest);
-        // The vmstate is still the one the epoch recorded: a union does not ask for another.
-        assert_eq!(order.vmstate_step(), VmstateStep::Replay(4096));
-    }
-
-    /// A union before any harvest leaves the epoch where it was: it owes nothing back.
-    #[test]
-    fn a_union_before_the_harvest_changes_nothing() {
-        let mut order = EpochOrder::default();
-
-        order.unioned();
-        assert_eq!(order.phase, EpochPhase::Open);
-
-        order.vmstate_written(4096);
-        order.unioned();
-        assert_eq!(order.phase, EpochPhase::StateWritten);
-        assert_eq!(order.vmstate_step(), VmstateStep::Replay(4096));
-    }
-
-    /// Every epoch starts owing a vmstate, whatever the previous one reached: `quiesce` and
-    /// `resume` both open a fresh one.
-    #[test]
-    fn opening_an_epoch_forgets_what_the_last_one_reached() {
-        let mut order = EpochOrder::default();
-        order.vmstate_written(4096);
-        order.harvested();
-
-        order.open();
-
-        assert_eq!(order.phase, EpochPhase::Open);
-        assert_eq!(
-            order.harvest_step(),
-            HarvestStep::Refuse(ErrorCode::CaptureOrderViolation),
-            "a fresh epoch must not inherit the last epoch's vmstate"
-        );
-        assert_eq!(
-            order.vmstate_step(),
-            VmstateStep::Serialize,
-            "a fresh epoch must not replay the last epoch's length"
-        );
-    }
-
-    /// The service half of the harvest: the second command reports success without reading or
-    /// clearing the accumulator, so the bitmap the first one produced survives the retry.
-    #[test]
-    fn the_served_harvest_runs_once_however_often_it_arrives() {
-        let mut order = EpochOrder::default();
-        serve_write_vmstate(&mut order, || Ok(4096)).unwrap();
-        let effect = Effect::default();
-
-        serve_dirty_snapshot(&mut order, || effect.run(Ok(()))).unwrap();
-        serve_dirty_snapshot(&mut order, || effect.run(Ok(()))).unwrap();
-        serve_dirty_snapshot(&mut order, || effect.run(Ok(()))).unwrap();
-
-        assert_eq!(
-            effect.runs.get(),
-            1,
-            "a repeated dirty_snapshot must not harvest a second time"
-        );
-    }
-
-    /// The service half of the serialization: the second command reports the first one's length
-    /// without running device serialization again.
-    #[test]
-    fn the_served_vmstate_runs_once_and_replays_its_length() {
-        let mut order = EpochOrder::default();
-        let effect = Effect::default();
-
-        let first = serve_write_vmstate(&mut order, || effect.run(Ok(9_001))).unwrap();
-        let second = serve_write_vmstate(&mut order, || effect.run(Ok(7))).unwrap();
-
-        assert_eq!(first, 9_001);
-        assert_eq!(
-            second, 9_001,
-            "a repeated write_vmstate must report the length that is in the buffer"
-        );
-        assert_eq!(
-            effect.runs.get(),
-            1,
-            "a repeated write_vmstate must not serialize a second time"
-        );
-    }
-
-    /// A failure records nothing: the retry of a failed command does the work, and a failed
-    /// serialization still blocks the harvest.
-    #[test]
-    fn a_failed_command_is_retried_rather_than_replayed() {
-        let mut order = EpochOrder::default();
-        let effect = Effect::default();
-
-        assert_eq!(
-            serve_write_vmstate(&mut order, || effect
-                .run(Err(ErrorCode::VmstateWriteFailed))),
-            Err(ErrorCode::VmstateWriteFailed)
-        );
-        assert_eq!(
-            serve_dirty_snapshot(&mut order, || effect.run(Ok(()))),
-            Err(ErrorCode::CaptureOrderViolation),
-            "a serialization that failed leaves the epoch owing one"
-        );
-        assert_eq!(effect.runs.get(), 1, "the refused harvest must not run");
-
-        assert_eq!(
-            serve_write_vmstate(&mut order, || effect.run(Ok(64))),
-            Ok(64)
-        );
-        assert_eq!(
-            serve_dirty_snapshot(&mut order, || effect
-                .run(Err(ErrorCode::DirtyHarvestFailed))),
-            Err(ErrorCode::DirtyHarvestFailed)
-        );
-        // The failed harvest cleared nothing, so the retry harvests instead of replaying.
-        assert_eq!(
-            serve_dirty_snapshot(&mut order, || effect.run(Ok(()))),
-            Ok(())
-        );
-        assert_eq!(effect.runs.get(), 4);
-        assert_eq!(order.phase, EpochPhase::Harvested);
-    }
-
-    /// A memfd of `size` bytes, owned by the caller.
-    fn memfd(name: &std::ffi::CStr, size: u64) -> OwnedFd {
-        // SAFETY: `name` is a NUL-terminated string that outlives the call.
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(fd >= 0, "{}", io::Error::last_os_error());
-        // SAFETY: the descriptor was just created and is not owned by anything else.
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        // SAFETY: `owned` is a fresh memfd, so it may be sized.
-        let sized = unsafe { libc::ftruncate(owned.as_raw_fd(), size.cast_signed()) };
-        assert_eq!(sized, 0, "{}", io::Error::last_os_error());
-        owned
-    }
-
-    /// Another descriptor for the same open file, as a retry of a descriptor-bearing command
-    /// carries: duplicated, not reopened.
-    fn duplicate(fd: &OwnedFd) -> OwnedFd {
-        fd.try_clone().unwrap()
-    }
-
-    /// The command a bodyless frame with no descriptors carries.
-    fn command(msg: MsgType) -> CommandKey {
-        CommandKey::of(msg, &[], &[])
-    }
-
-    /// The retry of an answered command is replayed by identifier and exact command, whatever the
-    /// epoch has done since. This is the case phase alone cannot cover: a `dirty_union` reopens
-    /// the dirty set, so the phase would harvest again for a command already answered.
-    #[test]
-    fn an_answered_request_is_replayed_after_later_commands() {
-        let mut replies = ReplyCache::default();
-        replies.record(
-            7,
-            command(MsgType::DirtySnapshot),
-            MsgType::DirtySnapshotDone,
-            Vec::new(),
-        );
-
-        // A union and a resume happen on other identifiers, and a new epoch follows.
-        let bitmap = memfd(c"farplane-union", 4096);
-        replies.record(
-            8,
-            CommandKey::of(MsgType::DirtyUnion, &[], std::slice::from_ref(&bitmap)),
-            MsgType::UnionDone,
-            Vec::new(),
-        );
-        let resumed = 1u32.to_le_bytes().to_vec();
-        replies.record(
-            9,
-            CommandKey::of(MsgType::Resume, &resumed, &[]),
-            MsgType::Resumed,
-            resumed.clone(),
-        );
-        replies.record(10, command(MsgType::Quiesce), MsgType::Quiesced, resumed);
-
-        assert_eq!(
-            replies.disposition(7, &command(MsgType::DirtySnapshot)),
-            FrameDisposition::Replay(MsgType::DirtySnapshotDone, Vec::new()),
-            "the original harvest reply must be replayed, not harvested again"
-        );
-    }
-
-    /// A retry of a descriptor-bearing command duplicates the descriptors of the same memfds. The
-    /// descriptor numbers differ, the files do not, so the answer is replayed.
-    #[test]
-    fn a_retry_with_duplicated_descriptors_is_replayed() {
-        let dirty = memfd(c"farplane-dirty", 4096);
-        let vmstate = memfd(c"farplane-vmstate", 8192);
-        let sent = [duplicate(&dirty), duplicate(&vmstate)];
-        let mut replies = ReplyCache::default();
-        replies.record(
-            3,
-            CommandKey::of(MsgType::CaptureBuffers, &[], &sent),
-            MsgType::CaptureBuffersArmed,
-            Vec::new(),
-        );
-
-        let retried = [duplicate(&dirty), duplicate(&vmstate)];
-        assert_ne!(
-            retried[0].as_raw_fd(),
-            sent[0].as_raw_fd(),
-            "the retry must carry other descriptor numbers for the same files"
-        );
-        assert_eq!(
-            replies.disposition(3, &CommandKey::of(MsgType::CaptureBuffers, &[], &retried)),
-            FrameDisposition::Replay(MsgType::CaptureBuffersArmed, Vec::new())
-        );
-    }
-
-    /// Same identifier, same message, same body, same descriptor count, other memfds: the answer
-    /// on record acknowledged buffers that are not these, so it is refused.
-    #[test]
-    fn a_retry_naming_other_memfds_is_refused() {
-        let dirty = memfd(c"farplane-dirty", 4096);
-        let vmstate = memfd(c"farplane-vmstate", 8192);
-        let mut replies = ReplyCache::default();
-        replies.record(
-            3,
-            CommandKey::of(
-                MsgType::CaptureBuffers,
-                &[],
-                &[duplicate(&dirty), duplicate(&vmstate)],
-            ),
-            MsgType::CaptureBuffersArmed,
-            Vec::new(),
-        );
-
-        // Other files of exactly the same sizes, in the same order.
-        let other_dirty = memfd(c"farplane-dirty", 4096);
-        let other_vmstate = memfd(c"farplane-vmstate", 8192);
-        assert_eq!(
-            replies.disposition(
-                3,
-                &CommandKey::of(MsgType::CaptureBuffers, &[], &[other_dirty, other_vmstate])
-            ),
-            FrameDisposition::Reused,
-            "a frame naming other memfds is not the command that was answered"
-        );
-
-        // Nor is the same file in the other position.
-        assert_eq!(
-            replies.disposition(
-                3,
-                &CommandKey::of(
-                    MsgType::CaptureBuffers,
-                    &[],
-                    &[duplicate(&vmstate), duplicate(&dirty)]
-                )
-            ),
-            FrameDisposition::Reused,
-            "descriptor order is part of the command"
-        );
-    }
-
-    /// Equality is over the command bytes themselves, not a digest of them: a message or a body
-    /// that differs is a different command, whatever any hash of it would say.
-    #[test]
-    fn a_different_message_or_body_is_refused() {
-        let mut replies = ReplyCache::default();
-        replies.record(
-            7,
-            command(MsgType::DirtySnapshot),
-            MsgType::DirtySnapshotDone,
-            Vec::new(),
-        );
-
-        assert_eq!(
-            replies.disposition(7, &command(MsgType::WriteVmstate)),
-            FrameDisposition::Reused
-        );
-
-        let mut replies = ReplyCache::default();
-        let stop = 0u32.to_le_bytes().to_vec();
-        replies.record(
-            9,
-            CommandKey::of(MsgType::Resume, &stop, &[]),
-            MsgType::Resumed,
-            Vec::new(),
-        );
-        assert_eq!(
-            replies.disposition(
-                9,
-                &CommandKey::of(MsgType::Resume, &1u32.to_le_bytes(), &[])
-            ),
-            FrameDisposition::Reused,
-            "the body of a resume decides whether the vCPUs run"
-        );
-    }
-
-    /// A descriptor whose identity could not be read is never exact, on either side: such a
-    /// command is refused rather than acknowledged with an answer about resources that may have
-    /// changed.
-    #[test]
-    fn an_unprovable_descriptor_identity_is_never_exact() {
-        let unprovable = CommandKey {
-            msg: MsgType::DirtyUnion,
-            body: Vec::new(),
-            descriptors: None,
-        };
-        assert!(!unprovable.is_exactly(&unprovable));
-
-        let bitmap = memfd(c"farplane-union", 4096);
-        let provable = CommandKey::of(MsgType::DirtyUnion, &[], std::slice::from_ref(&bitmap));
-        assert!(!unprovable.is_exactly(&provable));
-        assert!(!provable.is_exactly(&unprovable));
-
-        let mut replies = ReplyCache::default();
-        replies.record(4, unprovable.clone(), MsgType::UnionDone, Vec::new());
-        assert_eq!(
-            replies.disposition(4, &unprovable),
-            FrameDisposition::Reused
-        );
-
-        let mut replies = ReplyCache::default();
-        replies.record(4, provable, MsgType::UnionDone, Vec::new());
-        assert_eq!(
-            replies.disposition(4, &unprovable),
-            FrameDisposition::Reused
-        );
-    }
-
-    /// A fresh identifier is served, and one below the high-water mark whose answer has been
-    /// evicted is refused rather than served a second time.
-    #[test]
-    fn an_identifier_too_old_to_replay_is_refused_rather_than_served() {
-        let mut replies = ReplyCache::default();
-        for request_id in 1..=protocol::MAX_RETRYABLE_REQUESTS as u64 + 1 {
-            replies.record(
-                request_id,
-                command(MsgType::Quiesce),
-                MsgType::Quiesced,
-                Vec::new(),
-            );
-        }
-
-        assert_eq!(
-            replies.answers.len(),
-            protocol::MAX_RETRYABLE_REQUESTS,
-            "the history is bounded"
-        );
-        assert_eq!(
-            replies.disposition(1, &command(MsgType::Quiesce)),
-            FrameDisposition::Reused,
-            "an evicted answer must not be re-served"
-        );
-        assert_eq!(
-            replies.disposition(9_999, &command(MsgType::Quiesce)),
-            FrameDisposition::Serve
-        );
-    }
-
-    /// A send that never reached pagemaster does not undo the command: the answer is recorded, so
-    /// the retry that follows the lost reply is answered rather than served again.
-    #[test]
-    fn an_answer_whose_send_failed_is_still_recorded() {
-        let (sock, peer) = UnixStream::pair().unwrap();
-        drop(peer);
-        let mut replies = ReplyCache::default();
-        let mut pending = Some((5, command(MsgType::DirtySnapshot)));
-
-        let sent = send_and_record(
-            &sock,
-            &mut replies,
-            &mut pending,
-            5,
-            MsgType::DirtySnapshotDone,
-            Vec::new(),
-        );
-
-        assert!(
-            sent.is_err(),
-            "the peer is gone, so the send cannot succeed"
-        );
-        assert_eq!(
-            replies.disposition(5, &command(MsgType::DirtySnapshot)),
-            FrameDisposition::Replay(MsgType::DirtySnapshotDone, Vec::new()),
-            "the effect happened, so the answer has to survive the failed send"
-        );
-        assert!(pending.is_none(), "the command was answered exactly once");
-    }
-
-    /// The descriptors a replayed or refused frame carried are closed on the way out, exactly as
-    /// a served command closes them: `Incoming` owns them, and dropping it is that close.
-    #[test]
-    fn a_frames_descriptors_are_closed_when_it_is_not_served() {
-        let bitmap = memfd(c"farplane-union", 4096);
-        let raw = bitmap.as_raw_fd();
-        let incoming = Incoming {
-            header: protocol::Header::new(MsgType::DirtyUnion, 11, 0, 1),
-            body: Vec::new(),
-            fds: vec![bitmap],
-        };
-        // SAFETY: `F_GETFD` only reads the flags of a descriptor.
-        let open = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-        assert!(open >= 0, "the frame should own an open descriptor");
-
-        drop(incoming);
-
-        // SAFETY: as above; the descriptor is expected to be closed by now.
-        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
-        assert_eq!(
-            io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF),
-            "a frame that was not served must not leak its descriptors"
-        );
-    }
-}
+mod tests;

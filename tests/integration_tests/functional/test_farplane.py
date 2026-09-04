@@ -78,12 +78,58 @@ def boot(
     mem_size_mib=MEM_SIZE_MIB,
     fc_args=(),
     serial_input=False,
+    scratch_fd=-1,
     **pm_kwargs,
 ):
     """Launch the jail, serve the memory channel and start the guest."""
-    vm.spawn(fc_args=fc_args, serial_input=serial_input)
+    vm.spawn(fc_args=fc_args, serial_input=serial_input, scratch_fd=scratch_fd)
     pagemaster = vm.start_pagemaster(**pm_kwargs)
     vm.configure(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib)
+    vm.start()
+    pagemaster.wait_ready()
+    vm.api.vm.patch(state="Resumed")
+    return pagemaster
+
+
+def scratch_disk(vm, *, directory=None, **kwargs):
+    """Create this microVM's scratch disk in the staging area or a configured directory.
+    A staging filesystem that refuses `O_DIRECT` skips; a configured one fails.
+    """
+    try:
+        return vm.open_scratch_file(directory=directory, **kwargs)
+    except fp.DirectIoUnsupported as err:
+        if directory is None:
+            pytest.skip(str(err))
+        pytest.fail(
+            f"FARPLANE_TEST_XFS_DIR names {directory}, which refuses the O_DIRECT open"
+            f" every scratch descriptor carries: {err}"
+        )
+
+
+def boot_with_scratch(vm, *, directory=None, seed=None, fc_args=(), **pm_kwargs):
+    """Launch a guest whose fd 5 holds a writable scratch disk, attached as a second drive.
+
+    The disk is blank, so the guest boots off the root device and carries the scratch drive the
+    slot requires to be writable. `seed` is written to the head of the disk before the jail is
+    launched, so a test can name the bytes the disk holds.
+    """
+    scratch_disk(vm, directory=directory)
+    if seed is not None:
+        # The slot's descriptor is `O_DIRECT`, so the bytes are put on the disk itself rather
+        # than left dirty in the host's page cache for the guest's reads to miss.
+        with open(vm.scratch_file, "r+b") as disk:
+            disk.write(seed)
+            disk.flush()
+            os.fsync(disk.fileno())
+    vm.spawn(fc_args=fc_args)
+    pagemaster = vm.start_pagemaster(**pm_kwargs)
+    vm.configure()
+    vm.api.drive.put(
+        drive_id="scratch",
+        fd=fp.SCRATCH_FILENO,
+        is_root_device=False,
+        is_read_only=False,
+    )
     vm.start()
     pagemaster.wait_ready()
     vm.api.vm.patch(state="Resumed")
@@ -198,6 +244,70 @@ def smaps_of(pid, start, end):
         key, _, value = line.partition(":")
         current[key.strip()] = value.strip()
     return entries
+
+
+def fdinfo_flags(pid, fileno):
+    """The open flags of one of a process's descriptors, which `/proc` reports in octal."""
+    fdinfo = Path(f"/proc/{pid}/fdinfo/{fileno}").read_text(encoding="utf-8")
+    line = next(line for line in fdinfo.splitlines() if line.startswith("flags:"))
+    return int(line.split()[1], 8)
+
+
+def reflink_dir():
+    """The directory `FARPLANE_TEST_XFS_DIR` names, proven able to reflink a file in it.
+    Only an unset variable and an `EOPNOTSUPP` probe skip; anything else about it fails.
+    """
+    configured = os.environ.get("FARPLANE_TEST_XFS_DIR")
+    if not configured:
+        pytest.skip(
+            "FARPLANE_TEST_XFS_DIR must name a writable directory on an XFS filesystem"
+            " formatted with reflink=1, the only place a clone of the scratch disk can land"
+        )
+    directory = Path(configured)
+    if not directory.is_dir():
+        pytest.fail(
+            f"FARPLANE_TEST_XFS_DIR names {directory}, which is not an existing directory"
+        )
+    magic = utils.check_output(f"stat -f -c %T {directory}").stdout.strip()
+    if magic != "xfs":
+        pytest.fail(
+            f"FARPLANE_TEST_XFS_DIR names {directory}, whose filesystem is {magic} and"
+            " not xfs, so nothing measured about the clone holds there"
+        )
+    source = directory / "farplane-reflink-probe-source"
+    destination = directory / "farplane-reflink-probe-destination"
+    try:
+        source.write_bytes(bytes(PAGE))
+        destination.write_bytes(b"")
+        with open(source, "rb") as src, open(destination, "r+b") as dst:
+            fcntl.ioctl(dst.fileno(), fp.FICLONE, src.fileno())
+    except OSError as err:
+        if err.errno == errno.EOPNOTSUPP:
+            pytest.skip(
+                f"FARPLANE_TEST_XFS_DIR names {directory}, which is on a filesystem that"
+                " has no reflinks"
+            )
+        pytest.fail(
+            f"FARPLANE_TEST_XFS_DIR names {directory}, which cannot take the reflink the"
+            f" clone proofs need: {err}"
+        )
+    finally:
+        source.unlink(missing_ok=True)
+        destination.unlink(missing_ok=True)
+    return directory
+
+
+def clone_failure(vm):
+    """What Firecracker logged about the disk clone it could not take."""
+    log = (vm.chroot / "fc.log").read_text(encoding="utf-8", errors="replace")
+    return next(
+        (
+            line
+            for line in reversed(log.splitlines())
+            if "clone the scratch disk" in line
+        ),
+        "no disk clone failure was logged",
+    )
 
 
 def test_multi_extent_regions_boot_and_read_across_every_boundary(farplane_factory):
@@ -486,7 +596,7 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     # already in the page cache, so a first touch of one is a minor fault and not a missing fault.
     # The child plants no markers of its own: the bytes it has to serve are the ones the
     # descriptors already carry. The guest may have overwritten the original boot marker before
-    # capture, so the authority is the parent's frozen bytes rather than its bootstrap value.
+    # capture, so the authority is the parent's frozen bytes rather than the value it booted with.
     # Resolving this fault with a zero page would lose the checkpoint content and fail outright,
     # leaving the faulting Firecracker thread stranded.
     assert not child.markers
@@ -1034,74 +1144,56 @@ def test_root_drive_is_served_from_the_sealed_memfd(farplane_factory):
     ), "Firecracker fd 4 is not the supplied root memfd"
 
 
-def test_bootstrap_drive_is_served_from_the_sealed_memfd(farplane_factory):
-    """The bootstrap device comes from fd 5 and transfers its bytes to the guest."""
+def test_scratch_drive_is_served_from_the_supplied_writable_file(farplane_factory):
+    """The scratch device comes from fd 5, which Firecracker holds open for writing."""
     vm = farplane_factory()
-    vm.bootstrap_file = vm.rootfs
-    vm.spawn(fc_args=("--metrics-path", "fc.ndjson"))
-    pagemaster = vm.start_pagemaster()
-    vm.configure(
-        boot_args=(
-            "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0"
-            " cryptomgr.notests pci=off root=/dev/vdb ro"
-        )
-    )
-    vm.api.drive.put(
-        drive_id="bootstrap",
-        fd=fp.BOOTSTRAP_FILENO,
-        is_root_device=False,
-        is_read_only=True,
-    )
-    vm.start()
-    pagemaster.wait_ready()
-    vm.api.vm.patch(state="Resumed")
-    wait_for_block_read(vm, "bootstrap")
+    boot_with_scratch(vm, fc_args=("--metrics-path", "fc.ndjson"))
+    wait_for_block_read(vm, "scratch")
 
-    assert (
-        fp.seals_of(vm.bootstrap_fd) & fp.F_SEAL_WRITE
-    ), "the bootstrap memfd is writable"
-    inherited = os.stat(f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}")
-    supplied = os.fstat(vm.bootstrap_fd)
+    inherited = os.stat(f"/proc/{vm.pid}/fd/{fp.SCRATCH_FILENO}")
+    supplied = os.fstat(vm.scratch_fd)
     assert (inherited.st_dev, inherited.st_ino) == (
         supplied.st_dev,
         supplied.st_ino,
-    ), "Firecracker fd 5 is not the supplied bootstrap memfd"
+    ), "Firecracker fd 5 is not the supplied scratch disk"
+    # The slot is the sandbox's own disk: the descriptor grants the writes the guest makes to it,
+    # and reaches the inode itself rather than a second copy in the host's page cache.
+    flags = fdinfo_flags(vm.pid, fp.SCRATCH_FILENO)
+    assert flags & os.O_ACCMODE == os.O_RDWR, f"fd 5 is open {flags:#o}"
+    assert flags & os.O_DIRECT, f"fd 5 is open {flags:#o}"
 
 
-def test_bootstrap_fd_is_closed_when_not_handed_to_the_jailer(farplane_factory):
-    """An unsupplied bootstrap object cannot be selected through a reused fd number."""
+def test_scratch_fd_is_closed_when_not_handed_to_the_jailer(farplane_factory):
+    """An unsupplied scratch disk cannot be selected through a reused fd number."""
     vm = farplane_factory()
-    vm.bootstrap_file = vm.rootfs
-    supplied = vm.open_bootstrap_memfd()
-    supplied_identity = os.fstat(supplied)
-    vm.bootstrap_file = None
-    boot(vm)
+    supplied_identity = os.fstat(scratch_disk(vm))
+    boot(vm, scratch_fd=None)
 
     try:
-        inherited = os.stat(f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}")
+        inherited = os.stat(f"/proc/{vm.pid}/fd/{fp.SCRATCH_FILENO}")
     except FileNotFoundError:
         pass
     else:
         assert (inherited.st_dev, inherited.st_ino) != (
             supplied_identity.st_dev,
             supplied_identity.st_ino,
-        ), "the jailer handed Firecracker the bootstrap object it was told to omit"
+        ), "the jailer handed Firecracker the scratch disk it was told to omit"
 
     response = raw(
         vm.api,
         "PUT",
-        "/drives/bootstrap",
+        "/drives/scratch",
         {
-            "drive_id": "bootstrap",
-            "fd": fp.BOOTSTRAP_FILENO,
+            "drive_id": "scratch",
+            "fd": fp.SCRATCH_FILENO,
             "is_root_device": False,
-            "is_read_only": True,
+            "is_read_only": False,
         },
     )
     assert response.status_code == 400, response.text
 
 
-def test_api_refuses_bootstrap_fd_without_the_bootstrap_memfd(farplane_factory):
+def test_api_refuses_scratch_fd_without_the_scratch_disk(farplane_factory):
     """fd 5 cannot configure a drive when the jailer did not receive it."""
     vm = farplane_factory()
     boot(vm)
@@ -1109,15 +1201,149 @@ def test_api_refuses_bootstrap_fd_without_the_bootstrap_memfd(farplane_factory):
     response = raw(
         vm.api,
         "PUT",
-        "/drives/bootstrap",
+        "/drives/scratch",
         {
-            "drive_id": "bootstrap",
-            "fd": fp.BOOTSTRAP_FILENO,
+            "drive_id": "scratch",
+            "fd": fp.SCRATCH_FILENO,
             "is_root_device": False,
-            "is_read_only": True,
+            "is_read_only": False,
         },
     )
     assert response.status_code == 400, response.text
+
+
+def test_a_capture_with_a_destination_clones_the_scratch_disk(farplane_factory):
+    """A three-descriptor capture reflinks the disk into the destination inside the quiesce."""
+    directory = reflink_dir()
+    vm = farplane_factory("scratch-clone")
+    marker = f"farplane-scratch-{uuid.uuid4().hex}".encode()
+    pagemaster = boot_with_scratch(vm, directory=directory, seed=marker)
+    destination = vm.open_clone_destination(directory=directory)
+
+    assert pagemaster.capture_buffers(clone_fd=destination).error is None
+    reply = pagemaster.quiesce()
+    if reply.error == (fp.Err.DISK_CLONE_FAILED, fp.Msg.QUIESCE):
+        pytest.fail(
+            f"the quiesce could not reflink the scratch disk into {directory}, which the"
+            f" clone probe proved reflinks: {clone_failure(vm)}"
+        )
+    assert reply.error is None
+
+    cloned = vm.clone_file.read_bytes()
+    assert cloned.startswith(marker), "the clone does not hold the disk's bytes"
+    assert cloned == vm.scratch_file.read_bytes(), "the clone is not the whole disk"
+
+
+def test_a_clone_destination_without_a_scratch_drive_is_refused(farplane_factory):
+    """A capture cannot name a clone destination for a guest that has no disk to clone."""
+    vm = farplane_factory("clone-no-scratch")
+    pagemaster = boot(vm)
+    destination = vm.open_clone_destination()
+
+    reply = pagemaster.capture_buffers(clone_fd=destination)
+    assert reply.error == (fp.Err.NO_SCRATCH_DRIVE, fp.Msg.CAPTURE_BUFFERS)
+    assert vm.farplane_state()["capture_buffers_armed"] is False
+
+
+def test_a_failed_clone_refuses_the_quiesce_and_hands_the_vcpus_back(farplane_factory):
+    """A destination on another filesystem can hold no reflink, so the clone cannot succeed.
+
+    The clone is taken before the epoch opens, so its failure leaves the backend ready with the
+    vCPUs running and pagemaster free to arm the epoch again.
+    """
+    vm = farplane_factory("clone-failed")
+    pagemaster = boot_with_scratch(vm)
+    destination = vm.open_clone_destination(directory=vm.chroot_base)
+    # The session root is a tmpfs and the disk is on the node's own filesystem, so the two inodes
+    # belong to different superblocks and can never share an extent.
+    if os.fstat(destination).st_dev == os.fstat(vm.scratch_fd).st_dev:
+        pytest.skip(
+            f"{vm.chroot_base} and {vm.scratch_file.parent} are one filesystem, so a clone"
+            " between them can succeed"
+        )
+
+    assert pagemaster.capture_buffers(clone_fd=destination).error is None
+    assert pagemaster.quiesce().error == (fp.Err.DISK_CLONE_FAILED, fp.Msg.QUIESCE)
+    assert "clone the scratch disk" in clone_failure(vm)
+
+    state = vm.farplane_state()
+    assert state["backend_state"] == "ready"
+    assert state["vcpus"] == "running"
+
+    # The epoch never opened, so the whole cycle is still ahead of this capture.
+    assert pagemaster.capture_buffers().error is None
+    assert pagemaster.quiesce().error is None
+    assert pagemaster.write_vmstate().error is None
+
+
+def test_a_capture_of_a_guest_with_a_disk_needs_no_destination(farplane_factory):
+    """The disk is optional in a capture: two buffers capture a guest that has a scratch drive."""
+    vm = farplane_factory("scratch-no-clone")
+    pagemaster = boot_with_scratch(vm)
+
+    assert pagemaster.capture_buffers().error is None
+    assert pagemaster.quiesce().error is None
+    assert pagemaster.write_vmstate().error is None
+    assert pagemaster.dirty_snapshot().error is None
+    assert pagemaster.harvest().count() > 0
+    assert pagemaster.resume(run_vcpus=1).error is None
+    assert vm.farplane_state()["backend_state"] == "ready"
+
+
+def bad_root_fd(vm, flaw):
+    """A root descriptor breaking exactly one property of the image descriptor contract."""
+    if flaw.startswith("regular_"):
+        flaws = {
+            "regular_writable_mode": {"mode": 0o644},
+            "regular_jail_owned": {"owner": vm.uid},
+            "regular_o_path": {"open_flags": os.O_PATH},
+        }
+        # Mode and ownership belong to the regular-file arm of the contract, which is reached only
+        # off a sealing filesystem: `open_private_image_file` stages the image where an inode
+        # refuses `F_GET_SEALS`, or fails. The access mode is checked before either arm.
+        return vm.open_private_image_file("root", **flaws[flaw])
+    if flaw == "writable":
+        return vm.open_root_memfd(size=PAGE, read_only=False)
+    if flaw == "unsealed":
+        return vm.open_root_memfd(size=PAGE, seals=fp.F_SEAL_GROW)
+    if flaw == "empty":
+        return vm.open_root_memfd(size=0)
+    # A directory is never a regular file, whatever the host filesystem under the jail happens
+    # to be.
+    vm.chroot_base.mkdir(parents=True, exist_ok=True)
+    vm.root_fd = os.open(vm.chroot_base, os.O_RDONLY | os.O_DIRECTORY)
+    return vm.root_fd
+
+
+def bad_scratch_fd(vm, flaw):
+    """A scratch descriptor breaking exactly one property of the scratch descriptor contract."""
+    flags = {
+        "o_path": os.O_PATH,
+        "read_only": os.O_RDONLY | os.O_DIRECT,
+        "append": os.O_RDWR | os.O_DIRECT | os.O_APPEND,
+        "no_direct": os.O_RDWR,
+    }
+    if flaw in flags:
+        return scratch_disk(vm, flags=flags[flaw])
+    if flaw == "empty":
+        return scratch_disk(vm, size=0)
+    if flaw == "sealed_memfd":
+        # Every shmem inode answers `F_GET_SEALS`, memfd or not, so a memfd is refused for the
+        # writable slot however it is sealed: the disk lives on the node's own filesystem.
+        vm.scratch_fd = fp.sealed_memfd(
+            "scratch", PAGE, seals=fp.BUFFER_SEALS, read_only=False
+        )
+        return vm.scratch_fd
+    # A named pipe is never a regular file, and unlike a directory it can be opened read-write,
+    # so it is the regular-file rule that refuses it.
+    fifo = fp.regular_image_dir() / f"{vm.microvm_id}-scratch.fifo"
+    fifo.unlink(missing_ok=True)
+    os.mkfifo(fifo)
+    try:
+        vm.scratch_fd = os.open(fifo, os.O_RDWR)
+    finally:
+        fifo.unlink()
+    return vm.scratch_fd
 
 
 @pytest.mark.parametrize(
@@ -1131,14 +1357,6 @@ def test_api_refuses_bootstrap_fd_without_the_bootstrap_memfd(farplane_factory):
         ),
         ("root", "empty", "--root-fd must have a nonzero size"),
         ("root", "not_regular", "--root-fd must be a regular file"),
-        ("bootstrap", "writable", "--bootstrap-fd must be opened O_RDONLY"),
-        (
-            "bootstrap",
-            "unsealed",
-            "--bootstrap-fd is missing the write, grow, shrink or seal memfd seal",
-        ),
-        ("bootstrap", "empty", "--bootstrap-fd must have a nonzero size"),
-        ("bootstrap", "not_regular", "--bootstrap-fd must be a regular file"),
         (
             "root",
             "regular_writable_mode",
@@ -1150,46 +1368,45 @@ def test_api_refuses_bootstrap_fd_without_the_bootstrap_memfd(farplane_factory):
             "--root-fd must not be owned by the jailed uid",
         ),
         ("root", "regular_o_path", "--root-fd must be opened O_RDONLY"),
+        ("scratch", "o_path", "--scratch-fd must be opened O_RDWR"),
+        ("scratch", "read_only", "--scratch-fd must be opened O_RDWR"),
+        ("scratch", "append", "--scratch-fd must not be opened O_APPEND"),
+        ("scratch", "no_direct", "--scratch-fd must be opened O_DIRECT"),
+        ("scratch", "empty", "--scratch-fd must have a nonzero size"),
+        ("scratch", "not_regular", "--scratch-fd must be a regular file"),
         (
-            "bootstrap",
-            "regular_writable_mode",
-            "--bootstrap-fd must not have any write permission bit set",
+            "scratch",
+            "sealed_memfd",
+            "--scratch-fd must be a file on the node's filesystem, not on shmem or hugetlbfs",
         ),
     ],
 )
 def test_jailer_refuses_a_bad_block_fd(farplane_factory, descriptor, flaw, expected):
-    """Every root and bootstrap descriptor precondition is enforced before the jail is built."""
+    """Every root and scratch descriptor precondition is enforced before the jail is built."""
     vm = farplane_factory(f"{descriptor}fd-{flaw}")
-    open_memfd = vm.open_root_memfd if descriptor == "root" else vm.open_bootstrap_memfd
-    if flaw.startswith("regular_"):
-        flaws = {
-            "regular_writable_mode": {"mode": 0o644},
-            "regular_jail_owned": {"owner": vm.uid},
-            "regular_o_path": {"open_flags": os.O_PATH},
-        }
-        # Mode and ownership belong to the regular-file arm of the contract, which is reached only
-        # off a sealing filesystem: `open_private_image_file` stages the image where an inode
-        # refuses `F_GET_SEALS`, or fails. The access mode is checked before either arm.
-        block_fd = vm.open_private_image_file(descriptor, **flaws[flaw])
-    elif flaw == "writable":
-        block_fd = open_memfd(size=PAGE, read_only=False)
-    elif flaw == "unsealed":
-        block_fd = open_memfd(size=PAGE, seals=fp.F_SEAL_GROW)
-    elif flaw == "empty":
-        block_fd = open_memfd(size=0)
+    if descriptor == "root":
+        block_fd = bad_root_fd(vm, flaw)
     else:
-        # A directory is never a regular file, whatever the host filesystem under the jail
-        # happens to be.
-        vm.chroot_base.mkdir(parents=True, exist_ok=True)
-        block_fd = os.open(vm.chroot_base, os.O_RDONLY | os.O_DIRECTORY)
-        if descriptor == "root":
-            vm.root_fd = block_fd
-        else:
-            vm.bootstrap_fd = block_fd
+        block_fd = bad_scratch_fd(vm, flaw)
 
     vm.spawn(**{f"{descriptor}_fd": block_fd}, wait=False)
     assert vm.proc.wait(timeout=30) != 0
     assert expected in vm.stdio_text()
+    assert not vm.api_socket.exists()
+
+
+def test_jailer_refuses_a_scratch_descriptor_naming_the_root_inode(farplane_factory):
+    """One inode cannot be both the immutable root image and the disk the guest writes to."""
+    vm = farplane_factory("scratchfd-root-alias")
+    root_fd = vm.open_root_image_file()
+    try:
+        vm.scratch_fd = fp.open_disk_file(vm.root_image_path, size=None)
+    except fp.DirectIoUnsupported as err:
+        pytest.skip(str(err))
+
+    vm.spawn(root_fd=root_fd, scratch_fd=vm.scratch_fd, wait=False)
+    assert vm.proc.wait(timeout=30) != 0
+    assert "--scratch-fd must not name the root image inode" in vm.stdio_text()
     assert not vm.api_socket.exists()
 
 
@@ -1286,21 +1503,19 @@ def test_jail_hands_over_renumbered_fds_and_a_stripped_process(farplane_factory)
     """The jailer renumbers the inherited descriptors and strips the process it execs."""
     vm = farplane_factory()
     root_base = vm.open_root_memfd()
-    bootstrap_base = vm.open_root_memfd()
+    scratch_base = scratch_disk(vm)
     root_spares = [os.dup(root_base) for _ in range(8)]
-    bootstrap_spares = [os.dup(bootstrap_base) for _ in range(8)]
-    root_high = next(fd for fd in root_spares if fd > fp.BOOTSTRAP_FILENO)
-    bootstrap_high = next(fd for fd in bootstrap_spares if fd > fp.BOOTSTRAP_FILENO)
+    scratch_spares = [os.dup(scratch_base) for _ in range(8)]
+    root_high = next(fd for fd in root_spares if fd > fp.SCRATCH_FILENO)
+    scratch_high = next(fd for fd in scratch_spares if fd > fp.SCRATCH_FILENO)
     for fd in [root_base] + [fd for fd in root_spares if fd != root_high]:
         os.close(fd)
-    for fd in [bootstrap_base] + [
-        fd for fd in bootstrap_spares if fd != bootstrap_high
-    ]:
+    for fd in [scratch_base] + [fd for fd in scratch_spares if fd != scratch_high]:
         os.close(fd)
     vm.root_fd = root_high
-    vm.bootstrap_fd = bootstrap_high
+    vm.scratch_fd = scratch_high
 
-    vm.spawn(root_fd=root_high, bootstrap_fd=bootstrap_high)
+    vm.spawn(root_fd=root_high, scratch_fd=scratch_high)
     pagemaster = vm.start_pagemaster()
     vm.configure()
     vm.start()
@@ -1309,12 +1524,21 @@ def test_jail_hands_over_renumbered_fds_and_a_stripped_process(farplane_factory)
 
     device = f"/proc/{vm.pid}/fd/{fp.UFFD_DEVICE_FILENO}"
     root = f"/proc/{vm.pid}/fd/{fp.ROOT_FILENO}"
-    bootstrap = f"/proc/{vm.pid}/fd/{fp.BOOTSTRAP_FILENO}"
+    scratch = f"/proc/{vm.pid}/fd/{fp.SCRATCH_FILENO}"
     assert os.readlink(device) == str(fp.DEV_USERFAULTFD)
     assert os.stat(device).st_rdev == fp.DEV_USERFAULTFD.stat().st_rdev
     assert os.readlink(root).startswith("/memfd:rootfs")
-    assert os.readlink(bootstrap).startswith("/memfd:rootfs")
-    assert os.stat(root).st_ino != os.stat(bootstrap).st_ino
+    inherited = os.stat(scratch)
+    supplied = os.fstat(scratch_high)
+    assert (inherited.st_dev, inherited.st_ino) == (
+        supplied.st_dev,
+        supplied.st_ino,
+    ), "Firecracker fd 5 is not the supplied scratch disk"
+    # The immutable root image and the disk the guest writes to are never the same inode.
+    assert (os.stat(root).st_dev, os.stat(root).st_ino) != (
+        inherited.st_dev,
+        inherited.st_ino,
+    )
 
     status = Path(f"/proc/{vm.pid}/status").read_text(encoding="utf-8")
     caps = dict(

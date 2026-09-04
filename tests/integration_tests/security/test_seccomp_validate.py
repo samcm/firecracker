@@ -85,3 +85,35 @@ def test_validate_filter(seccompiler, bin_test_syscall, monkeypatch, tmp_path):
                     # if we call it with unallowed args, it should exit 159
                     # 159 = 128 (abnormal termination) + 31 (SIGSYS)
                     assert outcome.returncode == 159
+
+
+def test_vmm_filter_admits_the_disk_clone(
+    seccompiler, bin_test_syscall, monkeypatch, tmp_path
+):
+    """Assert the vmm filter admits the scratch disk reflink.
+
+    The capture thread installs the vmm filter and reflinks the scratch disk inside the
+    quiesce, so a missing rule would raise SIGSYS there instead of refusing the quiesce.
+    """
+    ficlone = 0x40049409
+
+    fc_filter_path = Path(f"../resources/seccomp/{ARCH}-unknown-linux-musl.json")
+    fc_filter = json.loads(fc_filter_path.read_text(encoding="ascii"))
+    assert any(
+        rule["syscall"] == "ioctl"
+        and any(
+            arg["index"] == 1 and arg["val"] == ficlone for arg in rule.get("args", [])
+        )
+        for rule in fc_filter["vmm"]["filter"]
+    ), "the vmm filter names no FICLONE rule"
+
+    monkeypatch.chdir(tmp_path)
+    # prevent coredumps
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    seccompiler.compile(fc_filter, split_output=True)
+
+    arch = seccomp.Arch.X86_64 if ARCH == "x86_64" else seccomp.Arch.AARCH64
+    cmd = f"{bin_test_syscall} vmm.bpf {seccomp.resolve_syscall(arch, 'ioctl')}"
+    assert utils.run_cmd(f"{cmd} 0 {ficlone} 0 0").returncode == 0
+    # 159 = 128 (abnormal termination) + 31 (SIGSYS)
+    assert utils.run_cmd(f"{cmd} 0 {ficlone + 1_000_000} 0 0").returncode == 159

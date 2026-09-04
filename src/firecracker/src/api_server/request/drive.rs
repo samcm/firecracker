@@ -253,12 +253,12 @@ mod tests {
         };
         assert_eq!(config.fd, 4);
 
-        // PUT with the bootstrap descriptor inherited from the jailer.
+        // PUT with the scratch descriptor inherited from the jailer.
         let body = r#"{
             "drive_id": "1000",
             "fd": 5,
             "is_root_device": false,
-            "is_read_only": true
+            "is_read_only": false
         }"#;
         let VmmAction::InsertBlockDevice(config) =
             vmm_action_from_request(parse_put_drive(&Body::new(body), Some("1000")).unwrap())
@@ -268,12 +268,12 @@ mod tests {
         assert_eq!(config.fd, 5);
         assert!(!config.is_root_device);
 
-        // PUT with the bootstrap descriptor backing the root device.
+        // PUT with the scratch descriptor backing the root device.
         let body = r#"{
             "drive_id": "1000",
             "fd": 5,
             "is_root_device": true,
-            "is_read_only": true
+            "is_read_only": false
         }"#;
         parse_put_drive(&Body::new(body), Some("1000")).unwrap_err();
 
@@ -286,7 +286,7 @@ mod tests {
         }"#;
         parse_put_drive(&Body::new(body), Some("1000")).unwrap_err();
 
-        // PUT with a descriptor the jailer never inherits a sealed image at.
+        // PUT with a descriptor the jailer never inherits an image at.
         let body = r#"{
             "drive_id": "1000",
             "fd": 9,

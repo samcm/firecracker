@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_descriptor_backed_device_is_read_only() {
+    fn test_descriptor_backed_device_access_mode() {
         let f = TempFile::new().unwrap();
         f.as_file().set_len(0x1000).unwrap();
 
@@ -731,9 +731,13 @@ mod tests {
                 let block =
                     default_block_with_descriptor(f.as_file().as_raw_fd(), is_root_device, engine);
 
+                // Only the root image is read-only, and only it advertises the feature.
                 assert_eq!(block.root_device, is_root_device);
-                assert!(block.read_only);
-                assert_ne!(block.avail_features & (1u64 << VIRTIO_BLK_F_RO), 0);
+                assert_eq!(block.read_only, is_root_device);
+                assert_eq!(
+                    block.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0,
+                    is_root_device
+                );
                 assert_eq!(block.avail_features & (1u64 << VIRTIO_BLK_F_FLUSH), 0);
                 assert_eq!(block.config_space.capacity, 0x1000 >> SECTOR_SHIFT);
             }
@@ -741,20 +745,14 @@ mod tests {
     }
 
     #[test]
-    fn test_descriptor_backed_device_rejects_writes() {
+    fn test_root_image_backed_device_rejects_writes() {
         let f = TempFile::new().unwrap();
         f.as_file().set_len(0x1000).unwrap();
         f.as_file().write_all(&[0x11; 0x1000]).unwrap();
 
-        // The root image and the bootstrap image are both read-only.
-        for (engine, is_root_device) in [
-            (FileEngineType::Sync, true),
-            (FileEngineType::Sync, false),
-            (FileEngineType::Async, true),
-            (FileEngineType::Async, false),
-        ] {
-            let mut block =
-                default_block_with_descriptor(f.as_file().as_raw_fd(), is_root_device, engine);
+        // The root image is read-only, so the device fails every write and flush request.
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let mut block = default_block_with_descriptor(f.as_file().as_raw_fd(), true, engine);
             let mem = default_mem();
             let interrupt = default_interrupt();
             let vq = VirtQueue::new(GuestAddress(0), &mem, 16);

@@ -37,14 +37,16 @@ pub fn default_block(file_engine_type: FileEngineType) -> VirtioBlock {
     default_block_with_backing(f.as_file().as_raw_fd(), false, false, file_engine_type)
 }
 
-/// Create a read-only Block instance backed by an inherited descriptor, to be used in tests. The
-/// root image backs the root device, the bootstrap image does not.
+/// Create a Block instance backed by an inherited descriptor, to be used in tests. The read-only
+/// root image backs the root device, and the read-write scratch descriptor backs a drive that
+/// never is.
 pub fn default_block_with_descriptor(
     fd: RawFd,
     is_root_device: bool,
     file_engine_type: FileEngineType,
 ) -> VirtioBlock {
-    default_block_with_backing(fd, is_root_device, true, file_engine_type)
+    // Only the root image is read-only.
+    default_block_with_backing(fd, is_root_device, is_root_device, file_engine_type)
 }
 
 fn default_block_with_backing(
