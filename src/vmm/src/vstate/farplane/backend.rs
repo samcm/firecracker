@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_ulong;
 use std::os::unix::fs::FileExt;
@@ -1054,6 +1054,7 @@ fn dup_cloexec(fd: RawFd) -> Result<OwnedFd, BackendError> {
 #[cfg(test)]
 mod tests {
     use std::ffi::CStr;
+    use std::io::{Seek, SeekFrom};
 
     use super::*;
     use crate::vmm_config::instance_info::InstanceInfo;
