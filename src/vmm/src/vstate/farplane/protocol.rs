@@ -857,6 +857,8 @@ mod tests {
         assert_eq!(ErrorCode::NoCaptureBuffers as u32, 17);
         assert_eq!(ErrorCode::PeercredMismatch as u32, 19);
         assert_eq!(ErrorCode::CaptureOrderViolation as u32, 22);
+        assert_eq!(ErrorCode::NoScratchDrive as u32, 24);
+        assert_eq!(ErrorCode::BadCloneDestination as u32, 25);
         assert_eq!(ErrorCode::DiskCloneFailed as u32, 26);
     }
 
