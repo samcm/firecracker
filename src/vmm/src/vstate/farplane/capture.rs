@@ -1563,8 +1563,9 @@ mod tests {
     }
 
     /// A clone the kernel refuses is reported as a failure carrying its errno, which is what the
-    /// quiesce answers `DiskCloneFailed` on. Only a regular file has extents to share, so a
-    /// character device as the source is refused on every filesystem.
+    /// quiesce answers `DiskCloneFailed` on. Which errno it is depends on the filesystems:
+    /// `EXDEV` across two of them, `EOPNOTSUPP` without reflinks, `EINVAL` or `ENOTTY` for a
+    /// source that has no extents to share.
     #[test]
     fn a_clone_the_kernel_refuses_is_reported_as_a_failure() {
         let destination = TempFile::new().unwrap();
@@ -1576,7 +1577,7 @@ mod tests {
         assert!(
             matches!(
                 err.raw_os_error(),
-                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY)
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV)
             ),
             "unexpected errno: {err}"
         );
