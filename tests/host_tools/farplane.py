@@ -183,6 +183,7 @@ UFFDIO_WRITEPROTECT = _ioc(
 UFFDIO_CONTINUE = _ioc(
     _IOC_WRITE | _IOC_READ, _UFFDIO, 0x07, ctypes.sizeof(_UffdioContinue)
 )
+FICLONE = 0x40049409
 
 _PROCESS_VM_ARGTYPES = [
     ctypes.c_int,

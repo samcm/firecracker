@@ -530,10 +530,13 @@ fn a_frames_descriptors_are_closed_when_it_is_not_served() {
     );
 }
 
+/// Filesystem magic of XFS, the only filesystem the measured clone and alignment facts hold on.
+const XFS_SUPER_MAGIC: i128 = 0x5846_5342;
+
 /// Directory the clone proofs run in, or `None` when the run did not configure one.
 ///
-/// A configured directory that does not exist is a broken environment and fails; one whose
-/// filesystem has no reflinks cannot host the proof and skips. Nothing else skips.
+/// A configured directory that is not an XFS one is a broken environment and fails; an XFS one
+/// without reflinks cannot host the proof and skips. Nothing else skips.
 fn reflink_dir() -> Option<std::path::PathBuf> {
     let Some(dir) = std::env::var_os("FARPLANE_TEST_XFS_DIR") else {
         eprintln!(
@@ -548,6 +551,13 @@ fn reflink_dir() -> Option<std::path::PathBuf> {
         "FARPLANE_TEST_XFS_DIR is {}, which is not a directory",
         dir.display()
     );
+    let magic = filesystem_magic(&dir);
+    assert_eq!(
+        magic,
+        XFS_SUPER_MAGIC,
+        "FARPLANE_TEST_XFS_DIR is {}, whose filesystem magic is {magic:#x} and not XFS",
+        dir.display()
+    );
 
     let source = file_in(&dir, "farplane-reflink-probe-source", &[0u8; 4096]);
     let destination = file_in(&dir, "farplane-reflink-probe-destination", &[]);
@@ -557,14 +567,28 @@ fn reflink_dir() -> Option<std::path::PathBuf> {
     match probe {
         Ok(_) => Some(dir),
         Err(err) if err.raw_os_error() == Some(libc::EOPNOTSUPP) => {
-            eprintln!(
-                "skipping: {} is on a filesystem without reflinks",
-                dir.display()
-            );
+            eprintln!("skipping: {} is XFS without reflinks", dir.display());
             None
         }
         Err(err) => panic!("the reflink probe in {} failed: {err}", dir.display()),
     }
+}
+
+/// Filesystem magic of the filesystem `dir` lives on.
+fn filesystem_magic(dir: &std::path::Path) -> i128 {
+    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and outlives the call, and `stat` is a valid allocation.
+    let probed = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    assert_eq!(
+        probed,
+        0,
+        "statfs {}: {}",
+        dir.display(),
+        io::Error::last_os_error()
+    );
+    // SAFETY: `statfs` returned success, so it initialized the whole struct.
+    i128::from(unsafe { stat.assume_init() }.f_type)
 }
 
 /// A file of `content` under `dir`, opened read-write.

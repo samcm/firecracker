@@ -91,12 +91,19 @@ def boot(
     return pagemaster
 
 
-def scratch_disk(vm, **kwargs):
-    """Create this microVM's scratch disk, skipping when its filesystem refuses `O_DIRECT`."""
+def scratch_disk(vm, *, directory=None, **kwargs):
+    """Create this microVM's scratch disk in the staging area or a configured directory.
+    A staging filesystem that refuses `O_DIRECT` skips; a configured one fails.
+    """
     try:
-        return vm.open_scratch_file(**kwargs)
+        return vm.open_scratch_file(directory=directory, **kwargs)
     except fp.DirectIoUnsupported as err:
-        pytest.skip(str(err))
+        if directory is None:
+            pytest.skip(str(err))
+        pytest.fail(
+            f"FARPLANE_TEST_XFS_DIR names {directory}, which refuses the O_DIRECT open"
+            f" every scratch descriptor carries: {err}"
+        )
 
 
 def boot_with_scratch(vm, *, directory=None, seed=None, fc_args=(), **pm_kwargs):
@@ -247,18 +254,47 @@ def fdinfo_flags(pid, fileno):
 
 
 def reflink_dir():
-    """The directory `FARPLANE_TEST_XFS_DIR` names, skipping when the run named none.
-
-    `FICLONE` shares the source's extents instead of copying them, which only a filesystem that
-    reflinks can do, so a clone can only be taken between two inodes of one such filesystem.
+    """The directory `FARPLANE_TEST_XFS_DIR` names, proven able to reflink a file in it.
+    Only an unset variable and an `EOPNOTSUPP` probe skip; anything else about it fails.
     """
-    directory = os.environ.get("FARPLANE_TEST_XFS_DIR")
-    if not directory:
+    configured = os.environ.get("FARPLANE_TEST_XFS_DIR")
+    if not configured:
         pytest.skip(
             "FARPLANE_TEST_XFS_DIR must name a writable directory on an XFS filesystem"
             " formatted with reflink=1, the only place a clone of the scratch disk can land"
         )
-    return Path(directory)
+    directory = Path(configured)
+    if not directory.is_dir():
+        pytest.fail(
+            f"FARPLANE_TEST_XFS_DIR names {directory}, which is not an existing directory"
+        )
+    magic = utils.check_output(f"stat -f -c %T {directory}").stdout.strip()
+    if magic != "xfs":
+        pytest.fail(
+            f"FARPLANE_TEST_XFS_DIR names {directory}, whose filesystem is {magic} and"
+            " not xfs, so nothing measured about the clone holds there"
+        )
+    source = directory / "farplane-reflink-probe-source"
+    destination = directory / "farplane-reflink-probe-destination"
+    try:
+        source.write_bytes(bytes(PAGE))
+        destination.write_bytes(b"")
+        with open(source, "rb") as src, open(destination, "r+b") as dst:
+            fcntl.ioctl(dst.fileno(), fp.FICLONE, src.fileno())
+    except OSError as err:
+        if err.errno == errno.EOPNOTSUPP:
+            pytest.skip(
+                f"FARPLANE_TEST_XFS_DIR names {directory}, which is on a filesystem that"
+                " has no reflinks"
+            )
+        pytest.fail(
+            f"FARPLANE_TEST_XFS_DIR names {directory}, which cannot take the reflink the"
+            f" clone proofs need: {err}"
+        )
+    finally:
+        source.unlink(missing_ok=True)
+        destination.unlink(missing_ok=True)
+    return directory
 
 
 def clone_failure(vm):
@@ -1187,9 +1223,9 @@ def test_a_capture_with_a_destination_clones_the_scratch_disk(farplane_factory):
     assert pagemaster.capture_buffers(clone_fd=destination).error is None
     reply = pagemaster.quiesce()
     if reply.error == (fp.Err.DISK_CLONE_FAILED, fp.Msg.QUIESCE):
-        pytest.skip(
-            f"FARPLANE_TEST_XFS_DIR names {directory}, which cannot hold a reflink of the"
-            f" scratch disk: {clone_failure(vm)}"
+        pytest.fail(
+            f"the quiesce could not reflink the scratch disk into {directory}, which the"
+            f" clone probe proved reflinks: {clone_failure(vm)}"
         )
     assert reply.error is None
 
