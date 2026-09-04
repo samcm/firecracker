@@ -7,7 +7,7 @@ use std::os::fd::RawFd;
 
 use vmm::EventManager;
 use vmm::builder::build_and_boot_microvm;
-use vmm::devices::virtio::block::{BOOTSTRAP_DESCRIPTOR_FILENO, CacheType, ROOT_DESCRIPTOR_FILENO};
+use vmm::devices::virtio::block::{CacheType, ROOT_DESCRIPTOR_FILENO, SCRATCH_DESCRIPTOR_FILENO};
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{LoadSnapshotError, PrebootApiController, VmmAction, VmmActionError};
 use vmm::seccomp::get_empty_filters;
@@ -20,30 +20,19 @@ use vmm::vmm_config::snapshot::LoadSnapshotParams;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 use vmm_sys_util::tempfile::TempFile;
 
-/// Stands the descriptors the jailer inherits up for this test binary: a sealed read-only image at
-/// [`ROOT_DESCRIPTOR_FILENO`] and at [`BOOTSTRAP_DESCRIPTOR_FILENO`]. It runs before `main`, so the
-/// reserved numbers are claimed before any test can be handed one for something else.
+/// Stands the descriptors the jailer inherits up for this test binary: a sealed read-only image
+/// at [`ROOT_DESCRIPTOR_FILENO`] and a read-write scratch disk at [`SCRATCH_DESCRIPTOR_FILENO`].
+/// It runs before `main`, so the reserved numbers are claimed before any test can be handed one.
 #[used]
 #[unsafe(link_section = ".init_array")]
-static INHERIT_SEALED_IMAGES: extern "C" fn() = inherit_sealed_images;
+static INHERIT_RESERVED_DESCRIPTORS: extern "C" fn() = inherit_reserved_descriptors;
 
-extern "C" fn inherit_sealed_images() {
-    let name = c"sealed-drive-image";
-    // SAFETY: `name` is a NUL-terminated string that outlives the call.
-    let image = unsafe {
-        libc::syscall(
-            libc::SYS_memfd_create,
-            name.as_ptr(),
-            libc::MFD_ALLOW_SEALING,
-        )
-    };
-    assert!(image >= 0, "memfd_create");
-    let image = RawFd::try_from(image).unwrap();
+extern "C" fn inherit_reserved_descriptors() {
+    let image = disk_image(c"sealed-drive-image", libc::MFD_ALLOW_SEALING);
 
     // SAFETY: `image` is an owned memfd of this process, and sealing only restricts what it
     // permits.
     unsafe {
-        assert_eq!(libc::ftruncate(image, 0x1000), 0, "ftruncate");
         let seals =
             libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
         assert_eq!(
@@ -58,12 +47,30 @@ extern "C" fn inherit_sealed_images() {
     let read_only = unsafe { libc::open(link.as_ptr(), libc::O_RDONLY) };
     assert!(read_only >= 0, "reopening the sealed image read-only");
 
+    // A memfd is opened read-write, the access mode the scratch slot requires.
+    let scratch = disk_image(c"scratch-disk", 0);
+
     // Both descriptors, and the ones they were duplicated from, stay open for the lifetime of the
     // process, exactly as a jailed Firecracker holds them.
-    for reserved in [ROOT_DESCRIPTOR_FILENO, BOOTSTRAP_DESCRIPTOR_FILENO] {
-        // SAFETY: `read_only` is an owned descriptor and `dup2` rewrites this process' own table.
-        assert!(unsafe { libc::dup2(read_only, reserved) } >= 0, "dup2");
+    for (source, reserved) in [
+        (read_only, ROOT_DESCRIPTOR_FILENO),
+        (scratch, SCRATCH_DESCRIPTOR_FILENO),
+    ] {
+        // SAFETY: `source` is an owned descriptor and `dup2` rewrites this process' own table.
+        assert!(unsafe { libc::dup2(source, reserved) } >= 0, "dup2");
     }
+}
+
+/// A memfd holding one page of disk image, opened read-write.
+fn disk_image(name: &std::ffi::CStr, flags: libc::c_uint) -> RawFd {
+    // SAFETY: `name` is a NUL-terminated string that outlives the call.
+    let image = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), flags) };
+    assert!(image >= 0, "memfd_create");
+    let image = RawFd::try_from(image).unwrap();
+
+    // SAFETY: `image` is an owned memfd of this process.
+    assert_eq!(unsafe { libc::ftruncate(image, 0x1000) }, 0, "ftruncate");
+    image
 }
 
 #[test]
@@ -125,8 +132,8 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         partuuid: None,
         is_root_device: false,
         cache_type: CacheType::Unsafe,
-        is_read_only: Some(true),
-        fd: BOOTSTRAP_DESCRIPTOR_FILENO,
+        is_read_only: Some(false),
+        fd: SCRATCH_DESCRIPTOR_FILENO,
         rate_limiter: None,
         file_engine_type: None,
     };

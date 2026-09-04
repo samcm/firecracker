@@ -273,7 +273,7 @@ mod tests {
     use crate::cpu_config::templates::test_utils::TEST_TEMPLATE_JSON;
     use crate::cpu_config::templates::{CpuTemplateType, StaticCpuTemplate};
     use crate::devices::virtio::block::{
-        BOOTSTRAP_DESCRIPTOR_FILENO, CacheType, ROOT_DESCRIPTOR_FILENO,
+        CacheType, ROOT_DESCRIPTOR_FILENO, SCRATCH_DESCRIPTOR_FILENO,
     };
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
@@ -318,8 +318,8 @@ mod tests {
             partuuid: Some("0eaa91a0-01".to_string()),
             is_root_device: false,
             cache_type: CacheType::Unsafe,
-            is_read_only: Some(true),
-            fd: BOOTSTRAP_DESCRIPTOR_FILENO,
+            is_read_only: Some(false),
+            fd: SCRATCH_DESCRIPTOR_FILENO,
             rate_limiter: Some(RateLimiterConfig::default()),
             file_engine_type: None,
         }
@@ -901,11 +901,12 @@ mod tests {
     #[test]
     fn test_set_block_device() {
         let mut vm_resources = default_vm_resources();
-        // The bootstrap drive is already configured, so the root image backs the drive added here.
+        // The scratch drive is already configured, so the root image backs the drive added here.
         let mut new_block_device_cfg = default_block_cfg();
         new_block_device_cfg.drive_id = "block2".to_string();
         new_block_device_cfg.is_root_device = true;
         new_block_device_cfg.fd = ROOT_DESCRIPTOR_FILENO;
+        new_block_device_cfg.is_read_only = Some(true);
         assert_eq!(vm_resources.block.devices.len(), 1);
         vm_resources.set_block_device(new_block_device_cfg).unwrap();
         assert_eq!(vm_resources.block.devices.len(), 2);

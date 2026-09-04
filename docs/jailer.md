@@ -21,7 +21,7 @@ jailer --id <id> \
        [--chroot-base-dir <chroot_base>] \
        [--netns <netns>] \
        --root-fd <n> \
-       [--bootstrap-fd <n>] \
+       [--scratch-fd <n>] \
        [--cgroup-join <absolute_cgroupfs_path>] \
        [--resource-limit <no-file|fsize|memlock>=<value>] \
        [--...extra arguments for Firecracker]
@@ -41,9 +41,10 @@ jailer --id <id> \
 - `--root-fd` is required and identifies the inherited read-only root block
   device image descriptor. The jailer validates it against the image descriptor
   contract below and renumbers it to file descriptor 4.
-- `--bootstrap-fd` is optional and identifies an inherited read-only bootstrap
-  block device image descriptor, held to the same contract. The jailer renumbers
-  it to file descriptor 5; when absent, file descriptor 5 is not reserved.
+- `--scratch-fd` is optional and identifies an inherited read-write descriptor
+  of the microVM's scratch disk, held to the scratch descriptor contract below.
+  The jailer renumbers it to file descriptor 5; when absent, file descriptor 5
+  is not reserved.
 - `--cgroup-join` identifies an absolute cgroupfs path for a pre-created leaf
   cgroup. The jailer joins that cgroup and does not create cgroups.
 - For extra security and control over resource usage, `--resource-limit` can be
@@ -66,9 +67,9 @@ jailer --id <id> \
 
 ## Image Descriptor Contract
 
-`--root-fd` and `--bootstrap-fd` name inherited descriptors of block device
-images. The jailer validates each one before it builds the jail, and rejects the
-launch if any check fails. It never reads the image.
+`--root-fd` names an inherited descriptor of a block device image. The jailer
+validates it before it builds the jail, and rejects the launch if any check
+fails. It never reads the image.
 
 Every image descriptor must satisfy all of the following:
 
@@ -132,6 +133,34 @@ cannot check.
   images and jail roots, so they are one trust domain no matter how many jails
   there are, and an image published for one of them is writable by all of them.
 
+## Scratch Descriptor Contract
+
+`--scratch-fd` names an inherited descriptor of the microVM's scratch disk. The
+jailer validates it before it builds the jail, and rejects the launch if any
+check fails. It never reads or writes the disk.
+
+The jail is meant to write this inode, so no permission, ownership or mode bit
+is read. The descriptor must satisfy all of the following:
+
+- Its access mode is `O_RDWR`, and it is not an `O_PATH` descriptor, which
+  reports `O_RDONLY` while granting no access to the inode at all.
+- `O_APPEND` is clear, because it moves every write to the end of the file,
+  wherever the guest aimed it.
+- `O_DIRECT` is set, so the guest's reads and writes reach the disk itself and
+  the host holds no second copy of a sandbox's data in its page cache.
+- `fstat` reports a regular file.
+- Its size is nonzero.
+- The inode does not answer `F_GET_SEALS`. Every shmem and hugetlbfs inode
+  answers it and every other filesystem fails it with `EINVAL`, so an answer
+  means the disk is the node's memory and not its filesystem.
+- It does not name the root image inode. One inode opened twice, read-only for
+  the root slot and writable for this one, would let the guest reach the
+  immutable root image through the writes it makes to its own disk.
+
+The bytes belong to one microVM, so the jailer holds the scratch disk to no
+immutability obligation and to none of the sharing obligations a published
+image carries.
+
 ## Jailer Operation
 
 After starting, the Jailer goes through the following operations:
@@ -161,6 +190,8 @@ After starting, the Jailer goes through the following operations:
   to file descriptor 3.
 - Validate the inherited root image descriptor against the image descriptor
   contract and renumber it to file descriptor 4.
+- If `--scratch-fd` is present, validate it against the scratch descriptor
+  contract and renumber it to file descriptor 5.
 - Use `chown` to change ownership of the `<chroot_dir>` (root path `/` as seen
   by the jailed firecracker), `/dev/net/tun`, and `/dev/kvm`. The ownership is
   changed to the provided `<uid>:<gid>`.

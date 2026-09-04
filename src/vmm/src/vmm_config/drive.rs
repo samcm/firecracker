@@ -13,7 +13,7 @@ use crate::VmmError;
 use crate::devices::virtio::block::device::Block;
 pub use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::devices::virtio::block::{
-    BOOTSTRAP_DESCRIPTOR_FILENO, BlockError, CacheType, ROOT_DESCRIPTOR_FILENO,
+    BlockError, CacheType, ROOT_DESCRIPTOR_FILENO, SCRATCH_DESCRIPTOR_FILENO,
 };
 use crate::devices::virtio::device::VirtioDevice;
 
@@ -30,6 +30,10 @@ pub enum DriveError {
     DescriptorRoleMismatch(RawFd),
     /// Unable to patch the block device: {0} Please verify the request arguments.
     DeviceUpdate(VmmError),
+    /// Descriptor {0} is not opened read-write.
+    ReadOnlyScratchDescriptor(RawFd),
+    /// A drive backed by the scratch descriptor requires `is_read_only` to be false.
+    ReadOnlyScratchDrive,
     /// A read-only drive has no write-back cache to flush.
     ReadOnlyWriteback,
     /// A root block device already exists!
@@ -63,8 +67,8 @@ pub struct BlockDeviceConfig {
     /// If set to true, the drive is opened in read-only mode. Otherwise, the
     /// drive is opened as read-write.
     pub is_read_only: Option<bool>,
-    /// Descriptor the read-only image backing this drive was inherited at: the root image at
-    /// [`ROOT_DESCRIPTOR_FILENO`], the bootstrap image at [`BOOTSTRAP_DESCRIPTOR_FILENO`].
+    /// Descriptor the image backing this drive was inherited at: the read-only root image at
+    /// [`ROOT_DESCRIPTOR_FILENO`], the read-write scratch disk at [`SCRATCH_DESCRIPTOR_FILENO`].
     pub fd: RawFd,
     /// Rate Limiter for I/O operations.
     pub rate_limiter: Option<RateLimiterConfig>,
@@ -75,13 +79,13 @@ pub struct BlockDeviceConfig {
 
 impl BlockDeviceConfig {
     /// Pairs the descriptors the jailer inherits with the drive each one backs: the root image at
-    /// [`ROOT_DESCRIPTOR_FILENO`] backs the root device, and the bootstrap image at
-    /// [`BOOTSTRAP_DESCRIPTOR_FILENO`] backs a drive that never is. No other number names a drive's
+    /// [`ROOT_DESCRIPTOR_FILENO`] backs the root device, and the scratch descriptor at
+    /// [`SCRATCH_DESCRIPTOR_FILENO`] backs a drive that never is. No other number names a drive's
     /// backing store.
     pub fn reserved_descriptor(&self) -> Result<RawFd, DriveError> {
         let backs_root = match self.fd {
             ROOT_DESCRIPTOR_FILENO => true,
-            BOOTSTRAP_DESCRIPTOR_FILENO => false,
+            SCRATCH_DESCRIPTOR_FILENO => false,
             fd => return Err(DriveError::UnreservedDescriptor(fd)),
         };
         if self.is_root_device != backs_root {
@@ -90,18 +94,23 @@ impl BlockDeviceConfig {
         Ok(self.fd)
     }
 
-    /// Validates the descriptor backing this drive. Every inherited image descriptor is read-only,
-    /// so the drive requires `is_read_only` and the number must still name a read-only descriptor.
+    /// The access mode a slot requires follows the slot: the root image is read-only and the
+    /// scratch descriptor is read-write. The number must still name a descriptor the jailer
+    /// inherited in that mode.
     pub fn descriptor(&self) -> Result<RawFd, DriveError> {
         let fd = self.reserved_descriptor()?;
-        if self.is_read_only != Some(true) {
+        let read_only = fd == ROOT_DESCRIPTOR_FILENO;
+        if read_only && self.is_read_only != Some(true) {
             return Err(DriveError::WritableDrive);
+        }
+        if !read_only && self.is_read_only != Some(false) {
+            return Err(DriveError::ReadOnlyScratchDrive);
         }
         if self.cache_type == CacheType::Writeback {
             return Err(DriveError::ReadOnlyWriteback);
         }
         // The jailer owns image identity, immutability and size validation; Firecracker only
-        // confirms that the number it was handed still names an inherited read-only descriptor.
+        // confirms that the number it was handed still names a descriptor opened in that mode.
         // SAFETY: `F_GETFL` only reads descriptor flags.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
@@ -110,8 +119,12 @@ impl BlockDeviceConfig {
                 io::Error::last_os_error(),
             ));
         }
-        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+        let mode = flags & libc::O_ACCMODE;
+        if read_only && mode != libc::O_RDONLY {
             return Err(DriveError::WritableDescriptor(fd));
+        }
+        if !read_only && mode != libc::O_RDWR {
+            return Err(DriveError::ReadOnlyScratchDescriptor(fd));
         }
         Ok(fd)
     }
@@ -226,6 +239,7 @@ impl BlockBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::os::fd::AsRawFd;
     use std::panic::AssertUnwindSafe;
 
@@ -257,8 +271,8 @@ mod tests {
         }
     }
 
-    /// Runs `body` in a child process, so retiring one of the inherited descriptors stands in for a
-    /// supervisor that passed none without disturbing the rest of the test binary.
+    /// Runs `body` in a child process, so rewriting one of the inherited descriptors stands in
+    /// for a supervisor that passed a different one, without disturbing the rest of the binary.
     fn in_child(body: impl FnOnce()) {
         // SAFETY: the fork is taken for its private descriptor table and the child never returns
         // to the test harness.
@@ -283,7 +297,7 @@ mod tests {
         assert_eq!(waited, child, "waitpid: {}", io::Error::last_os_error());
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "the child retiring an inherited descriptor failed"
+            "the child rewriting an inherited descriptor failed"
         );
     }
 
@@ -298,15 +312,23 @@ mod tests {
         }
     }
 
-    /// The drive the inherited bootstrap image backs.
-    fn bootstrap_drive(drive_id: &str) -> BlockDeviceConfig {
+    /// The drive the inherited scratch descriptor backs.
+    fn scratch_drive(drive_id: &str) -> BlockDeviceConfig {
         BlockDeviceConfig {
             drive_id: drive_id.to_string(),
             is_root_device: false,
-            is_read_only: Some(true),
-            fd: BOOTSTRAP_DESCRIPTOR_FILENO,
+            is_read_only: Some(false),
+            fd: SCRATCH_DESCRIPTOR_FILENO,
             ..Default::default()
         }
+    }
+
+    /// Installs `source` at one of the numbers the jailer reserves, which only a child of the
+    /// test binary may do.
+    fn install(source: RawFd, reserved: RawFd) {
+        // SAFETY: `dup2` rewrites this process' own descriptor table alone.
+        let installed = unsafe { libc::dup2(source, reserved) };
+        assert_eq!(installed, reserved, "dup2");
     }
 
     #[test]
@@ -316,20 +338,20 @@ mod tests {
     }
 
     #[test]
-    fn test_add_bootstrap_block_device() {
-        let bootstrap = bootstrap_drive("1");
+    fn test_add_scratch_block_device() {
+        let scratch = scratch_drive("1");
 
         let mut block_devs = BlockBuilder::new();
-        block_devs.insert(bootstrap.clone()).unwrap();
+        block_devs.insert(scratch.clone()).unwrap();
 
         assert!(!block_devs.has_root_device());
         assert_eq!(block_devs.devices.len(), 1);
         assert_eq!(block_devs.get_index_of_drive_id("1"), Some(0));
 
         let block = block_devs.devices[0].lock().unwrap();
-        assert_eq!(block.id(), bootstrap.drive_id);
-        assert_eq!(block.partuuid(), &bootstrap.partuuid);
-        assert!(block.read_only());
+        assert_eq!(block.id(), scratch.drive_id);
+        assert_eq!(block.partuuid(), &scratch.partuuid);
+        assert!(!block.read_only());
     }
 
     #[test]
@@ -361,8 +383,8 @@ mod tests {
     // The root device is first in the list whichever order the drives were added in.
     fn test_root_block_device_is_first() {
         for order in [
-            [root_drive("1"), bootstrap_drive("2")],
-            [bootstrap_drive("2"), root_drive("1")],
+            [root_drive("1"), scratch_drive("2")],
+            [scratch_drive("2"), root_drive("1")],
         ] {
             let mut block_devs = BlockBuilder::new();
             for config in order {
@@ -378,27 +400,25 @@ mod tests {
 
     #[test]
     fn test_update() {
-        let mut bootstrap = bootstrap_drive("2");
+        let mut scratch = scratch_drive("2");
 
         let mut block_devs = BlockBuilder::new();
         block_devs.insert(root_drive("1")).unwrap();
-        block_devs.insert(bootstrap.clone()).unwrap();
+        block_devs.insert(scratch.clone()).unwrap();
 
         assert_eq!(block_devs.get_index_of_drive_id("1"), Some(0));
         assert!(block_devs.get_index_of_drive_id("foo").is_none());
 
         // Update OK.
-        bootstrap.partuuid = Some("0eaa91a0-02".to_string());
-        block_devs.insert(bootstrap.clone()).unwrap();
+        scratch.partuuid = Some("0eaa91a0-02".to_string());
+        block_devs.insert(scratch.clone()).unwrap();
 
-        let index = block_devs
-            .get_index_of_drive_id(&bootstrap.drive_id)
-            .unwrap();
+        let index = block_devs.get_index_of_drive_id("2").unwrap();
         assert_eq!(
             block_devs.devices[index].lock().unwrap().partuuid(),
-            &bootstrap.partuuid
+            &scratch.partuuid
         );
-        assert!(block_devs.devices[index].lock().unwrap().read_only());
+        assert!(!block_devs.devices[index].lock().unwrap().read_only());
 
         // Update with 2 root block devices.
         let mut second_root = root_drive("2");
@@ -433,7 +453,7 @@ mod tests {
     #[test]
     fn test_add_device() {
         let mut block_devs = BlockBuilder::new();
-        let block = Block::new(bootstrap_drive("test_id")).unwrap();
+        let block = Block::new(scratch_drive("test_id")).unwrap();
 
         block_devs.add_virtio_device(Arc::new(Mutex::new(block)));
         assert_eq!(block_devs.devices.len(), 1);
@@ -445,14 +465,14 @@ mod tests {
 
     #[test]
     fn test_descriptor_admission_matrix() {
-        // The root image backs the root device, the bootstrap image a second drive that never is.
+        // The root image backs the root device, the scratch descriptor a drive that never is.
         assert_eq!(
             root_drive("root").descriptor().unwrap(),
             ROOT_DESCRIPTOR_FILENO
         );
         assert_eq!(
-            bootstrap_drive("bootstrap").descriptor().unwrap(),
-            BOOTSTRAP_DESCRIPTOR_FILENO
+            scratch_drive("scratch").descriptor().unwrap(),
+            SCRATCH_DESCRIPTOR_FILENO
         );
 
         // Neither descriptor backs the other's role.
@@ -463,11 +483,11 @@ mod tests {
             DriveError::DescriptorRoleMismatch(ROOT_DESCRIPTOR_FILENO)
         );
 
-        let mut promoted_bootstrap = bootstrap_drive("bootstrap");
-        promoted_bootstrap.is_root_device = true;
+        let mut promoted_scratch = scratch_drive("scratch");
+        promoted_scratch.is_root_device = true;
         assert_eq!(
-            promoted_bootstrap.descriptor().unwrap_err(),
-            DriveError::DescriptorRoleMismatch(BOOTSTRAP_DESCRIPTOR_FILENO)
+            promoted_scratch.descriptor().unwrap_err(),
+            DriveError::DescriptorRoleMismatch(SCRATCH_DESCRIPTOR_FILENO)
         );
 
         // No other number names a drive's backing store.
@@ -480,57 +500,71 @@ mod tests {
             );
         }
 
-        // An inherited image is neither writable nor flushable.
-        let mut writable = root_drive("root");
-        writable.is_read_only = Some(false);
-        assert_eq!(
-            writable.descriptor().unwrap_err(),
-            DriveError::WritableDrive
-        );
+        // The root image is read-only, so the drive it backs cannot be writable.
+        for is_read_only in [Some(false), None] {
+            let mut writable = root_drive("root");
+            writable.is_read_only = is_read_only;
+            assert_eq!(
+                writable.descriptor().unwrap_err(),
+                DriveError::WritableDrive
+            );
+        }
 
-        let mut unspecified = root_drive("root");
-        unspecified.is_read_only = None;
-        assert_eq!(
-            unspecified.descriptor().unwrap_err(),
-            DriveError::WritableDrive
-        );
+        // The scratch descriptor is read-write, so the drive it backs cannot be read-only.
+        for is_read_only in [Some(true), None] {
+            let mut read_only = scratch_drive("scratch");
+            read_only.is_read_only = is_read_only;
+            assert_eq!(
+                read_only.descriptor().unwrap_err(),
+                DriveError::ReadOnlyScratchDrive
+            );
+        }
 
-        let mut writeback = root_drive("root");
-        writeback.cache_type = CacheType::Writeback;
-        assert_eq!(
-            writeback.descriptor().unwrap_err(),
-            DriveError::ReadOnlyWriteback
-        );
+        // Neither drive has a write-back cache to flush.
+        for mut writeback in [root_drive("root"), scratch_drive("scratch")] {
+            writeback.cache_type = CacheType::Writeback;
+            assert_eq!(
+                writeback.descriptor().unwrap_err(),
+                DriveError::ReadOnlyWriteback
+            );
+        }
     }
 
     #[test]
     fn test_uninherited_descriptor_is_refused() {
         in_child(|| {
-            // A supervisor that passes no bootstrap descriptor leaves the number closed.
+            // A supervisor that passes no scratch descriptor leaves the number closed.
             // SAFETY: the descriptor belongs to this child alone.
-            assert_eq!(unsafe { libc::close(BOOTSTRAP_DESCRIPTOR_FILENO) }, 0);
+            assert_eq!(unsafe { libc::close(SCRATCH_DESCRIPTOR_FILENO) }, 0);
             assert_eq!(
-                bootstrap_drive("bootstrap").descriptor().unwrap_err(),
+                scratch_drive("scratch").descriptor().unwrap_err(),
                 DriveError::DescriptorNotInherited(
-                    BOOTSTRAP_DESCRIPTOR_FILENO,
+                    SCRATCH_DESCRIPTOR_FILENO,
                     io::Error::from_raw_os_error(libc::EBADF)
                 )
             );
+        });
+    }
 
-            // A writable descriptor never carries an admitted image.
-            let writable_image = TempFile::new().unwrap();
-            writable_image.as_file().set_len(0x1000).unwrap();
-            // SAFETY: `dup2` rewrites this child's own descriptor table alone.
-            let installed = unsafe {
-                libc::dup2(
-                    writable_image.as_file().as_raw_fd(),
-                    BOOTSTRAP_DESCRIPTOR_FILENO,
-                )
-            };
-            assert_eq!(installed, BOOTSTRAP_DESCRIPTOR_FILENO);
+    #[test]
+    fn test_descriptor_access_mode_is_refused() {
+        in_child(|| {
+            let image = TempFile::new().unwrap();
+            image.as_file().set_len(0x1000).unwrap();
+
+            // A writable descriptor never carries the root image.
+            install(image.as_file().as_raw_fd(), ROOT_DESCRIPTOR_FILENO);
             assert_eq!(
-                bootstrap_drive("bootstrap").descriptor().unwrap_err(),
-                DriveError::WritableDescriptor(BOOTSTRAP_DESCRIPTOR_FILENO)
+                root_drive("root").descriptor().unwrap_err(),
+                DriveError::WritableDescriptor(ROOT_DESCRIPTOR_FILENO)
+            );
+
+            // A read-only descriptor carries no disk the guest can write.
+            let read_only = File::open(image.as_path()).unwrap();
+            install(read_only.as_raw_fd(), SCRATCH_DESCRIPTOR_FILENO);
+            assert_eq!(
+                scratch_drive("scratch").descriptor().unwrap_err(),
+                DriveError::ReadOnlyScratchDescriptor(SCRATCH_DESCRIPTOR_FILENO)
             );
         });
     }
@@ -539,19 +573,24 @@ mod tests {
     fn test_insert_descriptor_backed_drives() {
         let mut block_devs = BlockBuilder::new();
         block_devs.insert(root_drive("root")).unwrap();
-        block_devs.insert(bootstrap_drive("bootstrap")).unwrap();
+        block_devs.insert(scratch_drive("scratch")).unwrap();
 
         assert!(block_devs.has_root_device());
         for device in &block_devs.devices {
             let block = device.lock().unwrap();
-            assert!(block.read_only());
-            assert_ne!(block.avail_features() & (1u64 << VIRTIO_BLK_F_RO), 0);
+            // Only the root image is read-only, and only it advertises the feature.
+            let read_only = block.root_device();
+            assert_eq!(block.read_only(), read_only);
+            assert_eq!(
+                block.avail_features() & (1u64 << VIRTIO_BLK_F_RO) != 0,
+                read_only
+            );
         }
 
         let configs = block_devs.configs();
         assert_eq!(configs[0].fd, ROOT_DESCRIPTOR_FILENO);
         assert!(configs[0].is_root_device);
-        assert_eq!(configs[1].fd, BOOTSTRAP_DESCRIPTOR_FILENO);
+        assert_eq!(configs[1].fd, SCRATCH_DESCRIPTOR_FILENO);
         assert!(!configs[1].is_root_device);
     }
 }
