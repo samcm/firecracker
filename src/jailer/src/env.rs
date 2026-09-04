@@ -19,7 +19,7 @@ use vmm_sys_util::syscall::SyscallReturnCode;
 
 use crate::chroot::chroot;
 use crate::resource_limits::{FSIZE_ARG, MEMLOCK_ARG, NO_FILE_ARG, ResourceLimits};
-use crate::{BOOTSTRAP_FILENO, JailerError, ROOT_FILENO, UFFD_FILENO, close_inherited_fds};
+use crate::{JailerError, ROOT_FILENO, SCRATCH_FILENO, UFFD_FILENO, close_inherited_fds};
 
 const DEV_KVM: &CStr = c"/dev/kvm";
 const DEV_KVM_MAJOR: u32 = 10;
@@ -81,12 +81,12 @@ fn open_userfaultfd_device() -> Result<RawFd, JailerError> {
 /// Moves `fd` past the descriptor numbers reserved for Firecracker, so that renumbering one of
 /// them cannot overwrite the other. The copy is returned and the original is closed.
 fn move_off_reserved_fds(fd: RawFd) -> Result<RawFd, JailerError> {
-    if fd > BOOTSTRAP_FILENO {
+    if fd > SCRATCH_FILENO {
         return Ok(fd);
     }
     // SAFETY: `F_DUPFD` returns the lowest free descriptor number greater than or equal to its
     // argument, and the return code is checked.
-    let moved = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_DUPFD, BOOTSTRAP_FILENO + 1) })
+    let moved = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_DUPFD, SCRATCH_FILENO + 1) })
         .into_result()
         .map_err(JailerError::Dup2)?;
     close(fd)?;
@@ -121,7 +121,7 @@ pub struct Env {
     extra_args: Vec<String>,
     resource_limits: ResourceLimits,
     root_fd: RawFd,
-    bootstrap_fd: Option<RawFd>,
+    scratch_fd: Option<RawFd>,
     cgroup_join: Option<PathBuf>,
 }
 
@@ -179,11 +179,11 @@ impl Env {
             .parse::<RawFd>()
             .map_err(|_| JailerError::RootFdArgument(root_fd_str.to_owned()))?;
 
-        let bootstrap_fd = arguments
-            .single_value("bootstrap-fd")
+        let scratch_fd = arguments
+            .single_value("scratch-fd")
             .map(|fd| {
                 fd.parse::<RawFd>()
-                    .map_err(|_| JailerError::BootstrapFdArgument(fd.to_owned()))
+                    .map_err(|_| JailerError::ScratchFdArgument(fd.to_owned()))
             })
             .transpose()?;
 
@@ -216,7 +216,7 @@ impl Env {
             extra_args: arguments.extra_args(),
             resource_limits,
             root_fd,
-            bootstrap_fd,
+            scratch_fd,
             cgroup_join,
         })
     }
@@ -396,35 +396,33 @@ impl Env {
     }
 
     /// Hands Firecracker the userfaultfd device as [`UFFD_FILENO`], the root image as
-    /// [`ROOT_FILENO`] and, when the caller passes one, the bootstrap image as
-    /// [`BOOTSTRAP_FILENO`]. Every passed descriptor is moved clear of the reserved slots first,
+    /// [`ROOT_FILENO`] and, when the caller passes one, the writable scratch disk as
+    /// [`SCRATCH_FILENO`]. Every passed descriptor is moved clear of the reserved slots first,
     /// because the caller is free to pass them in at any number.
     fn install_inherited_fds(&self) -> Result<(), JailerError> {
         let uffd_device = open_userfaultfd_device()?;
 
         validate_image_fd("--root-fd", self.root_fd, self.uid())?;
-        let root_fd = move_off_reserved_fds(self.root_fd)?;
+        if let Some(fd) = self.scratch_fd {
+            validate_scratch_fd("--scratch-fd", fd)?;
+            reject_root_alias(self.root_fd, fd)?;
+        }
 
-        let bootstrap_fd = match self.bootstrap_fd {
-            Some(fd) => {
-                validate_image_fd("--bootstrap-fd", fd, self.uid())?;
-                Some(move_off_reserved_fds(fd)?)
-            }
-            None => None,
-        };
+        let root_fd = move_off_reserved_fds(self.root_fd)?;
+        let scratch_fd = self.scratch_fd.map(move_off_reserved_fds).transpose()?;
 
         place_fd(uffd_device, UFFD_FILENO)?;
         place_fd(root_fd, ROOT_FILENO)?;
-        match bootstrap_fd {
-            Some(fd) => place_fd(fd, BOOTSTRAP_FILENO),
+        match scratch_fd {
+            Some(fd) => place_fd(fd, SCRATCH_FILENO),
             None => Ok(()),
         }
     }
 
     /// Last descriptor number Firecracker is given, which is the highest one that survives exec.
     fn highest_reserved_fd(&self) -> libc::c_int {
-        match self.bootstrap_fd {
-            Some(_) => BOOTSTRAP_FILENO,
+        match self.scratch_fd {
+            Some(_) => SCRATCH_FILENO,
             None => ROOT_FILENO,
         }
     }
@@ -689,7 +687,7 @@ fn validate_unwritable_image(
 /// The standard streams are the whole set of descriptors that reach Firecracker without the jailer
 /// choosing what they refer to: `close_inherited_fds` keeps them so the jailed process can log,
 /// [`UFFD_FILENO`] is a device the jailer opens itself, and [`ROOT_FILENO`] and
-/// [`BOOTSTRAP_FILENO`] are overwritten by the images it places there or closed with the rest. So a
+/// [`SCRATCH_FILENO`] are overwritten by the images it places there or closed with the rest. So a
 /// caller that points a standard stream at the image inode with an access mode that includes
 /// writing is the one way a writable alias survives into the jail, and that is refused here.
 fn reject_writable_stream_aliases(
@@ -723,6 +721,73 @@ fn reject_writable_stream_aliases(
     }
 
     Ok(())
+}
+
+/// Checks that `fd` is the descriptor the supervisor is contracted to pass for the scratch disk:
+/// a non-empty regular file on the node's filesystem, opened read-write for direct I/O. The inode
+/// is meant to be writable by the jail, so no permission, ownership or mode bit is read.
+fn validate_scratch_fd(flag: &'static str, fd: RawFd) -> Result<(), JailerError> {
+    // SAFETY: `F_GETFL` writes nothing and the return code is checked.
+    let flags = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GETFL) })
+        .into_result()
+        .map_err(|err| JailerError::ScratchFdInspect(flag, err))?;
+    // An `O_PATH` descriptor reports an access mode of `O_RDONLY` while referring to the inode
+    // without granting any access at all, so it is rejected explicitly.
+    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE != libc::O_RDWR {
+        return Err(JailerError::ScratchFdNotReadWrite(flag));
+    }
+    // `O_APPEND` moves every write to the end of the file, wherever the guest aimed it.
+    if flags & libc::O_APPEND != 0 {
+        return Err(JailerError::ScratchFdAppend(flag));
+    }
+
+    let stat = inode_of(fd).map_err(|err| JailerError::ScratchFdInspect(flag, err))?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(JailerError::ScratchFdNotRegularFile(flag));
+    }
+    if stat.st_size == 0 {
+        return Err(JailerError::ScratchFdEmpty(flag));
+    }
+
+    // Every shmem and hugetlbfs inode answers `F_GET_SEALS` and every other filesystem fails it
+    // with EINVAL, so an answer means the disk is the node's memory and not its filesystem.
+    // SAFETY: `F_GET_SEALS` writes nothing and the return code is checked.
+    match SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GET_SEALS) }).into_result() {
+        Ok(_) => return Err(JailerError::ScratchFdSealingFilesystem(flag)),
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {}
+        Err(err) => return Err(JailerError::ScratchFdInspect(flag, err)),
+    }
+
+    // The guest's reads and writes reach the disk itself, so the host holds no second copy of a
+    // sandbox's data in its page cache.
+    if flags & libc::O_DIRECT == 0 {
+        return Err(JailerError::ScratchFdNotDirect(flag));
+    }
+
+    Ok(())
+}
+
+/// Refuses a scratch descriptor that names the root image inode. A caller could open one inode
+/// twice, read-only for the root slot and writable for the scratch slot, and the guest would
+/// reach the immutable root image through the writes it makes to its own disk.
+fn reject_root_alias(root_fd: RawFd, scratch_fd: RawFd) -> Result<(), JailerError> {
+    let root = inode_of(root_fd).map_err(|err| JailerError::ImageFdInspect("--root-fd", err))?;
+    let scratch =
+        inode_of(scratch_fd).map_err(|err| JailerError::ScratchFdInspect("--scratch-fd", err))?;
+    if root.st_dev == scratch.st_dev && root.st_ino == scratch.st_ino {
+        return Err(JailerError::ScratchFdAliasesRoot);
+    }
+
+    Ok(())
+}
+
+/// The inode `fd` refers to.
+fn inode_of(fd: RawFd) -> Result<libc::stat, io::Error> {
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat` is a valid, aligned, sufficiently sized allocation for a `libc::stat`.
+    SyscallReturnCode(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }).into_empty_result()?;
+    // SAFETY: `fstat` returned success, so it initialized the whole struct.
+    Ok(unsafe { stat.assume_init() })
 }
 
 #[cfg(test)]
@@ -803,30 +868,30 @@ mod tests {
         assert_eq!(env.uid(), 1001);
         assert_eq!(env.gid(), 1002);
         assert_eq!(env.root_fd, 7);
-        assert_eq!(env.bootstrap_fd, None);
+        assert_eq!(env.scratch_fd, None);
         assert_eq!(env.highest_reserved_fd(), ROOT_FILENO);
     }
 
-    /// A bootstrap image is optional, and reserving fd 5 follows from passing one.
+    /// A scratch disk is optional, and reserving fd 5 follows from passing one.
     #[test]
-    fn test_bootstrap_fd_reserves_its_slot_only_when_passed() {
-        let env = new_env(&cmdline(
-            "7",
-            &["--chroot-base-dir", "/", "--bootstrap-fd", "8"],
-        ))
-        .unwrap();
-        assert_eq!(env.bootstrap_fd, Some(8));
-        assert_eq!(env.highest_reserved_fd(), BOOTSTRAP_FILENO);
+    fn test_scratch_fd_reserves_its_slot_only_when_passed() {
+        let args = cmdline("7", &["--chroot-base-dir", "/", "--scratch-fd", "8"]);
+        let env = new_env(&args).unwrap();
+
+        assert_eq!(env.scratch_fd, Some(8));
+        assert_eq!(env.highest_reserved_fd(), SCRATCH_FILENO);
     }
 
     #[test]
-    fn test_bootstrap_fd_must_be_a_descriptor_number() {
+    fn test_scratch_fd_must_be_a_descriptor_number() {
+        let args = cmdline(
+            "7",
+            &["--chroot-base-dir", "/", "--scratch-fd", "/dev/scratch"],
+        );
+
         assert!(matches!(
-            new_env(&cmdline(
-                "7",
-                &["--chroot-base-dir", "/", "--bootstrap-fd", "/dev/bootstrap"]
-            )),
-            Err(JailerError::BootstrapFdArgument(_))
+            new_env(&args),
+            Err(JailerError::ScratchFdArgument(_))
         ));
     }
 
@@ -945,58 +1010,6 @@ mod tests {
         assert!(fd >= 0, "{}", io::Error::last_os_error());
         fs::remove_file(&path).unwrap();
         fd
-    }
-
-    /// The bootstrap image is held to the same contract as the root image, reported under its own
-    /// flag name so a caller can tell which descriptor it got wrong.
-    #[test]
-    fn test_validate_bootstrap_fd_holds_the_root_contract() {
-        let sealed = memfd(4096, REQUIRED_IMAGE_SEALS);
-        let read_only = reopen_read_only(sealed);
-        validate_image_fd("--bootstrap-fd", read_only, other_uid()).unwrap();
-        close(read_only).unwrap();
-
-        assert!(matches!(
-            validate_image_fd("--bootstrap-fd", sealed, other_uid()),
-            Err(JailerError::ImageFdNotReadOnly("--bootstrap-fd"))
-        ));
-        close(sealed).unwrap();
-
-        let unsealed = memfd(4096, libc::F_SEAL_WRITE);
-        let read_only = reopen_read_only(unsealed);
-        assert!(matches!(
-            validate_image_fd("--bootstrap-fd", read_only, other_uid()),
-            Err(JailerError::ImageFdNotSealed("--bootstrap-fd"))
-        ));
-        close(read_only).unwrap();
-        close(unsealed).unwrap();
-
-        let empty = memfd(0, REQUIRED_IMAGE_SEALS);
-        let read_only = reopen_read_only(empty);
-        assert!(matches!(
-            validate_image_fd("--bootstrap-fd", read_only, other_uid()),
-            Err(JailerError::ImageFdEmpty("--bootstrap-fd"))
-        ));
-        close(read_only).unwrap();
-        close(empty).unwrap();
-
-        let mut pipe = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        assert!(matches!(
-            validate_image_fd("--bootstrap-fd", pipe[0], other_uid()),
-            Err(JailerError::ImageFdNotRegularFile("--bootstrap-fd"))
-        ));
-        close(pipe[0]).unwrap();
-        close(pipe[1]).unwrap();
-
-        let owner = jail_owner_uid();
-        let regular = regular_image_owned_by(owner, 0o400, 4096);
-        validate_image_fd("--bootstrap-fd", regular, other_uid()).unwrap();
-        assert!(matches!(
-            validate_image_fd("--bootstrap-fd", regular, owner),
-            Err(JailerError::ImageFdOwnedByJailUid("--bootstrap-fd"))
-        ));
-        close(regular).unwrap();
     }
 
     #[test]
@@ -1247,5 +1260,221 @@ mod tests {
 
         close(read_only).unwrap();
         close(writable).unwrap();
+    }
+
+    /// Creates a regular file of `size` bytes and returns a descriptor on it opened with
+    /// `open_flags`, which must include `O_DIRECT`. A filesystem that refuses direct I/O holds no
+    /// scratch disk, so the caller gets no descriptor and skips.
+    fn scratch_file_opened(size: u64, open_flags: libc::c_int) -> Option<RawFd> {
+        let dir = regular_image_dir();
+        let path = dir.join(format!(
+            "jailer-scratch-{}",
+            vmm_sys_util::rand::rand_alphanumerics(8)
+                .into_string()
+                .unwrap()
+        ));
+        let file = File::create(&path).unwrap();
+        file.set_len(size).unwrap();
+        drop(file);
+        fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+
+        let cstr = CString::new(path.to_str().unwrap()).unwrap();
+        let fd = unsafe { libc::open(cstr.as_ptr(), open_flags | libc::O_CLOEXEC) };
+        let err = io::Error::last_os_error();
+        fs::remove_file(&path).unwrap();
+        if fd < 0 && err.raw_os_error() == Some(libc::EINVAL) {
+            eprintln!("skipped: {} does not support O_DIRECT", dir.display());
+            return None;
+        }
+        assert!(fd >= 0, "{}", err);
+        Some(fd)
+    }
+
+    /// A fifo opened read-write, which is the non-regular inode a scratch descriptor can name
+    /// while still carrying the access mode the contract asks for.
+    fn read_write_fifo() -> RawFd {
+        let path = regular_image_dir().join(format!(
+            "jailer-fifo-{}",
+            vmm_sys_util::rand::rand_alphanumerics(8)
+                .into_string()
+                .unwrap()
+        ));
+
+        let cstr = CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let fd = unsafe { libc::open(cstr.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "{}", io::Error::last_os_error());
+        fs::remove_file(&path).unwrap();
+        fd
+    }
+
+    /// The scratch disk is a file on the node the guest reads and writes at offsets of its own
+    /// choosing, which is what the supervisor is contracted to hand over.
+    #[test]
+    fn test_validate_scratch_fd_accepts_read_write_direct_regular_file() {
+        let flags = libc::O_RDWR | libc::O_DIRECT;
+        let Some(fd) = scratch_file_opened(4096, flags) else {
+            return;
+        };
+
+        validate_scratch_fd("--scratch-fd", fd).unwrap();
+
+        close(fd).unwrap();
+    }
+
+    /// The two slots are held to opposite contracts, so neither of them takes the descriptor the
+    /// other one is given.
+    #[test]
+    fn test_root_and_scratch_contracts_refuse_each_others_descriptor() {
+        let flags = libc::O_RDWR | libc::O_DIRECT;
+        let Some(scratch) = scratch_file_opened(4096, flags) else {
+            return;
+        };
+
+        assert!(matches!(
+            validate_image_fd("--root-fd", scratch, other_uid()),
+            Err(JailerError::ImageFdNotReadOnly("--root-fd"))
+        ));
+        close(scratch).unwrap();
+
+        let image = regular_image(0o400, 4096);
+        assert!(matches!(
+            validate_scratch_fd("--scratch-fd", image),
+            Err(JailerError::ScratchFdNotReadWrite("--scratch-fd"))
+        ));
+        close(image).unwrap();
+    }
+
+    /// An `O_PATH` descriptor reports an access mode of `O_RDONLY` while granting no access at
+    /// all, so the access mode alone must not decide the question.
+    #[test]
+    fn test_validate_scratch_fd_rejects_o_path_fd() {
+        let fd = regular_image_opened(0o600, 4096, libc::O_PATH, None);
+
+        assert!(matches!(
+            validate_scratch_fd("--scratch-fd", fd),
+            Err(JailerError::ScratchFdNotReadWrite("--scratch-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_validate_scratch_fd_rejects_read_only_fd() {
+        let flags = libc::O_RDONLY | libc::O_DIRECT;
+        let Some(fd) = scratch_file_opened(4096, flags) else {
+            return;
+        };
+
+        assert!(matches!(
+            validate_scratch_fd("--scratch-fd", fd),
+            Err(JailerError::ScratchFdNotReadWrite("--scratch-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    /// `O_APPEND` moves every write to the end of the file, so a guest writing its first block
+    /// would land wherever the disk happens to end.
+    #[test]
+    fn test_validate_scratch_fd_rejects_o_append_fd() {
+        let flags = libc::O_RDWR | libc::O_DIRECT | libc::O_APPEND;
+        let Some(fd) = scratch_file_opened(4096, flags) else {
+            return;
+        };
+
+        assert!(matches!(
+            validate_scratch_fd("--scratch-fd", fd),
+            Err(JailerError::ScratchFdAppend("--scratch-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    /// Buffered writes leave a second copy of every sandbox's disk in the node's page cache,
+    /// which is the memory the sandboxes are sized against.
+    #[test]
+    fn test_validate_scratch_fd_rejects_buffered_fd() {
+        let fd = regular_image_opened(0o600, 4096, libc::O_RDWR, None);
+
+        assert!(matches!(
+            validate_scratch_fd("--scratch-fd", fd),
+            Err(JailerError::ScratchFdNotDirect("--scratch-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_validate_scratch_fd_rejects_empty_file() {
+        let flags = libc::O_RDWR | libc::O_DIRECT;
+        let Some(fd) = scratch_file_opened(0, flags) else {
+            return;
+        };
+
+        assert!(matches!(
+            validate_scratch_fd("--scratch-fd", fd),
+            Err(JailerError::ScratchFdEmpty("--scratch-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_validate_scratch_fd_rejects_non_regular_fd() {
+        let fd = read_write_fifo();
+
+        assert!(matches!(
+            validate_scratch_fd("--scratch-fd", fd),
+            Err(JailerError::ScratchFdNotRegularFile("--scratch-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    /// A sandbox disk on shmem or hugetlbfs is the node's memory rather than its storage, and
+    /// answering `F_GET_SEALS` at all is what tells those two filesystems apart from the rest.
+    #[test]
+    fn test_validate_scratch_fd_rejects_sealed_memfd() {
+        let fd = memfd(4096, REQUIRED_IMAGE_SEALS);
+
+        assert!(matches!(
+            validate_scratch_fd("--scratch-fd", fd),
+            Err(JailerError::ScratchFdSealingFilesystem("--scratch-fd"))
+        ));
+
+        close(fd).unwrap();
+    }
+
+    /// A caller can open one inode twice, read-only for the root slot and writable for the
+    /// scratch slot, which would leave the guest writing the immutable root image.
+    #[test]
+    fn test_reject_root_alias_refuses_one_inode_in_both_slots() {
+        let flags = libc::O_RDWR | libc::O_DIRECT;
+        let Some(scratch) = scratch_file_opened(4096, flags) else {
+            return;
+        };
+        let root = reopen_read_only(scratch);
+
+        assert!(matches!(
+            reject_root_alias(root, scratch),
+            Err(JailerError::ScratchFdAliasesRoot)
+        ));
+
+        // Two descriptors on inodes of their own are what the supervisor is contracted to pass,
+        // so the check must not refuse them.
+        let Some(other) = scratch_file_opened(4096, flags) else {
+            return;
+        };
+        reject_root_alias(root, other).unwrap();
+
+        close(other).unwrap();
+        close(root).unwrap();
+        close(scratch).unwrap();
     }
 }

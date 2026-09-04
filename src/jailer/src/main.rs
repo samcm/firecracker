@@ -23,9 +23,9 @@ const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const UFFD_FILENO: libc::c_int = 3;
 /// Descriptor Firecracker reads the read-only root block device image from.
 pub(crate) const ROOT_FILENO: libc::c_int = 4;
-/// Descriptor Firecracker reads the read-only bootstrap block device image from, when the caller
+/// Descriptor Firecracker reads and writes the scratch block device through, when the caller
 /// passes one.
-pub(crate) const BOOTSTRAP_FILENO: libc::c_int = 5;
+pub(crate) const SCRATCH_FILENO: libc::c_int = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JailerError {
@@ -97,8 +97,6 @@ pub enum JailerError {
     ResLimitValue(String, String),
     #[error("Failed to remove old jail root directory: {0}")]
     RmOldRootDir(io::Error),
-    #[error("--bootstrap-fd is not a descriptor number: {0}")]
-    BootstrapFdArgument(String),
     #[error("--root-fd is not a descriptor number: {0}")]
     RootFdArgument(String),
     #[error("{0} must have a nonzero size")]
@@ -123,6 +121,24 @@ pub enum JailerError {
     ImageFdWritablePermissions(&'static str),
     #[error("{0} shares an inode with fd {1}, which is open for writing and survives the exec")]
     ImageFdWritableStreamAlias(&'static str, libc::c_int),
+    #[error("--scratch-fd must not name the root image inode")]
+    ScratchFdAliasesRoot,
+    #[error("{0} must not be opened O_APPEND")]
+    ScratchFdAppend(&'static str),
+    #[error("--scratch-fd is not a descriptor number: {0}")]
+    ScratchFdArgument(String),
+    #[error("{0} must have a nonzero size")]
+    ScratchFdEmpty(&'static str),
+    #[error("Failed to inspect {0}: {1}")]
+    ScratchFdInspect(&'static str, io::Error),
+    #[error("{0} must be opened O_DIRECT")]
+    ScratchFdNotDirect(&'static str),
+    #[error("{0} must be opened O_RDWR")]
+    ScratchFdNotReadWrite(&'static str),
+    #[error("{0} must be a regular file")]
+    ScratchFdNotRegularFile(&'static str),
+    #[error("{0} must be a file on the node's filesystem, not on shmem or hugetlbfs")]
+    ScratchFdSealingFilesystem(&'static str),
     #[error("Failed to change current directory: {0}")]
     SetCurrentDir(io::Error),
     #[error("Failed to join network namespace: netns: {0}")]
@@ -179,10 +195,9 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                      and handed to Firecracker as fd 4.",
                 ),
         )
-        .arg(Argument::new("bootstrap-fd").takes_value(true).help(
-            "Inherited read-only descriptor of the bootstrap block device image, either a sealed \
-             memfd or a regular file the jailed uid cannot write. It is validated and handed to \
-             Firecracker as fd 5.",
+        .arg(Argument::new("scratch-fd").takes_value(true).help(
+            "Inherited read-write, O_DIRECT descriptor of the scratch block device, which is a \
+             regular non-empty file. It is validated and handed to Firecracker as fd 5.",
         ))
         .arg(
             Argument::new("chroot-base-dir")
@@ -236,8 +251,8 @@ pub fn readln_special<T: AsRef<Path> + Debug>(file_path: &T) -> Result<String, J
 
 /// Closes every inherited descriptor above the ones the jailed binary needs: the standard
 /// streams and the descriptors Firecracker is given. `highest_reserved` is the last of those:
-/// [`BOOTSTRAP_FILENO`] when the caller passed a bootstrap image, [`ROOT_FILENO`] otherwise, so an
-/// absent bootstrap image leaves fd 5 unreserved.
+/// [`SCRATCH_FILENO`] when the caller passed a scratch descriptor, [`ROOT_FILENO`] otherwise, so
+/// an absent scratch descriptor leaves fd 5 unreserved.
 pub(crate) fn close_inherited_fds(highest_reserved: libc::c_int) -> Result<(), JailerError> {
     // SAFETY: closing a range which holds no open descriptors is a no-op, and the return code
     // of the syscall is checked.
