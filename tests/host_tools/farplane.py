@@ -12,6 +12,7 @@ tests can talk to a real Firecracker over that channel.
 # pylint: disable=too-many-lines
 
 import ctypes
+import errno
 import fcntl
 import hashlib
 import os
@@ -37,7 +38,7 @@ MAGIC = 0x314D5046
 VERSION = 1
 MAX_DATAGRAM = 65536
 MAX_EXTENTS = 65536
-FEATURE_IDENTITY = "farplane/3"
+FEATURE_IDENTITY = "farplane/4"
 
 HEADER = struct.Struct("<IHHQIIQ")
 HELLO = struct.Struct("<IIHHI32s")
@@ -51,7 +52,7 @@ ERROR_BODY = struct.Struct("<IHH128s")
 DEV_USERFAULTFD = Path("/dev/userfaultfd")
 UFFD_DEVICE_FILENO = 3
 ROOT_FILENO = 4
-BOOTSTRAP_FILENO = 5
+SCRATCH_FILENO = 5
 
 ARCH_X86_64 = 1
 ARCH_AARCH64 = 2
@@ -109,6 +110,9 @@ class Err(IntEnum):
     QUIESCE_FAILED = 21
     CAPTURE_ORDER_VIOLATION = 22
     REQUEST_ID_REUSED = 23
+    NO_SCRATCH_DRIVE = 24
+    BAD_CLONE_DESTINATION = 25
+    DISK_CLONE_FAILED = 26
 
 
 F_ADD_SEALS = 1033
@@ -293,17 +297,18 @@ _REGULAR_IMAGE_SUBDIR = "farplane-images"
 
 @cache
 def regular_image_dir():
-    """The directory an ordinary regular image is staged in: the first candidate that seals no
-    inode.
+    """The directory a file the jailer must see on a real filesystem is staged in: the first
+    candidate that seals no inode.
 
-    The session root is tmpfs under `tools/devtool` (`--tmpfs /srv`), so an image published beside
-    the jails answers `F_GET_SEALS` and is held to the sealed-memfd arm of the image descriptor
-    contract, never reaching its regular-file arm. The candidates are the two directories the dev
-    container binds from the host, so an inode created in either carries the host filesystem's
-    answer to that call.
+    The session root is tmpfs under `tools/devtool` (`--tmpfs /srv`), so an inode created beside
+    the jails answers `F_GET_SEALS`. An image that answers it is held to the sealed-memfd arm of
+    the image descriptor contract, never reaching its regular-file arm, and a scratch disk that
+    answers it is refused outright. The candidates are the two directories the dev container
+    binds from the host, so an inode created in either carries the host filesystem's answer to
+    that call.
 
     Raises when every candidate seals its inodes. Skipping instead would take the jailer's
-    regular-file arm out of the run without failing it.
+    regular-file arm and its whole scratch slot out of the run without failing it.
     """
     # `framework.defs` reads the test artifacts as it is imported, and the cross-language wire
     # tests import this module on a runner that has none, so these paths are resolved on use.
@@ -372,6 +377,38 @@ def unpublish_images():
     for published in _PUBLISHED_IMAGES.values():
         published.unlink(missing_ok=True)
     _PUBLISHED_IMAGES.clear()
+
+
+SCRATCH_SIZE = 2 << 20
+
+
+class DirectIoUnsupported(Exception):
+    """Raised when a filesystem refuses the `O_DIRECT` open a scratch descriptor requires."""
+
+
+def open_disk_file(path, *, size=SCRATCH_SIZE, flags=os.O_RDWR | os.O_DIRECT):
+    """Open `path` as the backing file of a block device, creating it with `size` bytes first.
+
+    Both files the disk contract names are ordinary inodes on the node's own filesystem: the
+    scratch slot's `O_RDWR | O_DIRECT` disk, whose reads and writes reach it rather than a second
+    copy in the host's page cache, and the read-write destination a capture's clone lands in.
+    `size` is `None` to open a file that already exists, and `size` and `flags` otherwise exist so
+    a caller can offer a descriptor that breaks one property of either contract.
+    """
+    path = Path(path)
+    if size is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as disk:
+            disk.truncate(size)
+    try:
+        return os.open(path, flags | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as err:
+        if err.errno == errno.EINVAL and flags & os.O_DIRECT:
+            raise DirectIoUnsupported(
+                f"{path.parent} is on a filesystem that refuses O_DIRECT, which every scratch"
+                " descriptor carries"
+            ) from err
+        raise
 
 
 class DirtyBitmap:
@@ -911,8 +948,12 @@ class Pagemaster:
 
     # ------------------------------------------------------------ capture cycle
 
-    def capture_buffers(self, dirty_fd=None, vmstate_fd=None):
-        """Hand over the dirty bitmap and vmstate buffers."""
+    def capture_buffers(self, dirty_fd=None, vmstate_fd=None, clone_fd=None):
+        """Hand over the dirty bitmap and vmstate buffers, and a disk clone destination.
+
+        `clone_fd` is the inode the scratch disk is reflinked into inside the quiesce. Without it
+        the epoch carries no disk, which is the only capture a guest with no scratch drive can arm.
+        """
         if dirty_fd is None:
             if self.dirty_fd is not None:
                 os.close(self.dirty_fd)
@@ -933,7 +974,10 @@ class Pagemaster:
                 read_only=False,
             )
             self.vmstate_fd = vmstate_fd
-        return self.request(Msg.CAPTURE_BUFFERS, fds=[dirty_fd, vmstate_fd])
+        fds = [dirty_fd, vmstate_fd]
+        if clone_fd is not None:
+            fds.append(clone_fd)
+        return self.request(Msg.CAPTURE_BUFFERS, fds=fds)
 
     def quiesce(self):
         """Stop the vCPUs; returns the reply."""
@@ -1104,7 +1148,7 @@ class FarplaneMicrovm:
         self.microvm_id = microvm_id
         self.kernel = Path(kernel) if kernel else None
         self.rootfs = Path(rootfs) if rootfs else None
-        self.bootstrap_file = None
+        self.scratch_file = None
         self.netns = netns
         self.uid = uid
         self.gid = gid
@@ -1113,7 +1157,9 @@ class FarplaneMicrovm:
         self.wrapper = None
         self.root_fd = None
         self.root_image_path = None
-        self.bootstrap_fd = None
+        self.scratch_fd = None
+        self.clone_file = None
+        self.clone_fd = None
         self.api = None
         self.pagemaster = None
         self._pid = None
@@ -1173,17 +1219,33 @@ class FarplaneMicrovm:
             )
         return self.root_fd
 
-    def open_bootstrap_memfd(self, *, seals=ROOT_SEALS, read_only=True, size=None):
-        """Create the bootstrap memfd the jailer validates and renumbers to fd 5."""
-        if size is None:
-            self.bootstrap_fd = memfd_from_file(
-                "bootstrap", self.bootstrap_file, seals=seals, read_only=read_only
-            )
-        else:
-            self.bootstrap_fd = sealed_memfd(
-                "bootstrap", size, seals=seals, read_only=read_only
-            )
-        return self.bootstrap_fd
+    def open_scratch_file(
+        self, *, directory=None, size=SCRATCH_SIZE, flags=os.O_RDWR | os.O_DIRECT
+    ):
+        """Create the scratch disk the jailer validates and renumbers to fd 5.
+
+        The slot takes a writable regular file on the node's own filesystem, so the disk is
+        created where an inode refuses `F_GET_SEALS` instead of in the tmpfs session root, and its
+        path is kept in `scratch_file` so a test can read the bytes it holds. `directory`, `size`
+        and `flags` exist so a test can place the disk on a chosen filesystem or offer a
+        descriptor that breaks one property of the scratch descriptor contract.
+        """
+        base = regular_image_dir() if directory is None else Path(directory)
+        self.scratch_file = base / f"{self.microvm_id}-scratch.disk"
+        self.scratch_fd = open_disk_file(self.scratch_file, size=size, flags=flags)
+        return self.scratch_fd
+
+    def open_clone_destination(self, *, directory=None):
+        """Create the file a capture's disk clone lands in and open it read-write.
+
+        A reflink lands on the filesystem the destination inode was created on, so only a
+        destination beside the scratch disk on a reflinking filesystem can hold a clone of it and
+        the directory is the caller's to choose.
+        """
+        base = regular_image_dir() if directory is None else Path(directory)
+        self.clone_file = base / f"{self.microvm_id}-clone.disk"
+        self.clone_fd = open_disk_file(self.clone_file, size=0, flags=os.O_RDWR)
+        return self.clone_fd
 
     def open_root_image_file(self):
         """Open the node's published root image, the other descriptor the jailer accepts for fd 4.
@@ -1231,7 +1293,7 @@ class FarplaneMicrovm:
         self,
         *,
         root_fd=None,
-        bootstrap_fd=None,
+        scratch_fd=None,
         cgroup_join=None,
         resource_limits=(),
         fc_args=(),
@@ -1250,8 +1312,8 @@ class FarplaneMicrovm:
         ]
         if root_fd is not None:
             argv += ["--root-fd", str(root_fd)]
-        if bootstrap_fd is not None:
-            argv += ["--bootstrap-fd", str(bootstrap_fd)]
+        if scratch_fd is not None:
+            argv += ["--scratch-fd", str(scratch_fd)]
         argv += ["--chroot-base-dir", str(self.chroot_base)]
         if self.netns is not None:
             argv += ["--netns", str(self.netns.path)]
@@ -1275,7 +1337,7 @@ class FarplaneMicrovm:
         self,
         *,
         root_fd=-1,
-        bootstrap_fd=-1,
+        scratch_fd=-1,
         cgroup_join=None,
         resource_limits=(),
         fc_args=(),
@@ -1291,18 +1353,11 @@ class FarplaneMicrovm:
             root_fd = (
                 self.root_fd if self.root_fd is not None else self.open_root_memfd()
             )
-        if bootstrap_fd == -1:
-            if self.bootstrap_file is None:
-                bootstrap_fd = None
-            else:
-                bootstrap_fd = (
-                    self.bootstrap_fd
-                    if self.bootstrap_fd is not None
-                    else self.open_bootstrap_memfd()
-                )
+        if scratch_fd == -1:
+            scratch_fd = self.scratch_fd
         argv = self.jailer_argv(
             root_fd=root_fd,
-            bootstrap_fd=bootstrap_fd,
+            scratch_fd=scratch_fd,
             cgroup_join=cgroup_join,
             resource_limits=resource_limits,
             fc_args=fc_args,
@@ -1310,7 +1365,7 @@ class FarplaneMicrovm:
         self.chroot_base.mkdir(parents=True, exist_ok=True)
         stdio = self.stdio.open("wb")
         pass_fds = tuple(
-            fd for fd in [root_fd, bootstrap_fd] if fd is not None and fd >= 0
+            fd for fd in [root_fd, scratch_fd] if fd is not None and fd >= 0
         )
         if via_wrapper:
             # A shell that outlives the exec so the test can kill Firecracker's parent.
@@ -1447,9 +1502,22 @@ class FarplaneMicrovm:
             except OSError:
                 pass
             self.root_fd = None
-        if self.bootstrap_fd is not None:
+        if self.scratch_fd is not None:
             try:
-                os.close(self.bootstrap_fd)
+                os.close(self.scratch_fd)
             except OSError:
                 pass
-            self.bootstrap_fd = None
+            self.scratch_fd = None
+        if self.clone_fd is not None:
+            try:
+                os.close(self.clone_fd)
+            except OSError:
+                pass
+            self.clone_fd = None
+        # The scratch disk and any clone destination are staged outside the tmpfs session root,
+        # so they are removed here rather than left in the tree they were created in.
+        for path in (self.scratch_file, self.clone_file):
+            if path is not None:
+                path.unlink(missing_ok=True)
+        self.scratch_file = None
+        self.clone_file = None

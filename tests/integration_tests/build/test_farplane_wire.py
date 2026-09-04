@@ -44,7 +44,7 @@ def rust_enum(name):
 
 def test_feature_identity_agrees_with_rust():
     """The fake refuses a `hello` whose identity is not this one, so it has to match."""
-    assert fp.FEATURE_IDENTITY == "farplane/3"
+    assert fp.FEATURE_IDENTITY == "farplane/4"
     assert rust_constant("FEATURE_IDENTITY") == fp.FEATURE_IDENTITY
 
 

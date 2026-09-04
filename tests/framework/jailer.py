@@ -30,7 +30,7 @@ class JailerContext:
     extra_args = None
     api_socket_name = None
     root_fd = None
-    bootstrap_fd = None
+    scratch_fd = None
     cgroup_join = None
     resource_limits = None
 
@@ -43,7 +43,7 @@ class JailerContext:
         chroot_base=DEFAULT_CHROOT_PATH,
         netns=None,
         root_fd=None,
-        bootstrap_fd=None,
+        scratch_fd=None,
         cgroup_join=None,
         resource_limits=None,
         **extra_args,
@@ -58,8 +58,9 @@ class JailerContext:
         block device image. The process launching the jailer must let the child
         inherit it, since the jailer renumbers it for the exec'd Firecracker.
 
-        `bootstrap_fd` is the number of the descriptor holding the read-only
-        bootstrap block device image.
+        `scratch_fd` is the number of the descriptor holding the writable
+        scratch block device image, a regular non-empty file opened
+        `O_RDWR | O_DIRECT`.
 
         `cgroup_join` is the absolute cgroupfs path of a pre-created leaf
         cgroup. The jailer only writes its pid there; it creates no cgroup.
@@ -74,7 +75,7 @@ class JailerContext:
         self.extra_args = extra_args
         self.api_socket_name = DEFAULT_USOCKET_NAME
         self.root_fd = root_fd
-        self.bootstrap_fd = bootstrap_fd
+        self.scratch_fd = scratch_fd
         self.cgroup_join = cgroup_join
         self.resource_limits = resource_limits
         assert chroot_base is not None
@@ -103,8 +104,8 @@ class JailerContext:
             jailer_param_list.extend(["--gid", str(self.gid)])
         if self.root_fd is not None:
             jailer_param_list.extend(["--root-fd", str(self.root_fd)])
-        if self.bootstrap_fd is not None:
-            jailer_param_list.extend(["--bootstrap-fd", str(self.bootstrap_fd)])
+        if self.scratch_fd is not None:
+            jailer_param_list.extend(["--scratch-fd", str(self.scratch_fd)])
         if self.chroot_base is not None:
             jailer_param_list.extend(["--chroot-base-dir", str(self.chroot_base)])
         if self.netns is not None:

@@ -40,7 +40,12 @@ from framework.jailer import JailerContext
 from framework.microvm_helpers import MicrovmHelpers
 from framework.properties import global_props
 from framework.utils_cpu_templates import get_cpu_template_name
-from host_tools.farplane import ROOT_FILENO, Pagemaster, memfd_from_file
+from host_tools.farplane import (
+    ROOT_FILENO,
+    Pagemaster,
+    memfd_from_file,
+    open_disk_file,
+)
 from host_tools.fcmetrics import FCMetricsMonitor
 from host_tools.memory import MemoryMonitor
 
@@ -80,7 +85,7 @@ class Microvm:
 
         self.kernel_file = None
         self.rootfs_file = None
-        self.bootstrap_file = None
+        self.scratch_file = None
         self.distro = None
         self.ssh_key = None
         self.initrd_file = None
@@ -113,7 +118,7 @@ class Microvm:
         self.console_log = None
         self.pagemaster = None
         self._root_fd = None
-        self._bootstrap_fd = None
+        self._scratch_fd = None
 
         self.time_api_requests = global_props.host_linux_version != "6.1"
         # disable the HTTP API timings as they cause a lot of false positives
@@ -272,9 +277,9 @@ class Microvm:
         if self._root_fd is not None:
             os.close(self._root_fd)
             self._root_fd = None
-        if self._bootstrap_fd is not None:
-            os.close(self._bootstrap_fd)
-            self._bootstrap_fd = None
+        if self._scratch_fd is not None:
+            os.close(self._scratch_fd)
+            self._scratch_fd = None
         if self._console_fd is not None:
             os.close(self._console_fd)
             self._console_fd = None
@@ -560,10 +565,12 @@ class Microvm:
     ):
         """Spawn the microVM.
 
-        The root image and optional bootstrap image reach Firecracker as
-        read-only descriptors the jailer renumbers to `ROOT_FILENO` and fd 5,
-        and guest memory is served over the memory channel a `Pagemaster` binds
-        inside the jail.
+        The root image reaches Firecracker as a read-only descriptor the jailer
+        renumbers to `ROOT_FILENO`, an optional scratch disk as the writable
+        descriptor it renumbers to fd 5, and guest memory is served over the
+        memory channel a `Pagemaster` binds inside the jail.
+
+        `scratch_file` is the path the scratch disk is created at.
         """
         # pylint: disable=too-many-branches
         self.jailer.setup()
@@ -608,11 +615,11 @@ class Microvm:
         assert self.rootfs_file is not None, "the jailer requires a root image"
         self._root_fd = memfd_from_file("rootfs", self.rootfs_file)
         self.jailer.root_fd = self._root_fd
-        if self.bootstrap_file is not None:
-            self._bootstrap_fd = memfd_from_file("bootstrap", self.bootstrap_file)
-            self.jailer.bootstrap_fd = self._bootstrap_fd
+        if self.scratch_file is not None:
+            self._scratch_fd = open_disk_file(self.scratch_file)
+            self.jailer.scratch_fd = self._scratch_fd
         else:
-            self.jailer.bootstrap_fd = None
+            self.jailer.scratch_fd = None
         self.pagemaster = self.start_pagemaster()
         self.jailer.extra_args["farplane-mem-socket"] = f"/{self.MEM_SOCKET_NAME}"
 
@@ -622,9 +629,9 @@ class Microvm:
             *self.jailer.construct_param_list(),
         ]
 
-        # The jailer execs into Firecracker, so the root and optional bootstrap
+        # The jailer execs into Firecracker, so the root and optional scratch
         # descriptors have to survive the fork: `pass_fds` keeps exactly the
-        # numbers `--root-fd` and `--bootstrap-fd` name open.
+        # numbers `--root-fd` and `--scratch-fd` name open.
         console = self._open_console()
         self._jailer_proc = subprocess.Popen(
             cmd,
@@ -632,7 +639,7 @@ class Microvm:
             stdout=console,
             stderr=console,
             pass_fds=tuple(
-                fd for fd in (self._root_fd, self._bootstrap_fd) if fd is not None
+                fd for fd in (self._root_fd, self._scratch_fd) if fd is not None
             ),
         )
         os.close(console)

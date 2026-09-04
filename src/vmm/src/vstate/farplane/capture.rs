@@ -719,8 +719,9 @@ impl CaptureService {
     }
 
     /// Leaves the capture epoch, restarting the vCPUs when pagemaster asks for it, and hands event
-    /// dispatch back. The initial boot and restore acknowledgement is answered by the handshake
-    /// itself, so on this channel the command is only ever a capture exit.
+    /// dispatch back. The armed buffers go with it, the disk clone destination among them. The
+    /// initial boot and restore acknowledgement is answered by the handshake itself, so on this
+    /// channel the command is only ever a capture exit.
     fn resume(&mut self, request_id: u64, run_vcpus: u32) -> Result<(), ChannelError> {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Resume);
