@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_ulong;
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -766,12 +767,18 @@ fn read_extent_table(fd: &OwnedFd, count: u32) -> Result<Vec<ExtentRecord>, Erro
 /// Parses the vmstate handed over with a restore plan.
 fn parse_vmstate(fd: &OwnedFd) -> Result<MicrovmState, ErrorCode> {
     validate_vmstate_fd(fd.as_raw_fd())?;
-    let mut file = File::from(fd.try_clone().map_err(|_| ErrorCode::VmstateParseFailed)?);
+    let stat = fstat(fd.as_raw_fd()).ok_or(ErrorCode::VmstateParseFailed)?;
+    let len = usize::try_from(stat.st_size).map_err(|_| ErrorCode::VmstateParseFailed)?;
+    let file = File::from(fd.try_clone().map_err(|_| ErrorCode::VmstateParseFailed)?);
     // The finalized image is exact-sized, and the snapshot CRC is at its EOF. Reading from offset
-    // zero through that intrinsic boundary rejects both truncated and appended images.
-    file.seek(SeekFrom::Start(0))
+    // zero through that intrinsic boundary rejects both truncated and appended images. The reads
+    // are positional: a descriptor received over a socket shares its open file description, and
+    // so its offset, with every other holder, and siblings restoring the same image at the same
+    // instant must not move each other's cursor.
+    let mut image = vec![0u8; len];
+    file.read_exact_at(&mut image, 0)
         .map_err(|_| ErrorCode::VmstateParseFailed)?;
-    Snapshot::<MicrovmState>::load(&mut file)
+    Snapshot::<MicrovmState>::load(&mut io::Cursor::new(image))
         .map(|snapshot| snapshot.data)
         .map_err(|_| ErrorCode::VmstateParseFailed)
 }
@@ -1185,6 +1192,13 @@ mod tests {
         let exact = finalized_vmstate(&bytes);
         assert_eq!(validate_vmstate_fd(exact.as_raw_fd()), Ok(()));
         parse_vmstate(&exact).unwrap();
+
+        // A sibling holding the same open file description may have moved the shared offset;
+        // parsing must neither depend on it nor disturb it.
+        let mut shared = File::from(exact.try_clone().unwrap());
+        shared.seek(SeekFrom::Start(7)).unwrap();
+        parse_vmstate(&exact).unwrap();
+        assert_eq!(shared.stream_position().unwrap(), 7);
 
         let padded = finalized_vmstate(&[bytes.as_slice(), &[0]].concat());
         assert!(matches!(
