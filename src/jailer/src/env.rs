@@ -687,9 +687,10 @@ fn validate_unwritable_image(
 /// The standard streams are the whole set of descriptors that reach Firecracker without the jailer
 /// choosing what they refer to: `close_inherited_fds` keeps them so the jailed process can log,
 /// [`UFFD_FILENO`] is a device the jailer opens itself, and [`ROOT_FILENO`] and
-/// [`SCRATCH_FILENO`] are overwritten by the images it places there or closed with the rest. So a
-/// caller that points a standard stream at the image inode with an access mode that includes
-/// writing is the one way a writable alias survives into the jail, and that is refused here.
+/// [`SCRATCH_FILENO`] are overwritten by the descriptors it places there or closed with the rest.
+/// So a caller that points a standard stream at the image inode with an access mode that includes
+/// writing is the one way a writable alias survives into the jail, and that is refused here. The
+/// scratch disk is not held to this: the jail is meant to write it.
 fn reject_writable_stream_aliases(
     flag: &'static str,
     stat: &libc::stat,
