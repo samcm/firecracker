@@ -30,12 +30,12 @@ pub enum DriveError {
     DescriptorRoleMismatch(RawFd),
     /// Unable to patch the block device: {0} Please verify the request arguments.
     DeviceUpdate(VmmError),
+    /// A drive backed by an inherited descriptor requires `CacheType::Unsafe`.
+    InheritedDriveWriteback,
     /// Descriptor {0} is not opened read-write.
     ReadOnlyScratchDescriptor(RawFd),
     /// A drive backed by the scratch descriptor requires `is_read_only` to be false.
     ReadOnlyScratchDrive,
-    /// A read-only drive has no write-back cache to flush.
-    ReadOnlyWriteback,
     /// A root block device already exists!
     RootBlockDeviceAlreadyAdded,
     /// Descriptor {0} is not one of the descriptors the jailer reserves for inherited images.
@@ -107,7 +107,7 @@ impl BlockDeviceConfig {
             return Err(DriveError::ReadOnlyScratchDrive);
         }
         if self.cache_type == CacheType::Writeback {
-            return Err(DriveError::ReadOnlyWriteback);
+            return Err(DriveError::InheritedDriveWriteback);
         }
         // The jailer owns image identity, immutability and size validation; Firecracker only
         // confirms that the number it was handed still names a descriptor opened in that mode.
@@ -520,12 +520,12 @@ mod tests {
             );
         }
 
-        // Neither drive has a write-back cache to flush.
+        // Both slots are backed by inherited descriptors, which never flush a write-back cache.
         for mut writeback in [root_drive("root"), scratch_drive("scratch")] {
             writeback.cache_type = CacheType::Writeback;
             assert_eq!(
                 writeback.descriptor().unwrap_err(),
-                DriveError::ReadOnlyWriteback
+                DriveError::InheritedDriveWriteback
             );
         }
     }
