@@ -17,3 +17,5 @@ pub mod resources;
 pub mod vcpu;
 /// Module with Vm implementation.
 pub mod vm;
+/// Threads that own runtime state and return it when they stop.
+pub mod worker;

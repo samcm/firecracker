@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
@@ -321,40 +321,51 @@ impl KvmVm {
 
     /// Starts the microVM vCPUs.
     ///
-    /// Sets the terminal to raw/non-blocking mode, then spawns a thread per vCPU
-    /// and stores the resulting handles. The barrier is used to synchronize TLS
-    /// initialization across all vCPU threads before returning.
+    /// Sets the terminal to raw/non-blocking mode, then starts a thread per vCPU, each ready
+    /// with its kick handler and filter before the next one starts, and stores the handles.
+    /// On failure the vCPUs started so far are stopped again and every vCPU is returned.
     pub fn start_vcpus(
         self: &Arc<Self>,
-        mut vcpus: Vec<Vcpu>,
+        vcpus: Vec<Vcpu>,
         vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
-    ) -> Result<(), StartVcpusError> {
-        let vcpu_count = vcpus.len();
-        let barrier = Arc::new(Barrier::new(vcpu_count + 1));
-
+    ) -> Result<(), (StartVcpusError, Vec<Vcpu>)> {
         let stdin = std::io::stdin().lock();
-        stdin.set_raw_mode().inspect_err(|&err| {
-            crate::logger::warn!("Cannot set raw mode for the terminal. {:?}", err);
-        })?;
-        stdin.set_non_block(true).inspect_err(|&err| {
-            crate::logger::warn!("Cannot set non block for the terminal. {:?}", err);
-        })?;
+        let terminal = stdin
+            .set_raw_mode()
+            .inspect_err(|&err| {
+                crate::logger::warn!("Cannot set raw mode for the terminal. {:?}", err);
+            })
+            .and_then(|()| {
+                stdin.set_non_block(true).inspect_err(|&err| {
+                    crate::logger::warn!("Cannot set non block for the terminal. {:?}", err);
+                })
+            });
+        if let Err(err) = terminal {
+            return Err((err.into(), vcpus));
+        }
 
         let mut handles = self.vcpus_handles();
-        handles.reserve(vcpu_count);
-        for mut vcpu in vcpus.drain(..) {
+        let first = handles.len();
+        handles.reserve(vcpus.len());
+        let mut pending = vcpus.into_iter();
+        while let Some(mut vcpu) = pending.next() {
             vcpu.set_mmio_bus(self.common.mmio_bus.clone());
             #[cfg(target_arch = "x86_64")]
             vcpu.kvm_vcpu.set_pio_bus(self.pio_bus.clone());
 
-            handles.push(vcpu.start_threaded(
-                self,
-                vcpu_seccomp_filter.clone(),
-                barrier.clone(),
-            )?);
+            match vcpu.start_threaded(self, vcpu_seccomp_filter.clone()) {
+                Ok(handle) => handles.push(handle),
+                Err((err, vcpu)) => {
+                    let mut vcpus: Vec<Vcpu> = handles
+                        .drain(first..)
+                        .map(VcpuHandle::stop_and_return)
+                        .collect();
+                    vcpus.push(vcpu);
+                    vcpus.extend(pending);
+                    return Err((err.into(), vcpus));
+                }
+            }
         }
-        drop(handles);
-        barrier.wait();
 
         Ok(())
     }

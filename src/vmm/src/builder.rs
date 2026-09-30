@@ -170,7 +170,7 @@ pub fn build_microvm_for_boot(
                 .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vcpu".to_string()))?
                 .clone(),
         )
-        .map_err(VmmError::VcpuStart)?;
+        .map_err(|(err, _)| VmmError::VcpuStart(err))?;
     vmm.lock().unwrap().set_vm_state(VmState::Paused);
 
     #[cfg(feature = "gdb")]
@@ -529,13 +529,15 @@ pub fn build_microvm_from_snapshot(
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
-    kvm_vm.start_vcpus(
-        vcpus,
-        seccomp_filters
-            .get("vcpu")
-            .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
-            .clone(),
-    )?;
+    kvm_vm
+        .start_vcpus(
+            vcpus,
+            seccomp_filters
+                .get("vcpu")
+                .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
+                .clone(),
+        )
+        .map_err(|(err, _)| err)?;
 
     let vmm = Arc::new(Mutex::new(vmm));
     vmm.lock().unwrap().set_vm_state(VmState::Paused);

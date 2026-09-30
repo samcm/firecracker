@@ -6,9 +6,9 @@
 // found in the THIRD-PARTY file.
 
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::sync::{Arc, Barrier};
 use std::{fmt, io, thread};
 
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
@@ -23,11 +23,12 @@ use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
 #[cfg(feature = "gdb")]
 use crate::gdb::target::{GdbTargetError, get_raw_tid};
 use crate::logger::{IncMetric, METRICS, error, info, warn};
-use crate::seccomp::{BpfProgram, BpfProgramRef};
+use crate::seccomp::BpfProgram;
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
 use crate::vstate::bus::Bus;
 use crate::vstate::vm::KvmVm;
+use crate::vstate::worker::{OwnedWorker, WorkerStartError};
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub const VCPU_RTSIG_OFFSET: i32 = 0;
@@ -68,8 +69,8 @@ pub struct VcpuConfig {
 /// Error type for [`Vcpu::start_threaded`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum StartThreadedError {
-    /// Failed to spawn vCPU thread: {0}
-    Spawn(std::io::Error),
+    /// Failed to start vCPU thread: {0}
+    Worker(WorkerStartError),
     /// Failed to clone kvm Vcpu fd: {0}
     CopyFd(CopyKvmFdError),
 }
@@ -165,35 +166,42 @@ impl Vcpu {
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
+    ///
+    /// Returns once the thread registered its kick handler and installed its filter. On failure
+    /// no thread is left running and the vcpu is returned, ready for another start.
+    // The error hands the vcpu back on a cold path; boxing it would only add an allocation.
+    #[allow(clippy::result_large_err)]
     pub fn start_threaded(
         mut self,
         vm: &KvmVm,
         seccomp_filter: Arc<BpfProgram>,
-        barrier: Arc<Barrier>,
-    ) -> Result<VcpuHandle, StartThreadedError> {
+    ) -> Result<VcpuHandle, (StartThreadedError, Vcpu)> {
+        let vcpu_fd = match self.copy_kvm_vcpu_fd(vm) {
+            Ok(vcpu_fd) => vcpu_fd,
+            Err(err) => return Err((StartThreadedError::CopyFd(err), self)),
+        };
         let event_sender = self.event_sender.take().expect("vCPU already started");
         let response_receiver = self.response_receiver.take().unwrap();
-        let vcpu_fd = self
-            .copy_kvm_vcpu_fd(vm)
-            .map_err(StartThreadedError::CopyFd)?;
-        let vcpu_thread = thread::Builder::new()
-            .name(format!("fc_vcpu {}", self.kvm_vcpu.index))
-            .spawn(move || {
-                let filter = &*seccomp_filter;
-                self.register_kick_signal_handler();
-                // Synchronization to make sure thread local data is initialized.
-                barrier.wait();
-                self.run(filter);
-                self
-            })
-            .map_err(StartThreadedError::Spawn)?;
-
-        Ok(VcpuHandle::new(
-            event_sender,
-            response_receiver,
-            vcpu_fd,
-            vcpu_thread,
-        ))
+        let builder = thread::Builder::new().name(format!("fc_vcpu {}", self.kvm_vcpu.index));
+        match OwnedWorker::start(
+            builder,
+            self,
+            seccomp_filter,
+            Vcpu::register_kick_signal_handler,
+            Vcpu::run,
+        ) {
+            Ok(worker) => Ok(VcpuHandle::new(
+                event_sender,
+                response_receiver,
+                vcpu_fd,
+                worker,
+            )),
+            Err((err, mut vcpu)) => {
+                vcpu.event_sender = Some(event_sender);
+                vcpu.response_receiver = Some(response_receiver);
+                Err((StartThreadedError::Worker(err), vcpu))
+            }
+        }
     }
 
     /// Replaces the control channels, whose handle ends were dropped with the previous thread.
@@ -206,22 +214,12 @@ impl Vcpu {
         self.response_sender = response_sender;
     }
 
-    /// Main loop of the vCPU thread.
+    /// Main loop of the vCPU thread, once it is confined.
     ///
     /// Runs the vCPU in KVM context in a loop. Handles KVM_EXITs then goes back in.
     /// Note that the state of the VCPU and associated VM must be setup first for this to do
     /// anything useful.
-    pub fn run(&mut self, seccomp_filter: BpfProgramRef) {
-        // Load seccomp filters for this vCPU thread.
-        // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
-        // altogether is the desired behaviour.
-        if let Err(err) = crate::seccomp::apply_filter(seccomp_filter) {
-            panic!(
-                "Failed to set the requested seccomp filters on vCPU {}: Error: {}",
-                self.kvm_vcpu.index, err
-            );
-        }
-
+    fn run(&mut self) {
         // Start running the machine state in the `Paused` state.
         StateMachine::run(self, Self::paused);
     }
@@ -574,9 +572,8 @@ pub struct VcpuHandle {
     response_receiver: Receiver<VcpuResponse>,
     /// VcpuFd
     pub vcpu_fd: VcpuFd,
-    // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
-    // We want to be able to join these threads in tests.
-    vcpu_thread: Option<thread::JoinHandle<Vcpu>>,
+    // Taken by `stop_and_return`, or joined on drop.
+    vcpu_thread: Option<OwnedWorker<Vcpu>>,
 }
 
 /// Error type for [`VcpuHandle::send_event`].
@@ -590,12 +587,12 @@ impl VcpuHandle {
     /// # Arguments
     /// + `event_sender`: [`Sender`] to communicate [`VcpuEvent`] to control the vcpu.
     /// + `response_received`: [`Received`] from which the vcpu's responses can be read.
-    /// + `vcpu_thread`: A [`JoinHandle`] for the vcpu thread.
+    /// + `vcpu_thread`: The ready worker owning the vcpu.
     pub fn new(
         event_sender: Sender<VcpuEvent>,
         response_receiver: Receiver<VcpuResponse>,
         vcpu_fd: VcpuFd,
-        vcpu_thread: thread::JoinHandle<Vcpu>,
+        vcpu_thread: OwnedWorker<Vcpu>,
     ) -> Self {
         Self {
             event_sender,
@@ -622,6 +619,7 @@ impl VcpuHandle {
             .as_ref()
             // Safe to unwrap since constructor make this 'Some'.
             .unwrap()
+            .handle()
             .kill(sigrtmin() + VCPU_RTSIG_OFFSET)?;
         Ok(())
     }
@@ -634,7 +632,9 @@ impl VcpuHandle {
     /// Finishes the vCPU thread, joins it and returns the [`Vcpu`] it owned, ready for
     /// [`Vcpu::start_threaded`] with fresh control channels.
     ///
-    /// A failed kick is logged and the join still happens, as in [`KvmVm::shutdown_vcpus`].
+    /// Events queued before the finish are handled first; their responses go to this handle,
+    /// which outlives the join. A failed kick is logged and the join still happens, as in
+    /// [`KvmVm::shutdown_vcpus`].
     pub fn stop_and_return(mut self) -> Vcpu {
         if let Err(err) = self.send_event(VcpuEvent::Finish) {
             error!("Failed to send VcpuEvent::Finish to vCPU: {}", err);
@@ -644,8 +644,7 @@ impl VcpuHandle {
             .take()
             // Safe to unwrap since constructor make this 'Some' and only this consumer takes it.
             .unwrap()
-            .join()
-            .unwrap();
+            .join();
         vcpu.renew_channels();
         vcpu
     }
@@ -663,7 +662,7 @@ impl Drop for VcpuHandle {
         // sent by Vmm.
         // `stop_and_return` has already joined the thread it took.
         if let Some(vcpu_thread) = self.vcpu_thread.take() {
-            vcpu_thread.join().unwrap();
+            vcpu_thread.join();
         }
     }
 }
@@ -943,17 +942,9 @@ pub(crate) mod tests {
             )
             .expect("failed to configure vcpu");
 
-        let mut seccomp_filters = get_empty_filters();
-        let barrier = Arc::new(Barrier::new(2));
         let vcpu_handle = vcpu
-            .start_threaded(
-                &vm,
-                seccomp_filters.remove("vcpu").unwrap(),
-                barrier.clone(),
-            )
-            .expect("failed to start vcpu");
-        // Wait for vCPUs to initialize their TLS before moving forward.
-        barrier.wait();
+            .start_threaded(&vm, get_empty_filters().remove("vcpu").unwrap())
+            .unwrap_or_else(|(err, _)| panic!("failed to start vcpu: {err}"));
 
         (vm, vcpu_handle, vcpu_exit_evt)
     }
@@ -1089,19 +1080,23 @@ pub(crate) mod tests {
     fn test_vcpu_stop_and_return() {
         let (vm, mut vcpu_handle, vcpu_exit_evt) = vcpu_configured_for_boot();
         queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
-        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Pause, VcpuResponse::Paused);
-
-        // The joined vCPU restarts on a new thread with fresh channels, in the Paused state.
+        // A control command still queued when the stop arrives is handled first, and its
+        // response must find the handle's receiver alive until the join.
+        vcpu_handle.send_event(VcpuEvent::Pause).unwrap();
         let vcpu = vcpu_handle.stop_and_return();
-        let barrier = Arc::new(Barrier::new(2));
+
+        // A filter failure returns the vCPU without running it.
+        let too_large = Arc::new(vec![0; crate::seccomp::BPF_MAX_LEN + 1]);
+        let (err, vcpu) = vcpu.start_threaded(&vm, too_large).unwrap_err();
+        assert!(matches!(
+            err,
+            StartThreadedError::Worker(WorkerStartError::Filter(_))
+        ));
+
+        // The recovered vCPU restarts on a new thread with fresh channels, in the Paused state.
         let mut vcpu_handle = vcpu
-            .start_threaded(
-                &vm,
-                get_empty_filters().remove("vcpu").unwrap(),
-                barrier.clone(),
-            )
-            .expect("failed to restart vcpu");
-        barrier.wait();
+            .start_threaded(&vm, get_empty_filters().remove("vcpu").unwrap())
+            .unwrap_or_else(|(err, _)| panic!("failed to restart vcpu: {err}"));
         queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
         queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Pause, VcpuResponse::Paused);
 
