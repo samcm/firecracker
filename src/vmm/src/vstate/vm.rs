@@ -71,6 +71,16 @@ pub struct RoutingEntry {
     masked: bool,
 }
 
+/// One line interrupt's IRQFD registration, in the journal [`KvmVm::detach_irqfds`] keeps.
+#[derive(Debug)]
+struct IrqfdRegistration {
+    /// A duplicate of the registered eventfd.
+    evt: EventFd,
+    gsi: u32,
+    /// Whether KVM has the registration now.
+    attached: bool,
+}
+
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
 pub struct VmCommon {
@@ -82,6 +92,10 @@ pub struct VmCommon {
     next_kvm_slot: AtomicU32,
     /// Interrupts used by KvmVm's devices
     pub interrupts: Mutex<HashMap<u32, RoutingEntry>>,
+    /// Journal of every eventfd/GSI pair registered as a line interrupt's IRQFD: a duplicate of
+    /// the eventfd, so the exact registration can be detached and attached again, and whether it
+    /// is attached now.
+    irqfds: Mutex<Vec<IrqfdRegistration>>,
     /// Allocator for VM resources
     pub resource_allocator: Mutex<ResourceAllocator>,
     /// MMIO bus
@@ -131,6 +145,10 @@ pub enum VmError {
     MemoryError(#[from] MemoryError),
     /// Cannot adopt guest memory: {0}
     AdoptGuestMemory(#[from] AdoptGuestMemoryError),
+    /// Cannot detach or attach the IRQFD of GSI {0}: {1}
+    Irqfd(u32, errno::Error),
+    /// Detaching the IRQFD of GSI {0} failed ({1}), and attaching GSI {2} again failed too: {3}
+    IrqfdRollback(u32, errno::Error, u32, errno::Error),
 }
 
 /// Error type for [`KvmVm::adopt_guest_memory`].
@@ -274,6 +292,7 @@ impl KvmVm {
             guest_memory: GuestMemoryMmap::default(),
             next_kvm_slot: AtomicU32::new(0),
             interrupts: Mutex::new(HashMap::with_capacity(GSI_MSI_END as usize + 1)),
+            irqfds: Mutex::new(Vec::new()),
             resource_allocator: Mutex::new(ResourceAllocator::new()),
             mmio_bus: Arc::new(Bus::new()),
             kvm,
@@ -319,47 +338,54 @@ impl KvmVm {
         self.common.vcpus_handles.lock().expect("Poisoned lock")
     }
 
+    /// Puts the terminal into raw, non-blocking mode for an interactive serial console, as the
+    /// default mode does before starting its vCPUs. Native mode never acquires the terminal.
+    pub fn acquire_terminal() -> Result<(), StartVcpusError> {
+        let stdin = std::io::stdin().lock();
+        stdin.set_raw_mode().inspect_err(|&err| {
+            crate::logger::warn!("Cannot set raw mode for the terminal. {:?}", err);
+        })?;
+        stdin.set_non_block(true).inspect_err(|&err| {
+            crate::logger::warn!("Cannot set non block for the terminal. {:?}", err);
+        })?;
+        Ok(())
+    }
+
     /// Starts the microVM vCPUs.
     ///
-    /// Sets the terminal to raw/non-blocking mode, then starts a thread per vCPU, each ready
-    /// with its kick handler and filter before the next one starts, and stores the handles.
-    /// On failure the vCPUs started so far are stopped again and every vCPU is returned.
+    /// Starts a thread per vCPU, each ready with its kick handler and filter before the next one
+    /// starts, and stores the handles. On failure the vCPUs started so far are stopped again and
+    /// every vCPU is returned.
     pub fn start_vcpus(
         self: &Arc<Self>,
         vcpus: Vec<Vcpu>,
         vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
     ) -> Result<(), (StartVcpusError, Vec<Vcpu>)> {
-        let stdin = std::io::stdin().lock();
-        let terminal = stdin
-            .set_raw_mode()
-            .inspect_err(|&err| {
-                crate::logger::warn!("Cannot set raw mode for the terminal. {:?}", err);
-            })
-            .and_then(|()| {
-                stdin.set_non_block(true).inspect_err(|&err| {
-                    crate::logger::warn!("Cannot set non block for the terminal. {:?}", err);
-                })
-            });
-        if let Err(err) = terminal {
-            return Err((err.into(), vcpus));
-        }
-
         let mut handles = self.vcpus_handles();
         let first = handles.len();
         handles.reserve(vcpus.len());
         let mut pending = vcpus.into_iter();
-        while let Some(mut vcpu) = pending.next() {
+        for index in 0.. {
+            let Some(mut vcpu) = pending.next() else {
+                break;
+            };
             vcpu.set_mmio_bus(self.common.mmio_bus.clone());
             #[cfg(target_arch = "x86_64")]
             vcpu.kvm_vcpu.set_pio_bus(self.pio_bus.clone());
 
+            #[cfg(test)]
+            let vcpu_seccomp_filter = if tests::FAIL_VCPU_START.get() == Some(index) {
+                // A filter the kernel refuses fails this vCPU's start after the earlier ones ran.
+                Arc::new(vec![0; crate::seccomp::BPF_MAX_LEN + 1])
+            } else {
+                vcpu_seccomp_filter.clone()
+            };
+            #[cfg(not(test))]
+            let _ = index;
             match vcpu.start_threaded(self, vcpu_seccomp_filter.clone()) {
                 Ok(handle) => handles.push(handle),
                 Err((err, vcpu)) => {
-                    let mut vcpus: Vec<Vcpu> = handles
-                        .drain(first..)
-                        .map(VcpuHandle::stop_and_return)
-                        .collect();
+                    let mut vcpus = Self::stop_handles(handles.drain(first..).collect());
                     vcpus.push(vcpu);
                     vcpus.extend(pending);
                     return Err((err.into(), vcpus));
@@ -368,6 +394,21 @@ impl KvmVm {
         }
 
         Ok(())
+    }
+
+    /// Stops every vCPU worker and returns the vCPUs in start order. All are told to finish
+    /// before any is joined, so once this returns no vCPU runs, and none ran on after another's
+    /// return.
+    pub fn stop_vcpus(&self) -> Vec<Vcpu> {
+        let handles = self.vcpus_handles().drain(..).collect();
+        Self::stop_handles(handles)
+    }
+
+    fn stop_handles(mut handles: Vec<VcpuHandle>) -> Vec<Vcpu> {
+        for handle in &mut handles {
+            handle.finish();
+        }
+        handles.into_iter().map(VcpuHandle::join).collect()
     }
 
     /// Sends a pause event to all vCPUs and waits for acknowledgement.
@@ -601,6 +642,12 @@ impl KvmVm {
     /// region keeps the slot it was registered under, and this VM must not own memory yet. The
     /// collection is owned before the first slot is registered, so a partial registration failure
     /// never leaves KVM referencing a mapping this VM does not keep alive.
+    ///
+    /// Admission is fixed and sequential: a fresh VM assigns slots from 0 in address order, and
+    /// only memory whose slots are exactly that sequence is adopted; sparse or reordered slots are
+    /// rejected, never renumbered. A cold native boot satisfies this, because
+    /// [`KvmVm::register_memory_regions`] reserves one slot per region in address order on a VM
+    /// that has no other slots.
     ///
     /// The host dirty bitmaps are shared by every clone of the collection and are cleared here;
     /// adopt only where the original owner no longer harvests them. KVM's log for the new slots
@@ -857,7 +904,15 @@ impl KvmVm {
 
     /// Register a device IRQ
     pub fn register_irq(&self, fd: &EventFd, gsi: u32) -> Result<(), errno::Error> {
+        // The tracking duplicate comes first: a registration it failed to track could never be
+        // detached exactly.
+        let tracked = fd.try_clone()?;
         self.common.fd.register_irqfd(fd, gsi)?;
+        self.irqfds().push(IrqfdRegistration {
+            evt: tracked,
+            gsi,
+            attached: true,
+        });
 
         let mut entry = kvm_irq_routing_entry {
             gsi,
@@ -885,6 +940,73 @@ impl KvmVm {
                     masked: false,
                 },
             );
+        Ok(())
+    }
+
+    fn irqfds(&self) -> MutexGuard<'_, Vec<IrqfdRegistration>> {
+        self.common.irqfds.lock().expect("Poisoned lock")
+    }
+
+    /// Detaches every attached line interrupt's IRQFD, exactly the eventfd/GSI pairs
+    /// registered: an assignment with a different pair would detach nothing and still succeed.
+    /// KVM's deassign completes that registration's pending injection before returning, so
+    /// with every producer stopped, no device interrupt is in flight into the interrupt
+    /// controller afterwards.
+    ///
+    /// On failure the pairs this call detached are attached again. If that rollback fails too,
+    /// [`VmError::IrqfdRollback`] reports it; the journal still records exactly which pairs are
+    /// attached.
+    pub fn detach_irqfds(&self) -> Result<(), VmError> {
+        let mut irqfds = self.irqfds();
+        let mut detached = Vec::new();
+        for (index, registration) in irqfds.iter_mut().enumerate() {
+            if !registration.attached {
+                continue;
+            }
+            match self
+                .common
+                .fd
+                .unregister_irqfd(&registration.evt, registration.gsi)
+            {
+                Ok(()) => {
+                    registration.attached = false;
+                    detached.push(index);
+                }
+                Err(err) => {
+                    let failed = registration.gsi;
+                    for index in detached {
+                        let registration = &mut irqfds[index];
+                        if let Err(rollback) = self
+                            .common
+                            .fd
+                            .register_irqfd(&registration.evt, registration.gsi)
+                        {
+                            return Err(VmError::IrqfdRollback(
+                                failed,
+                                err,
+                                registration.gsi,
+                                rollback,
+                            ));
+                        }
+                        registration.attached = true;
+                    }
+                    return Err(VmError::Irqfd(failed, err));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attaches again every IRQFD the journal records as detached. A failure leaves the pairs
+    /// attached so far attached, as the journal records.
+    pub fn attach_irqfds(&self) -> Result<(), VmError> {
+        for registration in self.irqfds().iter_mut().filter(|r| !r.attached) {
+            self.common
+                .fd
+                .register_irqfd(&registration.evt, registration.gsi)
+                .map_err(|err| VmError::Irqfd(registration.gsi, err))?;
+            registration.attached = true;
+        }
         Ok(())
     }
 
@@ -1078,6 +1200,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_cold_native_memory_is_adoptable() {
+        // Native boot registers its private anonymous RAM on a fresh VM, the admission contract
+        // adoption relies on.
+        let regions = crate::arch::arch_memory_regions(mib_to_bytes(64));
+        let mut source = setup_vm();
+        source
+            .register_memory_regions(crate::vstate::memory::anonymous(&regions).unwrap())
+            .unwrap();
+        let memory = source.guest_memory().clone();
+        let state = memory.describe();
+        check_adoption(&memory, &state, 0, source.common.max_memslots).unwrap();
+        let mut child = setup_vm();
+        child.adopt_guest_memory(memory, &state).unwrap();
+    }
+
+    #[test]
     fn test_adopt_guest_memory() {
         let page_size = host_page_size();
         let mut source = setup_vm();
@@ -1124,6 +1262,41 @@ pub(crate) mod tests {
             child.adopt_guest_memory(again, &state),
             Err(VmError::AdoptGuestMemory(AdoptGuestMemoryError::NotFresh))
         ));
+    }
+
+    thread_local! {
+        /// Index of the vCPU whose start [`KvmVm::start_vcpus`] fails, if any.
+        pub(super) static FAIL_VCPU_START: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[test]
+    fn test_start_vcpus_recovers_every_vcpu_after_nth_failure() {
+        use crate::vstate::vcpu::StartThreadedError;
+        use crate::vstate::worker::WorkerStartError;
+
+        let mut vm = setup_vm_with_memory(mib_to_bytes(128));
+        let vcpus = vm.create_vcpus(3).unwrap();
+        let vm = Arc::new(vm);
+        let indexes = |vcpus: &[Vcpu]| vcpus.iter().map(|v| v.kvm_vcpu.index).collect::<Vec<_>>();
+
+        FAIL_VCPU_START.set(Some(1));
+        let (err, vcpus) = vm.start_vcpus(vcpus, Arc::new(vec![])).unwrap_err();
+        FAIL_VCPU_START.set(None);
+        assert!(matches!(
+            err,
+            StartVcpusError::VcpuHandle(StartThreadedError::Worker(WorkerStartError::Filter(_)))
+        ));
+        // The vCPU already running was stopped again: none is left running, none is lost.
+        assert!(vm.vcpus_handles().is_empty());
+        assert_eq!(indexes(&vcpus), [0, 1, 2]);
+
+        vm.start_vcpus(vcpus, Arc::new(vec![]))
+            .map_err(|(err, _)| err)
+            .unwrap();
+        let vcpus = vm.stop_vcpus();
+        assert!(vm.vcpus_handles().is_empty());
+        assert_eq!(indexes(&vcpus), [0, 1, 2]);
     }
 
     #[test]

@@ -34,6 +34,17 @@ pub fn init_metrics(metrics_cfg: MetricsConfig) -> Result<(), MetricsConfigError
         .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))
 }
 
+/// Sends metrics to `metrics_cfg`'s destination from now on, initialized or not.
+pub fn rebind_metrics(metrics_cfg: MetricsConfig) -> Result<(), MetricsConfigError> {
+    let writer = FcLineWriter::new(
+        open_file_nonblock(&metrics_cfg.metrics_path)
+            .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?,
+    );
+    METRICS
+        .rebind(writer)
+        .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use vmm_sys_util::tempfile::TempFile;

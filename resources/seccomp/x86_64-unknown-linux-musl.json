@@ -1367,5 +1367,700 @@
                 ]
             }
         ]
+    },
+    "native_main": {
+        "default_action": "trap",
+        "filter_action": "allow",
+        "filter": [
+            {
+                "syscall": "bind",
+                "comment": "Native main binds the API socket itself, after its filter is installed"
+            },
+            {
+                "syscall": "listen",
+                "comment": "Native main listens on the API socket"
+            },
+            {
+                "syscall": "epoll_create1",
+                "comment": "Native main creates the API server's and the event loop's epoll"
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Native main builds the microVM after its filter is installed: the KVM system, VM and vCPU ioctls construction and boot configuration issue all have the KVMIO type",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 65280
+                        },
+                        "val": 44544,
+                        "comment": "_IOC_TYPE == KVMIO (0xAE)"
+                    }
+                ]
+            },
+            {
+                "syscall": "timerfd_create",
+                "comment": "Native main creates device and metrics timers while building the microVM"
+            },
+            {
+                "syscall": "epoll_ctl"
+            },
+            {
+                "syscall": "epoll_pwait"
+            },
+            {
+                "syscall": "exit"
+            },
+            {
+                "syscall": "exit_group"
+            },
+            {
+                "syscall": "open"
+            },
+            {
+                "syscall": "read"
+            },
+            {
+                "syscall": "write"
+            },
+            {
+                "syscall": "fsync"
+            },
+            {
+                "syscall": "close"
+            },
+            {
+                "syscall": "eventfd2",
+                "comment": "Native main creates the event, exit and stop descriptors while building the microVM"
+            },
+            {
+                "syscall": "brk",
+                "comment": "Called for expanding the heap"
+            },
+            {
+                "syscall": "gettid",
+                "comment": "Rust std uses it during panic to print the thread id."
+            },
+            {
+                "syscall": "clock_gettime",
+                "comment": "Used for metrics and logging, via the helpers in utils/src/time.rs. It's not called on some platforms, because of vdso optimisations."
+            },
+            {
+                "syscall": "fstat",
+                "comment": "Used to read the local timezone from /etc/localtime and to inspect the launcher's control connection"
+            },
+            {
+                "syscall": "lseek",
+                "comment": "Used by the synchronous block engine, which seeks before each read or write"
+            },
+            {
+                "syscall": "mremap",
+                "comment": "Used for re-allocating large memory regions, for example vectors"
+            },
+            {
+                "syscall": "munmap",
+                "comment": "Used for freeing memory"
+            },
+            {
+                "syscall": "rt_sigprocmask",
+                "comment": "rt_sigprocmask is used by libc::abort during a panic to block and unblock signals"
+            },
+            {
+                "syscall": "rt_sigreturn",
+                "comment": "rt_sigreturn is needed in case a fault does occur, so that the signal handler can return. Otherwise we get stuck in a fault loop."
+            },
+            {
+                "syscall": "sigaltstack",
+                "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
+            },
+            {
+                "syscall": "getrandom",
+                "comment": "getrandom is used by aws-lc, which generates the VMGenID generation id"
+            },
+            {
+                "syscall": "accept4",
+                "comment": "Native main accepts API connections",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 524288,
+                        "comment": "libc::SOCK_CLOEXEC"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Used to set FD_CLOEXEC on descriptors native main opens",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2,
+                        "comment": "FCNTL_F_SETFD"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "FCNTL_FD_CLOEXEC"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Used to check the access mode of an inherited drive descriptor",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "F_GETFL"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "F_DUPFD_CLOEXEC: Rust's File/UnixStream/EventFd try_clone, e.g. the API listener, IRQFD tracking and the child's control connection",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1030,
+                        "comment": "F_DUPFD_CLOEXEC"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (during thread teardown when joining multiple vcpu threads at once)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "FUTEX_WAIT"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (during thread teardown)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "FUTEX_WAKE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 128,
+                        "comment": "FUTEX_WAIT_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 137,
+                        "comment": "FUTEX_WAIT_BITSET_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 129,
+                        "comment": "FUTEX_WAKE_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "madvise",
+                "comment": "Used by aws-lc, which generates the VMGenID generation id: it marks a page MADV_WIPEONFORK",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 18,
+                        "comment": "libc::MADV_WIPEONFORK"
+                    }
+                ]
+            },
+            {
+                "syscall": "madvise",
+                "comment": "Used by aws-lc with an invalid advice to see if madvise is supported",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4294967295,
+                        "comment": "-1"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used for reading the timezone in LocalTime::now()",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by rust's stdlib for large allocations, for example the dirty bitmap harvested during a capture",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 34,
+                        "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "rt_sigaction",
+                "comment": "rt_sigaction is used by libc::abort during a panic to install the default handler for SIGABRT",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
+                    }
+                ]
+            },
+            {
+                "syscall": "socket",
+                "comment": "Native main creates the API socket",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "libc::AF_UNIX"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 524289,
+                        "comment": "libc::SOCK_STREAM | libc::SOCK_CLOEXEC"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0
+                    }
+                ]
+            },
+            {
+                "syscall": "sendto",
+                "comment": "Rust std uses it to write to unix socket"
+            },
+            {
+                "syscall": "tkill",
+                "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
+                    }
+                ]
+            },
+            {
+                "syscall": "tkill",
+                "comment": "Used to kick vcpus",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 35,
+                        "comment": "sigrtmin() + vcpu::VCPU_RTSIG_OFFSET"
+                    }
+                ]
+            },
+            {
+                "syscall": "timerfd_settime",
+                "comment": "Needed for rate limiting and metrics",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Used to make API connections non-blocking",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 21537,
+                        "comment": "FIONBIO"
+                    }
+                ]
+            },
+            {
+                "syscall": "sched_yield",
+                "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
+            },
+            {
+                "syscall": "restart_syscall",
+                "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
+            },
+            {
+                "syscall": "clone",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4001536,
+                        "comment": "CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID"
+                    }
+                ],
+                "comment": "Native main starts the VMM and vCPU workers; threads only, no fork"
+            },
+            {
+                "syscall": "clone",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 8195840,
+                        "comment": "the same with CLONE_DETACHED, as musl pthread_create passes"
+                    }
+                ],
+                "comment": "Native main starts the VMM and vCPU workers; threads only, no fork"
+            },
+            {
+                "syscall": "mprotect",
+                "comment": "Guard pages of new worker thread stacks"
+            },
+            {
+                "syscall": "recvmsg",
+                "comment": "Native main reads API requests; the HTTP server receives with recvmsg"
+            },
+            {
+                "syscall": "fork",
+                "comment": "Native main forks a clone's child once every worker has been joined; musl's fork issues SYS_fork on x86_64"
+            },
+            {
+                "syscall": "dup2",
+                "comment": "A clone's child installs its own description of the root image at descriptor 4"
+            },
+            {
+                "syscall": "dup",
+                "comment": "Vcpu::copy_kvm_vcpu_fd (src/vmm/src/vstate/vcpu.rs) calls libc::dup when native main starts or restarts the vCPU workers"
+            },
+            {
+                "syscall": "pipe2",
+                "comment": "Native main passes a clone's child readiness to the source over a pipe made before the fork"
+            },
+            {
+                "syscall": "connect",
+                "comment": "A clone's child connects to the launcher's control socket"
+            },
+            {
+                "syscall": "mlockall",
+                "comment": "Native main locks guest memory resident once mapped, at cold boot and again in a clone's child"
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Native main reflinks a clone's scratch disk once every writer stopped",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074041865,
+                        "comment": "FICLONE"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Native main maps the guest's private anonymous memory, reserving no swap for it",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 16418,
+                        "comment": "libc::MAP_NORESERVE | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "madvise",
+                "comment": "Native main keeps transparent huge pages off guest memory, whatever the host's policy",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15,
+                        "comment": "libc::MADV_NOHUGEPAGE"
+                    }
+                ]
+            },
+            {
+                "syscall": "arch_prctl",
+                "comment": "request_dynamic_xstate_features (src/vmm/src/arch/x86_64/xstate.rs) queries the supported dynamic XSTATE features while native main creates KVM",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4129,
+                        "comment": "ARCH_GET_XCOMP_SUPP"
+                    }
+                ]
+            },
+            {
+                "syscall": "arch_prctl",
+                "comment": "request_dynamic_xstate_features requests guest permission for Intel AMX TILEDATA only",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4133,
+                        "comment": "ARCH_REQ_XCOMP_GUEST_PERM"
+                    },
+                    {
+                        "index": 1,
+                        "type": "qword",
+                        "op": "eq",
+                        "val": 18,
+                        "comment": "ARCH_XCOMP_TILEDATA"
+                    }
+                ]
+            },
+            {
+                "syscall": "rt_sigaction",
+                "comment": "OwnedWorker setup Vcpu::register_kick_signal_handler installs the vCPU kick handler under the inherited native_main filter",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 35,
+                        "comment": "sigrtmin() + VCPU_RTSIG_OFFSET with musl"
+                    }
+                ]
+            },
+            {
+                "syscall": "prctl",
+                "comment": "crate::seccomp::apply_filter sets no_new_privs before a worker installs its role filter",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 38,
+                        "comment": "PR_SET_NO_NEW_PRIVS"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "on"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": ""
+                    },
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": ""
+                    },
+                    {
+                        "index": 4,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": ""
+                    }
+                ]
+            },
+            {
+                "syscall": "seccomp",
+                "comment": "crate::seccomp::apply_filter installs a worker's role filter on top of the inherited native_main filter",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "SECCOMP_SET_MODE_FILTER"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "no flags"
+                    }
+                ]
+            },
+            {
+                "syscall": "prctl",
+                "comment": "Rust std names each worker thread (fc_vcpu N, fc_native_vmm) as it starts; musl pthread_setname_np on the calling thread",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15,
+                        "comment": "PR_SET_NAME"
+                    }
+                ]
+            },
+            {
+                "syscall": "unlink",
+                "comment": "ScratchCopy::abandon removes the scratch copy a failed clone created"
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Rust std maps each new worker thread's signal alternate stack (traced: MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, 12288 bytes)",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 131106,
+                        "comment": "libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "stat",
+                "comment": "AWS-LC's one-time fork-safety setup at the first random draw (VmGenId::make_genid, src/vmm/src/devices/acpi/vmgenid.rs) probes /dev/sysgenid; traced: stat(\"/dev/sysgenid\") = ENOENT after madvise MADV_WIPEONFORK"
+            },
+            {
+                "syscall": "set_tid_address",
+                "comment": "musl's fork resets the child's thread tid through set_tid_address before returning into the clone's child (Coordinator::clone_vm); traced on hardware: the child was killed there"
+            },
+            {
+                "syscall": "recvfrom",
+                "comment": "read_verdict reads the launcher's commit record through std's UnixStream::read, which musl's recv issues as recvfrom(fd, buf, len, 0, NULL, NULL); traced",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "no flags"
+                    },
+                    {
+                        "index": 4,
+                        "type": "qword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "no source address"
+                    },
+                    {
+                        "index": 5,
+                        "type": "qword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "no source address length"
+                    }
+                ]
+            }
+        ]
     }
 }

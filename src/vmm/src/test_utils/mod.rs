@@ -3,12 +3,9 @@
 
 #![allow(missing_docs)]
 
-use vm_memory::bitmap::NewBitmap;
 use vm_memory::{GuestAddress, GuestRegionCollection};
 
-use crate::vstate::memory::{
-    AtomicBitmap, GuestMemoryMmap, GuestRegionMmap, GuestRegionMmapExt, MmapRegionBuilder,
-};
+use crate::vstate::memory::{GuestMemoryMmap, GuestRegionMmap, GuestRegionMmapExt};
 
 /// Creates a [`GuestMemoryMmap`] with a single region of the given size starting at guest
 /// physical address 0.
@@ -32,20 +29,7 @@ pub fn single_region_mem_at_raw(at: u64, size: usize) -> Vec<GuestRegionMmap> {
 
 /// Creates anonymous, dirty-tracked, private mappings for the given regions.
 fn anonymous_regions(regions: &[(GuestAddress, usize)]) -> Vec<GuestRegionMmap> {
-    regions
-        .iter()
-        .map(|&(start, size)| {
-            let flags = libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-            let mapping =
-                MmapRegionBuilder::new_with_bitmap(size, Some(AtomicBitmap::with_len(size)))
-                    .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
-                    .with_mmap_flags(flags)
-                    .build()
-                    .expect("Cannot create guest memory mapping");
-
-            GuestRegionMmap::new(mapping, start).expect("Cannot create guest memory region")
-        })
-        .collect()
+    crate::vstate::memory::anonymous(regions).expect("Cannot create guest memory mapping")
 }
 
 /// Creates a [`GuestMemoryMmap`] with multiple regions, one KVM slot each.

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Local build tooling only. Orbs do not expose KVM; hardware tests run elsewhere.
 missing=()
-for package in cmake musl-tools libclang-dev libseccomp-dev gperf autoconf automake libtool linux-libc-dev; do
+for package in cmake musl-tools libclang-dev libseccomp-dev gperf autoconf automake libtool linux-libc-dev strace busybox-static squashfs-tools; do
     if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
         missing+=("$package")
     fi

@@ -242,7 +242,7 @@ pub struct VirtioBlock {
     pub metrics: Arc<BlockDeviceMetrics>,
     /// Whether this is a fork child's copy of the source's device, see
     /// [`VirtioBlock::mark_inherited`].
-    pub(super) inherited: bool,
+    pub(super) inherited: std::sync::atomic::AtomicBool,
 }
 
 macro_rules! unwrap_async_file_engine_or_return {
@@ -309,14 +309,15 @@ impl VirtioBlock {
             rate_limiter,
             is_io_engine_throttled: false,
             metrics: BlockMetricsPerDevice::alloc(config.drive_id),
-            inherited: false,
+            inherited: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// Marks this as a fork child's copy of the source's device, whose open file description
     /// and pending I/O belong to the source. Dropping it then neither drains nor flushes.
-    pub fn mark_inherited(&mut self) {
-        self.inherited = true;
+    pub fn mark_inherited(&self) {
+        self.inherited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns a copy of a device config
@@ -643,7 +644,7 @@ impl VirtioDevice for VirtioBlock {
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
-        if self.inherited {
+        if self.inherited.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         match self.cache_type {
@@ -1489,6 +1490,51 @@ mod tests {
                 assert_eq!(vq.used.ring[0].get().len, 1);
                 assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
             }
+        }
+    }
+
+    /// A guest's last queue notification before a stop is neither lost nor doubled by the kick
+    /// native resume sends: whether the notification is still pending on the same eventfd (a
+    /// restarted source) or stayed behind with the source's eventfd (a rebuilt clone child's
+    /// fresh one), the kick leaves the queue event readable for the event loop, which completes
+    /// the queued request once; a later kick completes nothing more.
+    #[test]
+    fn test_kick_completes_the_last_queued_request_exactly_once() {
+        let readable = |block: &VirtioBlock| {
+            let mut poll = libc::pollfd {
+                fd: block.queue_evts[0].as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: polling one valid descriptor without waiting.
+            unsafe { libc::poll(&mut poll, 1, 0) == 1 }
+        };
+        for pending in [true, false] {
+            let mut block = default_block(FileEngineType::Sync);
+            let mem = default_mem();
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+            set_queue(&mut block, 0, vq.create_queue());
+            block.activate(mem.clone(), default_interrupt()).unwrap();
+            read_blk_req_descriptors(&vq);
+            vq.dtable[0].next.set(2);
+            mem.write_obj::<u32>(VIRTIO_BLK_T_FLUSH, GuestAddress(vq.dtable[0].addr.get()))
+                .unwrap();
+            let status_addr = GuestAddress(vq.dtable[2].addr.get());
+            if pending {
+                block.queue_evts[0].write(1).unwrap();
+            }
+            assert_eq!(readable(&block), pending);
+
+            block.kick();
+            assert!(readable(&block));
+            block.process_queue_event();
+            assert_eq!(vq.used.idx.get(), 1);
+            assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+            assert!(!readable(&block));
+
+            block.kick();
+            block.process_queue_event();
+            assert_eq!(vq.used.idx.get(), 1);
         }
     }
 

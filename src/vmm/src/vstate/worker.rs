@@ -28,7 +28,9 @@ impl<T: Send + 'static> OwnedWorker<T> {
     ///
     /// The state crosses to the thread only after the spawn succeeded, and a thread whose filter
     /// fails is joined without running `body`, so on either failure the caller gets its state
-    /// back. `setup` runs unconfined, for per-thread work the filter would forbid.
+    /// back. `setup` runs before the thread's own filter, under whatever filter it inherited
+    /// from its creator (in native mode, `native_main`), for per-thread work its own filter
+    /// would forbid.
     pub fn start(
         builder: thread::Builder,
         state: T,

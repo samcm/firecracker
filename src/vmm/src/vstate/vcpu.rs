@@ -392,13 +392,13 @@ impl Vcpu {
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
+    ///
+    /// A kick sets `immediate_exit`, and `KVM_RUN` is still entered then: KVM first completes
+    /// the I/O or MMIO exit userspace just handled, which may exit again with the next fragment
+    /// of the same access, and only then returns `EINTR` without running a further guest
+    /// instruction. Skipping that run would leave the access half-applied in any state captured
+    /// next, so a restored vCPU would repeat its device effect.
     pub fn run_emulation(&mut self) -> Result<VcpuEmulation, VcpuError> {
-        if self.kvm_vcpu.fd.get_kvm_run().immediate_exit == 1u8 {
-            warn!("Requested a vCPU run with immediate_exit enabled. The operation was skipped");
-            self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
-            return Ok(VcpuEmulation::Interrupted);
-        }
-
         match self.kvm_vcpu.fd.run() {
             Err(ref err) if err.errno() == libc::EINTR => {
                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
@@ -633,16 +633,27 @@ impl VcpuHandle {
     /// [`Vcpu::start_threaded`] with fresh control channels.
     ///
     /// Events queued before the finish are handled first; their responses go to this handle,
-    /// which outlives the join. A failed kick is logged and the join still happens, as in
-    /// [`KvmVm::shutdown_vcpus`].
+    /// which outlives the join.
     pub fn stop_and_return(mut self) -> Vcpu {
+        self.finish();
+        self.join()
+    }
+
+    /// Tells the vCPU thread to finish. A failed kick is logged, as in
+    /// [`KvmVm::shutdown_vcpus`]; the queued event still ends the thread.
+    pub fn finish(&mut self) {
         if let Err(err) = self.send_event(VcpuEvent::Finish) {
             error!("Failed to send VcpuEvent::Finish to vCPU: {}", err);
         }
+    }
+
+    /// Joins a vCPU thread told to [`VcpuHandle::finish`] and returns the [`Vcpu`] it owned,
+    /// with fresh control channels.
+    pub fn join(mut self) -> Vcpu {
         let mut vcpu = self
             .vcpu_thread
             .take()
-            // Safe to unwrap since constructor make this 'Some' and only this consumer takes it.
+            // Safe to unwrap since constructor make this 'Some' and only a consumer takes it.
             .unwrap()
             .join();
         vcpu.renew_channels();
@@ -1019,29 +1030,181 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_immediate_exit_shortcircuits_execution() {
-        let (_, mut vcpu) = setup_vcpu(0x1000);
+    fn test_kick_completes_fragmented_mmio_before_interrupting() {
+        use crate::vstate::memory::Bytes;
 
+        /// Records the bytes the guest writes, in order.
+        #[derive(Debug, Default)]
+        struct Recorder(Vec<(u64, Vec<u8>)>);
+        impl BusDevice for Recorder {
+            fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+                self.0.push((offset, data.to_vec()));
+                None
+            }
+        }
+
+        const CODE: u64 = 0x2_0000;
+        const EXPECT: u64 = 0x2_1000;
+        const MMIO: u64 = 0x800_0080;
+        const UNTOUCHED_RAX: u64 = 0x0a1b_2c3d_4e5f_6071;
+        // movdqu (%rsi),%xmm0; movdqu %xmm0,(%rdi); mov $42,%al; out %al,$0xe9; hlt
+        let code = [
+            0xf3, 0x0f, 0x6f, 0x06, 0xf3, 0x0f, 0x7f, 0x07, 0xb0, 0x2a, 0xe6, 0xe9, 0xf4,
+        ];
+        const AFTER_STORE: u64 = CODE + 8;
+        let expected: [u8; 16] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+
+        let (vm, mut vcpu) = setup_vcpu(mib_to_bytes(16));
+        vm.guest_memory()
+            .write_slice(&code, GuestAddress(CODE))
+            .unwrap();
+        vm.guest_memory()
+            .write_slice(&expected, GuestAddress(EXPECT))
+            .unwrap();
+        {
+            use crate::cpu_config::x86_64::cpuid::Cpuid;
+            vcpu.kvm_vcpu
+                .configure(
+                    vm.guest_memory(),
+                    EntryPoint {
+                        entry_addr: GuestAddress(CODE),
+                        protocol: BootProtocol::LinuxBoot,
+                    },
+                    &VcpuConfig {
+                        vcpu_count: 1,
+                        smt: false,
+                        cpu_config: CpuConfiguration {
+                            cpuid: Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap(),
+                            msrs: BTreeMap::new(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        // Permit SSE: OSFXSR, with MP and ET set and EM and TS clear.
+        let mut sregs = vcpu.kvm_vcpu.fd.get_sregs().unwrap();
+        sregs.cr4 |= 1 << 9;
+        sregs.cr0 = (sregs.cr0 | (1 << 1) | (1 << 4)) & !((1 << 2) | (1 << 3));
+        vcpu.kvm_vcpu.fd.set_sregs(&sregs).unwrap();
+        let mut regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        regs.rip = CODE;
+        regs.rsi = EXPECT;
+        regs.rdi = MMIO;
+        regs.rax = UNTOUCHED_RAX;
+        vcpu.kvm_vcpu.fd.set_regs(&regs).unwrap();
+
+        let recorder = Arc::new(Mutex::new(Recorder::default()));
+        let bus = Arc::new(Bus::new());
+        bus.insert(recorder.clone(), MMIO, 16).unwrap();
+        vcpu.set_mmio_bus(bus);
+
+        // The 16-byte store exits with its first 8-byte fragment.
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Handled);
+        assert_eq!(recorder.lock().unwrap().0.len(), 1);
+        // A kick lands before the vCPU reenters KVM: the store still completes, exactly once.
         vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
-        // Set a dummy value to be returned by the emulate call
-        let result = vcpu.run_emulation().expect("Failed to run emulation");
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Handled);
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Interrupted);
+        assert_eq!(vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit, 0);
+
+        let written = &recorder.lock().unwrap().0;
         assert_eq!(
-            result,
-            VcpuEmulation::Interrupted,
-            "The Immediate Exit short-circuit should have prevented the execution of emulate"
+            written
+                .iter()
+                .map(|(offset, _)| *offset)
+                .collect::<Vec<_>>(),
+            [0, 8]
         );
-
-        let event_sender = vcpu.event_sender.take().expect("vCPU already started");
-        let _ = event_sender.send(VcpuEvent::Resume);
-        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
-        // paused is expected to coerce immediate_exit to 0 when receiving a VcpuEvent::Resume
-        let _ = vcpu.paused();
         assert_eq!(
-            0,
-            vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit,
-            "Immediate Exit should have been disabled by sending Resume to a paused VM"
-        )
+            written
+                .iter()
+                .flat_map(|(_, data)| data.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        // The interrupt fell between the store and the next instruction.
+        let regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        assert_eq!(regs.rip, AFTER_STORE);
+        assert_eq!(regs.rax, UNTOUCHED_RAX);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_kick_completes_pending_out_exactly_once() {
+        use crate::vstate::memory::Bytes;
+
+        #[derive(Debug, Default)]
+        struct Port(Vec<u8>);
+        impl BusDevice for Port {
+            fn write(&mut self, _base: u64, _offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+                self.0.extend_from_slice(data);
+                None
+            }
+        }
+
+        const CODE: u64 = 0x2_0000;
+        // mov $42,%al; out %al,$0xe9; mov $91,%al; out %al,$0xe9; jmp .
+        let code = [0xb0, 0x2a, 0xe6, 0xe9, 0xb0, 0x5b, 0xe6, 0xe9, 0xeb, 0xfe];
+        const AFTER_FIRST_OUT: u64 = CODE + 4;
+        const AFTER_SECOND_OUT: u64 = CODE + 8;
+
+        let (vm, mut vcpu) = setup_vcpu(mib_to_bytes(16));
+        vm.guest_memory()
+            .write_slice(&code, GuestAddress(CODE))
+            .unwrap();
+        {
+            use crate::cpu_config::x86_64::cpuid::Cpuid;
+            vcpu.kvm_vcpu
+                .configure(
+                    vm.guest_memory(),
+                    EntryPoint {
+                        entry_addr: GuestAddress(CODE),
+                        protocol: BootProtocol::LinuxBoot,
+                    },
+                    &VcpuConfig {
+                        vcpu_count: 1,
+                        smt: false,
+                        cpu_config: CpuConfiguration {
+                            cpuid: Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap(),
+                            msrs: BTreeMap::new(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let mut regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        regs.rip = CODE;
+        vcpu.kvm_vcpu.fd.set_regs(&regs).unwrap();
+        let port = Arc::new(Mutex::new(Port::default()));
+        let bus = Arc::new(Bus::new());
+        bus.insert(port.clone(), 0xe9, 1).unwrap();
+        vcpu.kvm_vcpu.set_pio_bus(bus);
+
+        // The first OUT exits to userspace, which applies it.
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Handled);
+        assert_eq!(port.lock().unwrap().0, [42]);
+        // A kick lands before the vCPU reenters KVM: KVM completes the OUT, then interrupts
+        // without entering the guest.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Interrupted);
+        assert_eq!(vcpu.kvm_vcpu.fd.get_regs().unwrap().rip, AFTER_FIRST_OUT);
+        assert_eq!(port.lock().unwrap().0, [42]);
+        // Resumed, the guest runs on to the second OUT, a distinct byte: the first OUT is not
+        // applied a second time.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Handled);
+        assert_eq!(port.lock().unwrap().0, [42, 91]);
+        // Completing the second OUT the same way leaves it applied once, and the guest never
+        // runs past it.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Interrupted);
+        assert_eq!(vcpu.kvm_vcpu.fd.get_regs().unwrap().rip, AFTER_SECOND_OUT);
+        assert_eq!(port.lock().unwrap().0, [42, 91]);
     }
 
     #[test]
