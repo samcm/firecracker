@@ -184,6 +184,7 @@ impl Vcpu {
                 // Synchronization to make sure thread local data is initialized.
                 barrier.wait();
                 self.run(filter);
+                self
             })
             .map_err(StartThreadedError::Spawn)?;
 
@@ -193,6 +194,16 @@ impl Vcpu {
             vcpu_fd,
             vcpu_thread,
         ))
+    }
+
+    /// Replaces the control channels, whose handle ends were dropped with the previous thread.
+    fn renew_channels(&mut self) {
+        let (event_sender, event_receiver) = channel();
+        let (response_sender, response_receiver) = channel();
+        self.event_receiver = event_receiver;
+        self.event_sender = Some(event_sender);
+        self.response_receiver = Some(response_receiver);
+        self.response_sender = response_sender;
     }
 
     /// Main loop of the vCPU thread.
@@ -565,7 +576,7 @@ pub struct VcpuHandle {
     pub vcpu_fd: VcpuFd,
     // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
     // We want to be able to join these threads in tests.
-    vcpu_thread: Option<thread::JoinHandle<()>>,
+    vcpu_thread: Option<thread::JoinHandle<Vcpu>>,
 }
 
 /// Error type for [`VcpuHandle::send_event`].
@@ -584,7 +595,7 @@ impl VcpuHandle {
         event_sender: Sender<VcpuEvent>,
         response_receiver: Receiver<VcpuResponse>,
         vcpu_fd: VcpuFd,
-        vcpu_thread: thread::JoinHandle<()>,
+        vcpu_thread: thread::JoinHandle<Vcpu>,
     ) -> Self {
         Self {
             event_sender,
@@ -619,6 +630,25 @@ impl VcpuHandle {
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
     }
+
+    /// Finishes the vCPU thread, joins it and returns the [`Vcpu`] it owned, ready for
+    /// [`Vcpu::start_threaded`] with fresh control channels.
+    ///
+    /// A failed kick is logged and the join still happens, as in [`KvmVm::shutdown_vcpus`].
+    pub fn stop_and_return(mut self) -> Vcpu {
+        if let Err(err) = self.send_event(VcpuEvent::Finish) {
+            error!("Failed to send VcpuEvent::Finish to vCPU: {}", err);
+        }
+        let mut vcpu = self
+            .vcpu_thread
+            .take()
+            // Safe to unwrap since constructor make this 'Some' and only this consumer takes it.
+            .unwrap()
+            .join()
+            .unwrap();
+        vcpu.renew_channels();
+        vcpu
+    }
 }
 
 // Wait for the Vcpu thread to finish execution
@@ -631,7 +661,10 @@ impl Drop for VcpuHandle {
         //
         // If the code hangs at this point, that means that a Finish event was not
         // sent by Vmm.
-        self.vcpu_thread.take().unwrap().join().unwrap();
+        // `stop_and_return` has already joined the thread it took.
+        if let Some(vcpu_thread) = self.vcpu_thread.take() {
+            vcpu_thread.join().unwrap();
+        }
     }
 }
 
@@ -1049,6 +1082,31 @@ pub(crate) mod tests {
         // Queue a Resume event, expect a response.
         queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
 
+        vcpu_handle.send_event(VcpuEvent::Finish).unwrap();
+    }
+
+    #[test]
+    fn test_vcpu_stop_and_return() {
+        let (vm, mut vcpu_handle, vcpu_exit_evt) = vcpu_configured_for_boot();
+        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
+        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Pause, VcpuResponse::Paused);
+
+        // The joined vCPU restarts on a new thread with fresh channels, in the Paused state.
+        let vcpu = vcpu_handle.stop_and_return();
+        let barrier = Arc::new(Barrier::new(2));
+        let mut vcpu_handle = vcpu
+            .start_threaded(
+                &vm,
+                get_empty_filters().remove("vcpu").unwrap(),
+                barrier.clone(),
+            )
+            .expect("failed to restart vcpu");
+        barrier.wait();
+        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
+        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Pause, VcpuResponse::Paused);
+
+        let err = vcpu_exit_evt.read().unwrap_err();
+        assert_eq!(err.raw_os_error().unwrap(), libc::EAGAIN);
         vcpu_handle.send_event(VcpuEvent::Finish).unwrap();
     }
 

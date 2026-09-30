@@ -137,6 +137,7 @@ impl Persist<'_> for VirtioBlock {
             rate_limiter,
             is_io_engine_throttled: false,
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
+            inherited: false,
         })
     }
 }

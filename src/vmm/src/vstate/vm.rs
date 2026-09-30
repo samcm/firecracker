@@ -129,6 +129,63 @@ pub enum VmError {
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
     MemoryError(#[from] MemoryError),
+    /// Cannot adopt guest memory: {0}
+    AdoptGuestMemory(#[from] AdoptGuestMemoryError),
+}
+
+/// Error type for [`KvmVm::adopt_guest_memory`].
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
+pub enum AdoptGuestMemoryError {
+    /// the VM already owns guest memory
+    NotFresh,
+    /// geometry {got:?} does not match the vmstate {want:?}
+    Geometry {
+        /// Geometry of the adopted memory.
+        got: GuestMemoryState,
+        /// Geometry recorded in the vmstate.
+        want: GuestMemoryState,
+    },
+    /// region at {addr:#x} is registered under slot {slot}, but this VM's next slot is {fresh}
+    Slot {
+        /// Guest physical base address of the region.
+        addr: u64,
+        /// Slot the region was registered under.
+        slot: u32,
+        /// Slot this VM would assign.
+        fresh: u32,
+    },
+}
+
+/// Checks that `memory` matches `state` and that its regions, in address order, carry exactly
+/// the slots a VM whose next free slot is `first_slot` would assign.
+fn check_adoption(
+    memory: &GuestMemoryMmap,
+    state: &GuestMemoryState,
+    first_slot: u32,
+    max_memslots: u32,
+) -> Result<(), VmError> {
+    let got = memory.describe();
+    if got != *state {
+        return Err(AdoptGuestMemoryError::Geometry {
+            got,
+            want: state.clone(),
+        }
+        .into());
+    }
+    for (fresh, region) in (first_slot..).zip(memory.iter()) {
+        if max_memslots <= fresh {
+            return Err(VmError::NotEnoughMemorySlots(max_memslots));
+        }
+        if region.slot != fresh {
+            return Err(AdoptGuestMemoryError::Slot {
+                addr: region.start_addr().0,
+                slot: region.slot,
+                fresh,
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// VM abstraction: either a KVM-based VM or (in the future) a Nitro Enclave.
@@ -525,6 +582,45 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Adopts an owned clone of guest memory registered by another [`KvmVm`] of this process,
+    /// such as the copy of the source VM a fork child inherits.
+    ///
+    /// Cloning a [`GuestMemoryMmap`] clones its region `Arc`s, not RAM, so this VM keeps the
+    /// mappings alive once the original owners drop. The geometry must match `state`, every
+    /// region keeps the slot it was registered under, and this VM must not own memory yet. The
+    /// collection is owned before the first slot is registered, so a partial registration failure
+    /// never leaves KVM referencing a mapping this VM does not keep alive.
+    ///
+    /// The host dirty bitmaps are shared by every clone of the collection and are cleared here;
+    /// adopt only where the original owner no longer harvests them. KVM's log for the new slots
+    /// is the caller's to baseline, as after [`KvmVm::restore_memory_regions`].
+    pub fn adopt_guest_memory(
+        &mut self,
+        memory: GuestMemoryMmap,
+        state: &GuestMemoryState,
+    ) -> Result<(), VmError> {
+        if self.common.guest_memory.num_regions() != 0 {
+            return Err(AdoptGuestMemoryError::NotFresh.into());
+        }
+        let next_slot = self.common.next_kvm_slot.get_mut();
+        check_adoption(&memory, state, *next_slot, self.common.max_memslots)?;
+        // Bounded by max_memslots, which is a u32, in check_adoption.
+        *next_slot += u32::try_from(memory.num_regions()).unwrap();
+
+        memory.reset_dirty();
+        self.common.guest_memory = memory;
+        for region in self.common.guest_memory.iter() {
+            self.set_user_memory_region(region.into())?;
+            let words = u64_to_usize(region.len())
+                .div_ceil(host_page_size())
+                .div_ceil(64);
+            self.pending_dirty_union()
+                .insert(region.slot, vec![0u64; words]);
+        }
+
+        Ok(())
+    }
+
     /// Gets a reference to the kvm file descriptor owned by this VM.
     pub fn fd(&self) -> &VmFd {
         &self.common.fd
@@ -850,8 +946,8 @@ impl KvmVm {
 pub(crate) mod tests {
     use std::sync::atomic::Ordering;
 
-    use vm_memory::GuestAddress;
     use vm_memory::mmap::MmapRegionBuilder;
+    use vm_memory::{Bytes, GuestAddress};
 
     use super::*;
     use crate::pci::PciSBDF;
@@ -860,7 +956,7 @@ pub(crate) mod tests {
     use crate::utils::mib_to_bytes;
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::Bitmap;
-    use crate::vstate::memory::GuestRegionMmap;
+    use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionMmap};
 
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> KvmVm {
@@ -874,6 +970,149 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_memory_regions(gm).unwrap();
         vm
+    }
+
+    fn slotted_memory(layout: &[(GuestAddress, usize)], slots: &[u32]) -> GuestMemoryMmap {
+        let regions = crate::test_utils::multi_region_mem_raw(layout)
+            .into_iter()
+            .zip(slots)
+            .map(|(region, &slot)| GuestRegionMmapExt::from_mmap_region(region, slot))
+            .collect();
+        GuestMemoryMmap::from_regions(regions).unwrap()
+    }
+
+    #[test]
+    fn test_adoption_rejects_asymmetric_geometry() {
+        let page_size = host_page_size();
+        let layout = [
+            (GuestAddress(0), 4 * page_size),
+            (GuestAddress(0x10_0000), 2 * page_size),
+        ];
+        let memory = slotted_memory(&layout, &[0, 1]);
+        check_adoption(&memory, &memory.describe(), 0, 32).unwrap();
+
+        let mut resized = memory.describe();
+        resized.regions[1].size = 4 * page_size;
+        let mut moved = memory.describe();
+        moved.regions[1].base_address = 0x20_0000;
+        let mut truncated = memory.describe();
+        truncated.regions.pop();
+        let mut extended = memory.describe();
+        extended.regions.push(GuestMemoryRegionState {
+            base_address: 0x30_0000,
+            size: page_size,
+        });
+        for want in [resized, moved, truncated, extended] {
+            assert_eq!(
+                check_adoption(&memory, &want, 0, 32)
+                    .unwrap_err()
+                    .to_string(),
+                VmError::from(AdoptGuestMemoryError::Geometry {
+                    got: memory.describe(),
+                    want: want.clone(),
+                })
+                .to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn test_adoption_preserves_slot_ids() {
+        let page_size = host_page_size();
+        let layout = [
+            (GuestAddress(0), page_size),
+            (GuestAddress(0x10_0000), page_size),
+        ];
+        let slot_error = |memory: &GuestMemoryMmap, first_slot, max_memslots| match check_adoption(
+            memory,
+            &memory.describe(),
+            first_slot,
+            max_memslots,
+        ) {
+            Err(VmError::AdoptGuestMemory(err)) => err,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let memory = slotted_memory(&layout, &[0, 1]);
+        // A VM that already reserved a slot would silently renumber the regions.
+        assert_eq!(
+            slot_error(&memory, 1, 32),
+            AdoptGuestMemoryError::Slot {
+                addr: 0,
+                slot: 0,
+                fresh: 1
+            }
+        );
+        // Slots must follow address order, as the source assigned them.
+        assert_eq!(
+            slot_error(&slotted_memory(&layout, &[1, 0]), 0, 32),
+            AdoptGuestMemoryError::Slot {
+                addr: 0,
+                slot: 1,
+                fresh: 0
+            }
+        );
+        assert_eq!(
+            slot_error(&slotted_memory(&layout, &[0, 2]), 0, 32),
+            AdoptGuestMemoryError::Slot {
+                addr: 0x10_0000,
+                slot: 2,
+                fresh: 1
+            }
+        );
+        assert!(matches!(
+            check_adoption(&memory, &memory.describe(), 0, 1),
+            Err(VmError::NotEnoughMemorySlots(1))
+        ));
+    }
+
+    #[test]
+    fn test_adopt_guest_memory() {
+        let page_size = host_page_size();
+        let mut source = setup_vm();
+        source
+            .register_memory_regions(crate::test_utils::multi_region_mem_raw(&[
+                (GuestAddress(0), 2 * page_size),
+                (GuestAddress(0x10_0000), 2 * page_size),
+            ]))
+            .unwrap();
+        let written = GuestAddress(0x10_0000 + page_size as u64);
+        source.guest_memory().write_obj(0xabu8, written).unwrap();
+        let any_dirty = |memory: &GuestMemoryMmap| {
+            memory.iter().any(|region| {
+                let bitmap = (**region).bitmap().as_ref().unwrap();
+                (0..u64_to_usize(region.len()))
+                    .step_by(page_size)
+                    .any(|offset| bitmap.dirty_at(offset))
+            })
+        };
+        assert!(any_dirty(source.guest_memory()));
+        let state = source.guest_memory().describe();
+        let memory = source.guest_memory().clone();
+        // The adopted RAM must outlive every original owner.
+        drop(source);
+
+        let mut child = setup_vm();
+        child.adopt_guest_memory(memory, &state).unwrap();
+        let adopted = child.guest_memory();
+        assert_eq!(
+            adopted.iter().map(|region| region.slot).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(adopted.read_obj::<u8>(written).unwrap(), 0xab);
+        // The source's host accumulator does not leak into the child's first harvest.
+        assert!(!any_dirty(adopted));
+        let mut union_slots: Vec<_> = child.pending_dirty_union().keys().copied().collect();
+        union_slots.sort_unstable();
+        assert_eq!(union_slots, [0, 1]);
+        // The next slot follows the adopted ones.
+        assert_eq!(child.next_kvm_slot(1), Some(2));
+
+        let again = child.guest_memory().clone();
+        assert!(matches!(
+            child.adopt_guest_memory(again, &state),
+            Err(VmError::AdoptGuestMemory(AdoptGuestMemoryError::NotFresh))
+        ));
     }
 
     #[test]

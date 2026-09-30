@@ -240,6 +240,9 @@ pub struct VirtioBlock {
     pub rate_limiter: RateLimiter,
     pub is_io_engine_throttled: bool,
     pub metrics: Arc<BlockDeviceMetrics>,
+    /// Whether this is a fork child's copy of the source's device, see
+    /// [`VirtioBlock::mark_inherited`].
+    pub(super) inherited: bool,
 }
 
 macro_rules! unwrap_async_file_engine_or_return {
@@ -306,7 +309,14 @@ impl VirtioBlock {
             rate_limiter,
             is_io_engine_throttled: false,
             metrics: BlockMetricsPerDevice::alloc(config.drive_id),
+            inherited: false,
         })
+    }
+
+    /// Marks this as a fork child's copy of the source's device, whose open file description
+    /// and pending I/O belong to the source. Dropping it then neither drains nor flushes.
+    pub fn mark_inherited(&mut self) {
+        self.inherited = true;
     }
 
     /// Returns a copy of a device config
@@ -633,6 +643,9 @@ impl VirtioDevice for VirtioBlock {
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
+        if self.inherited {
+            return;
+        }
         match self.cache_type {
             CacheType::Unsafe => {
                 if let Err(err) = self.disk.file_engine.drain(true) {

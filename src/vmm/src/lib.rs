@@ -277,6 +277,8 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
+    /// Whether this is a fork child's copy of the source's VMM, see [`Vmm::mark_inherited`].
+    inherited: bool,
 }
 
 impl Vmm {
@@ -288,6 +290,13 @@ impl Vmm {
     /// Provides the Vmm shutdown exit code if there is one.
     pub fn shutdown_exit_code(&self) -> Option<FcExitCode> {
         self.shutdown_exit_code
+    }
+
+    /// Marks this as a fork child's copy of the source's VMM, whose vCPU threads, terminal
+    /// settings and metrics sink belong to the source. Dropping it then leaves them untouched;
+    /// its vCPU handles must already have been taken, since the child has no threads to join.
+    pub fn mark_inherited(&mut self) {
+        self.inherited = true;
     }
 
     /// Builds a FullVmConfig from the current Vmm state.
@@ -531,6 +540,9 @@ fn construct_kvm_mpidrs(vcpu_states: &[VcpuState]) -> Vec<u64> {
 
 impl Drop for Vmm {
     fn drop(&mut self) {
+        if self.inherited {
+            return;
+        }
         if let Some(kvm_vm) = self.vm.as_kvm() {
             info!("Killing vCPU threads");
             kvm_vm.shutdown_vcpus();
