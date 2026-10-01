@@ -22,6 +22,7 @@ jailer --id <id> \
        [--netns <netns>] \
        --root-fd <n> \
        [--scratch-fd <n>] \
+       [--native] \
        [--cgroup-join <absolute_cgroupfs_path>] \
        [--resource-limit <no-file|fsize|memlock>=<value>] \
        [--...extra arguments for Firecracker]
@@ -45,6 +46,11 @@ jailer --id <id> \
   of the microVM's scratch disk, held to the scratch descriptor contract below.
   The jailer renumbers it to file descriptor 5; when absent, file descriptor 5
   is not reserved.
+- `--native` jails a native-mode Firecracker (pass `--native` to Firecracker
+  too). Native mode never opens or hands over `/dev/userfaultfd`, and file
+  descriptor 3 is left closed: nothing is handed to Firecracker there. Every
+  passed descriptor is first moved off descriptors 3 to 5, so any of them may
+  arrive in another's slot.
 - `--cgroup-join` identifies an absolute cgroupfs path for a pre-created leaf
   cgroup. The jailer joins that cgroup and does not create cgroups.
 - For extra security and control over resource usage, `--resource-limit` can be
@@ -187,7 +193,8 @@ After starting, the Jailer goes through the following operations:
 - Use `mknod` to create a `/dev/net/tun` equivalent inside the jail.
 - Use `mknod` to create a `/dev/kvm` equivalent inside the jail.
 - Open `/dev/userfaultfd` before dropping privileges and renumber its descriptor
-  to file descriptor 3.
+  to file descriptor 3; with `--native`, open no userfaultfd device and leave
+  file descriptor 3 closed.
 - Validate the inherited root image descriptor against the image descriptor
   contract and renumber it to file descriptor 4.
 - If `--scratch-fd` is present, validate it against the scratch descriptor

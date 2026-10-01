@@ -80,7 +80,7 @@ pub const SCMP_ACT_LOG: u32 = 0x7ffc0000;
 /// Allow the syscall to be executed
 pub const SCMP_ACT_ALLOW: u32 = 0x7fff0000;
 
-#[link(name = "seccomp")]
+// build.rs selects the static library and its linking modifiers.
 unsafe extern "C" {
     /// Initialize the filter state
     ///

@@ -47,6 +47,14 @@ impl Block {
         }
     }
 
+    /// Marks this as a fork child's copy of the source's device, see
+    /// [`VirtioBlock::mark_inherited`].
+    pub fn mark_inherited(&self) {
+        match self {
+            Self::Virtio(b) => b.mark_inherited(),
+        }
+    }
+
     pub fn update_rate_limiter(
         &mut self,
         bytes: BucketUpdate,

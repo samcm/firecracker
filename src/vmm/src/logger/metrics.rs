@@ -118,6 +118,25 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
             .map_err(|_| MetricsError::AlreadyInitialized)
     }
 
+    /// Starts a clone's child's metrics: every increment counted so far is forgotten, so the
+    /// next write reports only what this process counts from now on, and metrics go to
+    /// `metrics_dest`. The previous writer is dropped: a clone refuses to fork unless its last
+    /// write succeeded, which leaves a line writer nothing buffered to write on drop.
+    /// Stored values, such as gauges, keep their last value.
+    pub fn rebind(&self, metrics_dest: M) -> Result<(), MetricsError> {
+        // Serializing moves every increment metric's baseline to its current count.
+        serde_json::to_writer(std::io::sink(), &self.app_metrics)
+            .map_err(|err| MetricsError::Serde(err.to_string()))?;
+        match self.metrics_buf.get() {
+            Some(lock) => *lock.lock().expect("Poisoned lock") = metrics_dest,
+            None => {
+                // Unset, so this cannot race another initialization in a single-threaded child.
+                let _ = self.metrics_buf.set(Mutex::new(metrics_dest));
+            }
+        }
+        Ok(())
+    }
+
     /// Writes metrics to the destination provided as argument upon initialization of the metrics.
     /// Upon failure, an error is returned if metrics system is initialized and metrics could not be
     /// written.
@@ -903,7 +922,7 @@ impl FirecrackerMetrics {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{ErrorKind, LineWriter};
+    use std::io::ErrorKind;
     use std::sync::Arc;
     use std::sync::atomic::fence;
     use std::thread;
@@ -928,13 +947,74 @@ mod tests {
         assert!(res.is_ok() && !res.unwrap());
 
         let f = TempFile::new().expect("Failed to create temporary metrics file");
-        m.init(LineWriter::new(f.into_file())).unwrap();
+        m.init(FcLineWriter::new(f.into_file())).unwrap();
 
         m.write().unwrap();
 
         let f = TempFile::new().expect("Failed to create temporary metrics file");
 
-        m.init(LineWriter::new(f.into_file())).unwrap_err();
+        m.init(FcLineWriter::new(f.into_file())).unwrap_err();
+    }
+
+    fn put_logger_counts(file: &TempFile) -> Vec<u64> {
+        std::fs::read_to_string(file.as_path())
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let json: serde_json::Value = serde_json::from_str(line).unwrap();
+                json["put_api_requests"]["logger_count"].as_u64().unwrap()
+            })
+            .collect()
+    }
+
+    /// A child reports only what it counts after the fork, whether or not its source had a
+    /// destination or wrote successfully, and never writes to its source's destination; a
+    /// grandchild likewise.
+    #[test]
+    fn test_rebind_reports_only_counts_after_it() {
+        for source_has_destination in [false, true] {
+            let m = &Metrics::<_, FcLineWriter>::new(FirecrackerMetrics::new());
+            let source = TempFile::new().unwrap();
+            if source_has_destination {
+                m.init(FcLineWriter::new(source.as_file().try_clone().unwrap()))
+                    .unwrap();
+            }
+            m.put_api_requests.logger_count.add(3);
+
+            let child = TempFile::new().unwrap();
+            m.rebind(FcLineWriter::new(child.as_file().try_clone().unwrap()))
+                .unwrap();
+            m.put_api_requests.logger_count.add(5);
+            m.write().unwrap();
+            assert_eq!(put_logger_counts(&child), [5]);
+            assert_eq!(std::fs::read_to_string(source.as_path()).unwrap(), "");
+
+            let grandchild = TempFile::new().unwrap();
+            m.rebind(FcLineWriter::new(grandchild.as_file().try_clone().unwrap()))
+                .unwrap();
+            m.put_api_requests.logger_count.add(7);
+            m.write().unwrap();
+            assert_eq!(put_logger_counts(&grandchild), [7]);
+            assert_eq!(put_logger_counts(&child), [5]);
+        }
+    }
+
+    /// The default writer keeps `LineWriter`'s behavior: a successful metrics write leaves
+    /// nothing buffered, while bytes after the last newline are written when it drops.
+    #[test]
+    fn test_default_line_writer_behavior_is_kept() {
+        let file = TempFile::new().unwrap();
+        let mut writer = FcLineWriter::new(file.as_file().try_clone().unwrap());
+        writer.write_all(b"whole line\npartial").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(file.as_path()).unwrap(),
+            "whole line\n"
+        );
+        drop(writer);
+        assert_eq!(
+            std::fs::read_to_string(file.as_path()).unwrap(),
+            "whole line\npartial"
+        );
     }
 
     #[test]

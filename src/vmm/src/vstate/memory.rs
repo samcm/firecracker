@@ -9,6 +9,7 @@ use std::ops::Deref;
 
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use serde::{Deserialize, Serialize};
+use vm_memory::bitmap::NewBitmap;
 pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
 pub use vm_memory::mmap::MmapRegionBuilder;
 pub use vm_memory::{
@@ -42,6 +43,37 @@ pub enum MemoryError {
     },
     /// Farplane memory channel failed: {0}
     Farplane(String),
+    /// Cannot map anonymous guest memory: {0}
+    Anonymous(vm_memory::mmap::MmapRegionError),
+    /// Anonymous guest memory region at {0:#x} is invalid
+    AnonymousRegion(u64),
+    /// Cannot keep transparent huge pages off guest memory: {0}
+    NoHugePages(std::io::Error),
+}
+
+/// Maps private anonymous, dirty-tracked guest memory for `regions`, as native mode owns it.
+///
+/// The mappings are this process's own, so a fork child inherits them copy-on-write. Each is
+/// advised `MADV_NOHUGEPAGE` whatever the host's policy: guest memory stays in 4 KiB pages, the
+/// granularity a child shares with its source and dirty tracking reports.
+pub fn anonymous(regions: &[(GuestAddress, usize)]) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    regions
+        .iter()
+        .map(|&(start, size)| {
+            let flags = libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+            let mapping =
+                MmapRegionBuilder::new_with_bitmap(size, Some(AtomicBitmap::with_len(size)))
+                    .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+                    .with_mmap_flags(flags)
+                    .build()
+                    .map_err(MemoryError::Anonymous)?;
+            // SAFETY: advising the whole of a mapping just created, which `mapping` owns.
+            if unsafe { libc::madvise(mapping.as_ptr().cast(), size, libc::MADV_NOHUGEPAGE) } < 0 {
+                return Err(MemoryError::NoHugePages(std::io::Error::last_os_error()));
+            }
+            GuestRegionMmap::new(mapping, start).ok_or(MemoryError::AnonymousRegion(start.0))
+        })
+        .collect()
 }
 
 /// An extension to GuestMemoryRegion which records the KVM memory slot the region is
@@ -238,6 +270,38 @@ mod tests {
     use crate::snapshot::Snapshot;
     use crate::test_utils::multi_region_mem_raw;
     use crate::vstate::memory::test_utils::into_region_ext;
+
+    /// The kernel records `MADV_NOHUGEPAGE` as the `nh` flag of the mapping in smaps.
+    #[test]
+    fn test_anonymous_memory_refuses_transparent_huge_pages() {
+        let size = 4 << 20;
+        let regions = anonymous(&[(GuestAddress(0), size)]).unwrap();
+        let start = regions[0].as_ptr() as usize;
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut lines = smaps.lines();
+        let flags = loop {
+            let line = lines.next().expect("the mapping is in smaps");
+            let Some((range, _)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some((low, high)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(low), Ok(high)) = (
+                usize::from_str_radix(low, 16),
+                usize::from_str_radix(high, 16),
+            ) else {
+                continue;
+            };
+            if low <= start && start < high {
+                break lines
+                    .find_map(|line| line.strip_prefix("VmFlags:"))
+                    .unwrap()
+                    .to_string();
+            }
+        };
+        assert!(flags.split_whitespace().any(|flag| flag == "nh"), "{flags}");
+    }
 
     #[test]
     fn test_mark_dirty() {

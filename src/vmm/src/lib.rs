@@ -148,8 +148,9 @@ use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::{KvmVm, StartVcpusError, Vm};
 
-/// Shorthand type for the EventManager flavour used by Firecracker.
-pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber>>>;
+/// Shorthand type for the EventManager flavour used by Firecracker. Its subscribers are `Send`,
+/// so native mode can move the whole event loop to the worker that runs it.
+pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber + Send>>>;
 
 // Since the exit code names e.g. `SIGBUS` are most appropriate yet trigger a test error with the
 // clippy lint `upper_case_acronyms` we have disabled this lint for this enum.
@@ -277,6 +278,11 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
+    /// Whether this is a fork child's copy of the source's VMM, see [`Vmm::mark_inherited`].
+    inherited: bool,
+    /// Whether this VMM put the terminal into raw mode and must restore it; native mode never
+    /// acquires the terminal it shares with its launcher.
+    owns_terminal: bool,
 }
 
 impl Vmm {
@@ -288,6 +294,23 @@ impl Vmm {
     /// Provides the Vmm shutdown exit code if there is one.
     pub fn shutdown_exit_code(&self) -> Option<FcExitCode> {
         self.shutdown_exit_code
+    }
+
+    /// Marks this as a fork child's copy of the source's VMM, whose vCPU threads, terminal
+    /// settings and metrics sink belong to the source, together with its block devices, whose
+    /// open file descriptions and I/O belong to the source. Dropping it then leaves all of them
+    /// untouched; its vCPU handles must already have been taken, since the child has no threads
+    /// to join.
+    pub fn mark_inherited(&mut self) {
+        self.inherited = true;
+        self.device_manager
+            .for_each_virtio_device(|device_type, device| {
+                if device_type == VirtioDeviceType::Block
+                    && let Some(block) = device.as_any().downcast_ref::<Block>()
+                {
+                    block.mark_inherited();
+                }
+            });
     }
 
     /// Builds a FullVmConfig from the current Vmm state.
@@ -372,6 +395,38 @@ impl Vmm {
 
     /// Saves the state of a paused Microvm.
     pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
+        self.save_state_with(vm_info, KvmVm::save_vcpu_states)
+    }
+
+    /// Saves the state of a microVM whose vCPU threads were joined, from the vCPUs they
+    /// returned, in the same order as [`Vmm::save_state`]: devices before KVM.
+    pub fn save_stopped_state(
+        &mut self,
+        vm_info: &VmInfo,
+        vcpus: &[Vcpu],
+    ) -> Result<MicrovmState, MicrovmStateError> {
+        self.save_state_with(vm_info, |_| {
+            vcpus
+                .iter()
+                .map(|vcpu| {
+                    vcpu.kvm_vcpu.save_state().map_err(|err| {
+                        MicrovmStateError::SaveVcpuState(
+                            crate::vstate::vcpu::VcpuError::VcpuResponse(err),
+                        )
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn save_state_with(
+        &mut self,
+        vm_info: &VmInfo,
+        vcpu_states: impl FnOnce(
+            &KvmVm,
+        )
+            -> Result<Vec<crate::vstate::vcpu::VcpuState>, MicrovmStateError>,
+    ) -> Result<MicrovmState, MicrovmStateError> {
         // We need to save device state before saving KVM state.
         // Some devices, (at the time of writing this comment block device with async engine)
         // might modify the VirtIO transport and send an interrupt to the guest. If we save KVM
@@ -382,7 +437,7 @@ impl Vmm {
             .vm
             .as_kvm()
             .ok_or_else(|| MicrovmStateError::NotAllowed("save_state requires KVM".into()))?;
-        let vcpu_states = kvm_vm.save_vcpu_states()?;
+        let vcpu_states = vcpu_states(kvm_vm)?;
         let kvm_state = kvm_vm.kvm().save_state();
         let vm_state = {
             #[cfg(target_arch = "x86_64")]
@@ -531,12 +586,17 @@ fn construct_kvm_mpidrs(vcpu_states: &[VcpuState]) -> Vec<u64> {
 
 impl Drop for Vmm {
     fn drop(&mut self) {
+        if self.inherited {
+            return;
+        }
         if let Some(kvm_vm) = self.vm.as_kvm() {
             info!("Killing vCPU threads");
             kvm_vm.shutdown_vcpus();
         }
 
-        if let Err(err) = std::io::stdin().lock().set_canon_mode() {
+        if self.owns_terminal
+            && let Err(err) = std::io::stdin().lock().set_canon_mode()
+        {
             warn!("Cannot set canonical mode for the terminal. {:?}", err);
         }
 

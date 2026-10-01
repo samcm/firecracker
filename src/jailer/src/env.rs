@@ -122,6 +122,9 @@ pub struct Env {
     resource_limits: ResourceLimits,
     root_fd: RawFd,
     scratch_fd: Option<RawFd>,
+    /// Whether Firecracker runs in native mode, which owns anonymous guest memory: no
+    /// userfaultfd device is opened, and descriptor 3 is left closed.
+    native: bool,
     cgroup_join: Option<PathBuf>,
 }
 
@@ -187,6 +190,8 @@ impl Env {
             })
             .transpose()?;
 
+        let native = arguments.flag_present("native");
+
         let mut resource_limits = ResourceLimits::default();
         if let Some(args) = arguments.multiple_values("resource-limit") {
             Env::parse_resource_limits(&mut resource_limits, args)?;
@@ -217,6 +222,7 @@ impl Env {
             resource_limits,
             root_fd,
             scratch_fd,
+            native,
             cgroup_join,
         })
     }
@@ -395,12 +401,17 @@ impl Env {
         fs::write(&procs, id().to_string()).map_err(|err| JailerError::CgroupJoin(procs, err))
     }
 
-    /// Hands Firecracker the userfaultfd device as [`UFFD_FILENO`], the root image as
-    /// [`ROOT_FILENO`] and, when the caller passes one, the writable scratch disk as
-    /// [`SCRATCH_FILENO`]. Every passed descriptor is moved clear of the reserved slots first,
-    /// because the caller is free to pass them in at any number.
+    /// Hands Firecracker the userfaultfd device as [`UFFD_FILENO`] (not in native mode, which
+    /// leaves that slot closed), the root image as [`ROOT_FILENO`] and, when the caller passes
+    /// one, the writable scratch disk as [`SCRATCH_FILENO`]. Every passed descriptor is moved
+    /// clear of the reserved slots first, because the caller is free to pass them in at any
+    /// number.
     fn install_inherited_fds(&self) -> Result<(), JailerError> {
-        let uffd_device = open_userfaultfd_device()?;
+        let uffd_device = if self.native {
+            None
+        } else {
+            Some(open_userfaultfd_device()?)
+        };
 
         validate_image_fd("--root-fd", self.root_fd, self.uid())?;
         if let Some(fd) = self.scratch_fd {
@@ -411,7 +422,21 @@ impl Env {
         let root_fd = move_off_reserved_fds(self.root_fd)?;
         let scratch_fd = self.scratch_fd.map(move_off_reserved_fds).transpose()?;
 
-        place_fd(uffd_device, UFFD_FILENO)?;
+        match uffd_device {
+            Some(uffd_device) => place_fd(uffd_device, UFFD_FILENO)?,
+            // Every passed descriptor has left slot 3, so whatever else the caller left there
+            // is stray; native Firecracker is handed nothing at 3.
+            None => {
+                // SAFETY: closing a descriptor number nothing in this process owns any more.
+                let closed = unsafe { libc::close(UFFD_FILENO) };
+                match SyscallReturnCode(closed).into_empty_result() {
+                    Err(err) if err.raw_os_error() != Some(libc::EBADF) => {
+                        return Err(JailerError::NativeSlot(err));
+                    }
+                    _ => {}
+                }
+            }
+        }
         place_fd(root_fd, ROOT_FILENO)?;
         match scratch_fd {
             Some(fd) => place_fd(fd, SCRATCH_FILENO),

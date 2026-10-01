@@ -15,8 +15,9 @@ use utils::time::TimestampUs;
 #[cfg(target_arch = "aarch64")]
 use vm_memory::GuestAddress;
 
-#[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
+#[cfg(feature = "gdb")]
+use crate::arch::EntryPoint;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
@@ -47,7 +48,7 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vstate::farplane::{CaptureService, FarplaneBackend};
 use crate::vstate::kvm::{Kvm, KvmError};
-use crate::vstate::memory::GuestRegionMmap;
+use crate::vstate::memory::{GuestMemoryMmap, GuestRegionMmap};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -99,6 +100,8 @@ pub enum StartMicrovmError {
     MissingMemSizeConfig,
     /// The pagemaster memory channel was not established.
     MissingMemoryChannel,
+    /// Unsupported native configuration: {0}
+    NativeProfile(#[from] crate::resources::NativeProfileError),
     /// No seccomp filter for thread category: {0}
     MissingSeccompFilters(String),
     /// The net device configuration is missing the tap device.
@@ -142,9 +145,118 @@ pub fn build_microvm_for_boot(
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    let BootMicrovm {
+        vmm,
+        kvm_vm,
+        #[allow(unused_mut)]
+        mut vcpus,
+        #[cfg(feature = "gdb")]
+        entry_point,
+    } = construct_microvm_for_boot(instance_info, vm_resources, event_manager)?;
+    let vmm = Arc::new(Mutex::new(vmm));
+
+    #[cfg(feature = "gdb")]
+    let (gdb_tx, gdb_rx) = mpsc::channel();
+
+    #[cfg(feature = "gdb")]
+    vcpus
+        .iter_mut()
+        .for_each(|vcpu| vcpu.attach_debug_info(gdb_tx.clone()));
+
+    // Move vcpus to their own threads and start their state machine in the 'Paused' state.
+    let vcpu_filter = seccomp_filters
+        .get("vcpu")
+        .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vcpu".to_string()))?
+        .clone();
+    KvmVm::acquire_terminal().map_err(VmmError::VcpuStart)?;
+    kvm_vm
+        .start_vcpus(vcpus, vcpu_filter)
+        .map_err(|(err, _)| VmmError::VcpuStart(err))?;
+    vmm.lock().unwrap().set_vm_state(VmState::Paused);
+
+    #[cfg(feature = "gdb")]
+    if let Some(gdb_socket_path) = &vm_resources.machine_config.gdb_socket_path {
+        gdb::gdb_thread(vmm.clone(), gdb_rx, entry_point.entry_addr, gdb_socket_path)
+            .map_err(StartMicrovmError::GdbServer)?;
+    } else {
+        debug!("No GDB socket provided not starting gdb server.");
+    }
+
+    // Load seccomp filters for the VMM thread.
+    // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
+    // altogether is the desired behaviour.
+    // Keep this as the last step before resuming vcpus.
+    let vmm_filter = seccomp_filters
+        .get("vmm")
+        .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+        .clone();
+
+    // The channel's thread is started before this thread is confined, because it
+    // confines itself with the same filter and a filtered thread may not be
+    // allowed to create another.
+    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
+    CaptureService::spawn(
+        channel,
+        vmm.clone(),
+        VmInfo::from(vm_resources),
+        vmm_filter.clone(),
+    );
+
+    crate::seccomp::apply_filter(&vmm_filter).map_err(VmmError::SeccompFilters)?;
+
+    event_manager.add_subscriber(vmm.clone());
+
+    Ok(vmm)
+}
+
+/// Builds a native-mode microVM for boot, its vCPUs paused on their threads.
+///
+/// Unlike the Farplane startup, this takes no memory channel and leaves the calling thread
+/// unconfined by the `vmm` filter: the native main thread keeps its own filter and hands the
+/// event loop to a worker that confines itself. The vCPU threads inherit the caller's filter.
+fn build_native_microvm_for_boot(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    vm_resources.check_native_profile()?;
+    let vcpu_filter = seccomp_filters
+        .get("vcpu")
+        .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vcpu".to_string()))?
+        .clone();
+    let BootMicrovm {
+        vmm, kvm_vm, vcpus, ..
+    } = construct_microvm_for_boot(instance_info, vm_resources, event_manager)?;
+    let vmm = Arc::new(Mutex::new(vmm));
+
+    kvm_vm
+        .start_vcpus(vcpus, vcpu_filter)
+        .map_err(|(err, _)| VmmError::VcpuStart(err))?;
+    vmm.lock().unwrap().set_vm_state(VmState::Paused);
+    event_manager.add_subscriber(vmm.clone());
+
+    Ok(vmm)
+}
+
+/// A microVM constructed for boot whose vCPUs are configured but not yet running on threads.
+struct BootMicrovm {
+    vmm: Vmm,
+    kvm_vm: Arc<KvmVm>,
+    vcpus: Vec<Vcpu>,
+    #[cfg(feature = "gdb")]
+    entry_point: EntryPoint,
+}
+
+/// Constructs KVM, guest memory, devices and boot-configured vCPUs, leaving thread creation,
+/// confinement and event-loop registration to the mode-specific startup.
+fn construct_microvm_for_boot(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+) -> Result<BootMicrovm, StartMicrovmError> {
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
-
     let boot_config = vm_resources
         .boot_source
         .builder
@@ -179,6 +291,7 @@ pub fn build_microvm_for_boot(
         kvm_vm.vcpus_exit_evt(),
         &kvm_vm,
         vm_resources.serial_out_path.as_ref(),
+        !vm_resources.native,
         vm_resources.serial_rate_limiter(),
     )?;
 
@@ -272,62 +385,19 @@ pub fn build_microvm_for_boot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        inherited: false,
+        // The default Vmm restores the terminal it may have put into raw mode, even after a
+        // partial acquisition; native mode never takes it.
+        owns_terminal: !vm_resources.native,
     };
-    let vmm = Arc::new(Mutex::new(vmm));
 
-    #[cfg(feature = "gdb")]
-    let (gdb_tx, gdb_rx) = mpsc::channel();
-
-    #[cfg(feature = "gdb")]
-    vcpus
-        .iter_mut()
-        .for_each(|vcpu| vcpu.attach_debug_info(gdb_tx.clone()));
-
-    // Move vcpus to their own threads and start their state machine in the 'Paused' state.
-    kvm_vm
-        .start_vcpus(
-            vcpus,
-            seccomp_filters
-                .get("vcpu")
-                .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vcpu".to_string()))?
-                .clone(),
-        )
-        .map_err(VmmError::VcpuStart)?;
-    vmm.lock().unwrap().set_vm_state(VmState::Paused);
-
-    #[cfg(feature = "gdb")]
-    if let Some(gdb_socket_path) = &vm_resources.machine_config.gdb_socket_path {
-        gdb::gdb_thread(vmm.clone(), gdb_rx, entry_point.entry_addr, gdb_socket_path)
-            .map_err(StartMicrovmError::GdbServer)?;
-    } else {
-        debug!("No GDB socket provided not starting gdb server.");
-    }
-
-    // Load seccomp filters for the VMM thread.
-    // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
-    // altogether is the desired behaviour.
-    // Keep this as the last step before resuming vcpus.
-    let vmm_filter = seccomp_filters
-        .get("vmm")
-        .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
-        .clone();
-
-    // The channel's thread is started before this thread is confined, because it
-    // confines itself with the same filter and a filtered thread may not be
-    // allowed to create another.
-    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
-    CaptureService::spawn(
-        channel,
-        vmm.clone(),
-        VmInfo::from(vm_resources),
-        vmm_filter.clone(),
-    );
-
-    crate::seccomp::apply_filter(&vmm_filter).map_err(VmmError::SeccompFilters)?;
-
-    event_manager.add_subscriber(vmm.clone());
-
-    Ok(vmm)
+    Ok(BootMicrovm {
+        vmm,
+        kvm_vm,
+        vcpus,
+        #[cfg(feature = "gdb")]
+        entry_point,
+    })
 }
 
 /// Builds and boots a microVM based on the current Firecracker VmResources configuration.
@@ -344,7 +414,11 @@ pub fn build_and_boot_microvm(
     seccomp_filters: &BpfThreadMap,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     debug!("event_start: build microvm for boot");
-    let vmm = build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?;
+    let vmm = if vm_resources.native {
+        build_native_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?
+    } else {
+        build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?
+    };
     debug!("event_end: build microvm for boot");
     // The vcpus stay in the `Paused` state they were built in. The supervisor
     // resumes the instance once the envelope around it is armed, the same
@@ -405,7 +479,105 @@ pub fn build_microvm_from_snapshot(
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
+    let (vmm, kvm_vm, vcpus) = construct_microvm_from_state(
+        instance_info,
+        event_manager,
+        microvm_state,
+        RestoredMemory::Regions(guest_memory),
+        vm_resources,
+        clock_realtime,
+    )?;
 
+    // Move vcpus to their own threads and start their state machine in the 'Paused' state.
+    let vcpu_filter = seccomp_filters
+        .get("vcpu")
+        .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
+        .clone();
+    KvmVm::acquire_terminal()?;
+    kvm_vm
+        .start_vcpus(vcpus, vcpu_filter)
+        .map_err(|(err, _)| err)?;
+
+    let vmm = Arc::new(Mutex::new(vmm));
+    vmm.lock().unwrap().set_vm_state(VmState::Paused);
+    event_manager.add_subscriber(vmm.clone());
+
+    // Started before this thread is confined: the channel's thread confines
+    // itself with the same filter, and a filtered thread may not be allowed to
+    // create another.
+    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
+    CaptureService::spawn(
+        channel,
+        vmm.clone(),
+        VmInfo::from(&*vm_resources),
+        seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone(),
+    );
+
+    // Load seccomp filters for the VMM thread.
+    // Keep this as the last step of the building process.
+    crate::seccomp::apply_filter(
+        seccomp_filters
+            .get("vmm")
+            .ok_or(BuildMicrovmFromSnapshotError::MissingVmmSeccompFilters)?,
+    )?;
+    debug!("event_end: build microvm from snapshot");
+
+    Ok(vmm)
+}
+
+/// Rebuilds a native fork child from its source's captured state over the guest memory it
+/// inherited: fresh KVM, devices and vCPUs, paused on their threads. As in native boot, the
+/// calling thread keeps its own filter rather than the `vmm` one, and the vCPU threads inherit it.
+pub fn build_native_microvm_from_state(
+    instance_info: &InstanceInfo,
+    event_manager: &mut EventManager,
+    microvm_state: MicrovmState,
+    guest_memory: GuestMemoryMmap,
+    seccomp_filters: &BpfThreadMap,
+    vm_resources: &mut VmResources,
+) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
+    let vcpu_filter = seccomp_filters
+        .get("vcpu")
+        .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
+        .clone();
+    let (vmm, kvm_vm, vcpus) = construct_microvm_from_state(
+        instance_info,
+        event_manager,
+        microvm_state,
+        RestoredMemory::Adopted(guest_memory),
+        vm_resources,
+        false,
+    )?;
+    kvm_vm
+        .start_vcpus(vcpus, vcpu_filter)
+        .map_err(|(err, _)| err)?;
+    let vmm = Arc::new(Mutex::new(vmm));
+    vmm.lock().unwrap().set_vm_state(VmState::Paused);
+    event_manager.add_subscriber(vmm.clone());
+    Ok(vmm)
+}
+
+/// Guest memory a restored microVM registers.
+enum RestoredMemory {
+    /// Regions mapped for this restore, registered under fresh slots.
+    Regions(Vec<GuestRegionMmap>),
+    /// A fork child's owned clone of its source's registered memory, adopted with its slots.
+    Adopted(GuestMemoryMmap),
+}
+
+/// Constructs KVM, guest memory, devices and restored vCPUs from `microvm_state`, leaving
+/// thread creation, confinement and event-loop registration to the mode-specific startup.
+fn construct_microvm_from_state(
+    instance_info: &InstanceInfo,
+    event_manager: &mut EventManager,
+    microvm_state: MicrovmState,
+    memory: RestoredMemory,
+    vm_resources: &mut VmResources,
+    clock_realtime: bool,
+) -> Result<(Vmm, Arc<KvmVm>, Vec<Vcpu>), BuildMicrovmFromSnapshotError> {
     let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
         .map_err(StartMicrovmError::Kvm)?;
     // Set up KVM VM and register memory regions.
@@ -416,8 +588,12 @@ pub fn build_microvm_from_snapshot(
         .create_vcpus(vm_resources.machine_config.vcpu_count)
         .map_err(StartMicrovmError::KvmVm)?;
 
-    vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
-        .map_err(StartMicrovmError::KvmVm)?;
+    let state = &microvm_state.vm_state.memory;
+    match memory {
+        RestoredMemory::Regions(regions) => vm.restore_memory_regions(regions, state),
+        RestoredMemory::Adopted(memory) => vm.adopt_guest_memory(memory, state),
+    }
+    .map_err(StartMicrovmError::KvmVm)?;
 
     // The slots are committed, so KVM's initially-set state now describes nothing this VM did.
     // Retire it before anything writes guest memory, so this VM's first harvest reports only
@@ -490,45 +666,11 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        inherited: false,
+        owns_terminal: !vm_resources.native,
     };
 
-    // Move vcpus to their own threads and start their state machine in the 'Paused' state.
-    kvm_vm.start_vcpus(
-        vcpus,
-        seccomp_filters
-            .get("vcpu")
-            .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
-            .clone(),
-    )?;
-
-    let vmm = Arc::new(Mutex::new(vmm));
-    vmm.lock().unwrap().set_vm_state(VmState::Paused);
-    event_manager.add_subscriber(vmm.clone());
-
-    // Started before this thread is confined: the channel's thread confines
-    // itself with the same filter, and a filtered thread may not be allowed to
-    // create another.
-    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
-    CaptureService::spawn(
-        channel,
-        vmm.clone(),
-        VmInfo::from(&*vm_resources),
-        seccomp_filters
-            .get("vmm")
-            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
-            .clone(),
-    );
-
-    // Load seccomp filters for the VMM thread.
-    // Keep this as the last step of the building process.
-    crate::seccomp::apply_filter(
-        seccomp_filters
-            .get("vmm")
-            .ok_or(BuildMicrovmFromSnapshotError::MissingVmmSeccompFilters)?,
-    )?;
-    debug!("event_end: build microvm from snapshot");
-
-    Ok(vmm)
+    Ok((vmm, kvm_vm, vcpus))
 }
 
 /// 64 bytes due to alignment requirement in 3.1 of https://www.kernel.org/doc/html/v5.8/virt/kvm/devices/vcpu.html#attribute-kvm-arm-vcpu-pvtime-ipa
@@ -739,6 +881,8 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
+            inherited: false,
+            owns_terminal: true,
         }
     }
 

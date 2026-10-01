@@ -19,8 +19,8 @@ pub use crate::{
     debug, error, error_unrestricted, info, info_unrestricted, warn, warn_unrestricted,
 };
 pub use logging::{
-    DEFAULT_INSTANCE_ID, DEFAULT_LEVEL, INSTANCE_ID, LOGGER, LevelFilter, LevelFilterFromStrError,
-    LoggerConfig, LoggerInitError, LoggerUpdateError,
+    DEFAULT_INSTANCE_ID, DEFAULT_LEVEL, LOGGER, LevelFilter, LevelFilterFromStrError, LoggerConfig,
+    LoggerInitError, LoggerUpdateError, set_instance_id,
 };
 pub use metrics::{
     IncMetric, LatencyAggregateMetrics, METRICS, MetricsError, ProcessTimeReporter,

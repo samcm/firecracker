@@ -6,9 +6,9 @@
 // found in the THIRD-PARTY file.
 
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::sync::{Arc, Barrier};
 use std::{fmt, io, thread};
 
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
@@ -23,11 +23,12 @@ use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
 #[cfg(feature = "gdb")]
 use crate::gdb::target::{GdbTargetError, get_raw_tid};
 use crate::logger::{IncMetric, METRICS, error, info, warn};
-use crate::seccomp::{BpfProgram, BpfProgramRef};
+use crate::seccomp::BpfProgram;
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
 use crate::vstate::bus::Bus;
 use crate::vstate::vm::KvmVm;
+use crate::vstate::worker::{OwnedWorker, WorkerStartError};
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub const VCPU_RTSIG_OFFSET: i32 = 0;
@@ -68,8 +69,8 @@ pub struct VcpuConfig {
 /// Error type for [`Vcpu::start_threaded`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum StartThreadedError {
-    /// Failed to spawn vCPU thread: {0}
-    Spawn(std::io::Error),
+    /// Failed to start vCPU thread: {0}
+    Worker(WorkerStartError),
     /// Failed to clone kvm Vcpu fd: {0}
     CopyFd(CopyKvmFdError),
 }
@@ -165,52 +166,60 @@ impl Vcpu {
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
+    ///
+    /// Returns once the thread registered its kick handler and installed its filter. On failure
+    /// no thread is left running and the vcpu is returned, ready for another start.
+    // The error hands the vcpu back on a cold path; boxing it would only add an allocation.
+    #[allow(clippy::result_large_err)]
     pub fn start_threaded(
         mut self,
         vm: &KvmVm,
         seccomp_filter: Arc<BpfProgram>,
-        barrier: Arc<Barrier>,
-    ) -> Result<VcpuHandle, StartThreadedError> {
+    ) -> Result<VcpuHandle, (StartThreadedError, Vcpu)> {
+        let vcpu_fd = match self.copy_kvm_vcpu_fd(vm) {
+            Ok(vcpu_fd) => vcpu_fd,
+            Err(err) => return Err((StartThreadedError::CopyFd(err), self)),
+        };
         let event_sender = self.event_sender.take().expect("vCPU already started");
         let response_receiver = self.response_receiver.take().unwrap();
-        let vcpu_fd = self
-            .copy_kvm_vcpu_fd(vm)
-            .map_err(StartThreadedError::CopyFd)?;
-        let vcpu_thread = thread::Builder::new()
-            .name(format!("fc_vcpu {}", self.kvm_vcpu.index))
-            .spawn(move || {
-                let filter = &*seccomp_filter;
-                self.register_kick_signal_handler();
-                // Synchronization to make sure thread local data is initialized.
-                barrier.wait();
-                self.run(filter);
-            })
-            .map_err(StartThreadedError::Spawn)?;
-
-        Ok(VcpuHandle::new(
-            event_sender,
-            response_receiver,
-            vcpu_fd,
-            vcpu_thread,
-        ))
+        let builder = thread::Builder::new().name(format!("fc_vcpu {}", self.kvm_vcpu.index));
+        match OwnedWorker::start(
+            builder,
+            self,
+            seccomp_filter,
+            Vcpu::register_kick_signal_handler,
+            Vcpu::run,
+        ) {
+            Ok(worker) => Ok(VcpuHandle::new(
+                event_sender,
+                response_receiver,
+                vcpu_fd,
+                worker,
+            )),
+            Err((err, mut vcpu)) => {
+                vcpu.event_sender = Some(event_sender);
+                vcpu.response_receiver = Some(response_receiver);
+                Err((StartThreadedError::Worker(err), vcpu))
+            }
+        }
     }
 
-    /// Main loop of the vCPU thread.
+    /// Replaces the control channels, whose handle ends were dropped with the previous thread.
+    fn renew_channels(&mut self) {
+        let (event_sender, event_receiver) = channel();
+        let (response_sender, response_receiver) = channel();
+        self.event_receiver = event_receiver;
+        self.event_sender = Some(event_sender);
+        self.response_receiver = Some(response_receiver);
+        self.response_sender = response_sender;
+    }
+
+    /// Main loop of the vCPU thread, once it is confined.
     ///
     /// Runs the vCPU in KVM context in a loop. Handles KVM_EXITs then goes back in.
     /// Note that the state of the VCPU and associated VM must be setup first for this to do
     /// anything useful.
-    pub fn run(&mut self, seccomp_filter: BpfProgramRef) {
-        // Load seccomp filters for this vCPU thread.
-        // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
-        // altogether is the desired behaviour.
-        if let Err(err) = crate::seccomp::apply_filter(seccomp_filter) {
-            panic!(
-                "Failed to set the requested seccomp filters on vCPU {}: Error: {}",
-                self.kvm_vcpu.index, err
-            );
-        }
-
+    fn run(&mut self) {
         // Start running the machine state in the `Paused` state.
         StateMachine::run(self, Self::paused);
     }
@@ -383,13 +392,13 @@ impl Vcpu {
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
+    ///
+    /// A kick sets `immediate_exit`, and `KVM_RUN` is still entered then: KVM first completes
+    /// the I/O or MMIO exit userspace just handled, which may exit again with the next fragment
+    /// of the same access, and only then returns `EINTR` without running a further guest
+    /// instruction. Skipping that run would leave the access half-applied in any state captured
+    /// next, so a restored vCPU would repeat its device effect.
     pub fn run_emulation(&mut self) -> Result<VcpuEmulation, VcpuError> {
-        if self.kvm_vcpu.fd.get_kvm_run().immediate_exit == 1u8 {
-            warn!("Requested a vCPU run with immediate_exit enabled. The operation was skipped");
-            self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
-            return Ok(VcpuEmulation::Interrupted);
-        }
-
         match self.kvm_vcpu.fd.run() {
             Err(ref err) if err.errno() == libc::EINTR => {
                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
@@ -563,9 +572,8 @@ pub struct VcpuHandle {
     response_receiver: Receiver<VcpuResponse>,
     /// VcpuFd
     pub vcpu_fd: VcpuFd,
-    // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
-    // We want to be able to join these threads in tests.
-    vcpu_thread: Option<thread::JoinHandle<()>>,
+    // Taken by `stop_and_return`, or joined on drop.
+    vcpu_thread: Option<OwnedWorker<Vcpu>>,
 }
 
 /// Error type for [`VcpuHandle::send_event`].
@@ -579,12 +587,12 @@ impl VcpuHandle {
     /// # Arguments
     /// + `event_sender`: [`Sender`] to communicate [`VcpuEvent`] to control the vcpu.
     /// + `response_received`: [`Received`] from which the vcpu's responses can be read.
-    /// + `vcpu_thread`: A [`JoinHandle`] for the vcpu thread.
+    /// + `vcpu_thread`: The ready worker owning the vcpu.
     pub fn new(
         event_sender: Sender<VcpuEvent>,
         response_receiver: Receiver<VcpuResponse>,
         vcpu_fd: VcpuFd,
-        vcpu_thread: thread::JoinHandle<()>,
+        vcpu_thread: OwnedWorker<Vcpu>,
     ) -> Self {
         Self {
             event_sender,
@@ -611,6 +619,7 @@ impl VcpuHandle {
             .as_ref()
             // Safe to unwrap since constructor make this 'Some'.
             .unwrap()
+            .handle()
             .kill(sigrtmin() + VCPU_RTSIG_OFFSET)?;
         Ok(())
     }
@@ -618,6 +627,37 @@ impl VcpuHandle {
     /// Returns a reference to the [`Received`] from which the vcpu's responses can be read.
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
+    }
+
+    /// Finishes the vCPU thread, joins it and returns the [`Vcpu`] it owned, ready for
+    /// [`Vcpu::start_threaded`] with fresh control channels.
+    ///
+    /// Events queued before the finish are handled first; their responses go to this handle,
+    /// which outlives the join.
+    pub fn stop_and_return(mut self) -> Vcpu {
+        self.finish();
+        self.join()
+    }
+
+    /// Tells the vCPU thread to finish. A failed kick is logged, as in
+    /// [`KvmVm::shutdown_vcpus`]; the queued event still ends the thread.
+    pub fn finish(&mut self) {
+        if let Err(err) = self.send_event(VcpuEvent::Finish) {
+            error!("Failed to send VcpuEvent::Finish to vCPU: {}", err);
+        }
+    }
+
+    /// Joins a vCPU thread told to [`VcpuHandle::finish`] and returns the [`Vcpu`] it owned,
+    /// with fresh control channels.
+    pub fn join(mut self) -> Vcpu {
+        let mut vcpu = self
+            .vcpu_thread
+            .take()
+            // Safe to unwrap since constructor make this 'Some' and only a consumer takes it.
+            .unwrap()
+            .join();
+        vcpu.renew_channels();
+        vcpu
     }
 }
 
@@ -631,7 +671,10 @@ impl Drop for VcpuHandle {
         //
         // If the code hangs at this point, that means that a Finish event was not
         // sent by Vmm.
-        self.vcpu_thread.take().unwrap().join().unwrap();
+        // `stop_and_return` has already joined the thread it took.
+        if let Some(vcpu_thread) = self.vcpu_thread.take() {
+            vcpu_thread.join();
+        }
     }
 }
 
@@ -910,17 +953,9 @@ pub(crate) mod tests {
             )
             .expect("failed to configure vcpu");
 
-        let mut seccomp_filters = get_empty_filters();
-        let barrier = Arc::new(Barrier::new(2));
         let vcpu_handle = vcpu
-            .start_threaded(
-                &vm,
-                seccomp_filters.remove("vcpu").unwrap(),
-                barrier.clone(),
-            )
-            .expect("failed to start vcpu");
-        // Wait for vCPUs to initialize their TLS before moving forward.
-        barrier.wait();
+            .start_threaded(&vm, get_empty_filters().remove("vcpu").unwrap())
+            .unwrap_or_else(|(err, _)| panic!("failed to start vcpu: {err}"));
 
         (vm, vcpu_handle, vcpu_exit_evt)
     }
@@ -995,29 +1030,181 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_immediate_exit_shortcircuits_execution() {
-        let (_, mut vcpu) = setup_vcpu(0x1000);
+    fn test_kick_completes_fragmented_mmio_before_interrupting() {
+        use crate::vstate::memory::Bytes;
 
+        /// Records the bytes the guest writes, in order.
+        #[derive(Debug, Default)]
+        struct Recorder(Vec<(u64, Vec<u8>)>);
+        impl BusDevice for Recorder {
+            fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+                self.0.push((offset, data.to_vec()));
+                None
+            }
+        }
+
+        const CODE: u64 = 0x2_0000;
+        const EXPECT: u64 = 0x2_1000;
+        const MMIO: u64 = 0x800_0080;
+        const UNTOUCHED_RAX: u64 = 0x0a1b_2c3d_4e5f_6071;
+        // movdqu (%rsi),%xmm0; movdqu %xmm0,(%rdi); mov $42,%al; out %al,$0xe9; hlt
+        let code = [
+            0xf3, 0x0f, 0x6f, 0x06, 0xf3, 0x0f, 0x7f, 0x07, 0xb0, 0x2a, 0xe6, 0xe9, 0xf4,
+        ];
+        const AFTER_STORE: u64 = CODE + 8;
+        let expected: [u8; 16] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+
+        let (vm, mut vcpu) = setup_vcpu(mib_to_bytes(16));
+        vm.guest_memory()
+            .write_slice(&code, GuestAddress(CODE))
+            .unwrap();
+        vm.guest_memory()
+            .write_slice(&expected, GuestAddress(EXPECT))
+            .unwrap();
+        {
+            use crate::cpu_config::x86_64::cpuid::Cpuid;
+            vcpu.kvm_vcpu
+                .configure(
+                    vm.guest_memory(),
+                    EntryPoint {
+                        entry_addr: GuestAddress(CODE),
+                        protocol: BootProtocol::LinuxBoot,
+                    },
+                    &VcpuConfig {
+                        vcpu_count: 1,
+                        smt: false,
+                        cpu_config: CpuConfiguration {
+                            cpuid: Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap(),
+                            msrs: BTreeMap::new(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        // Permit SSE: OSFXSR, with MP and ET set and EM and TS clear.
+        let mut sregs = vcpu.kvm_vcpu.fd.get_sregs().unwrap();
+        sregs.cr4 |= 1 << 9;
+        sregs.cr0 = (sregs.cr0 | (1 << 1) | (1 << 4)) & !((1 << 2) | (1 << 3));
+        vcpu.kvm_vcpu.fd.set_sregs(&sregs).unwrap();
+        let mut regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        regs.rip = CODE;
+        regs.rsi = EXPECT;
+        regs.rdi = MMIO;
+        regs.rax = UNTOUCHED_RAX;
+        vcpu.kvm_vcpu.fd.set_regs(&regs).unwrap();
+
+        let recorder = Arc::new(Mutex::new(Recorder::default()));
+        let bus = Arc::new(Bus::new());
+        bus.insert(recorder.clone(), MMIO, 16).unwrap();
+        vcpu.set_mmio_bus(bus);
+
+        // The 16-byte store exits with its first 8-byte fragment.
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Handled);
+        assert_eq!(recorder.lock().unwrap().0.len(), 1);
+        // A kick lands before the vCPU reenters KVM: the store still completes, exactly once.
         vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
-        // Set a dummy value to be returned by the emulate call
-        let result = vcpu.run_emulation().expect("Failed to run emulation");
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Handled);
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Interrupted);
+        assert_eq!(vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit, 0);
+
+        let written = &recorder.lock().unwrap().0;
         assert_eq!(
-            result,
-            VcpuEmulation::Interrupted,
-            "The Immediate Exit short-circuit should have prevented the execution of emulate"
+            written
+                .iter()
+                .map(|(offset, _)| *offset)
+                .collect::<Vec<_>>(),
+            [0, 8]
         );
-
-        let event_sender = vcpu.event_sender.take().expect("vCPU already started");
-        let _ = event_sender.send(VcpuEvent::Resume);
-        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
-        // paused is expected to coerce immediate_exit to 0 when receiving a VcpuEvent::Resume
-        let _ = vcpu.paused();
         assert_eq!(
-            0,
-            vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit,
-            "Immediate Exit should have been disabled by sending Resume to a paused VM"
-        )
+            written
+                .iter()
+                .flat_map(|(_, data)| data.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        // The interrupt fell between the store and the next instruction.
+        let regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        assert_eq!(regs.rip, AFTER_STORE);
+        assert_eq!(regs.rax, UNTOUCHED_RAX);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_kick_completes_pending_out_exactly_once() {
+        use crate::vstate::memory::Bytes;
+
+        #[derive(Debug, Default)]
+        struct Port(Vec<u8>);
+        impl BusDevice for Port {
+            fn write(&mut self, _base: u64, _offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+                self.0.extend_from_slice(data);
+                None
+            }
+        }
+
+        const CODE: u64 = 0x2_0000;
+        // mov $42,%al; out %al,$0xe9; mov $91,%al; out %al,$0xe9; jmp .
+        let code = [0xb0, 0x2a, 0xe6, 0xe9, 0xb0, 0x5b, 0xe6, 0xe9, 0xeb, 0xfe];
+        const AFTER_FIRST_OUT: u64 = CODE + 4;
+        const AFTER_SECOND_OUT: u64 = CODE + 8;
+
+        let (vm, mut vcpu) = setup_vcpu(mib_to_bytes(16));
+        vm.guest_memory()
+            .write_slice(&code, GuestAddress(CODE))
+            .unwrap();
+        {
+            use crate::cpu_config::x86_64::cpuid::Cpuid;
+            vcpu.kvm_vcpu
+                .configure(
+                    vm.guest_memory(),
+                    EntryPoint {
+                        entry_addr: GuestAddress(CODE),
+                        protocol: BootProtocol::LinuxBoot,
+                    },
+                    &VcpuConfig {
+                        vcpu_count: 1,
+                        smt: false,
+                        cpu_config: CpuConfiguration {
+                            cpuid: Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap(),
+                            msrs: BTreeMap::new(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let mut regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        regs.rip = CODE;
+        vcpu.kvm_vcpu.fd.set_regs(&regs).unwrap();
+        let port = Arc::new(Mutex::new(Port::default()));
+        let bus = Arc::new(Bus::new());
+        bus.insert(port.clone(), 0xe9, 1).unwrap();
+        vcpu.kvm_vcpu.set_pio_bus(bus);
+
+        // The first OUT exits to userspace, which applies it.
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Handled);
+        assert_eq!(port.lock().unwrap().0, [42]);
+        // A kick lands before the vCPU reenters KVM: KVM completes the OUT, then interrupts
+        // without entering the guest.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Interrupted);
+        assert_eq!(vcpu.kvm_vcpu.fd.get_regs().unwrap().rip, AFTER_FIRST_OUT);
+        assert_eq!(port.lock().unwrap().0, [42]);
+        // Resumed, the guest runs on to the second OUT, a distinct byte: the first OUT is not
+        // applied a second time.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Handled);
+        assert_eq!(port.lock().unwrap().0, [42, 91]);
+        // Completing the second OUT the same way leaves it applied once, and the guest never
+        // runs past it.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Interrupted);
+        assert_eq!(vcpu.kvm_vcpu.fd.get_regs().unwrap().rip, AFTER_SECOND_OUT);
+        assert_eq!(port.lock().unwrap().0, [42, 91]);
     }
 
     #[test]
@@ -1049,6 +1236,35 @@ pub(crate) mod tests {
         // Queue a Resume event, expect a response.
         queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
 
+        vcpu_handle.send_event(VcpuEvent::Finish).unwrap();
+    }
+
+    #[test]
+    fn test_vcpu_stop_and_return() {
+        let (vm, mut vcpu_handle, vcpu_exit_evt) = vcpu_configured_for_boot();
+        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
+        // A control command still queued when the stop arrives is handled first, and its
+        // response must find the handle's receiver alive until the join.
+        vcpu_handle.send_event(VcpuEvent::Pause).unwrap();
+        let vcpu = vcpu_handle.stop_and_return();
+
+        // A filter failure returns the vCPU without running it.
+        let too_large = Arc::new(vec![0; crate::seccomp::BPF_MAX_LEN + 1]);
+        let (err, vcpu) = vcpu.start_threaded(&vm, too_large).unwrap_err();
+        assert!(matches!(
+            err,
+            StartThreadedError::Worker(WorkerStartError::Filter(_))
+        ));
+
+        // The recovered vCPU restarts on a new thread with fresh channels, in the Paused state.
+        let mut vcpu_handle = vcpu
+            .start_threaded(&vm, get_empty_filters().remove("vcpu").unwrap())
+            .unwrap_or_else(|(err, _)| panic!("failed to restart vcpu: {err}"));
+        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
+        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Pause, VcpuResponse::Paused);
+
+        let err = vcpu_exit_evt.read().unwrap_err();
+        assert_eq!(err.raw_os_error().unwrap(), libc::EAGAIN);
         vcpu_handle.send_event(VcpuEvent::Finish).unwrap();
     }
 
