@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_ulong;
 use std::os::unix::fs::FileExt;
@@ -59,7 +59,7 @@ const REQUIRED_VMSTATE_SEALS: i32 =
 /// Userfaultfd features the deployment kernel must provide for shmem-backed guest memory. Guest
 /// extents are file mappings, so write protection over them needs the shmem write-protect feature
 /// as well as write-protect fault reporting.
-const REQUIRED_UFFD_FEATURES: u64 = UFFD_FEATURE_PAGEFAULT_FLAG_WP
+pub(super) const REQUIRED_UFFD_FEATURES: u64 = UFFD_FEATURE_PAGEFAULT_FLAG_WP
     | UFFD_FEATURE_MISSING_SHMEM
     | UFFD_FEATURE_MINOR_SHMEM
     | UFFD_FEATURE_WP_HUGETLBFS_SHMEM;
@@ -206,12 +206,28 @@ pub struct MemoryChannel {
     pub sock: UnixStream,
     /// Checkpoint geometry the plan tiled, in ascending guest address order.
     pub regions: Vec<RegionRecord>,
+    /// Host address each region's reservation starts at, in the order of `regions`.
+    pub host_bases: Vec<u64>,
     /// Exact size of one dirty bitmap. A harvest writes two bitmaps of this size: the dirty pages,
     /// then the pages the guest reported free.
     pub dirty_bitmap_bytes: u64,
     /// The registered userfaultfd. Holding it until process exit is what keeps guest faults
-    /// blocked rather than zero-filled when pagemaster dies.
-    _uffd: Uffd,
+    /// blocked rather than zero-filled when pagemaster dies, and a rebase registers the ranges it
+    /// remaps on it.
+    pub(super) uffd: Uffd,
+}
+
+impl MemoryChannel {
+    /// Host address of a guest physical address inside one of the plan's regions.
+    pub fn host_addr(&self, guest_addr: u64) -> Option<u64> {
+        self.regions
+            .iter()
+            .zip(&self.host_bases)
+            .find(|(region, _)| {
+                guest_addr >= region.guest_addr && guest_addr < region.guest_addr + region.size
+            })
+            .map(|(region, base)| base + (guest_addr - region.guest_addr))
+    }
 }
 
 /// Handshake with pagemaster: the only way guest memory comes into existence.
@@ -570,8 +586,12 @@ fn commit_plan(
     *CHANNEL.lock().expect("Poisoned lock") = Some(MemoryChannel {
         sock,
         regions: plan.regions,
+        host_bases: ready_regions
+            .iter()
+            .map(|region| region.host_base)
+            .collect(),
         dirty_bitmap_bytes,
-        _uffd: uffd,
+        uffd,
     });
     Ok((memory, restored_state))
 }
@@ -693,7 +713,7 @@ fn memfd_seals(fd: RawFd) -> Option<i32> {
 }
 
 /// Returns the size of a backing descriptor that satisfies every precondition.
-fn validate_backing_fd(fd: RawFd) -> Result<u64, ErrorCode> {
+pub(super) fn validate_backing_fd(fd: RawFd) -> Result<u64, ErrorCode> {
     let seals = memfd_seals(fd).ok_or(ErrorCode::FdNotMemfd)?;
     let stat = fstat(fd).ok_or(ErrorCode::FdNotMemfd)?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
@@ -778,18 +798,32 @@ fn fstatfs(fd: RawFd) -> Option<libc::statfs> {
 
 /// Reads the extent table out of its sealed descriptor.
 fn read_extent_table(fd: &OwnedFd, count: u32) -> Result<Vec<ExtentRecord>, ErrorCode> {
-    if memfd_seals(fd.as_raw_fd())
+    let file = File::from(fd.try_clone().map_err(|_| ErrorCode::FdNotMemfd)?);
+    let buf = read_sealed_table(&file, count as usize * protocol::EXTENT_RECORD_LEN)?;
+    buf.chunks_exact(protocol::EXTENT_RECORD_LEN)
+        .map(|chunk| ExtentRecord::decode(chunk).map_err(|_| ErrorCode::BadExtent))
+        .collect()
+}
+
+/// Reads the first `len` bytes of a table pagemaster sealed against change before sending it.
+///
+/// It seeks and reads the descriptor it is handed, never a duplicate and never at a position,
+/// because the capture thread's seccomp policy admits neither `F_DUPFD_CLOEXEC` nor `pread64`.
+pub(super) fn read_sealed_table(table: &File, len: usize) -> Result<Vec<u8>, ErrorCode> {
+    if memfd_seals(table.as_raw_fd())
         .is_none_or(|seals| seals & REQUIRED_BACKING_SEALS != REQUIRED_BACKING_SEALS)
     {
         return Err(ErrorCode::FdNotSealed);
     }
-    let mut file = File::from(fd.try_clone().map_err(|_| ErrorCode::FdNotMemfd)?);
-    let mut buf = vec![0u8; count as usize * protocol::EXTENT_RECORD_LEN];
-    file.read_exact(&mut buf)
+    let mut reader = table;
+    reader
+        .seek(SeekFrom::Start(0))
         .map_err(|_| ErrorCode::BadExtent)?;
-    buf.chunks_exact(protocol::EXTENT_RECORD_LEN)
-        .map(|chunk| ExtentRecord::decode(chunk).map_err(|_| ErrorCode::BadExtent))
-        .collect()
+    let mut buf = vec![0u8; len];
+    reader
+        .read_exact(&mut buf)
+        .map_err(|_| ErrorCode::BadExtent)?;
+    Ok(buf)
 }
 
 /// Parses the vmstate handed over with a restore plan.

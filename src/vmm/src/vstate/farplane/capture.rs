@@ -10,11 +10,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use utils::time::{ClockType, get_time_us};
 
 use super::backend::{
-    BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, harvest_len, set_capture_buffers_armed,
-    validate_buffer_fd, validate_clone_destination,
+    BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, harvest_len, read_sealed_table,
+    set_capture_buffers_armed, validate_backing_fd, validate_buffer_fd, validate_clone_destination,
 };
 use super::dispatch;
-use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
+use super::protocol::{
+    self, ChannelError, ErrorCode, Incoming, MsgType, REBASE_BODY_LEN, REBASE_RUN_RECORD_LEN,
+    REBASED_RANGE_RECORD_LEN,
+};
+use super::rebase::{self, RebaseOutcome, RebaseRequest, RebaseRun};
 use crate::Vmm;
 use crate::logger::{IncMetric, METRICS, error, info};
 use crate::persist::{MicrovmState, VmInfo};
@@ -421,6 +425,8 @@ impl CaptureService {
             MsgType::Quiesce | MsgType::DirtySnapshot | MsgType::WriteVmstate => (0, &[0]),
             MsgType::DirtyUnion | MsgType::FreeSummary => (0, &[1]),
             MsgType::Resume => (4, &[0]),
+            // The overlay, the run table and the buffer the mapped ranges are written into.
+            MsgType::Rebase => (REBASE_BODY_LEN, &[3]),
             _ => return Err(ChannelError::Malformed),
         };
         if incoming.body.len() != body_len || !fd_counts.contains(&incoming.fds.len()) {
@@ -470,6 +476,7 @@ impl CaptureService {
                 let run_vcpus = protocol::parse_u32(&incoming.body)?;
                 self.resume(request_id, run_vcpus)
             }
+            MsgType::Rebase => self.rebase(incoming),
             _ => Err(ChannelError::Malformed),
         }
     }
@@ -805,6 +812,158 @@ impl CaptureService {
         )
     }
 
+    /// Maps a sealed generation's overlay over the guest pages a run table names that the guest
+    /// has not written since the last harvest, and reports the ranges it mapped.
+    ///
+    /// The command is its own epoch: it stops every guest-memory writer exactly as `quiesce`
+    /// does, reads the dirty accumulator without retiring a bit of it, remaps, and hands the
+    /// source back as it found it, vCPUs included, before it answers. Nothing outside the command
+    /// observes the pause: the API and every device wait at the dispatch gate.
+    ///
+    /// Everything the request names is validated before the source is touched, so a refusal
+    /// leaves it as it was. A remap that fails may already have destroyed the range it failed on,
+    /// so the channel fails closed with the vCPUs stopped instead of letting the guest read a hole.
+    fn rebase(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
+        let request_id = incoming.header.request_id;
+        match BackendState::load() {
+            BackendState::Ready => {}
+            BackendState::Quiesced => {
+                return self.reject(request_id, ErrorCode::AlreadyQuiesced, MsgType::Rebase);
+            }
+            _ => return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Rebase),
+        }
+        let request = rebase::parse_rebase(&incoming.body)?;
+        let [overlay, table, ranges_out] =
+            <[_; 3]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+        // The descriptors are this command's own, so they are used as files directly: the capture
+        // thread's seccomp policy admits no descriptor duplication.
+        let (table, ranges_out) = (File::from(table), File::from(ranges_out));
+        let runs = match self.rebase_runs(request, overlay.as_raw_fd(), &table, &ranges_out) {
+            Ok(runs) => runs,
+            Err(code) => return self.reject(request_id, code, MsgType::Rebase),
+        };
+
+        // Closing the gate waits out the event loop's current slice while the vCPUs still run,
+        // so the pause, its budget and the time it reports start after it.
+        dispatch::gate().close();
+        let mut vmm = self.vmm.lock().expect("Poisoned lock");
+        let started = get_time_us(ClockType::Monotonic);
+        let were_running = vmm.instance_info.state == VmState::Running;
+        if were_running && let Err(err) = vmm.pause_vm() {
+            error!("Farplane rebase could not pause the vCPUs: {err}");
+            drop(vmm);
+            dispatch::gate().open();
+            return self.reject(request_id, ErrorCode::RebaseFailed, MsgType::Rebase);
+        }
+        let keep = vmm
+            .drain_guest_memory_writers()
+            .map_err(|err| {
+                error!("Farplane rebase could not stop every guest-memory writer: {err}")
+            })
+            .and_then(|()| {
+                let kvm_vm = vmm.kvm_vm().ok_or(())?;
+                kvm_vm
+                    .snapshot_rebase_keep_log()
+                    .map_err(|err| error!("Farplane rebase could not read the dirty log: {err}"))
+            });
+        let Ok(keep) = keep else {
+            hand_back_source(vmm, were_running);
+            return self.reject(request_id, ErrorCode::RebaseFailed, MsgType::Rebase);
+        };
+
+        let page = crate::arch::host_page_size() as u64;
+        let channel = &self.channel;
+        let budget_us = request.budget_us;
+        let applied = rebase::apply_runs(
+            &runs,
+            &channel.regions,
+            &keep,
+            request.max_ranges,
+            page,
+            || get_time_us(ClockType::Monotonic).saturating_sub(started) >= budget_us,
+            |run, guest_addr, len| {
+                let host_addr = channel
+                    .host_addr(guest_addr)
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?;
+                rebase::map_overlay_range(
+                    host_addr,
+                    len,
+                    overlay.as_raw_fd(),
+                    run.fd_offset + (guest_addr - run.guest_addr),
+                    &channel.uffd,
+                )
+            },
+        );
+        let outcome = match applied {
+            Ok(outcome) => outcome,
+            Err((outcome, err)) => {
+                error!(
+                    "Farplane rebase failed after mapping {} ranges: {err}",
+                    outcome.ranges.len()
+                );
+                return self.fail_rebase(vmm);
+            }
+        };
+        // Pagemaster learns the new mappings only from this buffer, so a write it cannot read
+        // back is a source whose mappings no peer knows: the channel fails closed.
+        if let Err(err) = write_ranges(&ranges_out, &outcome) {
+            error!("Farplane rebase could not report the ranges it mapped: {err}");
+            return self.fail_rebase(vmm);
+        }
+        hand_back_source(vmm, were_running);
+        let paused_us = get_time_us(ClockType::Monotonic).saturating_sub(started);
+        info!(
+            "Farplane rebase mapped {} ranges of {} runs in {paused_us} us",
+            outcome.ranges.len(),
+            outcome.applied_runs
+        );
+        self.reply(
+            request_id,
+            MsgType::Rebased,
+            &rebase::encode_rebased(&outcome, paused_us),
+        )
+    }
+
+    /// Validates every descriptor and the run table of a `rebase` before the source is touched.
+    fn rebase_runs(
+        &self,
+        request: RebaseRequest,
+        overlay: RawFd,
+        table: &File,
+        ranges_out: &File,
+    ) -> Result<Vec<RebaseRun>, ErrorCode> {
+        if request.run_count > protocol::MAX_EXTENTS || request.max_ranges > protocol::MAX_EXTENTS {
+            return Err(ErrorCode::TooManyExtents);
+        }
+        let overlay_size = validate_backing_fd(overlay)?;
+        validate_buffer_fd(
+            ranges_out.as_raw_fd(),
+            u64::from(request.max_ranges) * REBASED_RANGE_RECORD_LEN as u64,
+        )?;
+        let raw = read_sealed_table(table, request.run_count as usize * REBASE_RUN_RECORD_LEN)?;
+        let runs = raw
+            .chunks_exact(REBASE_RUN_RECORD_LEN)
+            .map(|chunk| RebaseRun::decode(chunk).map_err(|_| ErrorCode::BadExtent))
+            .collect::<Result<Vec<_>, _>>()?;
+        rebase::validate_runs(
+            &runs,
+            &self.channel.regions,
+            overlay_size,
+            crate::arch::host_page_size() as u64,
+        )?;
+        Ok(runs)
+    }
+
+    /// Ends the channel with the source stopped, for a rebase that may have left a range unmapped.
+    /// The supervisor kills this process; no guest executes in between.
+    fn fail_rebase(&self, vmm: MutexGuard<'_, Vmm>) -> Result<(), ChannelError> {
+        BackendState::fail();
+        drop(vmm);
+        Err(ChannelError::Io(io::Error::other(
+            "rebase failed with the source stopped",
+        )))
+    }
+
     /// Reads a bitmap of the geometry's exact shape out of a descriptor.
     fn read_bitmap(&self, file: &mut File) -> Result<Vec<Vec<u64>>, ErrorCode> {
         let page = crate::arch::host_page_size() as u64;
@@ -880,6 +1039,13 @@ fn hand_back_source(mut vmm: MutexGuard<'_, Vmm>, were_running: bool) {
     if BackendState::load() != BackendState::ChannelFailed {
         dispatch::gate().open();
     }
+}
+
+/// Writes the ranges a rebase mapped into the buffer pagemaster reads them from.
+fn write_ranges(buffer: &File, outcome: &RebaseOutcome) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    buffer.write_all_at(&rebase::encode_ranges(&outcome.ranges), 0)
 }
 
 /// Reflinks the scratch disk into `destination`, reporting how long the ioctl took in

@@ -613,6 +613,29 @@ impl KvmVm {
             .collect()
     }
 
+    /// The pages a rebase must leave as they are, per region in ascending guest address order:
+    /// every page written since the last harvest, and every page the guest reported free.
+    ///
+    /// A report retires a page's dirty evidence, so the dirty log alone would call a page that was
+    /// written or zeroed after the flip and then reported unchanged. Its bytes are not the
+    /// generation's, and a guest that zeroes what it frees allocates it again without clearing it.
+    pub fn snapshot_rebase_keep_log(&self) -> Result<Vec<Vec<u64>>, VmError> {
+        let mut keep = self.snapshot_dirty_log()?;
+        let free = self.snapshot_free_log()?;
+        if keep.len() != free.len() {
+            return Err(VmError::DirtyBitmapShape);
+        }
+        for (kept, reported) in keep.iter_mut().zip(free) {
+            if kept.len() != reported.len() {
+                return Err(VmError::DirtyBitmapShape);
+            }
+            for (word, reported_word) in kept.iter_mut().zip(reported) {
+                *word |= reported_word;
+            }
+        }
+        Ok(keep)
+    }
+
     /// The uncaptured pages the guest has not written since it reported them, per region in
     /// ascending guest address order. Reading the log neither clears nor re-protects it.
     ///
@@ -1191,6 +1214,25 @@ pub(crate) mod tests {
             std::iter::once(64).chain(67..128).collect::<Vec<_>>()
         );
         assert!(set_pages(&vm.free_summary().unwrap()[0]).is_empty());
+    }
+
+    #[test]
+    fn test_a_rebase_keeps_every_written_and_every_reported_page() {
+        let page_size = host_page_size() as u64;
+        let addr = |page: u64| GuestAddress(page * page_size);
+        let vm = setup_vm_with_memory(u64_to_usize(256 * page_size));
+        vm.baseline_dirty_log().unwrap();
+        // Page 70 is zeroed by the guest's free and then reported, which retires its dirty bit;
+        // page 3 is written and never reported; page 200 is neither.
+        vm.guest_memory()
+            .mark_dirty(addr(70), u64_to_usize(page_size));
+        vm.guest_memory()
+            .mark_dirty(addr(3), u64_to_usize(page_size));
+        assert_eq!(vm.report_free(addr(64), 64 * page_size).unwrap(), 64);
+        assert!(!set_pages(&vm.snapshot_dirty_log().unwrap()[0]).contains(&70));
+
+        let keep = set_pages(&vm.snapshot_rebase_keep_log().unwrap()[0]);
+        assert_eq!(keep, std::iter::once(3).chain(64..128).collect::<Vec<_>>());
     }
 
     #[test]

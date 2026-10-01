@@ -253,6 +253,19 @@
             },
             {
                 "syscall": "madvise",
+                "comment": "Used by a farplane rebase to install a remapped guest range read-only from its generation before registering it",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 22,
+                        "comment": "libc::MADV_POPULATE_READ"
+                    }
+                ]
+            },
+            {
+                "syscall": "madvise",
                 "comment": "Used by aws-lc during random number generation. It marks a memory page with MADV_WIPEONFORK to be able to detect forks.",
                 "args": [
                     {
@@ -320,6 +333,26 @@
                         "op": "eq",
                         "val": 34,
                         "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by a farplane rebase to map a sealed generation over guest pages the guest has not written since the flip",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 18,
+                        "comment": "libc::MAP_PRIVATE | libc::MAP_FIXED"
                     },
                     {
                         "index": 2,

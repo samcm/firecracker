@@ -38,7 +38,7 @@ MAGIC = 0x314D5046
 VERSION = 1
 MAX_DATAGRAM = 65536
 MAX_EXTENTS = 65536
-FEATURE_IDENTITY = "farplane/5"
+FEATURE_IDENTITY = "farplane/6"
 
 HEADER = struct.Struct("<IHHQIIQ")
 HELLO = struct.Struct("<IIHHI32s")
@@ -84,6 +84,8 @@ class Msg(IntEnum):
     CAPTURE_BUFFERS_ARMED = 17
     FREE_SUMMARY = 18
     FREE_SUMMARY_DONE = 19
+    REBASE = 20
+    REBASED = 21
 
 
 class Err(IntEnum):
@@ -115,6 +117,7 @@ class Err(IntEnum):
     NO_SCRATCH_DRIVE = 24
     BAD_CLONE_DESTINATION = 25
     DISK_CLONE_FAILED = 26
+    REBASE_FAILED = 27
 
 
 F_ADD_SEALS = 1033
