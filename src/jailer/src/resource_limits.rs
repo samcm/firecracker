@@ -121,6 +121,26 @@ mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
     use super::*;
 
+    // Hard limits cannot be restored without privilege, so only a child may lower them.
+    fn in_child(body: impl FnOnce() + std::panic::UnwindSafe) {
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            std::panic::set_hook(Box::new(|panic| {
+                let report = format!("{panic}\n");
+                unsafe { libc::write(libc::STDERR_FILENO, report.as_ptr().cast(), report.len()) };
+            }));
+            let failed = std::panic::catch_unwind(body).is_err();
+            unsafe { libc::_exit(i32::from(failed)) }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "resource-limit child failed: {status:#x}"
+        );
+    }
+
     #[test]
     #[allow(clippy::unnecessary_cast)]
     fn test_from_resource() {
@@ -156,64 +176,68 @@ mod tests {
 
     #[test]
     fn test_set_resource_limits() {
-        let resource = Resource::NoFile;
-        let new_limit = NO_FILE - 1;
-        let mut rlim: libc::rlimit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        unsafe { libc::getrlimit(resource.into(), &mut rlim) };
-        assert_ne!(rlim.rlim_cur, new_limit);
-        assert_ne!(rlim.rlim_max, new_limit);
+        in_child(|| {
+            let resource = Resource::NoFile;
+            let new_limit = NO_FILE - 1;
+            let mut rlim: libc::rlimit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::getrlimit(resource.into(), &mut rlim) };
+            assert_ne!(rlim.rlim_cur, new_limit);
+            assert_ne!(rlim.rlim_max, new_limit);
 
-        ResourceLimits::set_limit(resource, new_limit).unwrap();
+            ResourceLimits::set_limit(resource, new_limit).unwrap();
 
-        let mut rlim: libc::rlimit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        unsafe { libc::getrlimit(resource.into(), &mut rlim) };
-        assert_eq!(rlim.rlim_cur, new_limit);
-        assert_eq!(rlim.rlim_max, new_limit);
+            let mut rlim: libc::rlimit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::getrlimit(resource.into(), &mut rlim) };
+            assert_eq!(rlim.rlim_cur, new_limit);
+            assert_eq!(rlim.rlim_max, new_limit);
+        });
     }
 
     #[test]
     fn test_install() {
-        let mut rlimits = ResourceLimits::default();
-        let new_file_size_limit = 2097151;
-        let new_no_file_limit = 1000;
-        rlimits.set_file_size(new_file_size_limit);
-        rlimits.set_no_file(new_no_file_limit);
-        let new_memlock_limit = 1048576;
-        rlimits.set_memlock(new_memlock_limit);
+        in_child(|| {
+            let mut rlimits = ResourceLimits::default();
+            let new_file_size_limit = 2097151;
+            let new_no_file_limit = 1000;
+            rlimits.set_file_size(new_file_size_limit);
+            rlimits.set_no_file(new_no_file_limit);
+            let new_memlock_limit = 1048576;
+            rlimits.set_memlock(new_memlock_limit);
 
-        rlimits.install().unwrap();
+            rlimits.install().unwrap();
 
-        let file_size_resource = Resource::Fsize;
-        let mut file_size_limit: libc::rlimit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        unsafe { libc::getrlimit(file_size_resource.into(), &mut file_size_limit) };
-        assert_eq!(file_size_limit.rlim_cur, new_file_size_limit);
-        assert_eq!(file_size_limit.rlim_max, new_file_size_limit);
+            let file_size_resource = Resource::Fsize;
+            let mut file_size_limit: libc::rlimit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::getrlimit(file_size_resource.into(), &mut file_size_limit) };
+            assert_eq!(file_size_limit.rlim_cur, new_file_size_limit);
+            assert_eq!(file_size_limit.rlim_max, new_file_size_limit);
 
-        let file_descriptor_resource = Resource::NoFile;
-        let mut file_descriptor_limit: libc::rlimit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        unsafe { libc::getrlimit(file_descriptor_resource.into(), &mut file_descriptor_limit) };
-        assert_eq!(file_descriptor_limit.rlim_cur, new_no_file_limit);
-        assert_eq!(file_descriptor_limit.rlim_max, new_no_file_limit);
+            let file_descriptor_resource = Resource::NoFile;
+            let mut file_descriptor_limit: libc::rlimit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::getrlimit(file_descriptor_resource.into(), &mut file_descriptor_limit) };
+            assert_eq!(file_descriptor_limit.rlim_cur, new_no_file_limit);
+            assert_eq!(file_descriptor_limit.rlim_max, new_no_file_limit);
 
-        let memlock_resource = Resource::Memlock;
-        let mut memlock_limit: libc::rlimit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        unsafe { libc::getrlimit(memlock_resource.into(), &mut memlock_limit) };
-        assert_eq!(memlock_limit.rlim_cur, new_memlock_limit);
-        assert_eq!(memlock_limit.rlim_max, new_memlock_limit);
+            let memlock_resource = Resource::Memlock;
+            let mut memlock_limit: libc::rlimit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::getrlimit(memlock_resource.into(), &mut memlock_limit) };
+            assert_eq!(memlock_limit.rlim_cur, new_memlock_limit);
+            assert_eq!(memlock_limit.rlim_max, new_memlock_limit);
+        });
     }
 }
