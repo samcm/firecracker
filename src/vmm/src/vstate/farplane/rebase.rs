@@ -695,7 +695,7 @@ mod tests {
                 let advice = u64::try_from(advice).unwrap();
                 assert!(admitted(rules, "madvise", 2, advice), "{target}: madvise {advice}");
             }
-            let onfault = u64::try_from(libc::MLOCK_ONFAULT).unwrap();
+            let onfault = u64::from(libc::MLOCK_ONFAULT);
             assert!(admitted(rules, "mlock2", 2, onfault), "{target}: mlock2");
             for syscall in ["lseek", "read", "pwrite64", "fstat", "fstatfs"] {
                 assert!(admitted(rules, syscall, 0, 0), "{target}: {syscall}");
