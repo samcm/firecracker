@@ -37,5 +37,8 @@ fn main() {
     };
 
     println!("cargo::rustc-link-search=native={}", lib_path.display());
-    println!("cargo::rustc-link-lib=static=seccomp");
+    // Resolve the supplied archive at the final link rather than embedding its objects in
+    // this crate's rlib. This keeps the selected library visible in the binary's link map
+    // and lets cross-target metadata checks run without a target libseccomp archive.
+    println!("cargo::rustc-link-lib=static:-bundle=seccomp");
 }

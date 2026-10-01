@@ -36,7 +36,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup component add clippy
 
-      # `src/seccompiler/build.rs` emits `cargo::rustc-link-lib=static=seccomp`, so anything that
+      # `src/seccompiler/build.rs` emits `cargo::rustc-link-lib=static:-bundle=seccomp`, so anything that
       # links the seccompiler library needs libseccomp present at link time. Here that is
       # the `firecracker` build script, which compiles the seccomp policies through
       # seccompiler as a library: without the package its link ends in `unable to find
@@ -47,6 +47,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y libseccomp-dev
+          echo "LIBSECCOMP_LIB_PATH=$(dirname "$(cc -print-file-name=libseccomp.a)")" >> "$GITHUB_ENV"
 
       # A release supplies its own audited libseccomp through LIBSECCOMP_LIB_PATH, and the
       # linker searches its default directories after every `-L`, so a build script that
@@ -73,7 +74,7 @@ jobs:
           echo "$supplied"
           grep -qxF "cargo::rerun-if-env-changed=LIBSECCOMP_LIB_PATH" <<<"$supplied"
           grep -qxF "cargo::rustc-link-search=native=$private" <<<"$supplied"
-          grep -qxF "cargo::rustc-link-lib=static=seccomp" <<<"$supplied"
+          grep -qxF "cargo::rustc-link-lib=static:-bundle=seccomp" <<<"$supplied"
           if grep -qF "/usr/local/lib" <<<"$supplied"; then
             echo "::error::the supplied path did not replace the default link search path"
             exit 1
@@ -82,7 +83,7 @@ jobs:
           default=$(env -u LIBSECCOMP_LIB_PATH "$work/build-script")
           echo "$default"
           grep -qxF "cargo::rustc-link-search=native=/usr/local/lib" <<<"$default"
-          grep -qxF "cargo::rustc-link-lib=static=seccomp" <<<"$default"
+          grep -qxF "cargo::rustc-link-lib=static:-bundle=seccomp" <<<"$default"
 
           shared_only="$work/shared-only"
           mkdir "$shared_only"
@@ -194,7 +195,8 @@ jobs:
           guarded_cargo_test 12 -p vmm --lib devices::virtio::vsock::persist
           guarded_cargo_test 12 -p vmm --lib snapshot::
           guarded_cargo_test 25 -p vmm --test farplane_channel
-          guarded_cargo_test 1 -p firecracker --bin firecracker api_server_adapter
+          guarded_cargo_test 72 -p firecracker --bin firecracker -- --test-threads=1
+          guarded_cargo_test 4 -p firecracker --test native -- --test-threads=1
           # One image-alias test briefly redirects stderr, so the jailer crate runs
           # single-threaded rather than exposing process-global fd 2 to another test.
           guarded_cargo_test 28 -p jailer -- --test-threads=1
@@ -643,6 +645,7 @@ jobs:
           sudo apt-get install -y \
             libseccomp-dev cmake clang \
             gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross
+          echo "LIBSECCOMP_LIB_PATH=$(dirname "$(cc -print-file-name=libseccomp.a)")" >> "$GITHUB_ENV"
 
       - name: "Cross clippy for the aarch64 GNU target"
         run: >
