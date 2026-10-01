@@ -351,6 +351,26 @@ impl Queue {
         Ok(slice.ptr_guard_mut().as_ptr().cast())
     }
 
+    /// Marks the queue's descriptor table and rings dirty in the guest memory's own bitmap.
+    ///
+    /// The device writes the used ring through the pointers `initialize` cached, which no dirty
+    /// log sees, so a reader of the dirty logs that must not miss a write to the rings marks them
+    /// first. A queue the driver has not made ready names no memory.
+    pub fn mark_memory_dirty<M: GuestMemory>(&self, mem: &M) {
+        if !self.ready {
+            return;
+        }
+        for (addr, len) in [
+            (self.desc_table_address, self.desc_table_size()),
+            (self.avail_ring_address, self.avail_ring_size()),
+            (self.used_ring_address, self.used_ring_size()),
+        ] {
+            if let Ok(slice) = mem.get_slice(addr, len) {
+                slice.bitmap().mark_dirty(0, len);
+            }
+        }
+    }
+
     /// Set up pointers to the queue objects in the guest memory
     /// and mark memory dirty for those objects
     pub fn initialize<M: GuestMemory>(&mut self, mem: &M) -> Result<(), QueueError> {

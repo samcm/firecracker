@@ -861,6 +861,9 @@ impl CaptureService {
                 error!("Farplane rebase could not stop every guest-memory writer: {err}")
             })
             .and_then(|()| {
+                // A ring the device wrote since the flip is not the generation's page, and
+                // only this marks it.
+                vmm.mark_virtio_queues_dirty();
                 let kvm_vm = vmm.kvm_vm().ok_or(())?;
                 kvm_vm
                     .snapshot_rebase_keep_log()
