@@ -65,6 +65,7 @@ pub enum VirtioDeviceType {
     Block = virtio_ids::VIRTIO_ID_BLOCK as u8,
     Rng = virtio_ids::VIRTIO_ID_RNG as u8,
     Vsock = virtio_ids::VIRTIO_ID_VSOCK as u8,
+    Balloon = virtio_ids::VIRTIO_ID_BALLOON as u8,
 }
 
 /// Unique identifier for a virtio device: its type and string ID.

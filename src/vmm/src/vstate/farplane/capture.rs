@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use utils::time::{ClockType, get_time_us};
 
 use super::backend::{
-    BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, set_capture_buffers_armed,
+    BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, harvest_len, set_capture_buffers_armed,
     validate_buffer_fd, validate_clone_destination,
 };
 use super::dispatch;
@@ -419,7 +419,7 @@ impl CaptureService {
         let (body_len, fd_counts): (usize, &[usize]) = match msg {
             MsgType::CaptureBuffers => (0, &[2, 3]),
             MsgType::Quiesce | MsgType::DirtySnapshot | MsgType::WriteVmstate => (0, &[0]),
-            MsgType::DirtyUnion => (0, &[1]),
+            MsgType::DirtyUnion | MsgType::FreeSummary => (0, &[1]),
             MsgType::Resume => (4, &[0]),
             _ => return Err(ChannelError::Malformed),
         };
@@ -465,6 +465,7 @@ impl CaptureService {
             MsgType::DirtySnapshot => self.dirty_snapshot(request_id),
             MsgType::WriteVmstate => self.write_vmstate(request_id),
             MsgType::DirtyUnion => self.dirty_union(incoming),
+            MsgType::FreeSummary => self.free_summary(incoming),
             MsgType::Resume => {
                 let run_vcpus = protocol::parse_u32(&incoming.body)?;
                 self.resume(request_id, run_vcpus)
@@ -485,7 +486,10 @@ impl CaptureService {
         let destination = (fds.len() == 3).then(|| fds.remove(2));
         let [dirty, vmstate] =
             <[_; 2]>::try_from(fds).map_err(|_| ChannelError::FdCountMismatch)?;
-        if let Err(code) = validate_buffer_fd(dirty.as_raw_fd(), self.channel.dirty_bitmap_bytes) {
+        if let Err(code) = validate_buffer_fd(
+            dirty.as_raw_fd(),
+            harvest_len(self.channel.dirty_bitmap_bytes),
+        ) {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
         if let Err(code) = validate_buffer_fd(vmstate.as_raw_fd(), VMSTATE_CAPACITY_BYTES) {
@@ -713,6 +717,59 @@ impl CaptureService {
         }
     }
 
+    /// Writes the reported-free pages no capture holds and nothing has written since into the
+    /// descriptor the request carried, shaped like a dirty bitmap, and answers with their count.
+    ///
+    /// It only reads the logs, but it is refused inside a capture epoch: the epoch's commands are
+    /// what own the dirty state there, and the answer would describe a machine that is about to
+    /// be harvested.
+    fn free_summary(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
+        let request_id = incoming.header.request_id;
+        match BackendState::load() {
+            BackendState::Ready => {}
+            BackendState::Quiesced => {
+                return self.reject(request_id, ErrorCode::AlreadyQuiesced, MsgType::FreeSummary);
+            }
+            _ => return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::FreeSummary),
+        }
+        let [buffer] =
+            <[_; 1]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+        if let Err(code) = validate_buffer_fd(buffer.as_raw_fd(), self.channel.dirty_bitmap_bytes) {
+            return self.reject(request_id, code, MsgType::FreeSummary);
+        }
+        let kvm_vm = self.vmm.lock().expect("Poisoned lock").kvm_vm().cloned();
+        let Some(kvm_vm) = kvm_vm else {
+            return self.reject(
+                request_id,
+                ErrorCode::DirtyHarvestFailed,
+                MsgType::FreeSummary,
+            );
+        };
+        let summary = match kvm_vm.free_summary() {
+            Ok(summary) => summary,
+            Err(err) => {
+                error!("Farplane could not summarise the reported free pages: {err}");
+                return self.reject(
+                    request_id,
+                    ErrorCode::DirtyHarvestFailed,
+                    MsgType::FreeSummary,
+                );
+            }
+        };
+        let mut file = File::from(buffer);
+        match write_bitmap(&mut file, 0, &summary, self.channel.dirty_bitmap_bytes) {
+            Ok(()) => {
+                let pages: u64 = summary
+                    .iter()
+                    .flatten()
+                    .map(|word| u64::from(word.count_ones()))
+                    .sum();
+                self.reply(request_id, MsgType::FreeSummaryDone, &pages.to_le_bytes())
+            }
+            Err(code) => self.reject(request_id, code, MsgType::FreeSummary),
+        }
+    }
+
     /// Leaves the capture epoch, restarting the vCPUs when pagemaster asks for it, and hands event
     /// dispatch back. The armed buffers go with it, the disk clone destination among them. The
     /// initial boot and restore acknowledgement is answered by the handshake itself, so on this
@@ -838,23 +895,21 @@ fn clone_scratch(destination: RawFd, scratch: RawFd) -> Result<u64, io::Error> {
     Ok(get_time_us(ClockType::Monotonic) - started)
 }
 
-/// Snapshots the dirty accumulator, writes it out, and only then clears it.
-fn harvest(vmm: &Mutex<Vmm>, dirty_bitmap_bytes: u64, buffer: &mut File) -> Result<(), ErrorCode> {
-    let vmm = vmm.lock().expect("Poisoned lock");
-    let kvm_vm = vmm.kvm_vm().ok_or(ErrorCode::DirtyHarvestFailed)?;
-    let snapshot = kvm_vm.snapshot_dirty_log().map_err(|err| {
-        error!("Farplane capture could not read the dirty log: {err}");
-        ErrorCode::DirtyHarvestFailed
-    })?;
-
-    let bytes: u64 = snapshot.iter().map(|words| words.len() as u64 * 8).sum();
-    if bytes != dirty_bitmap_bytes {
+/// Writes one bitmap of exactly `bytes` at `offset` of `buffer`.
+fn write_bitmap(
+    buffer: &mut File,
+    offset: u64,
+    bitmap: &[Vec<u64>],
+    bytes: u64,
+) -> Result<(), ErrorCode> {
+    let total: u64 = bitmap.iter().map(|words| words.len() as u64 * 8).sum();
+    if total != bytes {
         return Err(ErrorCode::DirtyHarvestFailed);
     }
     buffer
-        .seek(SeekFrom::Start(0))
+        .seek(SeekFrom::Start(offset))
         .map_err(|_| ErrorCode::DirtyHarvestFailed)?;
-    for words in &snapshot {
+    for words in bitmap {
         // SAFETY: the words are a contiguous little-endian bitmap, which is exactly the wire
         // representation, so they are written without a second copy.
         let raw =
@@ -863,7 +918,24 @@ fn harvest(vmm: &Mutex<Vmm>, dirty_bitmap_bytes: u64, buffer: &mut File) -> Resu
             .write_all(raw)
             .map_err(|_| ErrorCode::DirtyHarvestFailed)?;
     }
-    buffer.flush().map_err(|_| ErrorCode::DirtyHarvestFailed)?;
+    buffer.flush().map_err(|_| ErrorCode::DirtyHarvestFailed)
+}
+
+/// Snapshots the dirty accumulator and the reported-free pages, writes both out, and only then
+/// clears the accumulator. The free bitmap follows the dirty one at the same shape.
+fn harvest(vmm: &Mutex<Vmm>, dirty_bitmap_bytes: u64, buffer: &mut File) -> Result<(), ErrorCode> {
+    let vmm = vmm.lock().expect("Poisoned lock");
+    let kvm_vm = vmm.kvm_vm().ok_or(ErrorCode::DirtyHarvestFailed)?;
+    let snapshot = kvm_vm.snapshot_dirty_log().map_err(|err| {
+        error!("Farplane capture could not read the dirty log: {err}");
+        ErrorCode::DirtyHarvestFailed
+    })?;
+    let free = kvm_vm.snapshot_free_log().map_err(|err| {
+        error!("Farplane capture could not read the reported free pages: {err}");
+        ErrorCode::DirtyHarvestFailed
+    })?;
+    write_bitmap(buffer, 0, &snapshot, dirty_bitmap_bytes)?;
+    write_bitmap(buffer, dirty_bitmap_bytes, &free, dirty_bitmap_bytes)?;
 
     kvm_vm.clear_dirty_log(&snapshot).map_err(|err| {
         error!("Farplane capture could not clear the dirty log: {err}");

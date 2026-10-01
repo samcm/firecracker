@@ -206,7 +206,8 @@ pub struct MemoryChannel {
     pub sock: UnixStream,
     /// Checkpoint geometry the plan tiled, in ascending guest address order.
     pub regions: Vec<RegionRecord>,
-    /// Exact size of one harvested dirty bitmap.
+    /// Exact size of one dirty bitmap. A harvest writes two bitmaps of this size: the dirty pages,
+    /// then the pages the guest reported free.
     pub dirty_bitmap_bytes: u64,
     /// The registered userfaultfd. Holding it until process exit is what keeps guest faults
     /// blocked rather than zero-filled when pagemaster dies.
@@ -298,6 +299,12 @@ pub fn dirty_bitmap_len(regions: &[RegionRecord]) -> u64 {
         .iter()
         .map(|region| region.size.div_ceil(page).div_ceil(64) * 8)
         .sum()
+}
+
+/// Size of the harvest buffer `backend_ready` reports: the dirty bitmap followed by the
+/// reported-free bitmap of the same shape.
+pub fn harvest_len(dirty_bitmap_bytes: u64) -> u64 {
+    2 * dirty_bitmap_bytes
 }
 
 /// Validates a capture buffer descriptor against the requirement reported at `backend_ready`. A
@@ -535,7 +542,7 @@ fn commit_plan(
         &ready_regions,
         u32::try_from(mapped.len()).expect("region count is bounded by the plan datagram"),
         REQUIRED_UFFD_FEATURES,
-        dirty_bitmap_bytes,
+        harvest_len(dirty_bitmap_bytes),
         VMSTATE_CAPACITY_BYTES,
     );
     let dup = dup_cloexec(uffd.as_raw_fd())?;

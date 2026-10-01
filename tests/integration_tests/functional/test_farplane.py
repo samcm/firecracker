@@ -537,6 +537,78 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     )
 
 
+def test_freed_guest_memory_leaves_the_dirty_harvest_and_is_named_free(farplane_factory):
+    """Memory a guest writes and frees is reported, loses its dirty marks and is named free.
+
+    Nothing is discarded: the harvest names the reported pages beside the dirty ones, the dirty
+    half no longer marks them, and a free summary names them between epochs but is refused inside
+    one.
+    """
+    vm = farplane_factory()
+    pagemaster = boot(vm, mem_size_mib=512, serial_input=True)
+    wait_for_shell_prompt(vm)
+    freed_pages = 192 * 1024 * 1024 // PAGE
+
+    # Close the boot epoch, so the next harvest names only what follows it.
+    assert pagemaster.capture_buffers().error is None
+    assert pagemaster.quiesce().error is None
+    assert pagemaster.write_vmstate().error is None
+    assert pagemaster.dirty_snapshot().error is None
+    assert pagemaster.resume(run_vcpus=1).error is None
+
+    marker = f"farplane-freed-{uuid.uuid4().hex}"
+    vm.serial_input(
+        "dd if=/dev/urandom of=/dev/shm/freed bs=1M count=192 status=none"
+        f" && rm /dev/shm/freed && echo {marker}\n"
+    )
+    wait_for(
+        lambda: marker in vm.stdio_text(),
+        timeout=120,
+        message="the guest writing and freeing 192 MiB",
+    )
+
+    # The guest reports free 2 MiB blocks two seconds after the free, a share of its free lists
+    # per pass, so the summary grows over a few passes.
+    def summarized():
+        reply, bitmap = pagemaster.free_summary()
+        assert reply.error is None, reply.error
+        return bitmap.count()
+
+    wait_for(
+        lambda: summarized() >= freed_pages // 2,
+        timeout=60,
+        message="the guest reporting the memory it freed",
+    )
+
+    assert pagemaster.capture_buffers().error is None
+    assert pagemaster.quiesce().error is None
+    refused, _ = pagemaster.free_summary()
+    assert refused.error == (
+        fp.Err.ALREADY_QUIESCED,
+        fp.Msg.FREE_SUMMARY,
+    ), "a free summary was answered inside a capture epoch"
+    assert pagemaster.write_vmstate().error is None
+    assert pagemaster.dirty_snapshot().error is None
+    dirty = set(pagemaster.harvest().set_pages())
+    free = set(pagemaster.harvest_free().set_pages())
+    assert len(free) >= freed_pages // 2, f"the harvest names {len(free)} free pages"
+    assert len(dirty) < freed_pages // 4, (
+        f"the harvest still marks {len(dirty)} pages after the guest freed {freed_pages}"
+    )
+    assert pagemaster.resume(run_vcpus=1).error is None
+
+
+def present_pages(vm, pagemaster, pages):
+    """The guest pages of `pages` that Firecracker's mapping holds present."""
+    present = []
+    with open(f"/proc/{vm.pid}/pagemap", "rb") as pagemap:
+        for page in sorted(pages):
+            pagemap.seek(pagemaster.host_addr(page) // PAGE * 8)
+            if int.from_bytes(pagemap.read(8), "little") >> 63:
+                present.append(page)
+    return present
+
+
 def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     """A restored VM's first epoch holds the restore's writes, not the whole geometry."""
     parent_vm = farplane_factory("restore-parent")
@@ -640,7 +712,10 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     # KVM proved present during restore; other checkpoint content first-touches through minor
     # faults without artificial WP markers over absent PTEs.
     writes_cursor = len(child.written_pages())
-    for page in first_pages:
+    # Activating a restored device marks its rings dirty before anything touches them, so the
+    # harvest can name a page that is not present. Protecting one would plant a marker over an
+    # absent PTE, which is exactly what this test must not do.
+    for page in present_pages(child_vm, child, first_pages):
         child.protect_guest(page)
     assert child.resume(run_vcpus=0).error is None
     child_vm.api.vm.patch(state="Resumed")

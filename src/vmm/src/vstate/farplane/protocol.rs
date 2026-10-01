@@ -29,7 +29,7 @@ pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this protocol, quiesce semantics and vmstate format. A warm image
 /// baked by another identity is refused rather than restored: the capture command order and the
 /// vmstate the epoch produces are part of what this string names.
-pub const FEATURE_IDENTITY: &str = "farplane/4";
+pub const FEATURE_IDENTITY: &str = "farplane/5";
 /// Size of one extent table record.
 pub const EXTENT_RECORD_LEN: usize = 32;
 /// Size of one region record.
@@ -81,6 +81,10 @@ pub enum MsgType {
     Error = 16,
     /// Firecracker confirms the capture buffers are armed.
     CaptureBuffersArmed = 17,
+    /// Pagemaster asks which reported-free pages no capture holds and nothing has written since.
+    FreeSummary = 18,
+    /// Firecracker confirms the summary was written into the descriptor the request carried.
+    FreeSummaryDone = 19,
 }
 
 impl MsgType {
@@ -104,6 +108,8 @@ impl MsgType {
             15 => Some(Self::Resumed),
             16 => Some(Self::Error),
             17 => Some(Self::CaptureBuffersArmed),
+            18 => Some(Self::FreeSummary),
+            19 => Some(Self::FreeSummaryDone),
             _ => None,
         }
     }
@@ -543,7 +549,7 @@ pub fn encode_backend_ready(
     regions: &[BackendReadyRegion],
     kvm_slot_count: u32,
     uffd_features: u64,
-    dirty_bitmap_bytes: u64,
+    harvest_bytes: u64,
     vmstate_capacity_bytes: u64,
 ) -> Vec<u8> {
     let mut body =
@@ -556,7 +562,7 @@ pub fn encode_backend_ready(
     }
     body.extend_from_slice(&kvm_slot_count.to_le_bytes());
     body.extend_from_slice(&uffd_features.to_le_bytes());
-    body.extend_from_slice(&dirty_bitmap_bytes.to_le_bytes());
+    body.extend_from_slice(&harvest_bytes.to_le_bytes());
     body.extend_from_slice(&vmstate_capacity_bytes.to_le_bytes());
     body
 }
@@ -886,6 +892,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/4");
+        assert_eq!(FEATURE_IDENTITY, "farplane/5");
     }
 }
