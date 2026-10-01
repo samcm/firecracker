@@ -30,6 +30,8 @@ use crate::device_manager::{
 };
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::free_page_reporting::FreePageReporting;
+use crate::devices::virtio::free_page_reporting::device::FREE_PAGE_REPORTING_DEV_ID;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
@@ -111,6 +113,10 @@ pub enum StartMicrovmError {
     SetVmResources(MachineConfigError),
     /// Cannot create the entropy device: {0}
     CreateEntropyDevice(crate::devices::virtio::rng::EntropyError),
+    /// Cannot create the free page reporting device: {0}
+    CreateFreePageReportingDevice(
+        crate::devices::virtio::free_page_reporting::FreePageReportingError,
+    ),
     /// Failed to allocate guest resource: {0}
     AllocateResources(#[from] vm_allocator::Error),
     /// Error starting GDB debug session: {0}
@@ -233,6 +239,20 @@ pub fn build_microvm_for_boot(
             event_manager,
         )?;
     }
+
+    // Every machine reports its free pages, so a capture can publish them as zero instead of
+    // copying what the guest no longer holds.
+    let reporting = Arc::new(Mutex::new(
+        FreePageReporting::new(kvm_vm.clone())
+            .map_err(StartMicrovmError::CreateFreePageReportingDevice)?,
+    ));
+    device_manager.attach_virtio_device(
+        &vm,
+        FREE_PAGE_REPORTING_DEV_ID.to_string(),
+        reporting,
+        &mut boot_cmdline,
+        event_manager,
+    )?;
 
     #[cfg(target_arch = "aarch64")]
     device_manager.attach_legacy_devices_aarch64(

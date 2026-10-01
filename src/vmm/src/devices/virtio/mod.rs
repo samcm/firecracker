@@ -14,6 +14,7 @@ use crate::devices::virtio::net::TapError;
 
 pub mod block;
 pub mod device;
+pub mod free_page_reporting;
 pub mod generated;
 mod iov_deque;
 pub mod iovec;

@@ -381,6 +381,9 @@ fn header_round_trips_every_message_type() {
         MsgType::UnionDone,
         MsgType::Resumed,
         MsgType::Error,
+        MsgType::CaptureBuffersArmed,
+        MsgType::FreeSummary,
+        MsgType::FreeSummaryDone,
     ];
     for (index, msg_type) in types.into_iter().enumerate() {
         let request_id = index as u64 * 7;

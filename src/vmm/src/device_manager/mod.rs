@@ -34,6 +34,7 @@ use crate::devices::pseudo::BootTimer;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::free_page_reporting::persist::FreePageReportingPersistError;
 use crate::devices::virtio::net::persist::NetPersistError;
 use crate::devices::virtio::rng::persist::EntropyPersistError;
 use crate::devices::virtio::transport::mmio::{IrqTrigger, MmioTransport};
@@ -471,6 +472,8 @@ pub enum DevicePersistError {
     VsockUnixBackend(#[from] VsockUnixBackendError),
     /// Entropy: {0}
     Entropy(#[from] EntropyPersistError),
+    /// Free page reporting: {0}
+    FreePageReporting(#[from] FreePageReportingPersistError),
     /// Could not activate device: {0}
     DeviceActivation(#[from] ActivateError),
 }

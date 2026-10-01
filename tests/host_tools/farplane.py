@@ -38,7 +38,7 @@ MAGIC = 0x314D5046
 VERSION = 1
 MAX_DATAGRAM = 65536
 MAX_EXTENTS = 65536
-FEATURE_IDENTITY = "farplane/4"
+FEATURE_IDENTITY = "farplane/5"
 
 HEADER = struct.Struct("<IHHQIIQ")
 HELLO = struct.Struct("<IIHHI32s")
@@ -82,6 +82,8 @@ class Msg(IntEnum):
     RESUMED = 15
     ERROR = 16
     CAPTURE_BUFFERS_ARMED = 17
+    FREE_SUMMARY = 18
+    FREE_SUMMARY_DONE = 19
 
 
 class Err(IntEnum):
@@ -989,9 +991,34 @@ class Pagemaster:
         return self.request(Msg.DIRTY_SNAPSHOT)
 
     def harvest(self):
-        """The dirty bitmap the last `dirty_snapshot` produced."""
+        """The dirty bitmap the last `dirty_snapshot` produced: the first half of the buffer."""
         raw = os.pread(self.dirty_fd, self.dirty_bitmap_bytes, 0)
         return DirtyBitmap(
+            [(region["guest_addr"], region["size"]) for region in self.ready_regions],
+            raw[: self.dirty_bitmap_bytes // 2],
+        )
+
+    def harvest_free(self):
+        """The reported-free bitmap the last `dirty_snapshot` wrote after the dirty one."""
+        half = self.dirty_bitmap_bytes // 2
+        raw = os.pread(self.dirty_fd, half, half)
+        return DirtyBitmap(
+            [(region["guest_addr"], region["size"]) for region in self.ready_regions],
+            raw,
+        )
+
+    def free_summary(self):
+        """The reply, and the reported-free pages no capture holds and nothing wrote since."""
+        half = self.dirty_bitmap_bytes // 2
+        fd = sealed_memfd(
+            "farplane-free-summary", half, seals=BUFFER_SEALS, read_only=False
+        )
+        try:
+            reply = self.request(Msg.FREE_SUMMARY, fds=[fd])
+            raw = os.pread(fd, half, 0)
+        finally:
+            os.close(fd)
+        return reply, DirtyBitmap(
             [(region["guest_addr"], region["size"]) for region in self.ready_regions],
             raw,
         )

@@ -34,8 +34,8 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
-    GuestRegionMmap, GuestRegionMmapExt, MemoryError,
+    Address, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -96,6 +96,27 @@ pub struct VmCommon {
     /// the owning region's bitmap. Word-level so a rollback of a mostly-dirty multi-gigabyte
     /// bitmap costs one pass over the words rather than one atomic operation per page.
     pending_dirty_union: Mutex<HashMap<u32, Vec<u64>>>,
+    /// What the guest reported free, keyed by kvm slot. Locked only after `pending_dirty_union`,
+    /// never before it, so a report and a harvest see one consistent pair.
+    free_pages: Mutex<HashMap<u32, FreePages>>,
+}
+
+/// The pages of one slot the guest reported free, word for word with the slot's dirty bitmap.
+///
+/// A report retires the page's dirty evidence and records it here instead, because what the page
+/// holds no longer matters to the guest. A harvest that finds a reported page written again
+/// retires it from both sets: from then on the dirty log speaks for it.
+#[derive(Debug, Default)]
+struct FreePages {
+    /// Reported free and not written since.
+    reported: Vec<u64>,
+    /// The reported pages whose bytes no harvest has seen: they were written since the last
+    /// harvest, or reported before the slot's first one. They are the guest's private memory that
+    /// no capture of this machine holds.
+    uncaptured: Vec<u64>,
+    /// Whether KVM's log for the slot has been cleared since it was registered. Until then every
+    /// KVM bit is the initial all-dirty state and says nothing about what the guest wrote.
+    kvm_log_armed: bool,
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -223,6 +244,7 @@ impl KvmVm {
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
             pending_dirty_union: Mutex::new(HashMap::new()),
+            free_pages: Mutex::new(HashMap::new()),
         })
     }
 
@@ -468,6 +490,14 @@ impl KvmVm {
             .div_ceil(64);
         self.pending_dirty_union()
             .insert(region.slot, vec![0u64; words]);
+        self.free_pages().insert(
+            region.slot,
+            FreePages {
+                reported: vec![0u64; words],
+                uncaptured: vec![0u64; words],
+                kvm_log_armed: false,
+            },
+        );
         self.common.guest_memory = new_guest_memory;
 
         Ok(())
@@ -479,6 +509,157 @@ impl KvmVm {
             .pending_dirty_union
             .lock()
             .expect("Poisoned lock")
+    }
+
+    /// Locks the free-page record. Taken after [`KvmVm::pending_dirty_union`] whenever both are held.
+    fn free_pages(&self) -> MutexGuard<'_, HashMap<u32, FreePages>> {
+        self.common.free_pages.lock().expect("Poisoned lock")
+    }
+
+    /// Records that the guest reported `[addr, addr + len)` free.
+    ///
+    /// Only whole 64-page groups inside one slot are recorded, because KVM clears its log in
+    /// those units; a page left out keeps its dirty evidence and is captured as before. Each
+    /// recorded page loses its dirty evidence, so a write after the report marks it again, and
+    /// joins the reported set. A page whose dirty evidence was set at the report also joins the
+    /// uncaptured set. The guest keeps the pages isolated until the report is answered, so nothing
+    /// writes them in between. Returns the number of pages recorded.
+    pub fn report_free(&self, addr: GuestAddress, len: u64) -> Result<u64, VmError> {
+        let page_size = host_page_size() as u64;
+        let Some(region) = self.guest_memory().find_region(addr) else {
+            return Ok(0);
+        };
+        let region_start = region.start_addr().raw_value();
+        let region_len = region.len();
+        let region_pages = region_len / page_size;
+        let offset = addr.raw_value() - region_start;
+        let end = offset.saturating_add(len).min(region_len);
+        let first = offset.div_ceil(page_size).next_multiple_of(64);
+        let mut last = end / page_size;
+        if last < region_pages {
+            last -= last % 64;
+        }
+        if first >= last {
+            return Ok(0);
+        }
+
+        let mut pending = self.pending_dirty_union();
+        let mut free = self.free_pages();
+        let slot = region.slot;
+        let kvm_bits = self
+            .fd()
+            .get_dirty_log(slot, u64_to_usize(region_len))
+            .map_err(VmError::GetDirtyLog)?;
+        let (Some(returned), Some(record)) = (pending.get_mut(&slot), free.get_mut(&slot)) else {
+            return Err(VmError::DirtyBitmapShape);
+        };
+        if kvm_bits.len() != returned.len() || record.reported.len() != returned.len() {
+            return Err(VmError::DirtyBitmapShape);
+        }
+        let host_writes = region.inner.deref().bitmap().as_ref();
+
+        // KVM is cleared first: it is the only step that can fail, and until it succeeds nothing
+        // else has changed. Both ends are 64-page aligned or the slot's end, as KVM requires.
+        let mut mask = vec![0u64; u64_to_usize((last - first).div_ceil(64))];
+        for page in 0..(last - first) {
+            mask[u64_to_usize(page / 64)] |= 1 << (page % 64);
+        }
+        let clear = kvm_clear_dirty_log {
+            slot,
+            num_pages: u32::try_from(last - first).map_err(|_| VmError::DirtyBitmapShape)?,
+            first_page: first,
+            __bindgen_anon_1: kvm_bindings::kvm_clear_dirty_log__bindgen_ty_1 {
+                dirty_bitmap: mask.as_ptr().cast_mut().cast(),
+            },
+        };
+        // SAFETY: the ioctl reads `clear`, whose bitmap covers exactly the pages it names.
+        let ret = unsafe { ioctl_with_ref(self.fd(), KVM_CLEAR_DIRTY_LOG(), &clear) };
+        if ret != 0 {
+            return Err(VmError::ClearDirtyLog(errno::Error::last()));
+        }
+
+        for page in first..last {
+            let word = u64_to_usize(page / 64);
+            let bit = 1u64 << (page % 64);
+            let kvm_dirty = !record.kvm_log_armed || kvm_bits[word] & bit != 0;
+            let host_dirty = host_writes.is_some_and(|bits| bits.is_bit_set(u64_to_usize(page)));
+            if kvm_dirty || host_dirty || returned[word] & bit != 0 {
+                record.uncaptured[word] |= bit;
+            }
+            record.reported[word] |= bit;
+            returned[word] &= !bit;
+        }
+        if let Some(bits) = host_writes {
+            bits.reset_addr_range(
+                u64_to_usize(first * page_size),
+                u64_to_usize((last - first) * page_size),
+            );
+        }
+        Ok(last - first)
+    }
+
+    /// The reported set of every region, in ascending guest address order, shaped like the dirty
+    /// harvest. A harvest writes it beside the dirty bits so the capture can tell which unmarked
+    /// pages the guest holds free.
+    pub fn snapshot_free_log(&self) -> Result<Vec<Vec<u64>>, VmError> {
+        let free = self.free_pages();
+        self.guest_memory()
+            .iter()
+            .map(|region| {
+                free.get(&region.slot)
+                    .map(|record| record.reported.clone())
+                    .ok_or(VmError::DirtyBitmapShape)
+            })
+            .collect()
+    }
+
+    /// The uncaptured pages the guest has not written since it reported them, per region in
+    /// ascending guest address order. Reading the log neither clears nor re-protects it.
+    ///
+    /// Before a slot's first clear its KVM bits are the initial all-dirty state, so a rewrite
+    /// there shows only through the host and returned bits.
+    pub fn free_summary(&self) -> Result<Vec<Vec<u64>>, VmError> {
+        let pending = self.pending_dirty_union();
+        let free = self.free_pages();
+        let mut summary = Vec::with_capacity(self.guest_memory().num_regions());
+        for region in self.guest_memory().iter() {
+            let (Some(returned), Some(record)) =
+                (pending.get(&region.slot), free.get(&region.slot))
+            else {
+                return Err(VmError::DirtyBitmapShape);
+            };
+            let kvm_bits = if record.kvm_log_armed {
+                let bits = self
+                    .fd()
+                    .get_dirty_log(region.slot, u64_to_usize(region.len()))
+                    .map_err(VmError::GetDirtyLog)?;
+                if bits.len() != returned.len() {
+                    return Err(VmError::DirtyBitmapShape);
+                }
+                Some(bits)
+            } else {
+                None
+            };
+            let host_writes = region.inner.deref().bitmap().as_ref();
+            let mut words = record.uncaptured.clone();
+            for (index, word) in words.iter_mut().enumerate() {
+                *word &= !returned[index];
+                if let Some(bits) = &kvm_bits {
+                    *word &= !bits[index];
+                }
+                let mut remaining = *word;
+                while remaining != 0 {
+                    let bit = remaining.trailing_zeros();
+                    remaining &= remaining - 1;
+                    let page = index * 64 + bit as usize;
+                    if host_writes.is_some_and(|bits| bits.is_bit_set(page)) {
+                        *word &= !(1u64 << bit);
+                    }
+                }
+            }
+            summary.push(words);
+        }
+        Ok(summary)
     }
 
     /// Register a list of new memory regions to this [`KvmVm`].
@@ -666,11 +847,26 @@ impl KvmVm {
             }
         }
         self.guest_memory().reset_dirty();
+        let mut free = self.free_pages();
         for (region, reported) in self.guest_memory().iter().zip(snapshot) {
             if let Some(returned) = pending.get_mut(&region.slot) {
                 for (returned_word, reported_word) in returned.iter_mut().zip(reported) {
                     *returned_word &= !*reported_word;
                 }
+            }
+            // A page the harvest reports written is no longer free: the capture stores what it
+            // holds now. Every KVM bit of the slot has now been cleared at least once.
+            if let Some(record) = free.get_mut(&region.slot) {
+                for ((free_word, uncaptured_word), written) in record
+                    .reported
+                    .iter_mut()
+                    .zip(record.uncaptured.iter_mut())
+                    .zip(reported)
+                {
+                    *free_word &= !*written;
+                    *uncaptured_word &= !*written;
+                }
+                record.kvm_log_armed = true;
             }
         }
         Ok(())
@@ -706,6 +902,9 @@ impl KvmVm {
             let ret = unsafe { ioctl_with_ref(self.fd(), KVM_CLEAR_DIRTY_LOG(), &clear) };
             if ret != 0 {
                 return Err(VmError::ClearDirtyLog(errno::Error::last()));
+            }
+            if let Some(record) = self.free_pages().get_mut(&region.slot) {
+                record.kvm_log_armed = true;
             }
         }
         Ok(())
@@ -911,6 +1110,87 @@ pub(crate) mod tests {
                 assert_eq!(region.bitmap().unwrap().dirty_at(page * page_size), want);
             }
         }
+    }
+
+    /// The pages whose bits are set in `words`.
+    fn set_pages(words: &[u64]) -> Vec<u64> {
+        (0..words.len() as u64 * 64)
+            .filter(|page| words[u64_to_usize(page / 64)] & (1 << (page % 64)) != 0)
+            .collect()
+    }
+
+    #[test]
+    fn test_report_free_records_whole_groups_and_retires_their_dirty_evidence() {
+        let page_size = host_page_size() as u64;
+        let addr = |page: u64| GuestAddress(page * page_size);
+        let vm = setup_vm_with_memory(u64_to_usize(256 * page_size));
+        vm.guest_memory()
+            .mark_dirty(addr(70), u64_to_usize(page_size));
+        vm.guest_memory()
+            .mark_dirty(addr(20), u64_to_usize(page_size));
+
+        // 10..200 rounds inward to whole groups of 64: 64..192.
+        assert_eq!(vm.report_free(addr(10), 190 * page_size).unwrap(), 128);
+        assert_eq!(
+            set_pages(&vm.snapshot_free_log().unwrap()[0]),
+            (64..192).collect::<Vec<_>>()
+        );
+
+        // Before the slot's first clear KVM reports every page dirty; the recorded pages lost that
+        // evidence and the host write inside them, and everything outside kept it.
+        let dirty = set_pages(&vm.snapshot_dirty_log().unwrap()[0]);
+        assert!(dirty.iter().all(|page| !(64..192).contains(page)));
+        assert!(dirty.contains(&0) && dirty.contains(&20) && dirty.contains(&255));
+
+        // Nothing has been harvested, so every recorded page is still uncaptured and unwritten.
+        assert_eq!(
+            set_pages(&vm.free_summary().unwrap()[0]),
+            (64..192).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_report_free_ignores_what_no_whole_group_covers() {
+        let page_size = host_page_size() as u64;
+        let addr = |page: u64| GuestAddress(page * page_size);
+        let vm = setup_vm_with_memory(u64_to_usize(100 * page_size));
+        assert_eq!(vm.report_free(addr(10), 30 * page_size).unwrap(), 0);
+        assert_eq!(vm.report_free(addr(1_000), 64 * page_size).unwrap(), 0);
+        // The slot's last group is shorter than 64 pages and is recorded whole.
+        assert_eq!(vm.report_free(addr(64), 36 * page_size).unwrap(), 36);
+        assert_eq!(
+            set_pages(&vm.snapshot_free_log().unwrap()[0]),
+            (64..100).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_a_write_after_the_report_takes_the_page_back() {
+        let page_size = host_page_size() as u64;
+        let addr = |page: u64| GuestAddress(page * page_size);
+        let vm = setup_vm_with_memory(u64_to_usize(256 * page_size));
+        vm.baseline_dirty_log().unwrap();
+        // Page 65 was written before the report, so its bytes are in no capture.
+        vm.guest_memory()
+            .mark_dirty(addr(65), u64_to_usize(page_size));
+        assert_eq!(vm.report_free(addr(64), 64 * page_size).unwrap(), 64);
+        assert_eq!(set_pages(&vm.free_summary().unwrap()[0]), vec![65]);
+
+        // Writes after the report take pages back: the summary drops them at once, and the
+        // harvest that reports them retires them from the free set.
+        vm.guest_memory()
+            .mark_dirty(addr(65), u64_to_usize(page_size));
+        vm.guest_memory()
+            .mark_dirty(addr(66), u64_to_usize(page_size));
+        assert!(set_pages(&vm.free_summary().unwrap()[0]).is_empty());
+        let snapshot = vm.snapshot_dirty_log().unwrap();
+        assert_eq!(set_pages(&snapshot[0]), vec![65, 66]);
+        vm.clear_dirty_log(&snapshot).unwrap();
+        assert_eq!(
+            set_pages(&vm.snapshot_free_log().unwrap()[0]),
+            std::iter::once(64).chain(67..128).collect::<Vec<_>>()
+        );
+        assert!(set_pages(&vm.free_summary().unwrap()[0]).is_empty());
     }
 
     #[test]

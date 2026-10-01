@@ -22,6 +22,10 @@ use crate::devices::legacy::RTCDevice;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::free_page_reporting::FreePageReporting;
+use crate::devices::virtio::free_page_reporting::persist::{
+    FreePageReportingConstructorArgs, FreePageReportingState,
+};
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::{NetConstructorArgs, NetState};
 use crate::devices::virtio::persist::{MmioTransportConstructorArgs, MmioTransportState};
@@ -122,6 +126,8 @@ pub struct DeviceStates {
     pub vsock_device: Option<VirtioDeviceState<VsockState>>,
     /// Entropy device state.
     pub entropy_device: Option<VirtioDeviceState<EntropyState>>,
+    /// Free page reporting device state.
+    pub free_page_reporting_device: Option<VirtioDeviceState<FreePageReportingState>>,
 }
 
 pub struct MMIODevManagerConstructorArgs<'a> {
@@ -265,6 +271,20 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                     let device_state = entropy.save();
 
                     states.entropy_device = Some(VirtioDeviceState {
+                        device_id,
+                        device_state,
+                        transport_state,
+                        device_info,
+                    });
+                }
+                VirtioDeviceType::Balloon => {
+                    let reporting = locked_device
+                        .as_mut_any()
+                        .downcast_mut::<FreePageReporting>()
+                        .unwrap();
+                    let device_state = reporting.save();
+
+                    states.free_page_reporting_device = Some(VirtioDeviceState {
                         device_id,
                         device_state,
                         transport_state,
@@ -436,6 +456,25 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &entropy_state.device_id,
                 &entropy_state.transport_state,
                 &entropy_state.device_info,
+                constructor_args.event_manager,
+            )?;
+        }
+
+        if let Some(reporting_state) = &state.free_page_reporting_device {
+            let device = Arc::new(Mutex::new(FreePageReporting::restore(
+                FreePageReportingConstructorArgs {
+                    mem: mem.clone(),
+                    vm: vm.clone(),
+                },
+                &reporting_state.device_state,
+            )?));
+
+            restore_helper(
+                device,
+                reporting_state.device_state.virtio_state.activated,
+                &reporting_state.device_id,
+                &reporting_state.transport_state,
+                &reporting_state.device_info,
                 constructor_args.event_manager,
             )?;
         }
