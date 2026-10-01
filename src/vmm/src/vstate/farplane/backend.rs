@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_ulong;
 use std::os::unix::fs::FileExt;
@@ -798,22 +798,30 @@ fn fstatfs(fd: RawFd) -> Option<libc::statfs> {
 
 /// Reads the extent table out of its sealed descriptor.
 fn read_extent_table(fd: &OwnedFd, count: u32) -> Result<Vec<ExtentRecord>, ErrorCode> {
-    let buf = read_sealed_table(fd, count as usize * protocol::EXTENT_RECORD_LEN)?;
+    let file = File::from(fd.try_clone().map_err(|_| ErrorCode::FdNotMemfd)?);
+    let buf = read_sealed_table(&file, count as usize * protocol::EXTENT_RECORD_LEN)?;
     buf.chunks_exact(protocol::EXTENT_RECORD_LEN)
         .map(|chunk| ExtentRecord::decode(chunk).map_err(|_| ErrorCode::BadExtent))
         .collect()
 }
 
 /// Reads the first `len` bytes of a table pagemaster sealed against change before sending it.
-pub(super) fn read_sealed_table(fd: &OwnedFd, len: usize) -> Result<Vec<u8>, ErrorCode> {
-    if memfd_seals(fd.as_raw_fd())
+///
+/// It seeks and reads the descriptor it is handed, never a duplicate and never at a position,
+/// because the capture thread's seccomp policy admits neither `F_DUPFD_CLOEXEC` nor `pread64`.
+pub(super) fn read_sealed_table(table: &File, len: usize) -> Result<Vec<u8>, ErrorCode> {
+    if memfd_seals(table.as_raw_fd())
         .is_none_or(|seals| seals & REQUIRED_BACKING_SEALS != REQUIRED_BACKING_SEALS)
     {
         return Err(ErrorCode::FdNotSealed);
     }
-    let file = File::from(fd.try_clone().map_err(|_| ErrorCode::FdNotMemfd)?);
+    let mut reader = table;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ErrorCode::BadExtent)?;
     let mut buf = vec![0u8; len];
-    file.read_exact_at(&mut buf, 0)
+    reader
+        .read_exact(&mut buf)
         .map_err(|_| ErrorCode::BadExtent)?;
     Ok(buf)
 }

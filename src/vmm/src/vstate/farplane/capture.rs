@@ -835,6 +835,9 @@ impl CaptureService {
         let request = rebase::parse_rebase(&incoming.body)?;
         let [overlay, table, ranges_out] =
             <[_; 3]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+        // The descriptors are this command's own, so they are used as files directly: the capture
+        // thread's seccomp policy admits no descriptor duplication.
+        let (table, ranges_out) = (File::from(table), File::from(ranges_out));
         let runs = match self.rebase_runs(request, overlay.as_raw_fd(), &table, &ranges_out) {
             Ok(runs) => runs,
             Err(code) => return self.reject(request_id, code, MsgType::Rebase),
@@ -926,8 +929,8 @@ impl CaptureService {
         &self,
         request: RebaseRequest,
         overlay: RawFd,
-        table: &OwnedFd,
-        ranges_out: &OwnedFd,
+        table: &File,
+        ranges_out: &File,
     ) -> Result<Vec<RebaseRun>, ErrorCode> {
         if request.run_count > protocol::MAX_EXTENTS || request.max_ranges > protocol::MAX_EXTENTS {
             return Err(ErrorCode::TooManyExtents);
@@ -1039,11 +1042,10 @@ fn hand_back_source(mut vmm: MutexGuard<'_, Vmm>, were_running: bool) {
 }
 
 /// Writes the ranges a rebase mapped into the buffer pagemaster reads them from.
-fn write_ranges(buffer: &OwnedFd, outcome: &RebaseOutcome) -> io::Result<()> {
+fn write_ranges(buffer: &File, outcome: &RebaseOutcome) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
 
-    let file = File::from(buffer.try_clone()?);
-    file.write_all_at(&rebase::encode_ranges(&outcome.ranges), 0)
+    buffer.write_all_at(&rebase::encode_ranges(&outcome.ranges), 0)
 }
 
 /// Reflinks the scratch disk into `destination`, reporting how long the ioctl took in

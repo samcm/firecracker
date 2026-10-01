@@ -666,6 +666,43 @@ mod tests {
         unsafe { libc::munmap(base as *mut libc::c_void, u64_to_usize(pages * PAGE)) };
     }
 
+    /// The vmm thread runs a rebase under its seccomp policy, so every syscall the command makes
+    /// with the arguments it makes it with has to be admitted there, on every target: a missing
+    /// rule is a `SIGSYS` with the vCPUs stopped. Its descriptors are read and written in place,
+    /// so it needs neither descriptor duplication nor a positional read.
+    #[test]
+    fn the_vmm_seccomp_policies_admit_every_call_a_rebase_makes() {
+        let admitted = |rules: &serde_json::Value, syscall: &str, index: u64, val: u64| {
+            rules.as_array().unwrap().iter().any(|rule| {
+                rule["syscall"] == syscall
+                    && (rule.get("args").is_none_or(serde_json::Value::is_null)
+                        || rule["args"].as_array().unwrap().iter().any(|arg| {
+                            arg["index"] == index && arg["op"] == "eq" && arg["val"] == val
+                        }))
+            })
+        };
+        for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
+            let path = format!(
+                "{}/../../resources/seccomp/{target}.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let policy: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let rules = &policy["vmm"]["filter"];
+            let flags = u64::try_from(libc::MAP_PRIVATE | libc::MAP_FIXED).unwrap();
+            assert!(admitted(rules, "mmap", 3, flags), "{target}: mmap");
+            for advice in [libc::MADV_NOHUGEPAGE, MADV_POPULATE_READ] {
+                let advice = u64::try_from(advice).unwrap();
+                assert!(admitted(rules, "madvise", 2, advice), "{target}: madvise {advice}");
+            }
+            let onfault = u64::try_from(libc::MLOCK_ONFAULT).unwrap();
+            assert!(admitted(rules, "mlock2", 2, onfault), "{target}: mlock2");
+            for syscall in ["lseek", "read", "pwrite64", "fstat", "fstatfs"] {
+                assert!(admitted(rules, syscall, 0, 0), "{target}: {syscall}");
+            }
+        }
+    }
+
     #[test]
     fn the_reply_carries_the_outcome_in_a_fixed_shape() {
         let outcome = RebaseOutcome {
