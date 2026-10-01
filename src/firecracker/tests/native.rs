@@ -193,13 +193,29 @@ fn test_native_bootstrap_is_not_killed_by_its_filter() {
 #[test]
 fn test_native_requires_custom_native_main_filter() {
     let dir = scratch("filter");
-    let empty: Vec<u64> = Vec::new();
-    let mut map: HashMap<String, Vec<u64>> = ["vmm", "api", "vcpu"]
+    let policy = serde_json::json!({
+        "default_action": "allow",
+        "filter_action": "trap",
+        "filter": [],
+    });
+    let mut map: HashMap<String, serde_json::Value> = ["vmm", "api", "vcpu"]
         .into_iter()
-        .map(|category| (category.to_string(), empty.clone()))
+        .map(|category| (category.to_string(), policy.clone()))
         .collect();
+    let json = dir.join("policy.json");
+    let compile = |map: &HashMap<String, serde_json::Value>, output: &Path| {
+        std::fs::write(&json, serde_json::to_vec(map).unwrap()).unwrap();
+        seccompiler::compile_bpf(
+            json.to_str().unwrap(),
+            std::env::consts::ARCH,
+            output.to_str().unwrap(),
+            false,
+            false,
+        )
+        .unwrap();
+    };
     let without = dir.join("without.bpf");
-    std::fs::write(&without, bitcode::serialize(&map).unwrap()).unwrap();
+    compile(&map, &without);
     let sock = dir.join("api.sock");
 
     // Native mode fails closed before it binds the API socket.
@@ -218,9 +234,9 @@ fn test_native_requires_custom_native_main_filter() {
     assert!(!sock.exists());
 
     // The same policy with the category starts native mode.
-    map.insert("native_main".to_string(), empty);
+    map.insert("native_main".to_string(), policy);
     let with = dir.join("with.bpf");
-    std::fs::write(&with, bitcode::serialize(&map).unwrap()).unwrap();
+    compile(&map, &with);
     let mut child = spawn(&[
         "--native",
         "--seccomp-filter",
