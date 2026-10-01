@@ -1232,10 +1232,7 @@ pub(crate) mod tests {
         assert!(!set_pages(&vm.snapshot_dirty_log().unwrap()[0]).contains(&70));
 
         let keep = set_pages(&vm.snapshot_rebase_keep_log().unwrap()[0]);
-        assert_eq!(
-            keep,
-            std::iter::once(3).chain(64..128).collect::<Vec<_>>()
-        );
+        assert_eq!(keep, std::iter::once(3).chain(64..128).collect::<Vec<_>>());
     }
 
     #[test]

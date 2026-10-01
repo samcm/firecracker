@@ -695,7 +695,10 @@ mod tests {
             assert!(admitted(rules, "mmap", 3, flags), "{target}: mmap");
             for advice in [libc::MADV_NOHUGEPAGE, MADV_POPULATE_READ] {
                 let advice = u64::try_from(advice).unwrap();
-                assert!(admitted(rules, "madvise", 2, advice), "{target}: madvise {advice}");
+                assert!(
+                    admitted(rules, "madvise", 2, advice),
+                    "{target}: madvise {advice}"
+                );
             }
             let onfault = u64::from(libc::MLOCK_ONFAULT);
             assert!(admitted(rules, "mlock2", 2, onfault), "{target}: mlock2");
