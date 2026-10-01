@@ -845,7 +845,7 @@ definitions:
           and vmstate format.
         type: string
         enum:
-          - "farplane/5"
+          - "farplane/6"
       source_commit:
         description:
           Commit of the source tree this binary was built from, the same value

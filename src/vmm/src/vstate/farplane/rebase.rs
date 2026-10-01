@@ -12,6 +12,8 @@
 //!
 //! `MAP_FIXED` destroys whatever the range held, so only a page the dirty accumulator does not
 //! mark since the last harvest is remapped, and only while every guest-memory writer is stopped.
+//! A page the guest reported free stays as it is too: the report retired its dirty evidence, but
+//! what the guest left there is no longer the generation's page.
 
 use std::io;
 use std::os::fd::RawFd;

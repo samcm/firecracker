@@ -855,7 +855,7 @@ impl CaptureService {
             dispatch::gate().open();
             return self.reject(request_id, ErrorCode::RebaseFailed, MsgType::Rebase);
         }
-        let dirty = vmm
+        let keep = vmm
             .drain_guest_memory_writers()
             .map_err(|err| {
                 error!("Farplane rebase could not stop every guest-memory writer: {err}")
@@ -863,10 +863,10 @@ impl CaptureService {
             .and_then(|()| {
                 let kvm_vm = vmm.kvm_vm().ok_or(())?;
                 kvm_vm
-                    .snapshot_dirty_log()
+                    .snapshot_rebase_keep_log()
                     .map_err(|err| error!("Farplane rebase could not read the dirty log: {err}"))
             });
-        let Ok(dirty) = dirty else {
+        let Ok(keep) = keep else {
             hand_back_source(vmm, were_running);
             return self.reject(request_id, ErrorCode::RebaseFailed, MsgType::Rebase);
         };
@@ -877,7 +877,7 @@ impl CaptureService {
         let applied = rebase::apply_runs(
             &runs,
             &channel.regions,
-            &dirty,
+            &keep,
             request.max_ranges,
             page,
             || get_time_us(ClockType::Monotonic).saturating_sub(started) >= budget_us,
