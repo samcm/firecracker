@@ -29,9 +29,17 @@ pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this protocol, quiesce semantics and vmstate format. A warm image
 /// baked by another identity is refused rather than restored: the capture command order and the
 /// vmstate the epoch produces are part of what this string names.
-pub const FEATURE_IDENTITY: &str = "farplane/5";
+pub const FEATURE_IDENTITY: &str = "farplane/6";
 /// Size of one extent table record.
 pub const EXTENT_RECORD_LEN: usize = 32;
+/// Size of one record of a `rebase` run table.
+pub const REBASE_RUN_RECORD_LEN: usize = 24;
+/// Size of one record a `rebase` writes into its reply buffer.
+pub const REBASED_RANGE_RECORD_LEN: usize = 16;
+/// Size of a `rebase` body.
+pub const REBASE_BODY_LEN: usize = 16;
+/// Size of a `rebased` body.
+pub const REBASED_BODY_LEN: usize = 32;
 /// Size of one region record.
 pub const REGION_RECORD_LEN: usize = 16;
 /// Size of the region record reported by `backend_ready`.
@@ -85,6 +93,10 @@ pub enum MsgType {
     FreeSummary = 18,
     /// Firecracker confirms the summary was written into the descriptor the request carried.
     FreeSummaryDone = 19,
+    /// Pagemaster asks for unchanged private guest pages to be mapped from a generation instead.
+    Rebase = 20,
+    /// Firecracker reports what a `rebase` mapped.
+    Rebased = 21,
 }
 
 impl MsgType {
@@ -110,6 +122,8 @@ impl MsgType {
             17 => Some(Self::CaptureBuffersArmed),
             18 => Some(Self::FreeSummary),
             19 => Some(Self::FreeSummaryDone),
+            20 => Some(Self::Rebase),
+            21 => Some(Self::Rebased),
             _ => None,
         }
     }
@@ -173,6 +187,8 @@ pub enum ErrorCode {
     BadCloneDestination = 25,
     /// The scratch disk could not be cloned into the armed destination.
     DiskCloneFailed = 26,
+    /// A `rebase` could not stop every guest-memory writer; the source was handed back unchanged.
+    RebaseFailed = 27,
 }
 
 /// Architecture Firecracker is running on.
@@ -866,6 +882,7 @@ mod tests {
         assert_eq!(ErrorCode::NoScratchDrive as u32, 24);
         assert_eq!(ErrorCode::BadCloneDestination as u32, 25);
         assert_eq!(ErrorCode::DiskCloneFailed as u32, 26);
+        assert_eq!(ErrorCode::RebaseFailed as u32, 27);
     }
 
     /// The `hello` frame is the only place the feature identity crosses to pagemaster, so its
@@ -892,6 +909,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/5");
+        assert_eq!(FEATURE_IDENTITY, "farplane/6");
     }
 }

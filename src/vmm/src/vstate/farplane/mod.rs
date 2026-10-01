@@ -9,6 +9,8 @@ pub mod capture;
 pub mod dispatch;
 /// Wire format of the pagemaster memory channel.
 pub mod protocol;
+/// Remapping of a sealed generation's pages over a source's unchanged private copies.
+pub mod rebase;
 
 pub use backend::{BackendError, BackendState, FarplaneBackend, FarplaneState, set_source_commit};
 pub use capture::CaptureService;
