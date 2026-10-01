@@ -1236,6 +1236,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_a_rebase_keeps_the_rings_a_device_writes_through_its_cached_pointers() {
+        use crate::devices::virtio::queue::Queue;
+
+        let page_size = host_page_size() as u64;
+        let vm = setup_vm_with_memory(u64_to_usize(256 * page_size));
+        vm.baseline_dirty_log().unwrap();
+        let mut queue = Queue::new(16);
+        queue.desc_table_address = GuestAddress(10 * page_size);
+        queue.avail_ring_address = GuestAddress(11 * page_size);
+        queue.used_ring_address = GuestAddress(12 * page_size);
+
+        // A queue the driver has not made ready names no memory.
+        queue.mark_memory_dirty(vm.guest_memory());
+        assert!(set_pages(&vm.snapshot_rebase_keep_log().unwrap()[0]).is_empty());
+
+        queue.ready = true;
+        queue.mark_memory_dirty(vm.guest_memory());
+        assert_eq!(
+            set_pages(&vm.snapshot_rebase_keep_log().unwrap()[0]),
+            vec![10, 11, 12]
+        );
+    }
+
+    #[test]
     fn test_register_memory_regions() {
         let mut vm = setup_vm();
 

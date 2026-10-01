@@ -489,6 +489,20 @@ impl Vmm {
         Ok(())
     }
 
+    /// Marks the descriptor tables and rings of every virtio queue dirty. Devices write the used
+    /// rings through cached pointers that no dirty log sees.
+    pub fn mark_virtio_queues_dirty(&self) {
+        let Some(kvm_vm) = self.vm.as_kvm() else {
+            return;
+        };
+        let mem = kvm_vm.guest_memory();
+        self.device_manager.for_each_virtio_device(|_, device| {
+            for queue in device.queues() {
+                queue.mark_memory_dirty(mem);
+            }
+        });
+    }
+
     /// Descriptor of the drive backing the guest's scratch disk, which is the one block device
     /// that is not the root. A guest configured without one has no disk to clone.
     pub fn scratch_descriptor(&self) -> Option<RawFd> {
