@@ -24,6 +24,9 @@ pub enum Restriction {
     AllowOpCode(OpCode),
     /// Only allow operations on pre-registered fds.
     RequireFixedFds,
+    /// Permit forced worker issue in the experimental test ring; never in production.
+    #[cfg(test)]
+    AllowAsync,
 }
 
 impl From<&Restriction> for io_uring_restriction {
@@ -47,6 +50,14 @@ impl From<&Restriction> for io_uring_restriction {
                 .unwrap();
                 instance.__bindgen_anon_1.sqe_flags =
                     1 << io_uring_sqe_flags_bit::IOSQE_FIXED_FILE_BIT;
+            }
+            #[cfg(test)]
+            AllowAsync => {
+                instance.opcode = u16::try_from(
+                    io_uring_register_restriction_op::IORING_RESTRICTION_SQE_FLAGS_ALLOWED,
+                )
+                .unwrap();
+                instance.__bindgen_anon_1.sqe_flags = 1 << io_uring_sqe_flags_bit::IOSQE_ASYNC_BIT;
             }
         };
 

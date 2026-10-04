@@ -682,6 +682,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// Characterizes the existing boundary, not a recoverable memory-budget implementation.
+    /// A future budget exit must be distinguished from generic KVM faults: silently retrying
+    /// every ENOMEM/EFAULT would mask real failures, while the current policy exits the vCPU.
+    #[test]
+    fn memory_budget_baseline_kvm_errors_are_not_resource_stops() {
+        let mut peripherals = Peripherals::default();
+        for error in [libc::ENOMEM, libc::EFAULT] {
+            assert!(matches!(
+                handle_kvm_exit(&mut peripherals, Err(errno::Error::new(error))),
+                Err(VcpuError::FaultyKvmExit(_))
+            ));
+        }
+        // EAGAIN retries emulation; it is not a parked, supervisor-visible resource stop.
+        assert_eq!(
+            handle_kvm_exit(&mut peripherals, Err(errno::Error::new(libc::EAGAIN))).unwrap(),
+            VcpuEmulation::Handled
+        );
+    }
+
     #[test]
     fn test_handle_kvm_exit() {
         let (_, mut vcpu) = setup_vcpu(0x1000);

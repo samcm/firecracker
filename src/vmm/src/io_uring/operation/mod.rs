@@ -123,6 +123,12 @@ impl<T: Debug> Operation<T> {
         self.flags |= 1 << io_uring_sqe_flags_bit::IOSQE_IO_LINK_BIT;
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_async(mut self) -> Self {
+        self.flags |= 1 << io_uring_sqe_flags_bit::IOSQE_ASYNC_BIT;
+        self
+    }
+
     /// Transform the operation into an `Sqe`.
     /// Note: remember remove user_data from slab or it will leak.
     pub(crate) fn into_sqe(self, slab: &mut slab::Slab<T>) -> Sqe {

@@ -91,6 +91,8 @@ pub struct IoUring<T> {
     // and the ops that are in the CQ, but haven't been popped yet.
     num_ops: u32,
     slab: slab::Slab<T>,
+    #[cfg(test)]
+    force_async: bool,
 }
 
 impl<T: Debug> IoUring<T> {
@@ -146,6 +148,8 @@ impl<T: Debug> IoUring<T> {
             registered_fds_count: 0,
             num_ops: 0,
             slab,
+            #[cfg(test)]
+            force_async: false,
         };
 
         instance.check_operations()?;
@@ -165,6 +169,12 @@ impl<T: Debug> IoUring<T> {
 
     /// Push an [`Operation`](operation/struct.Operation.html) onto the submission queue.
     pub fn push(&mut self, op: Operation<T>) -> Result<(), (IoUringError, T)> {
+        #[cfg(test)]
+        let op = if self.force_async {
+            op.force_async()
+        } else {
+            op
+        };
         // validate that we actually did register fds
         let fd = op.fd();
         match self.registered_fds_count {
@@ -241,6 +251,30 @@ impl<T: Debug> IoUring<T> {
     /// in-flight ops.
     pub fn num_ops(&self) -> u32 {
         self.num_ops
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_async_for_test(&mut self) {
+        self.force_async = true;
+    }
+
+    /// Empty submit() intentionally skips the syscall; the experimental pin-drain test needs
+    /// task-work progress even after consuming its last CQE. This is not pin-drain evidence.
+    #[cfg(test)]
+    pub(crate) fn run_task_work_for_test(&self) -> Result<(), IOError> {
+        // SAFETY: valid owned ring fd, no submissions, no wait, no signal mask.
+        SyscallReturnCode(unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_enter,
+                self.fd.as_raw_fd(),
+                0u32,
+                0u32,
+                generated::IORING_ENTER_GETEVENTS,
+                std::ptr::null::<libc::sigset_t>(),
+                0usize,
+            )
+        })
+        .into_empty_result()
     }
 
     fn enable(&mut self) -> Result<(), IoUringError> {

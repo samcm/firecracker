@@ -652,6 +652,11 @@ impl Drop for VirtioBlock {
 }
 
 #[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+#[path = "budget_test.rs"]
+mod budget_test;
+
+#[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -1687,6 +1692,118 @@ mod tests {
 
             // Check that all the pending flush requests were processed during the drain.
             check_flush_requests_batch(5, &vq);
+        }
+    }
+
+    /// Real READ/WRITE, drain, device serialization and destruction for the proposed single-op
+    /// experiment. This does NOT enroll a budget, fork-shared memory or a VM; passing is only
+    /// baseline characterization, not isolated-reserve, quiescence or full-capture evidence.
+    #[test]
+    fn memory_budget_baseline_single_direct_request_drain_save_drop() {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        use crate::snapshot::Persist;
+        use crate::test_utils::single_region_mem;
+
+        const LEN: u32 = 65536;
+        let disk_bytes = vec![0x35; LEN as usize];
+        let guest_bytes = vec![0xa6; LEN as usize];
+        for request_type in [VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT] {
+            let image = TempFile::new().unwrap();
+            image.as_file().write_all(&disk_bytes).unwrap();
+            image.as_file().sync_all().unwrap();
+            let direct = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(image.as_path())
+                .unwrap();
+            let mut block =
+                default_block_with_descriptor(direct.as_raw_fd(), false, FileEngineType::Async);
+            let FileEngine::Async(engine) = &mut block.disk.file_engine else {
+                unreachable!()
+            };
+            engine.force_async_for_test();
+            let mem = single_region_mem(0x30000);
+            let vq = VirtQueue::new(GuestAddress(0x1000), &mem, 256);
+            block.queues[0] = vq.create_queue();
+            block.acked_features |= 1 << VIRTIO_RING_F_EVENT_IDX;
+            block.activate(mem.clone(), default_interrupt()).unwrap();
+            read_blk_req_descriptors(&vq);
+            // Header crosses two pages; sector-aligned payload crosses 17 pages.
+            let header = GuestAddress(0x4ff8);
+            let payload = GuestAddress(0x8200);
+            let status = GuestAddress(0x7000);
+            vq.dtable[0].addr.set(header.0);
+            vq.dtable[1].addr.set(payload.0);
+            vq.dtable[1].len.set(LEN);
+            if request_type == VIRTIO_BLK_T_OUT {
+                vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
+            }
+            vq.dtable[2].addr.set(status.0);
+            mem.write_obj(RequestHeader::new(request_type, 0), header)
+                .unwrap();
+            mem.write_obj(0xffu8, status).unwrap();
+            mem.write_slice(&guest_bytes, payload).unwrap();
+
+            block.process_queue(0).unwrap();
+            // Async completion has not been published into the guest yet.
+            assert_eq!(vq.used.idx.get(), 0);
+            assert_eq!(mem.read_obj::<u8>(status).unwrap(), 0xff);
+            assert_eq!(vq.used.event.get(), 1);
+            // Mutating descriptors after submission cannot enlarge the cached request.
+            vq.dtable[1].len.set(2 * LEN);
+            block.drain_writes().unwrap();
+            assert_eq!(mem.read_obj::<u8>(status).unwrap(), 0);
+            assert_eq!(vq.used.idx.get(), 1);
+            assert_eq!(vq.used.ring[0].get().id, 0);
+            assert_eq!(
+                vq.used.ring[0].get().len,
+                if request_type == VIRTIO_BLK_T_IN {
+                    LEN + 1
+                } else {
+                    1
+                }
+            );
+            let mut actual = vec![0; LEN as usize];
+            mem.read_slice(&mut actual, payload).unwrap();
+            assert_eq!(
+                actual,
+                if request_type == VIRTIO_BLK_T_IN {
+                    &disk_bytes
+                } else {
+                    &guest_bytes
+                }
+                .as_slice()
+            );
+            let saved = block.save();
+            assert_eq!(
+                serde_json::to_value(&saved.virtio_state.queues[0]).unwrap()["next_used"],
+                1
+            );
+            assert!(!bitcode::serialize(&saved).unwrap().is_empty());
+            // A repeated empty drain still visits ring state but must not republish a CQE.
+            block.drain_writes().unwrap();
+            assert_eq!(vq.used.idx.get(), 1);
+            let FileEngine::Async(engine) = &block.disk.file_engine else {
+                unreachable!()
+            };
+            engine.run_task_work_for_test().unwrap();
+            drop(block);
+            let mut file = image.as_file();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.read_exact(&mut actual).unwrap();
+            assert_eq!(
+                actual,
+                if request_type == VIRTIO_BLK_T_IN {
+                    &disk_bytes
+                } else {
+                    &guest_bytes
+                }
+                .as_slice()
+            );
+            assert_eq!(file.metadata().unwrap().len(), u64::from(LEN));
         }
     }
 

@@ -82,6 +82,9 @@ impl AsyncFileEngine {
                 Restriction::AllowOpCode(OpCode::Read),
                 Restriction::AllowOpCode(OpCode::Write),
                 Restriction::AllowOpCode(OpCode::Fsync),
+                // Optional flags are denied by default even with FIXED_FILE required.
+                #[cfg(test)]
+                Restriction::AllowAsync,
             ],
             Some(completion_fd),
         )
@@ -104,6 +107,16 @@ impl AsyncFileEngine {
     #[cfg(test)]
     pub fn file(&self) -> &File {
         &self.file
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_async_for_test(&mut self) {
+        self.ring.force_async_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_task_work_for_test(&self) -> Result<(), std::io::Error> {
+        self.ring.run_task_work_for_test()
     }
 
     pub fn completion_evt(&self) -> &EventFd {

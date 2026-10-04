@@ -443,6 +443,47 @@ mod tests {
         }
     }
 
+    /// An unsuccessful GUP/IO completion still owes guest status and used-ring writes. These
+    /// writes must have funding even after vCPUs stop; failing the IO is not a read-only drain.
+    /// This injects CQE errors, not kernel quota exhaustion or pin cancellation.
+    #[test]
+    fn memory_budget_baseline_failed_io_still_writes_status_and_ring() {
+        for error in [libc::ENOMEM, libc::EFAULT, libc::ECANCELED] {
+            let mem = default_mem();
+            let driver = VirtQueue::new(GuestAddress(0), &mem, 16);
+            let mut queue = driver.create_queue();
+            queue.initialize(&mem).unwrap();
+            let status_addr = GuestAddress(0x1000);
+            mem.write_obj(0xffu8, status_addr).unwrap();
+            let pending = PendingRequest {
+                r#type: RequestType::In,
+                data_len: 4096,
+                status_addr,
+                desc_idx: 3,
+            };
+            let finished = pending.finish(
+                &mem,
+                Err(IoErr::FileEngine(block_io::BlockIoError::Async(
+                    block_io::AsyncIoError::IO(std::io::Error::from_raw_os_error(error)),
+                ))),
+                &BlockDeviceMetrics::default(),
+            );
+            assert_eq!(
+                mem.read_obj::<u8>(status_addr).unwrap(),
+                u8::try_from(VIRTIO_BLK_S_IOERR).unwrap()
+            );
+            assert_eq!(finished.num_bytes_to_mem, 1);
+            queue
+                .add_used(finished.desc_idx, finished.num_bytes_to_mem)
+                .unwrap();
+            assert_eq!(driver.used.idx.get(), 0);
+            queue.advance_used_ring_idx();
+            assert_eq!(driver.used.idx.get(), 1);
+            assert_eq!(driver.used.ring[0].get().id, 3);
+            assert_eq!(driver.used.ring[0].get().len, 1);
+        }
+    }
+
     #[test]
     fn test_read_request_header() {
         let mem = single_region_mem(0x1000);
@@ -515,6 +556,38 @@ mod tests {
 
             assert_eq!(request.status_addr.raw_value(), self.status_desc.addr.get());
         }
+    }
+
+    /// A pre-read descriptor is not admission evidence. The experimental cap must apply to the
+    /// exact parsed Request that is consumed by process(), never to an earlier guest-memory read.
+    /// There is no production payload cap or isolated allocation allowance in this baseline.
+    #[test]
+    fn memory_budget_baseline_descriptor_mutation_changes_admission_input() {
+        const CAP: u32 = 65536;
+        let mem = single_region_mem(0x40000);
+        let driver = VirtQueue::new(GuestAddress(0), &mem, 256);
+        let chain = RequestDescriptorChain::new(&driver);
+        chain.header_desc.addr.set(0x4000);
+        chain.set_header(RequestHeader::new(VIRTIO_BLK_T_IN, 0));
+        chain.data_desc.addr.set(0x10000);
+        chain.data_desc.len.set(CAP);
+        let mut queue = driver.create_queue();
+        let head = queue.pop().unwrap().unwrap();
+
+        assert_eq!(chain.data_desc.len.get(), CAP); // Unsafe preflight observation.
+        chain.data_desc.len.set(2 * CAP); // Guest races before the authoritative parse.
+        let request = Request::parse(&head, &mem, NUM_DISK_SECTORS).unwrap();
+        assert!(request.data_len > CAP); // Must be refused BEFORE process(), not truncated.
+
+        chain.data_desc.len.set(CAP);
+        let cached = Request::parse(&head, &mem, NUM_DISK_SECTORS).unwrap();
+        assert_eq!(cached.data_len, CAP);
+        chain.data_desc.len.set(2 * CAP);
+        chain.data_desc.addr.set(0x20000);
+        chain.status_desc.addr.set(0x8000);
+        assert_eq!(cached.data_len, CAP);
+        assert_eq!(cached.data_addr, GuestAddress(0x10000));
+        assert_eq!(cached.status_addr, GuestAddress(0x3000));
     }
 
     #[test]
