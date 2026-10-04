@@ -27,6 +27,10 @@ use crate::test_utils::single_region_mem;
 use crate::vstate::farplane::dispatch;
 use crate::vstate::memory::{Bytes, GuestAddress, GuestMemory};
 
+#[cfg(test)]
+#[path = "running_budget_test.rs"]
+mod running_vmm;
+
 // Exact experimental header SHA256:
 // c215c3a6da4f63c911e8bd17c87888ff6e37783bcb7a80e5b07af8531cffc99b.
 // No production ABI or memory-version interface is implied.
