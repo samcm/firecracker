@@ -82,8 +82,13 @@ mod tests {
         let image = TempFile::new().unwrap();
         image.as_file().set_len(0x1000).unwrap();
 
-        let block =
+        let mut block =
             default_block_with_descriptor(image.as_file().as_raw_fd(), false, FileEngineType::Sync);
+        use crate::devices::virtio::device::VirtioDevice;
+        use crate::devices::virtio::generated::virtio_blk::{
+            VIRTIO_BLK_F_SEG_MAX, VIRTIO_BLK_F_SIZE_MAX,
+        };
+        block.set_acked_features((1 << VIRTIO_BLK_F_SIZE_MAX) | (1 << VIRTIO_BLK_F_SEG_MAX));
         let state = BlockState::Virtio(block.save());
 
         // The scratch descriptor backs the restored drive, so the guest can write it.

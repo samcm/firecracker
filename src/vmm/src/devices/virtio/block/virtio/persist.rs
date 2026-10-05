@@ -62,6 +62,21 @@ pub struct VirtioBlockState {
 }
 
 impl VirtioBlockState {
+    pub(crate) fn validate_write_limits(
+        &self,
+    ) -> Result<(), crate::devices::virtio::DeviceGuardError> {
+        use crate::devices::virtio::generated::virtio_blk::{
+            VIRTIO_BLK_F_SEG_MAX, VIRTIO_BLK_F_SIZE_MAX,
+        };
+        let required = (1 << VIRTIO_BLK_F_SIZE_MAX) | (1 << VIRTIO_BLK_F_SEG_MAX);
+        if self.virtio_state.avail_features & self.virtio_state.acked_features & required
+            != required
+        {
+            return Err(crate::devices::virtio::DeviceGuardError::BlockLimits);
+        }
+        Ok(())
+    }
+
     /// States whether the saved drive was the root device, which is what tells a restore which
     /// inherited descriptor backs it.
     pub fn root_device(&self) -> bool {
@@ -91,6 +106,7 @@ impl Persist<'_> for VirtioBlock {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
+        state.validate_write_limits()?;
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
         let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
             .map_err(VirtioBlockError::RateLimiter)?;
@@ -115,6 +131,8 @@ impl Persist<'_> for VirtioBlock {
 
         let config_space = ConfigSpace {
             capacity: disk_properties.nsectors.to_le(),
+            size_max: MAX_REQUEST_BYTES.to_le(),
+            seg_max: 1u32.to_le(),
         };
 
         Ok(VirtioBlock {
@@ -210,7 +228,11 @@ mod tests {
             file_engine_type: FileEngineType::default(),
         };
 
-        let block = VirtioBlock::new(config).unwrap();
+        let mut block = VirtioBlock::new(config).unwrap();
+        use crate::devices::virtio::generated::virtio_blk::{
+            VIRTIO_BLK_F_SEG_MAX, VIRTIO_BLK_F_SIZE_MAX,
+        };
+        block.set_acked_features((1 << VIRTIO_BLK_F_SIZE_MAX) | (1 << VIRTIO_BLK_F_SEG_MAX));
         let guest_mem = default_mem();
 
         // Save the block device.
@@ -239,5 +261,41 @@ mod tests {
         // Test that block specific fields are the same.
         assert_eq!(restored_block.disk.descriptor, block.disk.descriptor);
         assert!(restored_block.read_only);
+    }
+
+    #[test]
+    fn restore_guard_refuses_missing_limits_before_using_the_descriptor() {
+        use crate::devices::virtio::block::virtio::test_utils::default_block;
+        use crate::devices::virtio::generated::virtio_blk::{
+            VIRTIO_BLK_F_SEG_MAX, VIRTIO_BLK_F_SIZE_MAX,
+        };
+        let block = default_block(FileEngineType::Sync);
+        let mut state = block.save();
+        let required = (1 << VIRTIO_BLK_F_SIZE_MAX) | (1 << VIRTIO_BLK_F_SEG_MAX);
+        for missing in [
+            required,
+            1 << VIRTIO_BLK_F_SIZE_MAX,
+            1 << VIRTIO_BLK_F_SEG_MAX,
+        ] {
+            for unadvertised in [false, true] {
+                state.virtio_state.avail_features = block.avail_features();
+                state.virtio_state.acked_features = required;
+                if unadvertised {
+                    state.virtio_state.avail_features &= !missing;
+                } else {
+                    state.virtio_state.acked_features &= !missing;
+                }
+                let error = VirtioBlock::restore(
+                    BlockConstructorArgs {
+                        mem: default_mem(),
+                        descriptor: -1,
+                    },
+                    &state,
+                )
+                .unwrap_err();
+                assert!(matches!(error, VirtioBlockError::Guard(_)), "{error}");
+                assert!(error.to_string().contains("SIZE_MAX and SEG_MAX"));
+            }
+        }
     }
 }

@@ -44,6 +44,36 @@ use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
 
 const FRAME_HEADER_MAX_LEN: usize = 42;
 
+// Preserve a level-triggered host wake even when the guest suppresses kicks (EVENT_IDX),
+// or the unread TAP data has already delivered its edge-triggered notification.
+fn defer_queue_event(event: &EventFd, metrics: &NetDeviceMetrics) {
+    if let Err(err) = event.write(1)
+        && err.raw_os_error() != Some(EAGAIN)
+    {
+        error!("Failed to defer net queue event: {:?}", err);
+        metrics.event_fails.inc();
+    }
+}
+
+fn bounded_read_iovec(
+    slice: &mut [iovec],
+    read: impl FnOnce(&mut [iovec]) -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    let mut remaining = MAX_BUFFER_SIZE;
+    for index in 0..slice.len() {
+        if slice[index].iov_len >= remaining {
+            let capacity = slice[index].iov_len;
+            slice[index].iov_len = remaining;
+            let result = read(&mut slice[..=index]);
+            // Restore even on EAGAIN/error: cached capacities also drive mark_used.
+            slice[index].iov_len = capacity;
+            return result;
+        }
+        remaining -= slice[index].iov_len;
+    }
+    read(slice)
+}
+
 pub(crate) const fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
 }
@@ -457,7 +487,16 @@ impl Net {
         // This is safe since we checked in the event handler that the device is activated.
         let mem = &self.device_state.active_state().unwrap().mem;
         let queue = &mut self.queues[RX_INDEX];
-        while let Some(head) = queue.pop_or_enable_notification()? {
+        loop {
+            if crate::vstate::farplane::dispatch::gate().is_closed() {
+                defer_queue_event(&self.queue_evts[RX_INDEX], &self.metrics);
+                break;
+            }
+            let Some(head) = queue.pop_or_enable_notification()? else {
+                break;
+            };
+            #[cfg(test)]
+            tests::run_admission_hook(RX_INDEX);
             let index = head.index;
             // SAFETY: we are only using this `DescriptorChain` here.
             if let Err(err) = unsafe { self.rx_buffer.add_buffer(mem, head) } {
@@ -543,6 +582,13 @@ impl Net {
             }
         }
 
+        // Parsing may itself have yielded to close. Do not admit a frame afterwards.
+        if crate::vstate::farplane::dispatch::gate().is_closed() {
+            defer_queue_event(&self.queue_evts[RX_INDEX], &self.metrics);
+            return Ok(None);
+        }
+        #[cfg(test)]
+        tests::run_admission_hook(2);
         // SAFETY:
         // * We ensured that `self.rx_buffer` has at least one DescriptorChain parsed in it.
         let len = unsafe { self.read_tap().map_err(NetError::IO) }?;
@@ -561,6 +607,10 @@ impl Net {
     /// Read as many frames as possible.
     fn process_rx(&mut self) -> Result<(), DeviceError> {
         loop {
+            if crate::vstate::farplane::dispatch::gate().is_closed() {
+                defer_queue_event(&self.queue_evts[RX_INDEX], &self.metrics);
+                break;
+            }
             match self.read_from_tap() {
                 Ok(None) => {
                     self.metrics.no_rx_avail_buffer.inc();
@@ -612,7 +662,16 @@ impl Net {
         let mut used_any = false;
         let tx_queue = &mut self.queues[TX_INDEX];
 
-        while let Some(head) = tx_queue.pop_or_enable_notification()? {
+        loop {
+            if crate::vstate::farplane::dispatch::gate().is_closed() {
+                defer_queue_event(&self.queue_evts[TX_INDEX], &self.metrics);
+                break;
+            }
+            let Some(head) = tx_queue.pop_or_enable_notification()? else {
+                break;
+            };
+            #[cfg(test)]
+            tests::run_admission_hook(TX_INDEX);
             self.metrics
                 .tx_remaining_reqs_count
                 .add(tx_queue.len().into());
@@ -724,7 +783,7 @@ impl Net {
         } else {
             self.rx_buffer.single_chain_slice_mut()
         };
-        self.tap.read_iovec(slice)
+        bounded_read_iovec(slice, |bounded| self.tap.read_iovec(bounded))
     }
 
     fn write_tap(tap: &mut Tap, buf: &IoVecBuffer) -> std::io::Result<usize> {
@@ -996,6 +1055,237 @@ pub mod tests {
     use crate::test_utils::single_region_mem;
     use crate::utils::net::mac::{MAC_ADDR_LEN, MacAddr};
     use crate::vstate::memory::{Address, GuestMemory};
+
+    type AdmissionHook = Option<(usize, Box<dyn FnOnce()>)>;
+    thread_local! {
+        static ADMISSION_HOOK: std::cell::RefCell<AdmissionHook> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_admission_hook(point: usize) {
+        ADMISSION_HOOK.with_borrow_mut(|slot| {
+            if slot.as_ref().is_some_and(|(wanted, _)| *wanted == point) {
+                let (_, hook) = slot.take().unwrap();
+                hook();
+            }
+        });
+    }
+
+    fn socket_net() -> (Net, std::os::unix::net::UnixDatagram) {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let (socket, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        // SAFETY: ownership of this valid descriptor is transferred exactly once.
+        let file = unsafe { std::fs::File::from_raw_fd(socket.into_raw_fd()) };
+        (
+            Net::new_with_tap(
+                "guard-test".into(),
+                Tap::from_test_file(file),
+                None,
+                RateLimiter::default(),
+                RateLimiter::default(),
+                None,
+            )
+            .unwrap(),
+            peer,
+        )
+    }
+
+    #[test]
+    #[ignore = "process-global dispatch gate; run this exact test in isolation"]
+    fn close_yields_net_handlers_and_reopen_wakes() {
+        use crate::devices::virtio::test_utils::default_interrupt;
+        use crate::vstate::farplane::dispatch;
+        use crate::vstate::memory::Bytes;
+        use event_manager::SubscriberOps;
+        use std::sync::{Mutex, mpsc};
+
+        // 2 closes after frame admission with a second cached buffer; 3 admits a malformed RX
+        // chain, whose zero-length used element must survive until the next frame is published.
+        for point in [RX_INDEX, TX_INDEX, 2, 3] {
+            for event_idx in [false, true] {
+                let mem = single_region_mem(1024 * 1024);
+                let rx = VirtQueue::new(GuestAddress(0), &mem, 16);
+                let tx = VirtQueue::new(GuestAddress(0x4000), &mem, 16);
+                let (mut net, peer) = socket_net();
+                net.queues = vec![rx.create_queue(), tx.create_queue()];
+                for queue in &mut net.queues {
+                    queue.initialize(&mem).unwrap();
+                    if event_idx {
+                        queue.enable_notif_suppression();
+                    }
+                }
+                net.rx_buffer.min_buffer_size = 12;
+                net.device_state = DeviceState::Activated(ActiveState {
+                    mem: mem.clone(),
+                    interrupt: default_interrupt(),
+                });
+                let vq = if point == TX_INDEX { &tx } else { &rx };
+                let flags = if point == TX_INDEX {
+                    0
+                } else {
+                    VIRTQ_DESC_F_WRITE
+                };
+                let length = if point == TX_INDEX {
+                    64
+                } else {
+                    MAX_BUFFER_SIZE as u32
+                };
+                vq.dtable[0].set(0x10000, length, if point == 3 { 0 } else { flags }, 0);
+                vq.dtable[1].set(0x30000, length, flags, 0);
+                vq.avail.ring[0].set(0);
+                vq.avail.ring[1].set(1);
+                vq.avail.idx.set(1);
+                mem.write_obj(0xa5u8, GuestAddress(0x30000)).unwrap();
+                if point == 2 {
+                    vq.avail.idx.set(2);
+                    net.parse_rx_descriptors().unwrap();
+                }
+                if point != TX_INDEX {
+                    peer.send(&[0; 64]).unwrap();
+                    if point != 2 {
+                        peer.send(&[0; 64]).unwrap();
+                    }
+                }
+                let index = if point == TX_INDEX {
+                    TX_INDEX
+                } else {
+                    RX_INDEX
+                };
+                net.queue_evts[index].write(1).unwrap();
+                let net = Arc::new(Mutex::new(net));
+                let mut events = crate::EventManager::new().unwrap();
+                events.add_subscriber(net.clone());
+                let (send, recv) = mpsc::channel();
+                let closer = thread::spawn(move || {
+                    recv.recv().unwrap();
+                    dispatch::gate().close();
+                });
+                let publish = mem.clone();
+                let avail_idx = vq.avail.idx.location;
+                let refill = peer.try_clone().unwrap();
+                ADMISSION_HOOK.with_borrow_mut(|slot| {
+                    *slot = Some((
+                        if point == 3 { RX_INDEX } else { point },
+                        Box::new(move || {
+                            send.send(()).unwrap();
+                            dispatch::gate().wait_for_closing(1);
+                            publish.write_obj(2u16, avail_idx).unwrap();
+                            if point == 2 {
+                                // Refill while the first frame is still unread: readability never
+                                // falls, so the edge-triggered TAP cannot provide another edge.
+                                refill.send(&[0; 64]).unwrap();
+                            }
+                        }),
+                    ))
+                });
+                dispatch::dispatch_slice(&mut events).unwrap();
+                closer.join().unwrap();
+                assert!(dispatch::gate().is_closed());
+                assert_eq!(
+                    net.lock().unwrap().queues[index].next_avail.0,
+                    if point == 2 { 2 } else { 1 }
+                );
+                assert_eq!(
+                    vq.used.idx.get(),
+                    if point == RX_INDEX || point == 3 {
+                        0
+                    } else {
+                        1
+                    }
+                );
+                if point == 3 {
+                    assert_eq!(vq.used.ring[0].get().len, 0);
+                    assert_eq!(net.lock().unwrap().rx_buffer.used_descriptors, 1);
+                }
+                if point == 2 {
+                    assert_eq!(mem.read_obj::<u16>(GuestAddress(0x1000a)).unwrap(), 1);
+                    assert_eq!(vq.used.ring[0].get().len, 64);
+                }
+                assert_eq!(mem.read_obj::<u8>(GuestAddress(0x30000)).unwrap(), 0xa5);
+                dispatch::gate().open();
+                assert!(dispatch::dispatch_slice(&mut events).unwrap() > 0);
+                assert_eq!(vq.used.idx.get(), 2);
+                assert_eq!(net.lock().unwrap().queues[index].next_avail.0, 2);
+                if point != TX_INDEX {
+                    assert_eq!(mem.read_obj::<u8>(GuestAddress(0x30000)).unwrap(), 0);
+                }
+                // A saturated self-kick is already durable, not an event failure.
+                dispatch::gate().close();
+                {
+                    let mut net = net.lock().unwrap();
+                    net.queue_evts[index].write(u64::MAX - 1).unwrap();
+                    let failures = net.metrics.event_fails.count();
+                    if index == RX_INDEX {
+                        net.process_rx().unwrap();
+                    } else {
+                        net.process_tx().unwrap();
+                    }
+                    assert_eq!(net.metrics.event_fails.count(), failures);
+                }
+                dispatch::gate().open();
+                assert!(dispatch::dispatch_slice(&mut events).unwrap() > 0);
+                println!("NET_CLOSE_PASS point={point} event_idx={event_idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_tap_caps_inflated_guest_iovecs() {
+        use crate::devices::virtio::test_utils::default_interrupt;
+        use crate::vstate::memory::Bytes;
+        for merge in [false, true] {
+            let mem = single_region_mem(1024 * 1024);
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+            let (mut net, peer) = socket_net();
+            net.queues[RX_INDEX] = vq.create_queue();
+            net.queues[RX_INDEX].initialize(&mem).unwrap();
+            net.device_state = DeviceState::Activated(ActiveState {
+                mem: mem.clone(),
+                interrupt: default_interrupt(),
+            });
+            if merge {
+                net.acked_features |= 1 << VIRTIO_NET_F_MRG_RXBUF;
+            }
+            vq.dtable[0].set(0x10000, 200000, VIRTQ_DESC_F_WRITE, 0);
+            vq.avail.ring[0].set(0);
+            vq.avail.idx.set(1);
+            net.parse_rx_descriptors().unwrap();
+            let capacity = net.rx_buffer.capacity();
+            mem.write_obj(0xa5u8, GuestAddress(0x10000 + MAX_BUFFER_SIZE as u64))
+                .unwrap();
+            peer.send(&vec![0x42; MAX_BUFFER_SIZE + 1000]).unwrap();
+            // SAFETY: the parsed chain owns a valid writable mapping.
+            assert_eq!(unsafe { net.read_tap().unwrap() }, MAX_BUFFER_SIZE);
+            assert_eq!(
+                mem.read_obj::<u8>(GuestAddress(0x10000 + MAX_BUFFER_SIZE as u64))
+                    .unwrap(),
+                0xa5
+            );
+            assert_eq!(net.rx_buffer.capacity(), capacity);
+            assert_eq!(net.rx_buffer.all_chains_slice_mut()[0].iov_len, 200000);
+            assert_eq!(
+                // SAFETY: the same parsed chain still owns its live writable mapping.
+                unsafe { net.read_tap() }.unwrap_err().raw_os_error(),
+                Some(EAGAIN)
+            );
+            assert_eq!(net.rx_buffer.all_chains_slice_mut()[0].iov_len, 200000);
+        }
+        let mut slice = [iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 1000,
+        }; 256];
+        bounded_read_iovec(&mut slice, |bounded| {
+            assert_eq!(
+                bounded.iter().map(|iov| iov.iov_len).sum::<usize>(),
+                MAX_BUFFER_SIZE
+            );
+            Ok(0)
+        })
+        .unwrap();
+        assert!(slice.iter().all(|iov| iov.iov_len == 1000));
+    }
 
     impl Net {
         pub fn finish_frame(&mut self) {

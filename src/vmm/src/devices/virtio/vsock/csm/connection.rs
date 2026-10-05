@@ -215,7 +215,8 @@ where
 
             // The maximum amount of data we can read in is limited by both the RX buffer size and
             // the peer available buffer space.
-            let max_len = std::cmp::min(pkt.buf_size(), self.peer_avail_credit());
+            let max_len = std::cmp::min(pkt.buf_size(), self.peer_avail_credit())
+                .min(crate::devices::virtio::vsock::defs::MAX_PKT_BUF_SIZE);
 
             // Read data from the stream straight to the RX buffer, for maximum throughput.
             match pkt.read_at_offset_from(&mut self.stream, 0, max_len) {

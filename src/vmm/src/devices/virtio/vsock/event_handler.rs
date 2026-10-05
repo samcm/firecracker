@@ -57,6 +57,9 @@ where
         // A guest that kicks a data queue may have supplied the event queue with a descriptor for
         // a reset the device owes, or answered one it published, without the device seeing a
         // notification for either.
+        if Self::defer_closed_queue(&self.queue_events[RXQ_INDEX]) {
+            return used_queues;
+        }
         used_queues.extend(self.advance_transport_reset());
 
         if let Err(err) = self.queue_events[RXQ_INDEX].read() {
@@ -79,6 +82,9 @@ where
             return used_queues;
         }
 
+        if Self::defer_closed_queue(&self.queue_events[TXQ_INDEX]) {
+            return used_queues;
+        }
         used_queues.extend(self.advance_transport_reset());
 
         if let Err(err) = self.queue_events[TXQ_INDEX].read() {
@@ -112,6 +118,9 @@ where
         // token says the guest touched the event queue at some instant, never which of the
         // device's writes it followed, so it settles nothing and publishes nothing. A read that
         // failed observed no guest action at all, so there is nothing to look at the rings for.
+        if Self::defer_closed_queue(&self.queue_events[EVQ_INDEX]) {
+            return used_queues;
+        }
         if let Err(err) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {:?}", err);
             METRICS.ev_queue_event_fails.inc();

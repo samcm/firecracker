@@ -53,6 +53,17 @@ pub struct Tap {
     pub(crate) if_name: [u8; IFACE_NAME_MAX_LEN],
 }
 
+#[cfg(test)]
+impl Tap {
+    // A datagram socket exercises the real readv/writev and event handler without TAP ioctls.
+    pub(super) fn from_test_file(tap_file: File) -> Self {
+        Self {
+            tap_file,
+            if_name: [0; IFACE_NAME_MAX_LEN],
+        }
+    }
+}
+
 // Returns a byte vector representing the contents of a null terminated C string which
 // contains if_name.
 fn build_terminated_if_name(if_name: &str) -> Result<[u8; IFACE_NAME_MAX_LEN], TapError> {

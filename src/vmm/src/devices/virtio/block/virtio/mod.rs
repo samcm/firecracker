@@ -32,11 +32,20 @@ pub const BLOCK_QUEUE_SIZES: [u16; BLOCK_NUM_QUEUES] = [FIRECRACKER_MAX_QUEUE_SI
 /// Maximum number of io uring entries we allow in the queue.
 pub const IO_URING_NUM_ENTRIES: u16 = 128;
 
+/// Maximum payload of the single supported data descriptor.
+pub const MAX_REQUEST_BYTES: u32 = 65536;
+/// Includes queued, submitted and completed-but-unconsumed async requests.
+pub const MAX_INFLIGHT_REQUESTS: u32 = 32;
+
 /// Errors the block device can trigger.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VirtioBlockError {
+    /// Device state exceeds the installed guest-write guard: {0}
+    Guard(#[from] crate::devices::virtio::DeviceGuardError),
     /// Guest gave us too few descriptors in a descriptor chain.
     DescriptorChainTooShort,
+    /// Guest gave us more than one data descriptor or trailing status descriptors.
+    DescriptorChainTooLong,
     /// Guest gave us a descriptor that was too short to use.
     DescriptorLengthTooSmall,
     /// Getting a block's metadata fails for any reason.
@@ -45,6 +54,8 @@ pub enum VirtioBlockError {
     GuestMemory(GuestMemoryError),
     /// The data length is invalid.
     InvalidDataLength,
+    /// Payload exceeds SIZE_MAX; the validated status byte is at {0:?}.
+    PayloadTooLarge(crate::vstate::memory::GuestAddress),
     /// The requested operation would cause a seek beyond disk end.
     InvalidOffset,
     /// Guest gave us a read only descriptor that protocol says to write to.

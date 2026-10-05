@@ -32,7 +32,7 @@ pub const ENTROPY_DEV_ID: &str = "rng";
 /// exceed the amount of distinct guest memory actually backing the request.
 /// Capping the per-request allocation to 64 KiB keeps host memory usage
 /// bounded regardless of how the descriptor chain is constructed.
-const MAX_ENTROPY_BYTES: u32 = 64 * 1024;
+pub(crate) const MAX_ENTROPY_BYTES: u32 = 64 * 1024;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum EntropyError {
@@ -138,7 +138,26 @@ impl Entropy {
 
     fn process_entropy_queue(&mut self) -> Result<(), InvalidAvailIdx> {
         let mut used_any = false;
-        while let Some(desc) = self.queues[RNG_QUEUE].pop()? {
+        loop {
+            // Finish an admitted request, but never admit another after dispatch closes.
+            if crate::vstate::farplane::dispatch::gate().is_closed() {
+                if let Err(err) = self.queue_events[RNG_QUEUE].write(1)
+                    && err.raw_os_error() != Some(libc::EAGAIN)
+                {
+                    error!("entropy: could not defer queue event: {err}");
+                    METRICS.entropy_event_fails.inc();
+                }
+                break;
+            }
+            let Some(desc) = self.queues[RNG_QUEUE].pop()? else {
+                break;
+            };
+            #[cfg(test)]
+            tests::AFTER_QUEUE_POP.with_borrow_mut(|hook| {
+                if let Some(hook) = hook.take() {
+                    hook();
+                }
+            });
             // This is safe since we checked in the event handler that the device is activated.
             let mem = &self.device_state.active_state().unwrap().mem;
             let index = desc.index;
@@ -337,6 +356,55 @@ mod tests {
     use crate::devices::virtio::test_utils::test::{
         VirtioTestDevice, VirtioTestHelper, create_virtio_mem,
     };
+
+    thread_local! {
+        pub(super) static AFTER_QUEUE_POP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    #[ignore = "process-global dispatch gate; run this exact test in isolation"]
+    fn close_yields_entropy_loop_and_reopen_wakes_refill() {
+        use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt};
+        use crate::vstate::farplane::dispatch;
+        use crate::vstate::memory::{Bytes, GuestAddress};
+
+        let mem = create_virtio_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let mut device = default_entropy();
+        device.queues[RNG_QUEUE] = vq.create_queue();
+        device.activate(mem.clone(), default_interrupt()).unwrap();
+        vq.dtable[0].set(0x4000, 16, VIRTQ_DESC_F_WRITE, 0);
+        vq.dtable[1].set(0x5000, 16, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.ring[1].set(1);
+        vq.avail.idx.set(1);
+        mem.write_slice(&[0xaa; 16], GuestAddress(0x5000)).unwrap();
+        let publish_mem = mem.clone();
+        let avail_idx = vq.avail.idx.location;
+        AFTER_QUEUE_POP.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                dispatch::gate().close();
+                publish_mem.write_obj(2u16, avail_idx).unwrap();
+            }));
+        });
+        device.process_entropy_queue().unwrap();
+        assert_eq!(device.queues[RNG_QUEUE].next_avail.0, 1);
+        assert_eq!(vq.used.idx.get(), 1);
+        let mut sentinel = [0; 16];
+        mem.read_slice(&mut sentinel, GuestAddress(0x5000)).unwrap();
+        assert_eq!(sentinel, [0xaa; 16]);
+        // A full nonblocking counter is already a pending wake, not an event failure.
+        device.queue_events[RNG_QUEUE].read().unwrap();
+        device.queue_events[RNG_QUEUE].write(u64::MAX - 1).unwrap();
+        let failures = METRICS.entropy_event_fails.count();
+        device.process_entropy_queue().unwrap();
+        assert_eq!(METRICS.entropy_event_fails.count(), failures);
+        dispatch::gate().open();
+        device.process_entropy_queue_event();
+        assert_eq!(device.queues[RNG_QUEUE].next_avail.0, 2);
+        assert_eq!(vq.used.idx.get(), 2);
+    }
 
     impl VirtioTestDevice for Entropy {
         fn set_queues(&mut self, queues: Vec<Queue>) {

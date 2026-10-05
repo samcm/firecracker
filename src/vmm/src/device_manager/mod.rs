@@ -448,6 +448,34 @@ pub struct DevicesState {
     pub serial_state: Option<persist::SerialState>,
 }
 
+impl DevicesState {
+    /// Count both transports, even if PCI is disabled, before importing or activating anything.
+    pub(crate) fn validate_guest_write_guard(
+        &self,
+    ) -> Result<(), crate::devices::virtio::DeviceGuardError> {
+        let mmio = &self.mmio_state;
+        let pci = &self.pci_state;
+        crate::devices::virtio::validate_guard_counts([
+            mmio.block_devices.len() + pci.block_devices.len(),
+            mmio.net_devices.len() + pci.net_devices.len(),
+            usize::from(mmio.vsock_device.is_some()) + usize::from(pci.vsock_device.is_some()),
+            usize::from(mmio.entropy_device.is_some()) + usize::from(pci.entropy_device.is_some()),
+            usize::from(mmio.free_page_reporting_device.is_some())
+                + usize::from(pci.free_page_reporting_device.is_some()),
+        ])?;
+        use crate::devices::virtio::block::persist::BlockState;
+        for BlockState::Virtio(block) in mmio
+            .block_devices
+            .iter()
+            .map(|d| &d.device_state)
+            .chain(pci.block_devices.iter().map(|d| &d.device_state))
+        {
+            block.validate_write_limits()?;
+        }
+        Ok(())
+    }
+}
+
 /// Errors for (de)serialization of the devices.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum DevicePersistError {
@@ -481,6 +509,8 @@ pub enum DevicePersistError {
 /// Errors for (de)serialization of the device manager.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum DeviceManagerPersistError {
+    /// Device set exceeds capture guard: {0}
+    DeviceGuard(#[from] crate::devices::virtio::DeviceGuardError),
     /// Error restoring MMIO devices: {0}
     MmioRestore(DevicePersistError),
     /// Error restoring ACPI devices: {0}
@@ -529,6 +559,7 @@ impl<'a> Persist<'a> for DeviceManager {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
+        state.validate_guest_write_guard()?;
         // Setup legacy devices in case of x86
         #[cfg(target_arch = "x86_64")]
         let serial_state: Option<vm_superio::serial::SerialState> =
@@ -586,6 +617,57 @@ pub(crate) mod tests {
     use crate::devices::acpi::vmclock::VmClock;
     use crate::devices::acpi::vmgenid::VmGenId;
     use crate::vstate::resources::ResourceAllocator;
+
+    #[test]
+    fn restored_guard_counts_and_block_features_are_validated_before_activation() {
+        use crate::devices::virtio::DeviceGuardError;
+        use crate::devices::virtio::block::persist::BlockState;
+        use crate::devices::virtio::block::virtio::device::FileEngineType;
+        use crate::devices::virtio::block::virtio::test_utils::default_block;
+        use crate::devices::virtio::device::VirtioDevice;
+        use crate::devices::virtio::generated::virtio_blk::{
+            VIRTIO_BLK_F_SEG_MAX, VIRTIO_BLK_F_SIZE_MAX,
+        };
+        let mut block = default_block(FileEngineType::Sync);
+        let required = (1 << VIRTIO_BLK_F_SIZE_MAX) | (1 << VIRTIO_BLK_F_SEG_MAX);
+        block.set_acked_features(required);
+        let device = persist::VirtioDeviceState {
+            device_id: "root".into(),
+            device_state: BlockState::Virtio(block.save()),
+            transport_state: serde_json::from_value(serde_json::json!({
+                "features_select": 0, "acked_features_select": 0, "queue_select": 0,
+                "device_status": 0, "config_generation": 0, "interrupt_status": 0
+            }))
+            .unwrap(),
+            device_info: mmio::MMIODeviceInfo {
+                addr: 0xd0000000,
+                len: 4096,
+                gsi: Some(5),
+            },
+        };
+        let mut state = DevicesState::default();
+        state.validate_guest_write_guard().unwrap();
+        state.mmio_state.block_devices = vec![device.clone(); 2];
+        let encoded = bitcode::serialize(&state).unwrap();
+        let restored: DevicesState = bitcode::deserialize(&encoded).unwrap();
+        restored.validate_guest_write_guard().unwrap();
+        state.mmio_state.block_devices.push(device);
+        assert!(matches!(
+            state.validate_guest_write_guard(),
+            Err(DeviceGuardError::Count {
+                device: "block",
+                count: 3,
+                limit: 2
+            })
+        ));
+        state.mmio_state.block_devices.pop();
+        let BlockState::Virtio(block) = &mut state.mmio_state.block_devices[0].device_state;
+        block.virtio_state.acked_features = 0;
+        assert!(matches!(
+            state.validate_guest_write_guard(),
+            Err(DeviceGuardError::BlockLimits)
+        ));
+    }
 
     pub(crate) fn default_device_manager() -> DeviceManager {
         let mut resource_allocator = ResourceAllocator::new();

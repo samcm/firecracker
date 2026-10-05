@@ -68,6 +68,19 @@ impl WrappedRequest {
 }
 
 impl AsyncFileEngine {
+    fn check_capacity(
+        &self,
+        req: PendingRequest,
+    ) -> Result<PendingRequest, RequestError<AsyncIoError>> {
+        if self.ring.num_ops() >= super::super::MAX_INFLIGHT_REQUESTS {
+            return Err(RequestError {
+                req,
+                error: AsyncIoError::IoUring(IoUringError::FullCQueue),
+            });
+        }
+        Ok(req)
+    }
+
     fn new_ring(
         file: &File,
         completion_fd: RawFd,
@@ -131,6 +144,7 @@ impl AsyncFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<AsyncIoError>> {
+        let req = self.check_capacity(req)?;
         let buf = match mem.get_slice(addr, count as usize) {
             Ok(slice) => slice.ptr_guard_mut().as_ptr(),
             Err(err) => {
@@ -165,6 +179,7 @@ impl AsyncFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<AsyncIoError>> {
+        let req = self.check_capacity(req)?;
         let buf = match mem.get_slice(addr, count as usize) {
             Ok(slice) => slice.ptr_guard_mut().as_ptr(),
             Err(err) => {
@@ -192,6 +207,7 @@ impl AsyncFileEngine {
     }
 
     pub fn push_flush(&mut self, req: PendingRequest) -> Result<(), RequestError<AsyncIoError>> {
+        let req = self.check_capacity(req)?;
         let wrapped_user_data = WrappedRequest::new(req);
 
         self.ring
@@ -250,5 +266,55 @@ impl AsyncFileEngine {
         });
 
         Ok(cqe)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::single_region_mem;
+
+    #[test]
+    fn test_request_cap_and_completion_refund() {
+        let file = vmm_sys_util::tempfile::TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        let mut engine = AsyncFileEngine::from_file(file).unwrap();
+        let mem = single_region_mem(4096);
+        for _ in 0..super::super::super::MAX_INFLIGHT_REQUESTS {
+            engine.push_flush(PendingRequest::default()).unwrap();
+        }
+        assert_eq!(engine.ring.num_ops(), 32);
+        assert!(matches!(
+            engine
+                .push_flush(PendingRequest::default())
+                .unwrap_err()
+                .error,
+            AsyncIoError::IoUring(IoUringError::FullCQueue)
+        ));
+        assert!(matches!(
+            engine
+                .push_read(0, &mem, GuestAddress(0), 512, PendingRequest::default())
+                .unwrap_err()
+                .error,
+            AsyncIoError::IoUring(IoUringError::FullCQueue)
+        ));
+        assert!(matches!(
+            engine
+                .push_write(0, &mem, GuestAddress(0), 512, PendingRequest::default())
+                .unwrap_err()
+                .error,
+            AsyncIoError::IoUring(IoUringError::FullCQueue)
+        ));
+        engine.drain(false).unwrap();
+        // Completed but unconsumed requests still occupy capacity.
+        assert_eq!(engine.ring.num_ops(), 32);
+        assert!(engine.push_flush(PendingRequest::default()).is_err());
+        assert!(engine.pop(&mem).unwrap().is_some());
+        assert_eq!(engine.ring.num_ops(), 31);
+        engine.push_flush(PendingRequest::default()).unwrap();
+        engine.drain(true).unwrap();
+        assert_eq!(engine.ring.num_ops(), 0);
+        engine.push_flush(PendingRequest::default()).unwrap();
+        engine.drain(true).unwrap();
     }
 }

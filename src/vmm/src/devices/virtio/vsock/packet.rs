@@ -333,6 +333,11 @@ impl VsockPacketRx {
         if self.hdr.len > defs::MAX_PKT_BUF_SIZE {
             return Err(VsockError::InvalidPktLen(self.hdr.len));
         }
+        if self.buffer.len() < VSOCK_PKT_HDR_SIZE
+            || self.hdr.len > self.buffer.len() - VSOCK_PKT_HDR_SIZE
+        {
+            return Err(VsockError::GuestMemoryBounds);
+        }
         self.buffer
             .write_all_volatile_at(self.hdr.as_slice(), 0)
             .map_err(GuestMemoryError::from)
@@ -354,6 +359,9 @@ impl VsockPacketRx {
         offset: u32,
         count: u32,
     ) -> Result<u32, VsockError> {
+        if offset > defs::MAX_PKT_BUF_SIZE || count > defs::MAX_PKT_BUF_SIZE - offset {
+            return Err(VsockError::GuestMemoryBounds);
+        }
         if count
             > self
                 .buffer
@@ -691,5 +699,69 @@ mod tests {
             let res = pkt2.write_from_offset_to(&mut buf.as_mut_slice(), offset, count);
             assert!(matches!(res, Err(VsockError::GuestMemoryBounds)));
         }
+    }
+
+    #[test]
+    fn test_rx_writers_reject_malicious_lengths_before_guest_write() {
+        create_context!(test_ctx, handler_ctx);
+        // Receive capacity may exceed the per-packet write budget.
+        handler_ctx.guest_rxvq.dtable[1]
+            .len
+            .set(MAX_PKT_BUF_SIZE + 4096);
+        let mut pkt = VsockPacketRx::new().unwrap();
+        pkt.parse(
+            &test_ctx.mem,
+            handler_ctx.device.queues[RXQ_INDEX].pop().unwrap().unwrap(),
+        )
+        .unwrap();
+        handler_ctx.guest_rxvq.dtable[0].set_data(&[0xaa; 44]);
+        let sentinel = vec![0xaa; (MAX_PKT_BUF_SIZE + 4096) as usize];
+        handler_ctx.guest_rxvq.dtable[1].set_data(&sentinel);
+        let header = &handler_ctx.guest_rxvq.dtable[0];
+        let payload = &handler_ctx.guest_rxvq.dtable[1];
+        for (offset, count) in [
+            (0, MAX_PKT_BUF_SIZE + 1),
+            (MAX_PKT_BUF_SIZE, 1),
+            (MAX_PKT_BUF_SIZE + 1, 0),
+            (u32::MAX, 1),
+            (1, u32::MAX),
+        ] {
+            let source = [0x55; 1];
+            let mut source = source.as_slice();
+            assert!(matches!(
+                pkt.read_at_offset_from(&mut source, offset, count),
+                Err(VsockError::GuestMemoryBounds)
+            ));
+            assert_eq!(source.len(), 1, "source consumed before bounds validation");
+            header.check_data(&[0xaa; 44]);
+            payload.check_data(&sentinel);
+        }
+        pkt.hdr.set_len(MAX_PKT_BUF_SIZE + 1);
+        assert!(matches!(
+            pkt.commit_hdr(),
+            Err(VsockError::InvalidPktLen(_))
+        ));
+        header.check_data(&[0xaa; 44]);
+        payload.check_data(&sentinel);
+
+        // A legal packet length must also fit the actual guest buffer.
+        create_context!(small_ctx, small_handler);
+        let mut small = VsockPacketRx::new().unwrap();
+        small
+            .parse(
+                &small_ctx.mem,
+                small_handler.device.queues[RXQ_INDEX]
+                    .pop()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        small_handler.guest_rxvq.dtable[0].set_data(&[0xaa; 44]);
+        small.hdr.set_len(small.buf_size() + 1);
+        assert!(matches!(
+            small.commit_hdr(),
+            Err(VsockError::GuestMemoryBounds)
+        ));
+        small_handler.guest_rxvq.dtable[0].check_data(&[0xaa; 44]);
     }
 }

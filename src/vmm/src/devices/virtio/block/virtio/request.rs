@@ -293,6 +293,12 @@ impl Request {
             req.data_len = data_desc.len;
         }
 
+        // Reject malformed chains before any payload or status write: their status descriptor
+        // is not trustworthy. A valid but oversized request is handled separately below.
+        if status_desc.has_next() {
+            return Err(VirtioBlockError::DescriptorChainTooLong);
+        }
+
         // check request validity
         match req.r#type {
             RequestType::In | RequestType::Out => {
@@ -325,6 +331,12 @@ impl Request {
         }
 
         req.status_addr = status_desc.addr;
+
+        if req.data_len > super::MAX_REQUEST_BYTES {
+            // The caller publishes IOERR at this validated status descriptor, never touches
+            // the payload and never submits I/O, even if a guest disregards the advertised cap.
+            return Err(VirtioBlockError::PayloadTooLarge(req.status_addr));
+        }
 
         Ok(req)
     }
@@ -560,7 +572,7 @@ mod tests {
 
     /// A pre-read descriptor is not admission evidence. The experimental cap must apply to the
     /// exact parsed Request that is consumed by process(), never to an earlier guest-memory read.
-    /// There is no production payload cap or isolated allocation allowance in this baseline.
+    /// The production cap applies at parse time; it is not an allocation allowance.
     #[test]
     fn memory_budget_baseline_descriptor_mutation_changes_admission_input() {
         const CAP: u32 = 65536;
@@ -576,8 +588,14 @@ mod tests {
 
         assert_eq!(chain.data_desc.len.get(), CAP); // Unsafe preflight observation.
         chain.data_desc.len.set(2 * CAP); // Guest races before the authoritative parse.
-        let request = Request::parse(&head, &mem, NUM_DISK_SECTORS).unwrap();
-        assert!(request.data_len > CAP); // Must be refused BEFORE process(), not truncated.
+        mem.write_obj(0xa5u8, GuestAddress(0x10000)).unwrap();
+        mem.write_obj(0x5au8, GuestAddress(0x3000)).unwrap();
+        assert!(matches!(
+            Request::parse(&head, &mem, NUM_DISK_SECTORS),
+            Err(VirtioBlockError::PayloadTooLarge(_))
+        ));
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0x10000)).unwrap(), 0xa5);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0x3000)).unwrap(), 0x5a);
 
         chain.data_desc.len.set(CAP);
         let cached = Request::parse(&head, &mem, NUM_DISK_SECTORS).unwrap();
@@ -588,6 +606,41 @@ mod tests {
         assert_eq!(cached.data_len, CAP);
         assert_eq!(cached.data_addr, GuestAddress(0x10000));
         assert_eq!(cached.status_addr, GuestAddress(0x3000));
+    }
+
+    #[test]
+    fn test_extra_descriptor_refused_without_guest_writes() {
+        let mem = default_mem();
+        let driver = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let chain = RequestDescriptorChain::new(&driver);
+        chain.set_header(RequestHeader::new(VIRTIO_BLK_T_IN, 0));
+        chain
+            .data_desc
+            .flags
+            .set(VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT);
+        chain
+            .status_desc
+            .flags
+            .set(VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT);
+        mem.write_obj(0xa5u8, GuestAddress(chain.data_desc.addr.get()))
+            .unwrap();
+        mem.write_obj(0x5au8, GuestAddress(chain.status_desc.addr.get()))
+            .unwrap();
+        let mut queue = driver.create_queue();
+        assert!(matches!(
+            Request::parse(&queue.pop().unwrap().unwrap(), &mem, NUM_DISK_SECTORS),
+            Err(VirtioBlockError::DescriptorChainTooLong)
+        ));
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(chain.data_desc.addr.get()))
+                .unwrap(),
+            0xa5
+        );
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(chain.status_desc.addr.get()))
+                .unwrap(),
+            0x5a
+        );
     }
 
     #[test]

@@ -404,6 +404,27 @@ fn commit_plan(
         }
     };
 
+    if let Some(state) = &restored_state {
+        state
+            .device_states
+            .validate_guest_write_guard()
+            .map_err(|error| {
+                let body = protocol::encode_error(
+                    ErrorCode::VmstateParseFailed,
+                    incoming.header.msg(),
+                    &error.to_string(),
+                );
+                let _ = protocol::send_frame(
+                    &sock,
+                    MsgType::Error,
+                    incoming.header.request_id,
+                    &body,
+                    &[],
+                );
+                BackendError::Plan(ErrorCode::VmstateParseFailed)
+            })?;
+    }
+
     let mapped = memversion::map_regions(&geometry, incoming.fds.first().map(AsFd::as_fd))
         .map_err(|err| BackendError::Map(io::Error::other(err)))
         .inspect_err(|_| {

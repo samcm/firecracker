@@ -29,6 +29,8 @@ pub use self::defs::VSOCK_DEV_ID;
 pub use self::device::{TransportReset, Vsock};
 use self::packet::{VsockPacketRx, VsockPacketTx};
 pub use self::unix::{VsockUnixBackend, VsockUnixBackendError};
+#[cfg(test)]
+pub(super) use self::{defs::MAX_PKT_BUF_SIZE, packet::VSOCK_PKT_HDR_SIZE};
 use super::iov_deque::IovDequeError;
 use crate::devices::virtio::iovec::IoVecError;
 use crate::devices::virtio::persist::PersistError as VirtioStateError;

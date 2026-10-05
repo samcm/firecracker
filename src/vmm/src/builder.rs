@@ -63,6 +63,8 @@ pub enum StartMicrovmError {
     AttachBlockDevice(io::Error),
     /// Could not attach device: {0}
     AttachDevice(#[from] AttachDeviceError),
+    /// Device set exceeds capture guard: {0}
+    DeviceGuard(#[from] crate::devices::virtio::DeviceGuardError),
     /// System configuration error: {0}
     ConfigureSystem(#[from] ConfigurationError),
     /// Failed to create device manager: {0}
@@ -150,6 +152,14 @@ pub fn build_microvm_for_boot(
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
+
+    crate::devices::virtio::validate_guard_counts([
+        vm_resources.block.devices.len(),
+        vm_resources.net_builder.iter().len(),
+        usize::from(vm_resources.vsock.get().is_some()),
+        usize::from(vm_resources.entropy.get().is_some()),
+        1, // Free-page reporting is attached unconditionally below.
+    ])?;
 
     let boot_config = vm_resources
         .boot_source

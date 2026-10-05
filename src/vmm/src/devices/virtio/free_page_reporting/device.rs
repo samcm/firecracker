@@ -112,7 +112,15 @@ impl FreePageReporting {
     /// page is discarded.
     pub(crate) fn process_balloon_queue(&mut self, queue: usize) -> Result<(), InvalidAvailIdx> {
         let mut used_any = false;
-        while let Some(head) = self.queues[queue].pop()? {
+        loop {
+            if self.defer_closed_queue(queue) {
+                break;
+            }
+            let Some(head) = self.queues[queue].pop()? else {
+                break;
+            };
+            #[cfg(test)]
+            tests::after_queue_pop();
             if let Err(err) = self.queues[queue].add_used(head.index, 0) {
                 error!("free page reporting: could not return a balloon buffer: {err}");
                 break;
@@ -131,7 +139,15 @@ impl FreePageReporting {
     /// while they are recorded.
     pub(crate) fn process_reporting_queue(&mut self) -> Result<(), InvalidAvailIdx> {
         let mut used_any = false;
-        while let Some(head) = self.queues[REPORTING_QUEUE].pop()? {
+        loop {
+            if self.defer_closed_queue(REPORTING_QUEUE) {
+                break;
+            }
+            let Some(head) = self.queues[REPORTING_QUEUE].pop()? else {
+                break;
+            };
+            #[cfg(test)]
+            tests::after_queue_pop();
             let index = head.index;
             let mut next = Some(head);
             while let Some(desc) = next {
@@ -154,6 +170,19 @@ impl FreePageReporting {
             self.signal_used_queue(REPORTING_QUEUE);
         }
         Ok(())
+    }
+
+    fn defer_closed_queue(&self, queue: usize) -> bool {
+        if !crate::vstate::farplane::dispatch::gate().is_closed() {
+            return false;
+        }
+        // A saturated counter already holds a wake for reopen.
+        if let Err(err) = self.queue_events[queue].write(1)
+            && err.raw_os_error() != Some(libc::EAGAIN)
+        {
+            error!("free page reporting: could not defer queue {queue}: {err}");
+        }
+        true
     }
 
     pub(crate) fn process_queue_event(&mut self, queue: usize) {
@@ -288,6 +317,68 @@ mod tests {
     use super::*;
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt};
     use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    thread_local! {
+        static AFTER_QUEUE_POP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_queue_pop() {
+        AFTER_QUEUE_POP.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires KVM and process-global dispatch gate; run exact test in isolation"]
+    fn close_yields_reporting_loops_and_reopen_wakes_refill() {
+        use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
+        use crate::vstate::farplane::dispatch;
+        use crate::vstate::memory::Bytes;
+
+        for queue in [INFLATE_QUEUE, DEFLATE_QUEUE, REPORTING_QUEUE] {
+            let (mut device, mem) = device_with_memory();
+            let vqs: Vec<_> = (0..NUM_QUEUES)
+                .map(|index| VirtQueue::new(GuestAddress(index as u64 * 0x1000), &mem, 16))
+                .collect();
+            for (index, vq) in vqs.iter().enumerate() {
+                device.queues[index] = vq.create_queue();
+            }
+            device.set_acked_features(device.avail_features());
+            device.activate(mem.clone(), default_interrupt()).unwrap();
+            let vq = &vqs[queue];
+            vq.dtable[0].set(0x40000, 0x40000, VIRTQ_DESC_F_WRITE, 0);
+            vq.dtable[1].set(0x80000, 0x40000, VIRTQ_DESC_F_WRITE, 0);
+            vq.avail.ring[0].set(0);
+            vq.avail.ring[1].set(1);
+            vq.avail.idx.set(1);
+            mem.write_obj(0xaau8, GuestAddress(0x80000)).unwrap();
+            let publish_mem = mem.clone();
+            let avail_idx = vq.avail.idx.location;
+            AFTER_QUEUE_POP.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    dispatch::gate().close();
+                    publish_mem.write_obj(2u16, avail_idx).unwrap();
+                }));
+            });
+            device.queue_events[queue].write(1).unwrap();
+            device.process_queue_event(queue);
+            assert_eq!(device.queues[queue].next_avail.0, 1);
+            assert_eq!(vq.used.idx.get(), 1);
+            assert_eq!(mem.read_obj::<u8>(GuestAddress(0x80000)).unwrap(), 0xaa);
+            if queue == REPORTING_QUEUE {
+                assert_eq!(device.vm.snapshot_free_log().unwrap()[0][2], 0);
+            }
+            dispatch::gate().open();
+            device.process_queue_event(queue);
+            assert_eq!(device.queues[queue].next_avail.0, 2);
+            assert_eq!(vq.used.idx.get(), 2);
+            // Reporting is metadata-only, including after reopen.
+            assert_eq!(mem.read_obj::<u8>(GuestAddress(0x80000)).unwrap(), 0xaa);
+        }
+    }
 
     fn device_with_memory() -> (FreePageReporting, GuestMemoryMmap) {
         let vm = Arc::new(setup_vm_with_memory(0x10_0000));

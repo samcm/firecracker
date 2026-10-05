@@ -198,6 +198,9 @@ where
     /// have pending. Return `true` if the guest needs to be notified (respecting notification
     /// suppression).
     pub fn process_rx(&mut self) -> Result<bool, InvalidAvailIdx> {
+        if Self::defer_closed_queue(&self.queue_events[RXQ_INDEX]) {
+            return Ok(false);
+        }
         if self.data_gated() {
             return Ok(false);
         }
@@ -208,7 +211,15 @@ where
         let queue = &mut self.queues[RXQ_INDEX];
         let mut have_used = false;
 
-        while let Some(head) = queue.pop_or_enable_notification()? {
+        loop {
+            if Self::defer_closed_queue(&self.queue_events[RXQ_INDEX]) {
+                break;
+            }
+            let Some(head) = queue.pop_or_enable_notification()? else {
+                break;
+            };
+            #[cfg(test)]
+            tests::after_queue_pop();
             let index = head.index;
             let used_len = match self.rx_packet.parse(mem, head) {
                 Ok(()) => {
@@ -255,6 +266,9 @@ where
     /// to the backend for processing. Return `true` if the guest needs to be notified (respecting
     /// notification suppression).
     pub fn process_tx(&mut self) -> Result<bool, InvalidAvailIdx> {
+        if Self::defer_closed_queue(&self.queue_events[TXQ_INDEX]) {
+            return Ok(false);
+        }
         if self.data_gated() {
             return Ok(false);
         }
@@ -265,7 +279,15 @@ where
         let queue = &mut self.queues[TXQ_INDEX];
         let mut have_used = false;
 
-        while let Some(head) = queue.pop_or_enable_notification()? {
+        loop {
+            if Self::defer_closed_queue(&self.queue_events[TXQ_INDEX]) {
+                break;
+            }
+            let Some(head) = queue.pop_or_enable_notification()? else {
+                break;
+            };
+            #[cfg(test)]
+            tests::after_queue_pop();
             let index = head.index;
             match self.tx_packet.parse(mem, head) {
                 Ok(()) => (),
@@ -291,6 +313,18 @@ where
         Ok(have_used && queue.prepare_kick())
     }
 
+    pub(crate) fn defer_closed_queue(event: &EventFd) -> bool {
+        if !crate::vstate::farplane::dispatch::gate().is_closed() {
+            return false;
+        }
+        if let Err(err) = event.write(1)
+            && err.raw_os_error() != Some(libc::EAGAIN)
+        {
+            error!("vsock: could not defer queue event: {err}");
+        }
+        true
+    }
+
     /// Publishes a `TRANSPORT_RESET` event to the guest.
     ///
     /// According to specs, the driver shuts down established connections and the guest_cid
@@ -307,6 +341,10 @@ where
     /// records that the guest touched the queue at some instant, never which of the device's
     /// writes it followed.
     pub fn send_transport_reset_event(&mut self) -> Result<(), DeviceError> {
+        if Self::defer_closed_queue(&self.queue_events[EVQ_INDEX]) {
+            self.owe_transport_reset();
+            return Ok(());
+        }
         // `pop_or_enable_notification` arms `avail_event` and rechecks the ring as one step, so a
         // descriptor the guest publishes concurrently either carries the reset now or produces the
         // notification that carries it later. A bare `enable_notification` loses that race: it
@@ -403,7 +441,9 @@ where
             return;
         }
 
-        if let Err(err) = self.queue_events[EVQ_INDEX].write(1) {
+        if let Err(err) = self.queue_events[EVQ_INDEX].write(1)
+            && err.raw_os_error() != Some(libc::EAGAIN)
+        {
             METRICS.ev_queue_event_fails.inc();
             error!(
                 "vsock: failed to schedule the event queue wakeup the driver's progress needs: \
@@ -763,6 +803,113 @@ mod tests {
     };
     use crate::snapshot::Persist;
     use crate::vstate::memory::GuestAddress;
+
+    thread_local! {
+        static AFTER_QUEUE_POP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_queue_pop() {
+        AFTER_QUEUE_POP.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "process-global dispatch gate; run this exact test in isolation"]
+    fn close_yields_vsock_loops_and_reopen_wakes_refill() {
+        use crate::vstate::farplane::dispatch;
+
+        for queue in [RXQ_INDEX, TXQ_INDEX] {
+            let ctx = TestContext::new();
+            let mut handler = ctx.create_event_handler_context();
+            handler.mock_activate(ctx.mem.clone(), ctx.interrupt.clone());
+            handler.device.backend.set_pending_rx(true);
+            let vq = if queue == RXQ_INDEX {
+                &handler.guest_rxvq
+            } else {
+                &handler.guest_txvq
+            };
+            let flags = if queue == RXQ_INDEX {
+                VIRTQ_DESC_F_WRITE
+            } else {
+                0
+            };
+            vq.dtable[2].set(0x0050_0000, VSOCK_PKT_HDR_SIZE, flags, 0);
+            vq.avail.ring[1].set(2);
+            ctx.mem
+                .write_slice(&[0xaa; 44], GuestAddress(0x0050_0000))
+                .unwrap();
+            // A valid, empty TX packet at the second head.
+            if queue == TXQ_INDEX {
+                ctx.mem
+                    .write_slice(&[0; 44], GuestAddress(0x0050_0000))
+                    .unwrap();
+            }
+            let publish_mem = ctx.mem.clone();
+            let avail_idx = vq.avail.idx.location;
+            AFTER_QUEUE_POP.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    dispatch::gate().close();
+                    publish_mem.write_obj(2u16, avail_idx).unwrap();
+                }));
+            });
+            handler.device.queue_events[queue].write(1).unwrap();
+            if queue == RXQ_INDEX {
+                handler.device.handle_rxq_event(EventSet::IN);
+            } else {
+                handler.device.handle_txq_event(EventSet::IN);
+            }
+            assert_eq!(handler.device.queues[queue].next_avail.0, 1);
+            assert_eq!(vq.used.idx.get(), 1);
+            let mut sentinel = [0; 44];
+            ctx.mem
+                .read_slice(&mut sentinel, GuestAddress(0x0050_0000))
+                .unwrap();
+            assert_eq!(
+                sentinel,
+                if queue == RXQ_INDEX {
+                    [0xaa; 44]
+                } else {
+                    [0; 44]
+                }
+            );
+            dispatch::gate().open();
+            // Consume only the retained host wake; no new guest kick.
+            if queue == RXQ_INDEX {
+                handler.device.handle_rxq_event(EventSet::IN);
+            } else {
+                handler.device.handle_txq_event(EventSet::IN);
+            }
+            assert_eq!(handler.device.queues[queue].next_avail.0, 2);
+            assert_eq!(vq.used.idx.get(), 2);
+        }
+    }
+
+    #[test]
+    #[ignore = "process-global dispatch gate; run this exact test in isolation"]
+    fn closed_reset_retains_event_wake_and_reopens() {
+        use crate::vstate::farplane::dispatch;
+
+        let ctx = TestContext::new();
+        let mut handler = ctx.create_event_handler_context();
+        handler.mock_activate(ctx.mem.clone(), ctx.interrupt.clone());
+        handler.publish_evq_descriptor();
+        dispatch::gate().close();
+        handler.device.send_transport_reset_event().unwrap();
+        handler.device.handle_evq_event(EventSet::IN);
+        assert_eq!(handler.device.queues[EVQ_INDEX].next_avail.0, 0);
+        assert_eq!(handler.device.transport_reset, TransportReset::Owed);
+        dispatch::gate().open();
+        handler.device.handle_evq_event(EventSet::IN);
+        assert_eq!(handler.device.queues[EVQ_INDEX].next_avail.0, 1);
+        assert!(matches!(
+            handler.device.transport_reset,
+            TransportReset::Published { .. }
+        ));
+    }
 
     #[test]
     fn test_virtio_device() {

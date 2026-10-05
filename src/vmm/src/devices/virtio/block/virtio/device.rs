@@ -27,7 +27,8 @@ use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::virtio::metrics::{BlockDeviceMetrics, BlockMetricsPerDevice};
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_blk::{
-    VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_ID_BYTES,
+    VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SEG_MAX, VIRTIO_BLK_F_SIZE_MAX,
+    VIRTIO_BLK_ID_BYTES,
 };
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -39,7 +40,7 @@ use crate::rate_limiter::{BucketUpdate, RateLimiter};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::RateLimiterConfig;
 use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
-use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::memory::{Bytes, GuestMemoryMmap};
 
 /// The engine file type, either Sync or Async (through io_uring).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -150,6 +151,8 @@ impl DiskProperties {
 #[repr(C)]
 pub struct ConfigSpace {
     pub capacity: u64,
+    pub size_max: u32,
+    pub seg_max: u32,
 }
 
 // SAFETY: `ConfigSpace` contains only PODs in `repr(C)` or `repr(transparent)`, without padding.
@@ -268,7 +271,10 @@ impl VirtioBlock {
             .map_err(VirtioBlockError::RateLimiter)?
             .unwrap_or_default();
 
-        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_RING_F_EVENT_IDX)
+            | (1u64 << VIRTIO_BLK_F_SIZE_MAX)
+            | (1u64 << VIRTIO_BLK_F_SEG_MAX);
 
         if config.cache_type == CacheType::Writeback {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
@@ -284,6 +290,8 @@ impl VirtioBlock {
 
         let config_space = ConfigSpace {
             capacity: disk_properties.nsectors.to_le(),
+            size_max: super::MAX_REQUEST_BYTES.to_le(),
+            seg_max: 1u32.to_le(),
         };
 
         Ok(VirtioBlock {
@@ -407,6 +415,25 @@ impl VirtioBlock {
                             &active_state.mem,
                             &self.metrics,
                         )
+                    }
+                    Err(VirtioBlockError::PayloadTooLarge(status)) => {
+                        // Refuse before touching the payload, but give a valid request an
+                        // explicit EIO rather than completing with its stale status byte.
+                        self.metrics.execute_fails.inc();
+                        let written = active_state
+                        .mem
+                        .write_obj(
+                            u8::try_from(
+                                crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_S_IOERR,
+                            )
+                            .unwrap(),
+                            status,
+                        )
+                        .is_ok();
+                        ProcessingResult::Executed(FinishedRequest {
+                            num_bytes_to_mem: u32::from(written),
+                            desc_idx: head.index,
+                        })
                     }
                     Err(err) => {
                         error!("Failed to parse available descriptor chain: {:?}", err);
@@ -707,6 +734,74 @@ mod tests {
             const { std::cell::RefCell::new(None) };
     }
 
+    #[test]
+    fn guard_limits_real_queue_payload_and_returns_eio() {
+        use crate::devices::virtio::block::persist::BlockConstructorArgs;
+        use crate::snapshot::Persist;
+        use crate::test_utils::single_region_mem;
+
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let cap = super::super::MAX_REQUEST_BYTES;
+            let backing = TempFile::new().unwrap();
+            backing.as_file().set_len(u64::from(cap + 512)).unwrap();
+            let mut block =
+                default_block_with_descriptor(backing.as_file().as_raw_fd(), false, engine);
+            block.acked_features = (1 << VIRTIO_BLK_F_SIZE_MAX) | (1 << VIRTIO_BLK_F_SEG_MAX);
+            let state = block.save();
+            let mem = single_region_mem(3 * 1024 * 1024);
+            let mut block = VirtioBlock::restore(
+                BlockConstructorArgs {
+                    mem: mem.clone(),
+                    descriptor: backing.as_file().as_raw_fd(),
+                },
+                &state,
+            )
+            .unwrap();
+            assert_eq!(
+                block.save().virtio_state.acked_features,
+                state.virtio_state.acked_features
+            );
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+            block.queues[0] = vq.create_queue();
+            block.activate(mem.clone(), default_interrupt()).unwrap();
+            for (iteration, len) in [cap, cap + 512].into_iter().enumerate() {
+                vq.dtable[0].set(0x1000, 16, VIRTQ_DESC_F_NEXT, 1);
+                vq.dtable[1].set(0x10000, len, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2);
+                vq.dtable[2].set(0x2000, 1, VIRTQ_DESC_F_WRITE, 0);
+                vq.avail.ring[iteration].set(0);
+                vq.avail.idx.set(u16::try_from(iteration + 1).unwrap());
+                mem.write_obj(RequestHeader::new(VIRTIO_BLK_T_IN, 0), GuestAddress(0x1000))
+                    .unwrap();
+                mem.write_slice(&vec![0xa5; len as usize], GuestAddress(0x10000))
+                    .unwrap();
+                mem.write_obj(0xffu8, GuestAddress(0x2000)).unwrap();
+                block.process_queue(0).unwrap();
+                block.drain_writes().unwrap();
+                let mut payload = vec![0; len as usize];
+                mem.read_slice(&mut payload, GuestAddress(0x10000)).unwrap();
+                let expected_status = if len == cap {
+                    0
+                } else {
+                    u8::try_from(VIRTIO_BLK_S_IOERR).unwrap()
+                };
+                assert_eq!(
+                    mem.read_obj::<u8>(GuestAddress(0x2000)).unwrap(),
+                    expected_status
+                );
+                assert!(
+                    payload
+                        .iter()
+                        .all(|byte| *byte == if len == cap { 0 } else { 0xa5 })
+                );
+                assert_eq!(vq.used.idx.get(), u16::try_from(iteration + 1).unwrap());
+                assert_eq!(
+                    vq.used.ring[iteration].get().len,
+                    if len == cap { cap + 1 } else { 1 }
+                );
+            }
+        }
+    }
+
     // The gate is process-global: this portable test must run alone, not alongside other
     // block tests that deliberately invoke device methods without a dispatch hold.
     #[test]
@@ -971,7 +1066,10 @@ mod tests {
 
             assert_eq!(block.device_type(), VirtioDeviceType::Block);
 
-            let features: u64 = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+            let features: u64 = (1u64 << VIRTIO_F_VERSION_1)
+                | (1u64 << VIRTIO_RING_F_EVENT_IDX)
+                | (1u64 << VIRTIO_BLK_F_SIZE_MAX)
+                | (1u64 << VIRTIO_BLK_F_SEG_MAX);
 
             assert_eq!(
                 block.avail_features_by_page(0),
@@ -1000,11 +1098,18 @@ mod tests {
             // This will read the number of sectors.
             // The block's backing file size is 0x1000, so there are 8 (4096/512) sectors.
             // The config space is little endian.
-            let expected_config_space = ConfigSpace { capacity: 8 };
+            let expected_config_space = ConfigSpace {
+                capacity: 8,
+                size_max: super::super::MAX_REQUEST_BYTES.to_le(),
+                seg_max: 1u32.to_le(),
+            };
             assert_eq!(actual_config_space, expected_config_space);
 
             // Invalid read.
-            let expected_config_space = ConfigSpace { capacity: 696969 };
+            let expected_config_space = ConfigSpace {
+                capacity: 696969,
+                ..Default::default()
+            };
             actual_config_space = expected_config_space;
             block.read_config(
                 std::mem::size_of::<ConfigSpace>() as u64 + 1,
@@ -1021,7 +1126,10 @@ mod tests {
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
             let mut block = default_block(engine);
 
-            let expected_config_space = ConfigSpace { capacity: 696969 };
+            let expected_config_space = ConfigSpace {
+                capacity: 696969,
+                ..Default::default()
+            };
             block.write_config(0, expected_config_space.as_slice());
 
             let mut actual_config_space = ConfigSpace::default();
@@ -1031,6 +1139,7 @@ mod tests {
             // If privileged user writes to `/dev/mem`, in block config space - byte by byte.
             let expected_config_space = ConfigSpace {
                 capacity: 0x1122334455667788,
+                ..Default::default()
             };
             let expected_config_space_slice = expected_config_space.as_slice();
             for (i, b) in expected_config_space_slice.iter().enumerate() {
@@ -1042,6 +1151,7 @@ mod tests {
             // Invalid write.
             let new_config_space = ConfigSpace {
                 capacity: 0xDEADBEEF,
+                ..Default::default()
             };
             block.write_config(5, new_config_space.as_slice());
             // Make sure nothing got written.
@@ -1773,7 +1883,8 @@ mod tests {
 
     #[test]
     fn test_io_engine_throttling() {
-        // FullSQueue BlockError
+        // Device admission is bounded independently of the larger SQ/CQ capacities.
+        let cap = u16::try_from(super::super::MAX_INFLIGHT_REQUESTS).unwrap();
         {
             let mut block = default_block(FileEngineType::Async);
 
@@ -1783,32 +1894,32 @@ mod tests {
             block.queues[0] = vq.create_queue();
             block.activate(mem.clone(), interrupt).unwrap();
 
-            // Run scenario that doesn't trigger FullSq BlockError: Add sq_size flush requests.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
+            // Exactly the fixed admission cap fits.
+            add_flush_requests_batch(&mut block, &vq, cap);
             simulate_queue_event(&mut block, Some(false));
             assert!(!block.is_io_engine_throttled);
             simulate_async_completion_event(&mut block, true);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
+            check_flush_requests_batch(cap, &vq);
 
-            // Run scenario that triggers FullSqError : Add sq_size + 10 flush requests.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES + 10);
+            // Further guest refill must wait for completed requests to be consumed.
+            add_flush_requests_batch(&mut block, &vq, cap + 10);
             simulate_queue_event(&mut block, Some(false));
             assert!(block.is_io_engine_throttled);
             // When the async_completion_event is triggered:
-            // 1. sq_size requests should be processed processed.
+            // 1. cap requests should be completed.
             // 2. is_io_engine_throttled should be set back to false.
             // 3. process_queue() should be called again.
             simulate_async_completion_event(&mut block, true);
             assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
+            check_flush_requests_batch(cap, &vq);
             // check that process_queue() was called again resulting in the processing of the
             // remaining 10 ops.
             simulate_async_completion_event(&mut block, true);
             assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES + 10, &vq);
+            check_flush_requests_batch(cap + 10, &vq);
         }
 
-        // FullCQueue BlockError
+        // Completion in the kernel alone does not free device admission capacity.
         {
             let mut block = default_block(FileEngineType::Async);
 
@@ -1818,23 +1929,21 @@ mod tests {
             block.queues[0] = vq.create_queue();
             block.activate(mem.clone(), interrupt).unwrap();
 
-            // Run scenario that triggers FullCqError. Push 2 * IO_URING_NUM_ENTRIES and wait for
-            // completion. Then try to push another entry.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
+            add_flush_requests_batch(&mut block, &vq, cap + 1);
             simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
-            thread::sleep(Duration::from_millis(150));
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
-            simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
-            thread::sleep(Duration::from_millis(150));
-
-            add_flush_requests_batch(&mut block, &vq, 1);
-            simulate_queue_event(&mut block, Some(false));
+            let FileEngine::Async(engine) = &mut block.disk.file_engine else {
+                unreachable!()
+            };
+            engine.drain(false).unwrap();
+            block.process_queue(0).unwrap();
             assert!(block.is_io_engine_throttled);
+            assert_eq!(block.queues[0].next_avail.0, cap);
+            assert_eq!(vq.used.idx.get(), 0);
             simulate_async_completion_event(&mut block, true);
             assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES * 2, &vq);
+            check_flush_requests_batch(cap, &vq);
+            simulate_async_completion_event(&mut block, true);
+            check_flush_requests_batch(cap + 1, &vq);
         }
     }
 

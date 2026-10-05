@@ -25,10 +25,6 @@
 //! [`SNAPSHOT_VERSION`].
 pub mod crc;
 mod persist;
-// Experimental legacy DTO evidence only; no production restore path or cohort is enabled.
-#[cfg(test)]
-#[cfg(target_arch = "x86_64")]
-mod compatibility;
 use std::fmt::Debug;
 use std::io::{Read, Write};
 
