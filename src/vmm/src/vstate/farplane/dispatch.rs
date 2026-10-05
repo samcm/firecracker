@@ -110,7 +110,8 @@ impl DispatchGate {
         self.changed.notify_all();
     }
 
-    /// States whether dispatch is currently stopped.
+    /// States whether the gate is closed to new holds (close has been requested).
+    /// Existing holds may still be running: only `close` returning proves they have drained.
     pub fn is_closed(&self) -> bool {
         self.state.lock().expect("Poisoned lock").closed
     }
@@ -152,11 +153,12 @@ pub fn gate() -> &'static DispatchGate {
     &GATE
 }
 
-/// Milliseconds one dispatch slice of the event loop may block for.
+/// Maximum idle epoll wait in one dispatch slice, in milliseconds.
 ///
-/// The loop takes a hold for the length of a slice, so the slice bounds how long `close` waits for
-/// dispatch that is already running. An idle loop wakes ten times a second, which costs nothing
-/// and is what lets a capture start promptly.
+/// The hold spans both this wait and all callbacks in the slice. This timeout bounds neither
+/// callback work nor `close` latency: an admitted request may still block or take longer.
+/// Queue handlers must observe closing between requests to stop a guest refill from keeping
+/// the current slice alive indefinitely; this does not bound the cost of one admitted request.
 const DISPATCH_SLICE_MS: i32 = 100;
 
 /// Runs one dispatch slice of the microVM's event loop, parked while a capture epoch is open.

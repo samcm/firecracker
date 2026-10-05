@@ -364,7 +364,30 @@ impl VirtioBlock {
         let queue = &mut self.queues[queue_index];
         let mut used_any = false;
 
-        while let Some(head) = queue.pop_or_enable_notification()? {
+        loop {
+            // A close racing after this check may finish this iteration, but cannot keep
+            // dispatch alive by refilling the queue. Still run the submission/used epilogue.
+            if crate::vstate::farplane::dispatch::gate().is_closed() {
+                // The handler consumed its eventfd before entering this loop. Preserve a host
+                // wakeup for reopen, even when EVENT_IDX suppressed the guest's refill kick.
+                // EAGAIN means the nonblocking counter is full: a wake is already pending.
+                if let Err(err) = self.queue_evts[queue_index].write(1)
+                    && err.raw_os_error() != Some(libc::EAGAIN)
+                {
+                    error!("Failed to defer block queue event: {:?}", err);
+                    self.metrics.event_fails.inc();
+                }
+                break;
+            }
+            let Some(head) = queue.pop_or_enable_notification()? else {
+                break;
+            };
+            #[cfg(test)]
+            tests::AFTER_QUEUE_POP.with_borrow_mut(|hook| {
+                if let Some(hook) = hook.take() {
+                    hook();
+                }
+            });
             self.metrics.remaining_reqs_count.add(queue.len().into());
             let processing_result =
                 match Request::parse(&head, &active_state.mem, self.disk.nsectors) {
@@ -678,6 +701,147 @@ mod tests {
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
     use crate::rate_limiter::TokenType;
     use crate::vstate::memory::{Address, Bytes, GuestAddress};
+
+    thread_local! {
+        pub(super) static AFTER_QUEUE_POP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // The gate is process-global: this portable test must run alone, not alongside other
+    // block tests that deliberately invoke device methods without a dispatch hold.
+    #[test]
+    #[ignore = "process-global dispatch gate; run this exact test in isolation"]
+    fn close_yields_real_block_handler_and_reopen_wakes_pending_work() {
+        use std::sync::{Mutex, mpsc};
+
+        use event_manager::SubscriberOps;
+
+        use crate::vstate::farplane::dispatch;
+
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            for event_idx in [false, true] {
+                let mem = default_mem();
+                let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+                let mut block = default_block(engine);
+                block.queues[0] = vq.create_queue();
+                if event_idx {
+                    block.acked_features |= 1 << VIRTIO_RING_F_EVENT_IDX;
+                }
+                block.activate(mem.clone(), default_interrupt()).unwrap();
+                read_blk_req_descriptors(&vq);
+                vq.dtable[3].set(0x4000, 16, VIRTQ_DESC_F_NEXT, 4);
+                vq.dtable[4].set(0x5000, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 5);
+                vq.dtable[5].set(0x6000, 1, VIRTQ_DESC_F_WRITE, 0);
+                vq.avail.ring[1].set(3);
+                mem.write_obj(RequestHeader::new(VIRTIO_BLK_T_IN, 0), GuestAddress(0x1000))
+                    .unwrap();
+                mem.write_obj(RequestHeader::new(VIRTIO_BLK_T_IN, 0), GuestAddress(0x4000))
+                    .unwrap();
+                mem.write_obj(0xffu8, GuestAddress(0x3000)).unwrap();
+                mem.write_obj(0xffu8, GuestAddress(0x6000)).unwrap();
+                block.queue_evts[0].write(1).unwrap();
+                let queue_event = block.queue_evts[0].try_clone().unwrap();
+                let block = Arc::new(Mutex::new(block));
+                let mut events = crate::EventManager::new().unwrap();
+                events.add_subscriber(block.clone());
+
+                let (close_tx, close_rx) = mpsc::channel();
+                let closer = thread::spawn(move || {
+                    close_rx.recv().unwrap();
+                    dispatch::gate().close();
+                });
+                let publish_mem = mem.clone();
+                let avail_idx = vq.avail.idx.location;
+                AFTER_QUEUE_POP.with_borrow_mut(|hook| {
+                    *hook = Some(Box::new(move || {
+                        // The real event handler consumed the only queue event and popped the
+                        // first head. Close while it is in flight, then simulate guest refill.
+                        assert_eq!(
+                            queue_event.read().unwrap_err().raw_os_error(),
+                            Some(libc::EAGAIN)
+                        );
+                        close_tx.send(()).unwrap();
+                        dispatch::gate().wait_for_closing(1);
+                        publish_mem.write_obj(2u16, avail_idx).unwrap();
+                        // No new eventfd write: EVENT_IDX may suppress this notification.
+                    }));
+                });
+                assert_eq!(dispatch::dispatch_slice(&mut events).unwrap(), 1);
+                closer.join().unwrap();
+                assert!(dispatch::gate().is_closed());
+                {
+                    let mut block = block.lock().unwrap();
+                    assert_eq!(
+                        block.queues[0].next_avail.0, 1,
+                        "second request admitted after close"
+                    );
+                    assert_eq!(mem.read_obj::<u8>(GuestAddress(0x6000)).unwrap(), 0xff);
+                    if engine == FileEngineType::Async {
+                        assert_eq!(vq.used.idx.get(), 0, "async completion still owed");
+                        assert_eq!(mem.read_obj::<u8>(GuestAddress(0x3000)).unwrap(), 0xff);
+                    }
+                    block.drain_writes().unwrap();
+                    assert_eq!(vq.used.idx.get(), 1);
+                    assert_eq!(vq.used.ring[0].get().id, 0);
+                    assert_eq!(mem.read_obj::<u8>(GuestAddress(0x3000)).unwrap(), 0);
+                    assert_eq!(mem.read_obj::<u8>(GuestAddress(0x6000)).unwrap(), 0xff);
+                }
+                dispatch::gate().open();
+                // No guest kick and no resume_vm kick: the yielding handler must retain a wakeup.
+                assert!(dispatch::dispatch_slice(&mut events).unwrap() > 0);
+                {
+                    let mut block = block.lock().unwrap();
+                    assert_eq!(
+                        block.queues[0].next_avail.0, 2,
+                        "pending work stranded after reopen"
+                    );
+                    block.drain_writes().unwrap();
+                    assert_eq!(vq.used.idx.get(), 2);
+                    assert_eq!(vq.used.ring[1].get().id, 3);
+                    assert_eq!(mem.read_obj::<u8>(GuestAddress(0x6000)).unwrap(), 0);
+                    if event_idx {
+                        assert_eq!(vq.used.event.get(), 2, "normal empty-queue path must rearm");
+                    }
+                    // Publish a third request after the queue drained. With EVENT_IDX its
+                    // advance crosses the rearmed avail_event, so the driver issues this kick.
+                    vq.avail.ring[2].set(0);
+                    vq.avail.idx.set(3);
+                    mem.write_obj(0xffu8, GuestAddress(0x3000)).unwrap();
+                    block.queue_evts[0].write(1).unwrap();
+                }
+                assert!(dispatch::dispatch_slice(&mut events).unwrap() > 0);
+                block.lock().unwrap().drain_writes().unwrap();
+                assert_eq!(vq.used.idx.get(), 3);
+                assert_eq!(mem.read_obj::<u8>(GuestAddress(0x3000)).unwrap(), 0);
+                if event_idx {
+                    assert_eq!(vq.used.event.get(), 3);
+                }
+                // Exercise a failed self-kick too: saturating the eventfd makes write(1)
+                // return EAGAIN, but must leave the existing wake readable after reopen.
+                dispatch::gate().close();
+                vq.avail.ring[3].set(3);
+                vq.avail.idx.set(4);
+                mem.write_obj(0xffu8, GuestAddress(0x6000)).unwrap();
+                {
+                    let mut block = block.lock().unwrap();
+                    block.queue_evts[0].write(u64::MAX - 1).unwrap();
+                    let errors = block.metrics.event_fails.count();
+                    block.process_queue(0).unwrap();
+                    assert_eq!(block.metrics.event_fails.count(), errors);
+                    assert_eq!(block.queues[0].next_avail.0, 3);
+                    assert_eq!(mem.read_obj::<u8>(GuestAddress(0x6000)).unwrap(), 0xff);
+                }
+                dispatch::gate().open();
+                assert!(dispatch::dispatch_slice(&mut events).unwrap() > 0);
+                block.lock().unwrap().drain_writes().unwrap();
+                assert_eq!(vq.used.idx.get(), 4);
+                assert_eq!(mem.read_obj::<u8>(GuestAddress(0x6000)).unwrap(), 0);
+                println!(
+                    "CLOSE_YIELD_PASS engine={engine:?} event_idx={event_idx} admitted_at_close=1 drained=1 reopened=2 rearmed=3 saturated_wake=4"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_from_config() {
