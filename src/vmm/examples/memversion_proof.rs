@@ -20,6 +20,10 @@ use vmm_sys_util::ioctl::ioctl_with_mut_ref;
 
 const BASE: u64 = 0x3000_0000_0000;
 const RAM: u64 = 64 << 20;
+// Production memoryenvelope: guest bytes + FirecrackerWorkingSetBytes, not RAM alone.
+const WORKING_SET: u64 = 64 << 20;
+const MEMLOCK: u64 = RAM + WORKING_SET;
+const MEMLOCK_MARGIN: u64 = 1 << 20;
 const PATTERN: u64 = 0x400000;
 const TIMEOUT: Duration = Duration::from_secs(30);
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -161,7 +165,10 @@ fn api(path: &Path, endpoint: &str, value: serde_json::Value) -> Result<()> {
     let mut response = Vec::new();
     let mut data = [0; 4096];
     loop {
-        let n = sock.read(&mut data)?;
+        let n = match sock.read(&mut data) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if n == 0 {
             break;
         }
@@ -234,6 +241,7 @@ fn capture_console(
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(err) if err.raw_os_error() == Some(libc::EIO) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err),
             }
         }
@@ -244,6 +252,14 @@ fn capture_console(
 fn dump_logs(work: &Path) {
     // The wrapper repeats these on normal exit too; this hook runs even in panic=abort builds.
     for id in ["a", "b"] {
+        if let Ok(pid) = fs::read_to_string(work.join(format!("{id}.pid"))) {
+            for name in ["status", "limits"] {
+                let path = format!("/proc/{}/{name}", pid.trim());
+                if let Ok(text) = fs::read_to_string(&path) {
+                    eprintln!("--- {path} ---\n{text}");
+                }
+            }
+        }
         let path = work.join(format!("{id}.console"));
         if let Ok(bytes) = fs::read(&path) {
             eprintln!(
@@ -356,7 +372,7 @@ impl Vm {
                 "--root-fd",
                 &root.as_raw_fd().to_string(),
                 "--resource-limit",
-                "memlock=67108864",
+                &format!("memlock={MEMLOCK}"),
                 "--chroot-base-dir",
             ])
             .arg(work)
@@ -464,7 +480,41 @@ impl Vm {
             next_id: 3,
             vmstate_capacity: capacity,
         };
+        vm.assert_memlock(if restore_mode { "restore" } else { "boot" });
         Ok(vm)
+    }
+
+    fn assert_memlock(&self, stage: &str) {
+        let base = format!("/proc/{}", self.child.id());
+        let status = fs::read_to_string(format!("{base}/status")).unwrap();
+        let locked = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmLck:"))
+            .expect("VmLck missing")
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            * 1024;
+        let limits = fs::read_to_string(format!("{base}/limits")).unwrap();
+        let limit_line = limits
+            .lines()
+            .find_map(|line| line.strip_prefix("Max locked memory"))
+            .expect("RLIMIT_MEMLOCK missing");
+        let mut fields = limit_line.split_whitespace();
+        let soft: u64 = fields.next().unwrap().parse().unwrap();
+        let hard: u64 = fields.next().unwrap().parse().unwrap();
+        println!(
+            "MEMLOCK stage={stage} pid={} guest={RAM} working_set={WORKING_SET} limit={MEMLOCK} soft={soft} hard={hard} VmLck={locked} margin={MEMLOCK_MARGIN}",
+            self.child.id()
+        );
+        assert_eq!((soft, hard), (MEMLOCK, MEMLOCK));
+        assert!(locked >= RAM, "guest RAM must be locked");
+        assert!(
+            locked <= MEMLOCK - MEMLOCK_MARGIN,
+            "VMM exceeds working-set allowance"
+        );
     }
 
     fn assert_confined(&self) {

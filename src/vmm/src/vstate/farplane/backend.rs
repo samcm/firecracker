@@ -405,14 +405,14 @@ fn commit_plan(
     };
 
     let mapped = memversion::map_regions(&geometry, incoming.fds.first().map(AsFd::as_fd))
-        .map_err(BackendError::Map)
+        .map_err(|err| BackendError::Map(io::Error::other(err)))
         .inspect_err(|_| {
             reject(&sock, &incoming, ErrorCode::MapFailed);
         })?;
     for region in &mapped {
         region
             .lock_on_fault()
-            .map_err(BackendError::Map)
+            .map_err(|err| BackendError::Map(io::Error::other(err)))
             .inspect_err(|_| {
                 reject(&sock, &incoming, ErrorCode::MlockFailed);
             })?;

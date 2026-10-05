@@ -16,6 +16,32 @@ pub(crate) const GUEST_RAM_BASE: u64 = 0x3000_0000_0000;
 pub(crate) const MAX_REGIONS: usize = 16;
 const MAX_EXCLUSIONS: usize = 65_536;
 
+/// Mapping failure retaining the exact guest range and failed operation.
+#[derive(Debug, thiserror::Error)]
+#[error("{operation}(addr={addr:#x}, len={len:#x}) failed: {source}")]
+pub struct MappingError {
+    operation: &'static str,
+    addr: u64,
+    len: u64,
+    source: io::Error,
+}
+
+impl MappingError {
+    fn last(operation: &'static str, addr: usize, len: usize) -> Self {
+        Self {
+            operation,
+            addr: addr as u64,
+            len: len as u64,
+            source: io::Error::last_os_error(),
+        }
+    }
+
+    #[cfg(test)]
+    fn raw_os_error(&self) -> Option<i32> {
+        self.source.raw_os_error()
+    }
+}
+
 /// Owns exactly one successful reservation or import until the last guest-region owner drops.
 /// It must never own the released hole while an import is being attempted.
 #[derive(Debug)]
@@ -32,9 +58,10 @@ impl Drop for Mapping {
 }
 
 impl Mapping {
-    fn reserve(region: Region) -> io::Result<Self> {
-        let addr = usize::try_from(region.addr).map_err(|_| invalid())?;
-        let len = usize::try_from(region.len).map_err(|_| invalid())?;
+    fn reserve(region: Region) -> Result<Self, MappingError> {
+        // Supported architectures have 64-bit usize; geometry already checked the range.
+        let addr = usize::try_from(region.addr).expect("validated 64-bit geometry");
+        let len = usize::try_from(region.len).expect("validated 64-bit geometry");
         // SAFETY: NOREPLACE cannot overwrite another mapping. No guest accesses exist yet.
         let result = unsafe {
             libc::mmap(
@@ -47,14 +74,23 @@ impl Mapping {
             )
         };
         if result == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+            return Err(MappingError::last(
+                "mmap(PROT_NONE, PRIVATE|ANONYMOUS|FIXED_NOREPLACE, fd=-1, offset=0)",
+                addr,
+                len,
+            ));
         }
         let mapping = Self {
             addr: result as usize,
             len,
         };
         if mapping.addr != addr {
-            return Err(invalid());
+            return Err(MappingError {
+                operation: "mmap returned wrong address",
+                addr: region.addr,
+                len: region.len,
+                source: invalid(),
+            });
         }
         // CREATE requires this VMA policy, not merely the absence of huge pages today.
         // Set it while still PROT_NONE, before boot can touch any guest RAM.
@@ -62,7 +98,7 @@ impl Mapping {
         Ok(mapping)
     }
 
-    fn no_huge_pages(&self) -> io::Result<()> {
+    fn no_huge_pages(&self) -> Result<(), MappingError> {
         // SAFETY: this object exclusively owns the live VMA; the call changes only its policy.
         if unsafe {
             libc::madvise(
@@ -72,12 +108,16 @@ impl Mapping {
             )
         } != 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(MappingError::last(
+                "madvise(MADV_NOHUGEPAGE)",
+                self.addr,
+                self.len,
+            ));
         }
         Ok(())
     }
 
-    pub(crate) fn lock_on_fault(&self) -> io::Result<()> {
+    pub(crate) fn lock_on_fault(&self) -> Result<(), MappingError> {
         // SAFETY: the live owned mapping; locking on fault changes only residency policy.
         if unsafe {
             libc::mlock2(
@@ -87,7 +127,11 @@ impl Mapping {
             )
         } != 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(MappingError::last(
+                "mlock2(MLOCK_ONFAULT)",
+                self.addr,
+                self.len,
+            ));
         }
         Ok(())
     }
@@ -97,7 +141,7 @@ impl Mapping {
 pub(crate) fn map_regions(
     regions: &[Region],
     version: Option<BorrowedFd<'_>>,
-) -> io::Result<Vec<Mapping>> {
+) -> Result<Vec<Mapping>, MappingError> {
     map_regions_with(regions, version.is_some(), |index, addr| {
         map_private(
             version.expect("import only runs with a version"),
@@ -111,11 +155,11 @@ fn map_regions_with(
     regions: &[Region],
     import: bool,
     mut map: impl FnMut(u32, u64) -> io::Result<()>,
-) -> io::Result<Vec<Mapping>> {
+) -> Result<Vec<Mapping>, MappingError> {
     let mut mappings = regions
         .iter()
         .map(|region| Mapping::reserve(*region).map(Some))
-        .collect::<io::Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
     for (index, slot) in mappings.iter_mut().enumerate() {
         if import {
             // Drop releases just this owned reservation; the slot stays empty if MAP fails.
@@ -123,7 +167,16 @@ fn map_regions_with(
             let (addr, len) = (reservation.addr, reservation.len);
             drop(reservation);
             let region = regions[index];
-            map(u32::try_from(index).map_err(|_| invalid())?, region.addr)?;
+            map(
+                u32::try_from(index).expect("bounded by MAX_REGIONS"),
+                region.addr,
+            )
+            .map_err(|source| MappingError {
+                operation: "MV_MAP(PRIVATE)",
+                addr: region.addr,
+                len: region.len,
+                source,
+            })?;
             *slot = Some(Mapping { addr, len });
             // PRIVATE imports carry VM_NOHUGEPAGE in v1; explicitly enforce it here too,
             // before exposing the mapping to guest-memory users.
@@ -139,7 +192,11 @@ fn map_regions_with(
                 )
             } != 0
             {
-                return Err(io::Error::last_os_error());
+                return Err(MappingError::last(
+                    "mprotect(PROT_READ|PROT_WRITE)",
+                    mapping.addr,
+                    mapping.len,
+                ));
             }
         }
     }
@@ -423,7 +480,8 @@ mod tests {
                 );
             }
             // Model a successful NOREPLACE import, without claiming a kernel version proof.
-            let mapped = map_regions(&[regions[index as usize]], None)?
+            let mapped = map_regions(&[regions[index as usize]], None)
+                .unwrap()
                 .pop()
                 .unwrap();
             // Deliberately strip the reservation policy to catch a missing import madvise.
@@ -451,7 +509,8 @@ mod tests {
         let mut collision = None;
         assert_eq!(
             map_regions_with(&regions, true, |index, _| {
-                let mapped = map_regions(&[regions[index as usize]], None)?
+                let mapped = map_regions(&[regions[index as usize]], None)
+                    .unwrap()
                     .pop()
                     .unwrap();
                 if index == 0 {
