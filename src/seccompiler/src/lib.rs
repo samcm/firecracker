@@ -215,3 +215,82 @@ pub fn compile_bpf(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_filters_trap_madv_free_on_every_thread() {
+        let arch = std::env::consts::ARCH;
+        let policy = format!(
+            "{}/../../resources/seccomp/{arch}-unknown-linux-musl.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        // SAFETY: a constant name; the returned descriptor is checked and owned below.
+        let fd = unsafe { libc::memfd_create(c"test-filter".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: the successful syscall transferred ownership of this descriptor.
+        let mut output = unsafe { File::from_raw_fd(fd) };
+        compile_bpf(&policy, arch, &format!("/proc/self/fd/{fd}"), false, false).unwrap();
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).unwrap();
+        let filters: BTreeMap<String, Vec<u64>> = bitcode::deserialize(&bytes).unwrap();
+        assert_eq!(filters.len(), 3);
+        for name in ["vmm", "vcpu", "api"] {
+            let filter = &filters[name];
+            // The kernel consumes advice as an int. High register bits must not bypass it.
+            for advice in [u64::from(libc::MADV_FREE as u32), (1 << 32) | 8] {
+                assert_advice_action(filter, advice, true);
+            }
+        }
+        // Positive control: the filter is argument-selective, not a blanket madvise denial.
+        assert_advice_action(&filters["vmm"], libc::MADV_NOHUGEPAGE as u64, false);
+    }
+
+    fn assert_advice_action(filter: &[u64], advice: u64, trap: bool) {
+        let prog = libc::sock_fprog {
+            len: u16::try_from(filter.len()).unwrap(),
+            filter: filter.as_ptr().cast::<libc::sock_filter>().cast_mut(),
+        };
+        // SAFETY: the child uses only async-signal-safe syscalls then _exit; all pointers
+        // reference live stack/filter memory inherited across fork. No child unwinding.
+        unsafe {
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                let no_core = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+                let page = libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if page == libc::MAP_FAILED
+                    || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &prog)
+                        != 0
+                {
+                    libc::_exit(90);
+                }
+                let result = libc::syscall(libc::SYS_madvise, page, 4096, advice);
+                libc::_exit(if result == 0 { 0 } else { 91 });
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &mut status, 0), child);
+            if trap {
+                assert!(libc::WIFSIGNALED(status), "advice={advice} status={status}");
+                assert_eq!(libc::WTERMSIG(status), libc::SIGSYS);
+            } else {
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 0);
+            }
+        }
+    }
+}
