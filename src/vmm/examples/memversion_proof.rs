@@ -211,10 +211,69 @@ impl Drop for ChildOwner {
     }
 }
 
+// Drain from spawn, including while the main thread blocks in API/memory-channel calls.
+// EIO is the terminal's EOF after its slave closes. Preserve stdout AND stderr in one file.
+fn capture_console(
+    mut console: File,
+    mut transcript: File,
+) -> (
+    std::sync::mpsc::Receiver<Vec<u8>>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+) {
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        loop {
+            let mut bytes = [0u8; 4096];
+            match console.read(&mut bytes) {
+                Ok(0) => return Ok(()),
+                Ok(n) => {
+                    transcript.write_all(&bytes[..n])?;
+                    let _ = send.send(bytes[..n].to_vec());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) if err.raw_os_error() == Some(libc::EIO) => return Ok(()),
+                Err(err) => return Err(err),
+            }
+        }
+    });
+    (receive, reader)
+}
+
+fn dump_logs(work: &Path) {
+    // The wrapper repeats these on normal exit too; this hook runs even in panic=abort builds.
+    for id in ["a", "b"] {
+        let path = work.join(format!("{id}.console"));
+        if let Ok(bytes) = fs::read(&path) {
+            eprintln!(
+                "--- {} ---\n{}",
+                path.display(),
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
+    if let Ok(binaries) = fs::read_dir(work) {
+        for binary in binaries.flatten().filter(|entry| entry.path().is_dir()) {
+            for id in ["a", "b"] {
+                let path = binary.path().join(id).join("root/fc.log");
+                if let Ok(bytes) = fs::read(&path) {
+                    eprintln!(
+                        "--- {} ---\n{}",
+                        path.display(),
+                        String::from_utf8_lossy(&bytes)
+                    );
+                }
+            }
+        }
+    }
+}
+
 struct Vm {
     child: ChildOwner,
     console: File,
-    transcript: File,
+    console_messages: std::sync::mpsc::Receiver<Vec<u8>>,
+    console_reader: std::thread::JoinHandle<std::io::Result<()>>,
     socket: UnixStream,
     next_id: u64,
     vmstate_capacity: u64,
@@ -230,6 +289,7 @@ impl Vm {
         );
         self.child.kill().unwrap();
         assert_eq!(self.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        self.console_reader.join().unwrap().unwrap();
         assert!(
             !Path::new(&format!("/proc/{pid}")).exists(),
             "FC was not reaped"
@@ -284,6 +344,7 @@ impl Vm {
             unsafe { libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK) },
             0
         );
+        let transcript = File::create(work.join(format!("{id}.console")))?;
         let child = Command::new(jailer)
             .args(["--id", id, "--exec-file"])
             .arg(fc)
@@ -315,13 +376,20 @@ impl Vm {
             .stderr(Stdio::from(terminal))
             .spawn()?;
         let mut child = ChildOwner(child);
+        fs::write(work.join(format!("{id}.pid")), child.id().to_string())?;
+        let (console_messages, console_reader) = capture_console(console.try_clone()?, transcript);
         let api_path = jail.join("api.sock");
         let deadline = Instant::now() + TIMEOUT;
         while !api_path.exists() {
-            assert!(
-                child.try_wait()?.is_none(),
-                "jailer exited before API startup"
-            );
+            if let Some(status) = child.try_wait()? {
+                console_reader.join().expect("console reader panicked")?;
+                dump_logs(work);
+                return Err(format!(
+                    "jailer pid={} exited before API startup: {status}",
+                    child.id()
+                )
+                .into());
+            }
             assert!(Instant::now() < deadline, "API startup timed out");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -390,7 +458,8 @@ impl Vm {
         let vm = Self {
             child,
             console,
-            transcript: File::create(work.join(format!("{id}.console")))?,
+            console_messages,
+            console_reader,
             socket,
             next_id: 3,
             vmstate_capacity: capacity,
@@ -445,20 +514,23 @@ impl Vm {
         let deadline = Instant::now() + TIMEOUT;
         let mut text = String::new();
         loop {
-            let mut bytes = [0u8; 4096];
-            match self.console.read(&mut bytes) {
-                Ok(n) if n > 0 => {
-                    self.transcript.write_all(&bytes[..n])?;
-                    text.push_str(&String::from_utf8_lossy(&bytes[..n]));
+            match self.console_messages.recv_timeout(Duration::from_millis(5)) {
+                Ok(bytes) => {
+                    text.push_str(&String::from_utf8_lossy(&bytes));
                     assert!(!text.contains("MVG FAIL"), "guest pattern mismatch");
                     if text.contains(marker) {
                         return Ok(());
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                other => panic!("FC console ended: {other:?}; {text}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                other => {
+                    let status = self.child.try_wait()?;
+                    panic!("FC console ended: {other:?}; child_status={status:?}; {text}");
+                }
             }
-            assert!(self.child.try_wait()?.is_none(), "FC exited: {text}");
+            if let Some(status) = self.child.try_wait()? {
+                panic!("FC pid={} exited: {status}; {text}", self.child.id());
+            }
             assert!(Instant::now() < deadline, "guest marker timeout: {text}");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -556,6 +628,12 @@ fn main() -> Result<()> {
     let work = PathBuf::from(&args[4]);
     fs::create_dir(&work)?;
     let work = fs::canonicalize(work)?;
+    let failure_work = work.clone();
+    let old_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        dump_logs(&failure_work);
+        old_hook(info);
+    }));
     let producer = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &fs::read(&fc)?);
     let device = fs::OpenOptions::new()
         .read(true)
@@ -617,6 +695,28 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use vmm_sys_util::tempdir::TempDir;
+
+    #[test]
+    #[ignore = "root required for the production listener ownership; no KVM required"]
+    fn startup_failure_keeps_stdout_stderr_and_exit_status() {
+        let dir = TempDir::new().unwrap();
+        let jailer = dir.as_path().join("failing-jailer");
+        fs::write(
+            &jailer,
+            b"#!/bin/sh\necho STARTUP_STDOUT\necho STARTUP_STDERR >&2\nexit 17\n",
+        )
+        .unwrap();
+        fs::set_permissions(&jailer, fs::Permissions::from_mode(0o755)).unwrap();
+        let work = dir.as_path().join("work");
+        fs::create_dir(&work).unwrap();
+        let error = Vm::start(&jailer, &jailer, &jailer, &work, "a", None, &[0; 32])
+            .err()
+            .expect("fake jailer must fail");
+        assert!(error.to_string().contains("exit status: 17"), "{error}");
+        let transcript = fs::read_to_string(work.join("a.console")).unwrap();
+        assert!(transcript.contains("STARTUP_STDOUT"));
+        assert!(transcript.contains("STARTUP_STDERR"));
+    }
 
     #[test]
     fn api_handles_split_http_headers_and_body() {
