@@ -5,6 +5,7 @@
 //! Needs /dev/kvm, the same experimental budget header, tty stdin, and disposable raw scratch.
 //! One 64KiB READ is host-admitted while a real guest independently blocks on a COW store.
 //! No guest driver, event-loop fairness, net/vsock/rng/reporting or durable RAM export is tested.
+//! Normal VMGenID/VMClock activation runs before enrollment; their save is host-state-only.
 
 use std::sync::{Arc, Mutex};
 
@@ -174,6 +175,10 @@ fn memory_budget_running_vmm_pause_save_drop() {
         }
         assert!(transport.locked_device().is_activated());
     }
+    // DeviceManager::save requires both ACPI devices, just like the production builder.
+    // Their activation writes guest memory now, before enrollment or vCPU execution.
+    devices.attach_vmgenid_device(&kvm).unwrap();
+    devices.attach_vmclock_device(&kvm).unwrap();
     let mut vmm = Vmm {
         instance_info: InstanceInfo {
             state: VmState::Paused,
@@ -341,8 +346,8 @@ fn memory_budget_running_vmm_pause_save_drop() {
     assert!(drained.worker_issues > 0 && drained.bios_done > 0 && drained.unauth_denied > 0);
     println!("FC_RUNNING_DRAINED {drained:?}");
 
-    // No operation authority after FINISH. The block-only device set's prepare_save does not
-    // write guest memory. This is real CPU/KVM/device vmstate, NOT a RAM export or disk clone.
+    // No operation authority after FINISH. The drained block and initialized ACPI devices'
+    // save paths do not write guest memory. This is vmstate, NOT a RAM export or disk clone.
     let info = VmInfo::from(&vmm);
     let state = vmm.save_state(&info).unwrap();
     assert_eq!(state.vcpu_states.len(), 1);
