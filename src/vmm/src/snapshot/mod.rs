@@ -289,12 +289,12 @@ mod tests {
             snapshot.header.feature_identity,
             crate::vstate::farplane::FEATURE_IDENTITY
         );
-        assert_eq!(snapshot.header.feature_identity, "farplane/6");
+        assert_eq!(snapshot.header.feature_identity, "farplane/7");
 
         snapshot.save(&mut buf).unwrap();
 
         let loaded = Snapshot::<MicrovmState>::load(&mut buf.as_slice()).unwrap();
-        assert_eq!(loaded.header.feature_identity, "farplane/6");
+        assert_eq!(loaded.header.feature_identity, "farplane/7");
     }
 
     /// A warm image baked by an older identity is refused before its state is used: the capture
@@ -310,7 +310,7 @@ mod tests {
         match err {
             SnapshotError::IncompatibleFeatureIdentity { expected, found } => {
                 assert_eq!(found, "farplane/1");
-                assert_eq!(expected, "farplane/6");
+                assert_eq!(expected, "farplane/7");
             }
             other => panic!("unexpected error: {other:?}"),
         }

@@ -219,9 +219,13 @@ fn legacy_layout_converts_only_the_two_absent_fields() {
             .is_none()
     );
     candidate(PRODUCER_6, &encoded).unwrap_err();
-    let current = image(&Snapshot::new(MicrovmState::default()));
+    let mut fp6 = Snapshot::new(MicrovmState::default());
+    fp6.header.feature_identity = "farplane/6".to_string();
+    let current = image(&fp6);
     candidate(PRODUCER_4, &current).unwrap_err();
     candidate(PRODUCER_6, &current).unwrap();
+    // A new /7 image is not a pinned historical producer's output.
+    candidate(PRODUCER_6, &image(&Snapshot::new(MicrovmState::default()))).unwrap_err();
     old.header.feature_identity = "farplane/6".to_string();
     assert!(matches!(
         candidate(PRODUCER_4, &image(&old)),

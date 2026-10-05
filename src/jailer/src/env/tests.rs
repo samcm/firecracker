@@ -90,6 +90,80 @@ fn test_scratch_fd_reserves_its_slot_only_when_passed() {
     assert_eq!(env.highest_reserved_fd(), SCRATCH_FILENO);
 }
 
+/// Renumbering and closing arbitrary inherited descriptors must not affect the test runner.
+#[test]
+fn test_inherited_fd_three_is_a_hole() {
+    const CHILD: &str = "JAILER_FD_HOLE_TEST";
+    let Some(case) = std::env::var_os(CHILD) else {
+        for case in ["root", "scratch", "alias", "closed"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "env::tests::test_inherited_fd_three_is_a_hole"])
+                .env(CHILD, case)
+                .status()
+                .unwrap();
+            assert!(status.success(), "fd 3 case {case}: {status}");
+        }
+        return;
+    };
+
+    let writable = memfd(4096, REQUIRED_IMAGE_SEALS);
+    let root = move_off_reserved_fds(reopen_read_only(writable)).unwrap();
+    // The writable descriptor is not part of the inherited contract.
+    if writable != 3 {
+        close(writable).unwrap();
+    }
+    let root_inode = inode_of(root).unwrap();
+    let mut env = new_env(&cmdline(&root.to_string(), &["--chroot-base-dir", "/"])).unwrap();
+    fs::remove_file(&env.exec_file_path).unwrap();
+    fs::remove_dir(env.exec_file_path.parent().unwrap()).unwrap();
+    let mut scratch_inode = None;
+    match case.to_str().unwrap() {
+        "root" => {
+            place_fd(root, 3).unwrap();
+            env.root_fd = 3;
+        }
+        "scratch" => {
+            let Some(scratch) = scratch_file_opened(4096, libc::O_RDWR | libc::O_DIRECT) else {
+                return;
+            };
+            scratch_inode = Some(inode_of(scratch).unwrap());
+            place_fd(scratch, 3).unwrap();
+            env.scratch_fd = Some(3);
+        }
+        "alias" => dup2(root, 3).unwrap(),
+        "closed" => {
+            // close_range accepts an already closed slot.
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_close_range, 3u32, 3u32, 0u32) },
+                0
+            );
+        }
+        _ => unreachable!(),
+    }
+    env.install_inherited_fds().unwrap();
+    close_inherited_fds(env.highest_reserved_fd()).unwrap();
+    assert_eq!(unsafe { libc::fcntl(3, libc::F_GETFD) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    let installed = inode_of(ROOT_FILENO).unwrap();
+    assert_eq!(
+        (installed.st_dev, installed.st_ino),
+        (root_inode.st_dev, root_inode.st_ino)
+    );
+    assert_eq!(unsafe { libc::fcntl(ROOT_FILENO, libc::F_GETFD) }, 0);
+    if let Some(expected) = scratch_inode {
+        let installed = inode_of(SCRATCH_FILENO).unwrap();
+        assert_eq!(
+            (installed.st_dev, installed.st_ino),
+            (expected.st_dev, expected.st_ino)
+        );
+        assert_eq!(unsafe { libc::fcntl(SCRATCH_FILENO, libc::F_GETFD) }, 0);
+    } else {
+        assert_eq!(unsafe { libc::fcntl(SCRATCH_FILENO, libc::F_GETFD) }, -1);
+    }
+    // Descriptor cleanup may have closed libtest's own descriptors in this isolated process.
+    unsafe { libc::_exit(0) };
+}
+
 #[test]
 fn test_scratch_fd_must_be_a_descriptor_number() {
     let args = cmdline(

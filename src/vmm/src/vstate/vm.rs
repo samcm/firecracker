@@ -6,7 +6,6 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
@@ -556,7 +555,7 @@ impl KvmVm {
         if kvm_bits.len() != returned.len() || record.reported.len() != returned.len() {
             return Err(VmError::DirtyBitmapShape);
         }
-        let host_writes = region.inner.deref().bitmap().as_ref();
+        let host_writes = region.inner.bitmap().as_ref();
 
         // KVM is cleared first: it is the only step that can fail, and until it succeeds nothing
         // else has changed. Both ends are 64-page aligned or the slot's end, as KVM requires.
@@ -663,7 +662,7 @@ impl KvmVm {
             } else {
                 None
             };
-            let host_writes = region.inner.deref().bitmap().as_ref();
+            let host_writes = region.inner.bitmap().as_ref();
             let mut words = record.uncaptured.clone();
             for (index, word) in words.iter_mut().enumerate() {
                 *word &= !returned[index];
@@ -772,7 +771,7 @@ impl KvmVm {
             if words.len() != pages.div_ceil(64) {
                 return Err(VmError::DirtyBitmapShape);
             }
-            if let Some(host_writes) = region.inner.deref().bitmap().as_ref()
+            if let Some(host_writes) = region.inner.bitmap().as_ref()
                 && (host_writes.len() != pages || host_writes.byte_size() != len)
             {
                 return Err(VmError::DirtyBitmapShape);
@@ -791,7 +790,7 @@ impl KvmVm {
             let returned = pending
                 .entry(region.slot)
                 .or_insert_with(|| vec![0u64; words.len()]);
-            if let Some(host_writes) = region.inner.deref().bitmap().as_ref() {
+            if let Some(host_writes) = region.inner.bitmap().as_ref() {
                 let host_words = host_writes.clone().get_and_reset();
                 if host_words.len() != words.len() {
                     return Err(VmError::DirtyBitmapShape);

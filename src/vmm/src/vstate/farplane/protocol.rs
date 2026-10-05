@@ -15,10 +15,6 @@ pub const VERSION: u16 = 1;
 pub const HEADER_LEN: usize = 32;
 /// Largest datagram accepted or produced, header included.
 pub const MAX_DATAGRAM: usize = 65_536;
-/// Largest extent table accepted, in records.
-pub const MAX_EXTENTS: u32 = 65_536;
-/// Largest number of backing descriptors accepted for one plan, across datagrams.
-pub const MAX_PLAN_FDS: u32 = 1_024;
 /// Largest number of descriptors one datagram carries: the kernel's `SCM_MAX_FD`.
 pub const MAX_SCM_FDS: usize = 253;
 /// Number of answered requests one connection keeps, so a retry of one is replayed rather than
@@ -29,17 +25,7 @@ pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this protocol, quiesce semantics and vmstate format. A warm image
 /// baked by another identity is refused rather than restored: the capture command order and the
 /// vmstate the epoch produces are part of what this string names.
-pub const FEATURE_IDENTITY: &str = "farplane/6";
-/// Size of one extent table record.
-pub const EXTENT_RECORD_LEN: usize = 32;
-/// Size of one record of a `rebase` run table.
-pub const REBASE_RUN_RECORD_LEN: usize = 24;
-/// Size of one record a `rebase` writes into its reply buffer.
-pub const REBASED_RANGE_RECORD_LEN: usize = 16;
-/// Size of a `rebase` body.
-pub const REBASE_BODY_LEN: usize = 16;
-/// Size of a `rebased` body.
-pub const REBASED_BODY_LEN: usize = 32;
+pub const FEATURE_IDENTITY: &str = "farplane/7";
 /// Size of one region record.
 pub const REGION_RECORD_LEN: usize = 16;
 /// Size of the region record reported by `backend_ready`.
@@ -57,7 +43,7 @@ pub const FEATURE_IDENTITY_LEN: usize = 32;
 pub enum MsgType {
     /// Pagemaster transfers backing descriptors.
     PlanFds = 1,
-    /// Pagemaster transfers the geometry and the extent table.
+    /// Pagemaster transfers geometry and, on restore, one version and vmstate.
     BackingPlan = 2,
     /// Pagemaster arms one capture epoch with its buffers.
     CaptureBuffers = 3,
@@ -73,7 +59,7 @@ pub enum MsgType {
     Resume = 8,
     /// Firecracker announces itself and its geometry.
     Hello = 9,
-    /// Firecracker reports the mapped geometry and hands over a userfaultfd duplicate.
+    /// Firecracker reports fixed mapped geometry without returning descriptors.
     BackendReady = 10,
     /// Firecracker confirms every guest-memory writer has stopped.
     Quiesced = 11,
@@ -103,27 +89,19 @@ impl MsgType {
     /// Returns the message type for `value`, or `None` if it names no message.
     pub fn from_u16(value: u16) -> Option<Self> {
         match value {
-            1 => Some(Self::PlanFds),
             2 => Some(Self::BackingPlan),
             3 => Some(Self::CaptureBuffers),
             4 => Some(Self::Quiesce),
-            5 => Some(Self::DirtySnapshot),
             6 => Some(Self::WriteVmstate),
-            7 => Some(Self::DirtyUnion),
             8 => Some(Self::Resume),
             9 => Some(Self::Hello),
             10 => Some(Self::BackendReady),
             11 => Some(Self::Quiesced),
-            12 => Some(Self::DirtySnapshotDone),
             13 => Some(Self::VmstateWritten),
-            14 => Some(Self::UnionDone),
             15 => Some(Self::Resumed),
             16 => Some(Self::Error),
             17 => Some(Self::CaptureBuffersArmed),
-            18 => Some(Self::FreeSummary),
-            19 => Some(Self::FreeSummaryDone),
-            20 => Some(Self::Rebase),
-            21 => Some(Self::Rebased),
+            // Reserved /6 tags must never be interpreted as /7 commands.
             _ => None,
         }
     }
@@ -313,48 +291,6 @@ impl RegionRecord {
             guest_addr: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             size: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
         })
-    }
-}
-
-/// One extent of the backing plan: a maximal range served by one descriptor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExtentRecord {
-    /// Guest physical address the extent starts at.
-    pub guest_addr: u64,
-    /// Extent length in bytes.
-    pub len: u64,
-    /// Index into the ordered descriptor table.
-    pub fd_index: u32,
-    /// Must be zero.
-    pub reserved: u32,
-    /// Offset into the descriptor the extent is served from.
-    pub fd_offset: u64,
-}
-
-impl ExtentRecord {
-    /// Parses one record.
-    pub fn decode(buf: &[u8]) -> Result<Self, ChannelError> {
-        if buf.len() < EXTENT_RECORD_LEN {
-            return Err(ChannelError::Malformed);
-        }
-        Ok(Self {
-            guest_addr: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            len: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            fd_index: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            reserved: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            fd_offset: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
-        })
-    }
-
-    /// Serializes the record.
-    pub fn encode(self) -> [u8; EXTENT_RECORD_LEN] {
-        let mut buf = [0u8; EXTENT_RECORD_LEN];
-        buf[0..8].copy_from_slice(&self.guest_addr.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.len.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.fd_index.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.reserved.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.fd_offset.to_le_bytes());
-        buf
     }
 }
 
@@ -594,14 +530,16 @@ pub fn parse_u32(body: &[u8]) -> Result<u32, ChannelError> {
 /// Parsed `backing_plan` body.
 #[derive(Debug)]
 pub struct BackingPlanBody {
-    /// Pid of the pagemaster that serves faults on this channel.
+    /// Pid of the pagemaster peer on this channel.
     pub pm_pid: u32,
-    /// Number of extent records in the transferred table.
+    /// Reserved /6 field, required to be zero.
     pub extent_count: u32,
-    /// Frame flags; bit 0 states a vmstate descriptor rides along.
+    /// Frame flags; bit 0 states version and vmstate descriptors ride along.
     pub flags: u32,
-    /// Checkpoint geometry the plan tiles.
+    /// Checkpoint geometry of the single multi-region version.
     pub regions: Vec<RegionRecord>,
+    /// Exact producer digest from immutable snapshot provenance, present on restore only.
+    pub expected_producer: Option<[u8; 32]>,
 }
 
 impl BackingPlanBody {
@@ -623,10 +561,11 @@ pub fn parse_backing_plan(body: &[u8]) -> Result<BackingPlanBody, ChannelError> 
     let region_count = u32::from_le_bytes(body[4..8].try_into().unwrap());
     let extent_count = u32::from_le_bytes(body[8..12].try_into().unwrap());
     let flags = u32::from_le_bytes(body[12..16].try_into().unwrap());
-    if flags & !BackingPlanBody::FLAG_VMSTATE != 0 {
+    if flags & !BackingPlanBody::FLAG_VMSTATE != 0 || extent_count != 0 {
         return Err(ChannelError::Malformed);
     }
-    let expected = 16 + region_count as usize * REGION_RECORD_LEN;
+    let restore = flags & BackingPlanBody::FLAG_VMSTATE != 0;
+    let expected = 16 + region_count as usize * REGION_RECORD_LEN + usize::from(restore) * 32;
     if body.len() != expected {
         return Err(ChannelError::Malformed);
     }
@@ -641,6 +580,7 @@ pub fn parse_backing_plan(body: &[u8]) -> Result<BackingPlanBody, ChannelError> 
         extent_count,
         flags,
         regions,
+        expected_producer: restore.then(|| body[off..off + 32].try_into().unwrap()),
     })
 }
 
@@ -773,10 +713,10 @@ mod tests {
         let fds = vec![memfd.as_raw_fd(); MAX_SCM_FDS];
 
         let count = u32::try_from(MAX_SCM_FDS).unwrap();
-        send_frame(&tx, MsgType::PlanFds, 0, &count.to_le_bytes(), &fds).unwrap();
+        send_frame(&tx, MsgType::BackingPlan, 0, &count.to_le_bytes(), &fds).unwrap();
 
         let frame = recv_frame(&rx).unwrap();
-        assert_eq!(frame.header.msg(), MsgType::PlanFds);
+        assert_eq!(frame.header.msg(), MsgType::BackingPlan);
         assert_eq!(frame.fds.len(), MAX_SCM_FDS);
     }
 
@@ -829,18 +769,6 @@ mod tests {
     }
 
     #[test]
-    fn extent_record_roundtrip() {
-        let record = ExtentRecord {
-            guest_addr: 0x1000,
-            len: 0x2000,
-            fd_index: 1,
-            reserved: 0,
-            fd_offset: 0x3000,
-        };
-        assert_eq!(ExtentRecord::decode(&record.encode()).unwrap(), record);
-    }
-
-    #[test]
     fn backing_plan_rejects_unknown_flags() {
         let mut body = Vec::new();
         body.extend_from_slice(&1u32.to_le_bytes());
@@ -851,6 +779,45 @@ mod tests {
             parse_backing_plan(&body),
             Err(ChannelError::Malformed)
         ));
+    }
+
+    #[test]
+    fn v7_backing_plan_provenance_and_reserved_tags() {
+        let mut body = [1u32, 1, 0, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        body.extend_from_slice(
+            &RegionRecord {
+                guest_addr: 0,
+                size: 4096,
+            }
+            .encode(),
+        );
+        assert_eq!(parse_backing_plan(&body).unwrap().expected_producer, None);
+        body.extend_from_slice(&[0xab; 32]);
+        assert!(
+            parse_backing_plan(&body).is_err(),
+            "boot rejects provenance suffix"
+        );
+        body[12] = 1;
+        assert_eq!(
+            parse_backing_plan(&body).unwrap().expected_producer,
+            Some([0xab; 32])
+        );
+        body.pop();
+        parse_backing_plan(&body).unwrap_err();
+        body.push(0xab);
+        body[8] = 1;
+        assert!(
+            parse_backing_plan(&body).is_err(),
+            "extent count must stay zero"
+        );
+        for tag in [1, 5, 7, 12, 14, 18, 19, 20, 21] {
+            let mut raw = Header::new(MsgType::Hello, 1, 0, 0).encode();
+            raw[6..8].copy_from_slice(&u16::to_le_bytes(tag));
+            assert!(Header::decode(&raw).is_err(), "reserved tag {tag}");
+        }
     }
 
     #[test]
@@ -909,6 +876,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/6");
+        assert_eq!(FEATURE_IDENTITY, "farplane/7");
     }
 }

@@ -345,21 +345,21 @@
             },
             {
                 "syscall": "mmap",
-                "comment": "Used by a farplane rebase to map a sealed generation over guest pages the guest has not written since the flip",
+                "comment": "Reserve a non-executable guest range for memversion without replacing existing mappings",
                 "args": [
                     {
                         "index": 3,
                         "type": "dword",
                         "op": "eq",
-                        "val": 18,
-                        "comment": "libc::MAP_PRIVATE | libc::MAP_FIXED"
+                        "val": 1048610,
+                        "comment": "libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE"
                     },
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": "eq",
                         "val": 0,
-                        "comment": "Ensure PROT_EXEC is not set"
+                        "comment": "libc::PROT_NONE"
                     }
                 ]
             },
@@ -380,6 +380,19 @@
                         "op": {"masked_eq": 4},
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mprotect",
+                "comment": "Make the boot memversion reservation readable and writable, never executable",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "libc::PROT_READ | libc::PROT_WRITE"
                     }
                 ]
             },
@@ -594,40 +607,40 @@
             },
             {
                 "syscall": "ioctl",
-                "comment": "Used to create the userfaultfd from the /dev/userfaultfd descriptor the jailer passes on fd 3",
+                "comment": "Create a memversion generation using the device received via SCM_RIGHTS",
                 "args": [
                     {
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
-                        "val": 43520,
-                        "comment": "USERFAULTFD_IOC_NEW"
+                        "val": 3223344704,
+                        "comment": "MV_CREATE (0xc0205640)"
                     }
                 ]
             },
             {
                 "syscall": "ioctl",
-                "comment": "Used for the userfaultfd API handshake, which selects the fault features guest memory needs",
+                "comment": "Map an imported memversion generation into a released guest range with NOREPLACE",
                 "args": [
                     {
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
-                        "val": 3222841919,
-                        "comment": "UFFDIO_API"
+                        "val": 1074812481,
+                        "comment": "MV_MAP (0x40105641)"
                     }
                 ]
             },
             {
                 "syscall": "ioctl",
-                "comment": "Used to register missing, minor and write-protect faults over every guest memory extent",
+                "comment": "Inspect a memversion generation, including new_pages in the 40-byte mv_info",
                 "args": [
                     {
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
-                        "val": 3223366144,
-                        "comment": "UFFDIO_REGISTER"
+                        "val": 3223868994,
+                        "comment": "MV_INFO (0xc0285642)"
                     }
                 ]
             },
@@ -646,38 +659,6 @@
             {
                 "syscall": "restart_syscall",
                 "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
-            },
-            {
-                "syscall": "prctl",
-                "comment": "Used to make the process dumpable so that the pagemaster can access its memory",
-                "args": [
-                    {
-                        "index": 0,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 4,
-                        "comment": "PR_SET_DUMPABLE"
-                    },
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 1
-                    }
-                ]
-            },
-            {
-                "syscall": "prctl",
-                "comment": "Used to allow the pagemaster to ptrace this process",
-                "args": [
-                    {
-                        "index": 0,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 1499557217,
-                        "comment": "PR_SET_PTRACER"
-                    }
-                ]
             },
             {
                 "syscall": "prctl",

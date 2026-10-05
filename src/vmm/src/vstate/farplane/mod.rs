@@ -7,15 +7,14 @@ pub mod backend;
 pub mod capture;
 /// Exclusion that stops event dispatch for the whole of a capture epoch.
 pub mod dispatch;
+pub(crate) mod memversion;
 /// Wire format of the pagemaster memory channel.
 pub mod protocol;
-/// Remapping of a sealed generation's pages over a source's unchanged private copies.
-pub mod rebase;
 
 pub use backend::{BackendError, BackendState, FarplaneBackend, FarplaneState, set_source_commit};
 pub use capture::CaptureService;
 pub use dispatch::{dispatch_slice, gate, outside_capture_epoch};
 pub use protocol::{
-    Arch, BackendReadyRegion, ChannelError, ErrorCode, ExtentRecord, FEATURE_IDENTITY, Header,
-    MAGIC, MAX_DATAGRAM, MAX_EXTENTS, MAX_PLAN_FDS, Mode, MsgType, RegionRecord, VERSION,
+    Arch, BackendReadyRegion, ChannelError, ErrorCode, FEATURE_IDENTITY, Header, MAGIC,
+    MAX_DATAGRAM, Mode, MsgType, RegionRecord, VERSION,
 };

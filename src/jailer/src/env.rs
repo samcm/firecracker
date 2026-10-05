@@ -19,7 +19,7 @@ use vmm_sys_util::syscall::SyscallReturnCode;
 
 use crate::chroot::chroot;
 use crate::resource_limits::{FSIZE_ARG, MEMLOCK_ARG, NO_FILE_ARG, ResourceLimits};
-use crate::{JailerError, ROOT_FILENO, SCRATCH_FILENO, UFFD_FILENO, close_inherited_fds};
+use crate::{JailerError, ROOT_FILENO, SCRATCH_FILENO, close_inherited_fds};
 
 const DEV_KVM: &CStr = c"/dev/kvm";
 const DEV_KVM_MAJOR: u32 = 10;
@@ -32,8 +32,6 @@ const DEV_NET_TUN_MINOR: u32 = 200;
 const DEV_URANDOM: &CStr = c"/dev/urandom";
 const DEV_URANDOM_MAJOR: u32 = 1;
 const DEV_URANDOM_MINOR: u32 = 9;
-
-const DEV_USERFAULTFD: &CStr = c"/dev/userfaultfd";
 
 const FOLDER_HIERARCHY: [&str; 4] = ["/", "/dev", "/dev/net", "/run"];
 const FOLDER_PERMISSIONS: u32 = 0o700;
@@ -63,19 +61,6 @@ fn close(fd: RawFd) -> Result<(), JailerError> {
     SyscallReturnCode(unsafe { libc::close(fd) })
         .into_empty_result()
         .map_err(JailerError::Close)
-}
-
-/// Opens the userfaultfd device Firecracker turns into its own userfaultfd. A userfaultfd is
-/// bound to the memory map of the process that created it, so only the exec'd binary can create
-/// one that its guest mappings can be registered on; access to this device node is the
-/// permission that lets it.
-fn open_userfaultfd_device() -> Result<RawFd, JailerError> {
-    // SAFETY: the path is a static NUL-terminated string and the return code is checked.
-    SyscallReturnCode(unsafe {
-        libc::open(DEV_USERFAULTFD.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
-    })
-    .into_result()
-    .map_err(JailerError::UserfaultfdDevice)
 }
 
 /// Moves `fd` past the descriptor numbers reserved for Firecracker, so that renumbering one of
@@ -395,13 +380,11 @@ impl Env {
         fs::write(&procs, id().to_string()).map_err(|err| JailerError::CgroupJoin(procs, err))
     }
 
-    /// Hands Firecracker the userfaultfd device as [`UFFD_FILENO`], the root image as
-    /// [`ROOT_FILENO`] and, when the caller passes one, the writable scratch disk as
+    /// Hands Firecracker the root image as [`ROOT_FILENO`] and, when the caller passes one,
+    /// the writable scratch disk as
     /// [`SCRATCH_FILENO`]. Every passed descriptor is moved clear of the reserved slots first,
     /// because the caller is free to pass them in at any number.
     fn install_inherited_fds(&self) -> Result<(), JailerError> {
-        let uffd_device = open_userfaultfd_device()?;
-
         validate_image_fd("--root-fd", self.root_fd, self.uid())?;
         if let Some(fd) = self.scratch_fd {
             validate_scratch_fd("--scratch-fd", fd)?;
@@ -411,7 +394,6 @@ impl Env {
         let root_fd = move_off_reserved_fds(self.root_fd)?;
         let scratch_fd = self.scratch_fd.map(move_off_reserved_fds).transpose()?;
 
-        place_fd(uffd_device, UFFD_FILENO)?;
         place_fd(root_fd, ROOT_FILENO)?;
         match scratch_fd {
             Some(fd) => place_fd(fd, SCRATCH_FILENO),
@@ -555,6 +537,8 @@ impl Env {
 
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
         self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
+        // Setup may reuse the hole at fd 3. Leave only the contracted descriptors at exec.
+        close_inherited_fds(self.highest_reserved_fd())?;
         Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
     }
 }
@@ -686,7 +670,7 @@ fn validate_unwritable_image(
 ///
 /// The standard streams are the whole set of descriptors that reach Firecracker without the jailer
 /// choosing what they refer to: `close_inherited_fds` keeps them so the jailed process can log,
-/// [`UFFD_FILENO`] is a device the jailer opens itself, and [`ROOT_FILENO`] and
+/// fd 3 is closed, and [`ROOT_FILENO`] and
 /// [`SCRATCH_FILENO`] are overwritten by the descriptors it places there or closed with the rest.
 /// So a caller that points a standard stream at the image inode with an access mode that includes
 /// writing is the one way a writable alias survives into the jail, and that is refused here.

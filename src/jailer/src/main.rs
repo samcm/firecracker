@@ -19,8 +19,6 @@ mod resource_limits;
 
 const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Descriptor Firecracker creates its userfaultfd from.
-pub(crate) const UFFD_FILENO: libc::c_int = 3;
 /// Descriptor Firecracker reads the read-only root block device image from.
 pub(crate) const ROOT_FILENO: libc::c_int = 4;
 /// Descriptor Firecracker reads and writes the scratch block device through, when the caller
@@ -151,8 +149,6 @@ pub enum JailerError {
     UmountOldRoot(io::Error),
     #[error("Failed to unshare into new mount namespace: {0}")]
     UnshareNewNs(io::Error),
-    #[error("Failed to open the userfaultfd device: {0}")]
-    UserfaultfdDevice(io::Error),
     #[error("{}", format!("Failed to write to {:?}: {}", .0, .1).replace('\"', ""))]
     Write(PathBuf, io::Error),
 }
@@ -252,8 +248,14 @@ pub fn readln_special<T: AsRef<Path> + Debug>(file_path: &T) -> Result<String, J
 /// Closes every inherited descriptor above the ones the jailed binary needs: the standard
 /// streams and the descriptors Firecracker is given. `highest_reserved` is the last of those:
 /// [`SCRATCH_FILENO`] when the caller passed a scratch descriptor, [`ROOT_FILENO`] otherwise, so
-/// an absent scratch descriptor leaves fd 5 unreserved.
+/// an absent scratch descriptor leaves fd 5 unreserved. The unused fd 3 is also closed;
+/// memversion descriptors are received later via SCM_RIGHTS, not inherited from the jailer.
 pub(crate) fn close_inherited_fds(highest_reserved: libc::c_int) -> Result<(), JailerError> {
+    // SAFETY: close_range tolerates an already closed slot. Installation has moved root and
+    // scratch clear of fd 3 before this function is called.
+    SyscallReturnCode(unsafe { libc::syscall(libc::SYS_close_range, 3u32, 3u32, 0u32) })
+        .into_empty_result()
+        .map_err(JailerError::CloseRange)?;
     // SAFETY: closing a range which holds no open descriptors is a no-op, and the return code
     // of the syscall is checked.
     SyscallReturnCode(unsafe {
@@ -343,6 +345,104 @@ mod tests {
     fn test_to_cstring() {
         let path = PathBuf::from("/tmp");
         assert_eq!(to_cstring(&path).unwrap(), CString::new("/tmp").unwrap());
+    }
+
+    /// Compile both architectures with libseccomp and interpret their actual classic BPF.
+    /// This requires only the repository's Python/libseccomp tooling, not KVM or memversion.
+    #[test]
+    fn test_memversion_seccomp_policies() {
+        let result = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(r#"
+import ctypes as c
+import json, os, pathlib, struct, sys
+lib = c.CDLL('libseccomp.so.2')
+class Cmp(c.Structure):
+    _fields_ = [('arg', c.c_uint), ('op', c.c_uint), ('a', c.c_uint64), ('b', c.c_uint64)]
+def api(name, result, *args):
+    f = getattr(lib, name)
+    f.restype, f.argtypes = result, args
+    return f
+init = api('seccomp_init', c.c_void_p, c.c_uint32)
+release = api('seccomp_release', None, c.c_void_p)
+native = api('seccomp_arch_native', c.c_uint32)
+add_arch = api('seccomp_arch_add', c.c_int, c.c_void_p, c.c_uint32)
+remove_arch = api('seccomp_arch_remove', c.c_int, c.c_void_p, c.c_uint32)
+resolve = api('seccomp_syscall_resolve_name', c.c_int, c.c_char_p)
+resolve_arch = api('seccomp_syscall_resolve_name_arch', c.c_int, c.c_uint32, c.c_char_p)
+add = api('seccomp_rule_add_array', c.c_int, c.c_void_p, c.c_uint32, c.c_int, c.c_uint, c.POINTER(Cmp))
+export = api('seccomp_export_bpf', c.c_int, c.c_void_p, c.c_int)
+ALLOW, TRAP = 0x7fff0000, 0x30000
+for arch, token in [('x86_64', 0xc000003e), ('aarch64', 0xc00000b7)]:
+    policy = json.loads((pathlib.Path(sys.argv[1]) / (arch + '-unknown-linux-musl.json')).read_text())['vmm']
+    assert policy['default_action'] == 'trap' and policy['filter_action'] == 'allow'
+    ctx = init(TRAP)
+    assert ctx
+    if native() != token:
+        assert add_arch(ctx, token) == 0
+        assert remove_arch(ctx, native()) == 0
+    for rule in policy['filter']:
+        comparisons = []
+        for arg in rule.get('args', []):
+            assert arg['type'] == 'dword'
+            op = arg['op']
+            if op == 'eq':
+                # Match seccompiler's dword comparisons, including musl ioctl's high bits.
+                comparisons.append(Cmp(arg['index'], 7, 0xffffffff, arg['val']))
+            else:
+                comparisons.append(Cmp(arg['index'], 7, op['masked_eq'], arg['val']))
+        args = (Cmp * len(comparisons))(*comparisons)
+        assert add(ctx, ALLOW, resolve(rule['syscall'].encode()), len(args), args) == 0
+    fd = os.memfd_create('policy-bpf')
+    assert export(ctx, fd) == 0
+    release(ctx)
+    os.lseek(fd, 0, 0)
+    bpf = list(struct.iter_unpack('HBBI', os.read(fd, 32768)))
+    os.close(fd)
+    def permits(name, args):
+        nr = resolve_arch(token, name.encode())
+        data = struct.pack('iIQ6Q', nr, token, 0, *(args + [0] * (6 - len(args))))
+        pc, acc = 0, 0
+        while True:
+            code, jt, jf, k = bpf[pc]
+            pc += 1
+            if code == 0x20: acc = struct.unpack_from('I', data, k)[0]
+            elif code == 0x54: acc &= k
+            elif code == 0x15: pc += jt if acc == k else jf
+            elif code == 0x25: pc += jt if acc > k else jf
+            elif code == 0x35: pc += jt if acc >= k else jf
+            elif code == 0x45: pc += jt if acc & k else jf
+            elif code == 0x05: pc += k
+            elif code == 0x06: return k == ALLOW
+            else: raise AssertionError(hex(code))
+    for op in [0xc0205640, 0x40105641, 0xc0285642]:
+        assert permits('ioctl', [9, op]), (arch, hex(op))
+        assert permits('ioctl', [9, op | (0xdeadbeef << 32)]), (arch, hex(op))
+    for op in [43520, 3222841919, 3223366144, 0xc0205642, 0xc0285643, 0xc0205641, 0]:
+        assert not permits('ioctl', [9, op]), (arch, hex(op))
+    assert permits('mmap', [0, 4096, 0, 1048610])
+    for prot in [1, 2, 3, 4, 7]:
+        assert not permits('mmap', [0, 4096, prot, 1048610])
+    for flags in [18, 50, 1048611, 1048626]:
+        assert not permits('mmap', [0, 4096, 0, flags])
+    assert permits('mprotect', [0, 4096, 3])
+    for prot in [4, 5, 6, 7]:
+        assert not permits('mprotect', [0, 4096, prot])
+    assert permits('munmap', [0, 4096])
+    assert not permits('prctl', [4, 1])
+    assert not permits('prctl', [1499557217, 123])
+    assert permits('prctl', [1, 9])
+    print(arch + ': compiled BPF memversion policy checks passed')
+"#)
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/seccomp"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "policy checks failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        print!("{}", String::from_utf8_lossy(&result.stdout));
     }
 
     #[test]

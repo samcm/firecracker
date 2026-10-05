@@ -19,8 +19,59 @@ use vm_memory::{GuestMemoryRegionBytes, VolatileSlice};
 
 use crate::utils::u64_to_usize;
 
-/// Type of GuestRegionMmap.
-pub type GuestRegionMmap = vm_memory::GuestRegionMmap<Option<AtomicBitmap>>;
+/// Guest region and, for externally imported RAM, ownership of its virtual mapping.
+/// The mapping outlives every device/vCPU Arc referring to this region, not just the channel.
+#[derive(Debug)]
+pub struct GuestRegionMmap {
+    region: vm_memory::GuestRegionMmap<Option<AtomicBitmap>>,
+    _mapping: Option<super::farplane::memversion::Mapping>,
+}
+
+impl GuestRegionMmap {
+    /// Constructs a region whose mmap object owns the allocation.
+    pub fn new(mapping: GuestMmapRegion, address: GuestAddress) -> Option<Self> {
+        vm_memory::GuestRegionMmap::new(mapping, address).map(|region| Self {
+            region,
+            _mapping: None,
+        })
+    }
+
+    /// Wraps an externally allocated mapping and transfers lifetime ownership to the region.
+    pub(crate) fn from_external(
+        mapping: super::farplane::memversion::Mapping,
+        address: GuestAddress,
+    ) -> Result<Self, std::io::Error> {
+        use vm_memory::bitmap::NewBitmap;
+        let builder = MmapRegionBuilder::new_with_bitmap(
+            mapping.len,
+            Some(AtomicBitmap::with_len(mapping.len)),
+        )
+        .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+        .with_mmap_flags(libc::MAP_PRIVATE);
+        // SAFETY: the owned mapping is live for exactly len bytes; the raw mmap does not unmap it.
+        let mmap = unsafe { builder.with_raw_mmap_pointer(mapping.addr as *mut u8) }
+            .build()
+            .map_err(std::io::Error::other)?;
+        let region = vm_memory::GuestRegionMmap::new(mmap, address)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        Ok(Self {
+            region,
+            _mapping: Some(mapping),
+        })
+    }
+
+    /// Full host-write accumulator, rather than the region trait's borrowed bitmap slice.
+    pub fn bitmap(&self) -> &Option<AtomicBitmap> {
+        self.region.deref().bitmap()
+    }
+}
+
+impl Deref for GuestRegionMmap {
+    type Target = vm_memory::GuestRegionMmap<Option<AtomicBitmap>>;
+    fn deref(&self) -> &Self::Target {
+        &self.region
+    }
+}
 /// Type of GuestMemoryMmap.
 pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 /// Type of GuestMmapRegion.
@@ -117,7 +168,7 @@ impl GuestMemoryRegion for GuestRegionMmapExt {
     }
 
     fn bitmap(&self) -> BS<'_, Self::B> {
-        self.inner.bitmap()
+        GuestMemoryRegion::bitmap(&self.inner.region)
     }
 
     fn get_host_address(
