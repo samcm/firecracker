@@ -3,7 +3,8 @@
 
 //! Test-only manually constructed VMM: no production backend switch or UFFD fallback.
 //! Needs /dev/kvm, the same experimental budget header, tty stdin, and disposable raw scratch.
-//! One 64KiB READ is host-admitted while a real guest independently blocks on a COW store.
+//! The real event handler admits one host-seeded 64KiB READ while a real vCPU blocks on COW.
+//! An after-pop hook closes dispatch and simulates a second guest head published without a kick.
 //! No guest driver, event-loop fairness, net/vsock/rng/reporting or durable RAM export is tested.
 //! Normal VMGenID/VMClock activation runs before enrollment; their save is host-state-only.
 
@@ -46,7 +47,7 @@ fn memory_budget_baseline_running_guest_layout() {
 
 #[test]
 #[ignore = "requires KVM, experimental mv-budget kernel, tty stdin and disposable raw scratch"]
-fn memory_budget_running_vmm_pause_save_drop() {
+fn memory_budget_running_vmm_real_handler_pause_save_drop() {
     const MEM_LEN: usize = 64 << 20;
     const LEN: u32 = 65536;
     assert_eq!(
@@ -143,6 +144,33 @@ fn memory_budget_running_vmm_pause_save_drop() {
     mem.write_obj(RequestHeader::new(VIRTIO_BLK_T_IN, 0), header)
         .unwrap();
     mem.write_obj(0xffu8, status).unwrap();
+    // Only the first head is initially available. The close hook publishes the second;
+    // these fixture inputs are bounded, not a production request-size restriction.
+    let second_payload = GuestAddress(0x50000);
+    let second_status = GuestAddress(0x29000);
+    driver.dtable[3].set(0x22000, 16, VIRTQ_DESC_F_NEXT, 4);
+    driver.dtable[4].set(
+        second_payload.0,
+        512,
+        VIRTQ_DESC_F_NEXT | crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE,
+        5,
+    );
+    driver.dtable[5].set(
+        second_status.0,
+        1,
+        crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE,
+        0,
+    );
+    driver.avail.ring[1].set(3);
+    mem.write_obj(
+        RequestHeader::new(VIRTIO_BLK_T_IN, 0),
+        GuestAddress(0x22000),
+    )
+    .unwrap();
+    mem.write_obj(0xffu8, second_status).unwrap();
+    mem.write_slice(&[0xa6; 512], second_payload).unwrap();
+    assert_eq!(driver.avail.idx.get(), 1);
+    assert!(driver.dtable[1].len.get() <= LEN && driver.dtable[4].len.get() <= LEN);
     let mut block = default_block_with_descriptor(direct.as_raw_fd(), false, FileEngineType::Async);
     block.queues[0] = driver.create_queue();
     block.acked_features = block.avail_features;
@@ -174,6 +202,16 @@ fn memory_budget_running_vmm_pause_save_drop() {
             transport.write(mmio.resources.addr, 0x70, &value.to_le_bytes());
         }
         assert!(transport.locked_device().is_activated());
+    }
+    // Consume activation and register the real queue/completion subscribers before enrollment.
+    // No queue event exists until resume_vm below, so this cannot admit a block request.
+    assert!(events.run_with_timeout(0).unwrap() > 0);
+    assert_eq!(driver.used.idx.get(), 0);
+    {
+        let locked = block.lock().unwrap();
+        let Block::Virtio(device) = &*locked;
+        assert_eq!(device.queues[0].next_avail.0, 0);
+        assert_eq!(device.metrics.queue_event_count.count(), 0);
     }
     // DeviceManager::save requires both ACPI devices, just like the production builder.
     // Their activation writes guest memory now, before enrollment or vCPU execution.
@@ -244,34 +282,31 @@ fn memory_budget_running_vmm_pause_save_drop() {
         "FC_RUNNING_BLOCKED expected_rip={FAULT_RIP:#x} target=0x5a ordinary={blocked:?} {before_io:?}"
     );
 
-    let hold = dispatch::gate().enter();
-    {
-        let mut locked = block.lock().unwrap();
-        let Block::Virtio(device) = &mut *locked;
-        // A test-only single dispatch, never the normal unbounded process_queue loop.
-        device.queue_evts[0].read().unwrap(); // consume resume_vm's queued notification
-        let head = device.queues[0]
-            .pop_or_enable_notification()
-            .unwrap()
-            .unwrap();
-        let request = Request::parse(&head, &mem, device.disk.nsectors).unwrap();
-        assert!(request.data_len <= LEN);
-        assert_eq!(request.r#type, RequestType::In);
-        assert!(matches!(
-            request.process(&mut device.disk, false, head.index, &mem, &device.metrics),
-            ProcessingResult::Submitted
-        ));
-        let FileEngine::Async(engine) = &mut device.disk.file_engine else {
-            unreachable!()
-        };
-        engine.kick_submission_queue().unwrap();
-    }
-    stop_tx.send(()).unwrap();
-    dispatch::gate().wait_for_closing(1);
+    let refill_mem = mem.clone();
+    let avail_idx = driver.avail.idx.location;
+    super::super::tests::AFTER_QUEUE_POP.with_borrow_mut(|hook| {
+        *hook = Some(Box::new(move || {
+            stop_tx.send(()).unwrap();
+            dispatch::gate().wait_for_closing(1);
+            // A deterministic guest-refill simulation; the faulting vCPU cannot publish it.
+            // Do not kick: normal process_queue must yield instead of admitting this head.
+            refill_mem.write_obj(2u16, avail_idx).unwrap();
+        }));
+    });
+    assert!(dispatch::dispatch_slice(&mut events).unwrap() > 0);
+    super::super::tests::AFTER_QUEUE_POP.with_borrow(|hook| assert!(hook.is_none()));
     call(&budget, OP_LEAVE(), &mut 0u64).unwrap();
-    drop(hold);
     stopper.join().unwrap();
     assert!(dispatch::gate().is_closed());
+    {
+        let locked = block.lock().unwrap();
+        let Block::Virtio(device) = &*locked;
+        assert_eq!(device.metrics.queue_event_count.count(), 1);
+        assert_eq!(device.queues[0].next_avail.0, 1);
+    }
+    assert_eq!(driver.avail.idx.get(), 2);
+    assert_eq!(mem.read_obj::<u8>(second_status).unwrap(), 0xff);
+    println!("FC_RUNNING_HANDLER next_avail=1 avail_idx=2 second_status=0xff dispatch_closed=1");
     vmm.pause_vm().unwrap();
     assert_eq!(vmm.instance_info.state, VmState::Paused);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -310,6 +345,16 @@ fn memory_budget_running_vmm_pause_save_drop() {
     let mut data = vec![0; LEN as usize];
     mem.read_slice(&mut data, payload).unwrap();
     assert!(data.iter().all(|byte| *byte == 0x35));
+    let mut untouched = [0; 512];
+    mem.read_slice(&mut untouched, second_payload).unwrap();
+    assert_eq!(untouched, [0xa6; 512]);
+    assert_eq!(mem.read_obj::<u8>(second_status).unwrap(), 0xff);
+    let drained_queue = {
+        let locked = block.lock().unwrap();
+        let Block::Virtio(device) = &*locked;
+        assert_eq!(device.queues[0].next_avail.0, 1);
+        device.queues[0].save()
+    };
     call(&budget, OP_LEAVE(), &mut 0u64).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -367,9 +412,15 @@ fn memory_budget_running_vmm_pause_save_drop() {
     Snapshot::new(state).save(&mut encoded).unwrap();
     let decoded = Snapshot::<MicrovmState>::load(&mut encoded.as_slice()).unwrap();
     assert_eq!(decoded.data.vcpu_states[0].regs.rip, FAULT_RIP);
+    let crate::devices::virtio::block::persist::BlockState::Virtio(saved_block) =
+        &decoded.data.device_states.mmio_state.block_devices[0].device_state;
+    assert_eq!(saved_block.virtio_state.queues[0], drained_queue);
+    assert_eq!(driver.avail.idx.get(), 2);
+    assert_eq!(driver.used.idx.get(), 1);
+    assert_eq!(mem.read_obj::<u8>(second_status).unwrap(), 0xff);
     assert_eq!(mem.read_obj::<u8>(GuestAddress(TARGET)).unwrap(), 0x5a);
     println!(
-        "FC_RUNNING_VMSTATE bytes={} saved_rip={FAULT_RIP:#x} target=0x5a",
+        "FC_RUNNING_VMSTATE bytes={} saved_rip={FAULT_RIP:#x} target=0x5a saved_next_avail=1 avail_idx=2 used_idx=1 second_status=0xff",
         encoded.len()
     );
     assert_eq!(stats(&budget).spent, drained.spent);
@@ -392,7 +443,9 @@ fn memory_budget_running_vmm_pause_save_drop() {
     );
     assert_eq!(stats(&budget).spent, drained.spent);
     assert!(dispatch::gate().is_closed());
+    assert_eq!(driver.used.idx.get(), 1);
+    assert_eq!(mem.read_obj::<u8>(second_status).unwrap(), 0xff);
     println!(
-        "FC_RUNNING_VMM_PASS joined=1 target=0x5a ordinary={ordinary:?}; vmstate only, NO RAM export/durable capture"
+        "FC_RUNNING_VMM_PASS real_handler=1 joined=1 target=0x5a unadmitted=1 second_status=0xff ordinary={ordinary:?}; vmstate only, NO RAM export/durable capture"
     );
 }
