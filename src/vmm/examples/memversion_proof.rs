@@ -5,6 +5,7 @@
 //! Requires root, /dev/kvm, /dev/memversion_v1, procfs, devpts and the default release seccomp.
 //! The two jailed FCs get their own ptys; the driver's stdin need not be a tty.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -24,6 +25,9 @@ const RAM: u64 = 64 << 20;
 const WORKING_SET: u64 = 64 << 20;
 const MEMLOCK: u64 = RAM + WORKING_SET;
 const MEMLOCK_MARGIN: u64 = 1 << 20;
+// Exact bootstrap paging layout in arch/x86_64/regs.rs, not an allowance for arbitrary pages.
+const PAGE_TABLES: [(u64, &str); 3] = [(0x9000, "PML4"), (0xa000, "PDPT"), (0xb000, "PD")];
+const PFN_MASK: u64 = (1 << 55) - 1;
 const PATTERN: u64 = 0x400000;
 const TIMEOUT: Duration = Duration::from_secs(30);
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -282,6 +286,89 @@ fn dump_logs(work: &Path) {
                 }
             }
         }
+    }
+}
+
+struct ObservedPage {
+    entry: u64,
+    bytes: Vec<u8>,
+}
+
+fn page_changes(
+    stage: &str,
+    before: &BTreeMap<u64, ObservedPage>,
+    after: &BTreeMap<u64, ObservedPage>,
+) -> Vec<u64> {
+    let mut changed = Vec::new();
+    for (gpa, page) in after {
+        let old = before.get(gpa).map_or(0, |page| page.entry);
+        let became_exclusive = old & (1 << 56) == 0 && page.entry & (1 << 56) != 0;
+        let pfn_changed = old & PFN_MASK != page.entry & PFN_MASK;
+        if pfn_changed || became_exclusive {
+            let name = PAGE_TABLES
+                .iter()
+                .find(|(addr, _)| addr == gpa)
+                .map_or("unclassified", |(_, name)| *name);
+            println!(
+                "PAGE_CHANGE stage={stage} gpn={:#x} gpa={gpa:#x} before_pfn={:#x} after_pfn={:#x} became_exclusive={became_exclusive} name={name}",
+                gpa / 4096,
+                old & PFN_MASK,
+                page.entry & PFN_MASK
+            );
+            if pfn_changed {
+                changed.push(*gpa);
+            }
+        }
+        // Pagemap exclusive is mapping-count metadata, not proof that a version released
+        // ownership (killing FC-A can change it). The baseline version stays retained here.
+        if !pfn_changed {
+            assert_eq!(
+                before[gpa].bytes, page.bytes,
+                "retained version's PFN mutated in place"
+            );
+        }
+    }
+    for gpa in before.keys() {
+        assert!(
+            after.contains_key(gpa),
+            "resident page disappeared: {gpa:#x}"
+        );
+    }
+    println!("PAGE_CHANGE_SET stage={stage} gpas={changed:x?}");
+    changed
+}
+
+fn assert_paging_maintenance(
+    before: &BTreeMap<u64, ObservedPage>,
+    after: &BTreeMap<u64, ObservedPage>,
+    changed: &[u64],
+) {
+    for gpa in changed {
+        let (_, name) = PAGE_TABLES
+            .iter()
+            .find(|(addr, _)| addr == gpa)
+            .expect("unexplained page changed during read-only resume");
+        let old = &before[gpa].bytes;
+        let new = &after[gpa].bytes;
+        assert_eq!((old.len(), new.len()), (4096, 4096));
+        let mut differences = 0;
+        for (index, (old, new)) in old.chunks_exact(8).zip(new.chunks_exact(8)).enumerate() {
+            let old = u64::from_le_bytes(old.try_into().unwrap());
+            let new = u64::from_le_bytes(new.try_into().unwrap());
+            if old != new {
+                println!(
+                    "PAGE_TABLE_WORD name={name} gpa={:#x} before={old:#x} after={new:#x}",
+                    gpa + index as u64 * 8
+                );
+                differences += 1;
+            }
+            // Only hardware accessed/dirty bits may change. Other writes remain a finding.
+            assert_eq!(old & !0x60, new & !0x60, "unexplained page-table mutation");
+        }
+        println!(
+            "PAGING_MAINTENANCE name={name} gpa={gpa:#x} changed_words={differences} identical_bytes={}",
+            differences == 0
+        );
     }
 }
 
@@ -663,6 +750,28 @@ impl Vm {
             pfn
         })
     }
+
+    fn observe_pages(&self) -> BTreeMap<u64, ObservedPage> {
+        // Privileged oracle only: read pagemap first, then read only already-present pages.
+        // Reading untouched RAM through /proc/pid/mem would fault it in and invalidate the proof.
+        let map = File::open(format!("/proc/{}/pagemap", self.child.id())).unwrap();
+        let memory = File::open(format!("/proc/{}/mem", self.child.id())).unwrap();
+        let mut entries = vec![0; usize::try_from(RAM / 4096 * 8).unwrap()];
+        map.read_exact_at(&mut entries, BASE / 4096 * 8).unwrap();
+        let mut pages = BTreeMap::new();
+        for (index, bytes) in entries.chunks_exact(8).enumerate() {
+            let entry = u64::from_le_bytes(bytes.try_into().unwrap());
+            if entry & (1 << 63) == 0 {
+                continue;
+            }
+            assert_ne!(entry & PFN_MASK, 0, "privileged PFN oracle unavailable");
+            let gpa = index as u64 * 4096;
+            let mut bytes = vec![0; 4096];
+            memory.read_exact_at(&mut bytes, BASE + gpa).unwrap();
+            pages.insert(gpa, ObservedPage { entry, bytes });
+        }
+        pages
+    }
 }
 
 fn main() -> Result<()> {
@@ -713,17 +822,34 @@ fn main() -> Result<()> {
     b.resume();
     b.serial(Some(b'v'), "MVG VERIFIED")?;
     let (baseline, _bst, _) = b.capture(&device);
+    let baseline_pages = b.observe_pages();
     assert_eq!(ap, b.pfns(), "restore copied unwritten pattern pages");
     println!("SHARING same_pfn_pages=4 guest_verified=1 confined=1");
     a.stop();
     b.resume();
     b.serial(Some(b'v'), "MVG VERIFIED")?;
     println!("PARENT_DELETED child_verified=1");
+    b.request(MsgType::Quiesce, &[], &[]);
+    let read_only_pages = b.observe_pages();
+    let maintenance = page_changes("read-only-resume", &baseline_pages, &read_only_pages);
+    assert_paging_maintenance(&baseline_pages, &read_only_pages, &maintenance);
+    b.resume();
     b.serial(Some(b'w'), "MVG VERIFIED")?;
     let (deep, _dst, di) = b.capture(&device);
+    let deep_pages = b.observe_pages();
+    let changed = page_changes("deep-capture", &baseline_pages, &deep_pages);
+    assert_paging_maintenance(&baseline_pages, &deep_pages, &maintenance);
+    let mut expected = maintenance.clone();
+    expected.extend([PATTERN, PATTERN + 4096]);
+    expected.sort_unstable();
     assert_eq!(
-        di.new_pages, 2,
-        "baseline retains restore metadata; guest writes exactly two pages"
+        changed, expected,
+        "unexplained pages outside the two writes and observed paging maintenance"
+    );
+    assert_eq!(
+        di.new_pages,
+        u64::try_from(expected.len()).unwrap(),
+        "INFO new_pages must match the exact privileged oracle page set"
     );
     let bp = b.pfns();
     assert_ne!(bp[0], ap[0]);
@@ -735,7 +861,9 @@ fn main() -> Result<()> {
     b.serial(Some(b'v'), "MVG VERIFIED")?;
     b.stop();
     println!(
-        "MEMVERSION_FC_PASS jailed=2 seccomp=1 same_pfn=4 cow_pages=2 new_pages=2 replay_same=1 parent_delete=1 joined=2"
+        "MEMVERSION_FC_PASS jailed=2 seccomp=1 same_pfn=4 guest_cow_pages=2 maintenance_pages={} new_pages={} replay_same=1 parent_delete=1 joined=2",
+        maintenance.len(),
+        di.new_pages
     );
     Ok(())
 }
@@ -745,6 +873,31 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use vmm_sys_util::tempdir::TempDir;
+
+    #[test]
+    fn page_oracle_requires_named_pages_and_allows_only_accessed_dirty_bits() {
+        let page = |entry| ObservedPage {
+            entry,
+            bytes: vec![0; 4096],
+        };
+        let before = BTreeMap::from([(0x9000, page(1))]);
+        let mut after = BTreeMap::from([(0x9000, page(2))]);
+        after.get_mut(&0x9000).unwrap().bytes[0] = 0x60;
+        let changed = page_changes("test", &before, &after);
+        assert_eq!(changed, [0x9000]);
+        assert_paging_maintenance(&before, &after, &changed);
+        after.get_mut(&0x9000).unwrap().bytes[0] = 1;
+        assert!(
+            std::panic::catch_unwind(|| assert_paging_maintenance(&before, &after, &changed))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| assert_paging_maintenance(&before, &after, &[0x12000]))
+                .is_err()
+        );
+        let exclusive = BTreeMap::from([(0x9000, page(1 | (1 << 56)))]);
+        assert!(page_changes("mapping-count-only", &before, &exclusive).is_empty());
+    }
 
     #[test]
     #[ignore = "root required for the production listener ownership; no KVM required"]

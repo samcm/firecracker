@@ -278,7 +278,9 @@ impl KvmVcpu {
         // depending on the workload. For example, EINVAL is returned if kvm-clock is not
         // activated (e.g., no-kvmclock is specified in the guest kernel parameter).
         // https://elixir.bootlin.com/linux/v6.17.5/source/arch/x86/kvm/x86.c#L5736-L5737
-        if let Err(err) = self.fd.kvmclock_ctrl() {
+        if let Err(err) = self.fd.kvmclock_ctrl()
+            && err.errno() != libc::EINVAL
+        {
             METRICS.vcpu.kvmclock_ctrl_fails.inc();
             warn!("KVM_KVMCLOCK_CTRL call failed {}", err);
         }
