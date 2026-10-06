@@ -34,8 +34,8 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    Address, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
-    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
+    Address, AtomicBitmap, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap,
+    GuestMemoryRegion, GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -652,7 +652,7 @@ impl KvmVm {
     }
 
     /// Advisory, read-only query with a cooperative deadline. Never waits on bookkeeping locks;
-    /// checks the deadline between regions and every bitmap word. A kernel ioctl itself is not
+    /// checks the deadline between regions and bitmap chunks. A kernel ioctl itself is not
     /// preemptible by this userspace deadline. Manual dirty protection is mandatory at VM creation.
     pub fn free_summary_until(&self, deadline: Instant) -> Result<Vec<Vec<u64>>, VmError> {
         let check = || {
@@ -693,29 +693,57 @@ impl KvmVm {
                 .get_dirty_log(region.slot, u64_to_usize(region.len()))
                 .map_err(VmError::GetDirtyLog)?;
             check()?;
-            if kvm_bits.len() != returned.len() || record.reported.len() != returned.len() {
-                return Err(VmError::DirtyBitmapShape);
-            }
-            let host_writes = region.inner.bitmap().as_ref();
-            let mut words = Vec::with_capacity(record.reported.len());
-            for (index, &reported) in record.reported.iter().enumerate() {
-                check()?;
-                let mut word = reported & !returned[index] & !kvm_bits[index];
-                let mut remaining = word;
-                while remaining != 0 {
-                    let bit = remaining.trailing_zeros();
-                    remaining &= remaining - 1;
-                    let page = index * 64 + bit as usize;
-                    if host_writes.is_some_and(|bits| bits.is_bit_set(page)) {
-                        word &= !(1u64 << bit);
-                    }
-                }
-                words.push(word);
-            }
-            summary.push(words);
+            summary.push(Self::free_summary_words(
+                &record.reported,
+                returned,
+                &kvm_bits,
+                region.inner.bitmap().as_ref(),
+                deadline,
+            )?);
         }
         check()?;
         Ok(summary)
+    }
+
+    fn free_summary_words(
+        reported: &[u64],
+        returned: &[u64],
+        kvm_bits: &[u64],
+        host_writes: Option<&AtomicBitmap>,
+        deadline: Instant,
+    ) -> Result<Vec<u64>, VmError> {
+        if Instant::now() >= deadline {
+            return Err(VmError::FreeSummaryUnavailable);
+        }
+        if kvm_bits.len() != returned.len() || reported.len() != returned.len() {
+            return Err(VmError::DirtyBitmapShape);
+        }
+        // AtomicBitmap has no public word reader. Clone deep-copies its atomics; extracting
+        // the disposable copy (as in snapshot_dirty_log) NEVER resets the live host bitmap.
+        // This reads each live word once rather than once per reported page (up to 64 times).
+        let host_words = host_writes.map(|bits| bits.clone().get_and_reset());
+        if host_words
+            .as_ref()
+            .is_some_and(|bits| bits.len() != reported.len())
+        {
+            return Err(VmError::DirtyBitmapShape);
+        }
+        let mut words = Vec::with_capacity(reported.len());
+        for (index, &reported) in reported.iter().enumerate() {
+            if index % 256 == 0 && Instant::now() >= deadline {
+                return Err(VmError::FreeSummaryUnavailable);
+            }
+            words.push(
+                reported
+                    & !returned[index]
+                    & !kvm_bits[index]
+                    & !host_words.as_ref().map_or(0, |bits| bits[index]),
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err(VmError::FreeSummaryUnavailable);
+        }
+        Ok(words)
     }
 
     /// Register a list of new memory regions to this [`KvmVm`].
@@ -1342,6 +1370,133 @@ pub(crate) mod tests {
         ));
         drop(free);
         vm.free_summary().unwrap();
+    }
+
+    #[test]
+    fn test_free_summary_words_preserve_sources_and_refuse_expiry_or_shape() {
+        let host = AtomicBitmap::new(128 * 4096, 4096.try_into().unwrap());
+        host.set_addr_range(65 * 4096, 1);
+        let reported = [u64::MAX; 2];
+        let pending = [1, 0];
+        let kvm = [0, 1];
+        let deadline = || Instant::now() + Duration::from_secs(1);
+        let query = || {
+            KvmVm::free_summary_words(&reported, &pending, &kvm, Some(&host), deadline()).unwrap()
+        };
+        assert_eq!(query(), [!1, !3]);
+        host.set_addr_range(66 * 4096, 1);
+        assert_eq!(query(), [!1, !7]);
+        assert_eq!(query(), [!1, !7]);
+        assert!(host.is_bit_set(65) && host.is_bit_set(66));
+        assert_eq!(reported, [u64::MAX; 2]);
+        assert_eq!(pending, [1, 0]);
+        assert_eq!(kvm, [0, 1]);
+        assert_eq!(
+            KvmVm::free_summary_words(&reported, &pending, &kvm, None, deadline()).unwrap(),
+            [!1, !1]
+        );
+        assert!(matches!(
+            KvmVm::free_summary_words(&reported, &pending, &kvm, Some(&host), Instant::now()),
+            Err(VmError::FreeSummaryUnavailable)
+        ));
+        assert!(matches!(
+            KvmVm::free_summary_words(&reported, &[], &kvm, Some(&host), deadline()),
+            Err(VmError::DirtyBitmapShape)
+        ));
+        assert!(matches!(
+            KvmVm::free_summary_words(&[1], &[0], &[0], Some(&host), deadline()),
+            Err(VmError::DirtyBitmapShape)
+        ));
+    }
+
+    #[test]
+    fn test_free_summary_userspace_cost_8gib() {
+        // Only metadata is allocated, not 8 GiB of RAM. Compare the actual production
+        // helper with the previous per-page/per-word-clock loop. Release runs collect
+        // timings; ordinary debug CI still checks every result against the reference.
+        use std::hint::black_box;
+
+        fn cpu_nanos() -> u128 {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                // SAFETY: ts is a valid writable timespec, and this clock has no inputs.
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) },
+                0
+            );
+            u128::try_from(ts.tv_sec).unwrap() * 1_000_000_000 + u128::try_from(ts.tv_nsec).unwrap()
+        }
+
+        let host = AtomicBitmap::new(8usize << 30, 4096.try_into().unwrap());
+        let zero = vec![0u64; host.len().div_ceil(64)];
+        let samples = if cfg!(debug_assertions) { 1 } else { 40 };
+        for (name, reported) in [
+            ("all", vec![u64::MAX; zero.len()]),
+            (
+                "sparse",
+                (0..zero.len()).map(|i| u64::from(i % 16 == 0)).collect(),
+            ),
+            ("zero", zero.clone()),
+        ] {
+            let mut old_times = Vec::new();
+            let mut new_times = Vec::new();
+            let mut old_cpu = Vec::new();
+            let mut new_cpu = Vec::new();
+            for _ in 0..samples {
+                let cpu_start = cpu_nanos();
+                let start = Instant::now();
+                let deadline = start + Duration::from_secs(5);
+                let mut reference = Vec::with_capacity(reported.len());
+                for (index, &reported) in black_box(&reported).iter().enumerate() {
+                    assert!(Instant::now() < deadline);
+                    let mut word = reported & !zero[index] & !zero[index];
+                    let mut remaining = word;
+                    while remaining != 0 {
+                        let bit = remaining.trailing_zeros();
+                        remaining &= remaining - 1;
+                        if host.is_bit_set(index * 64 + bit as usize) {
+                            word &= !(1u64 << bit);
+                        }
+                    }
+                    reference.push(word);
+                }
+                black_box(&reference);
+                old_times.push(start.elapsed().as_micros());
+                old_cpu.push((cpu_nanos() - cpu_start) / 1000);
+                let cpu_start = cpu_nanos();
+                let start = Instant::now();
+                let words = KvmVm::free_summary_words(
+                    black_box(&reported),
+                    &zero,
+                    &zero,
+                    Some(&host),
+                    start + Duration::from_secs(5),
+                )
+                .unwrap();
+                black_box(&words);
+                new_times.push(start.elapsed().as_micros());
+                new_cpu.push((cpu_nanos() - cpu_start) / 1000);
+                assert_eq!(words, reference);
+            }
+            for (metric, mut times) in [
+                ("old_wall", old_times),
+                ("old_cpu", old_cpu),
+                ("new_wall", new_times),
+                ("new_cpu", new_cpu),
+            ] {
+                times.sort_unstable();
+                eprintln!(
+                    "FREE_SUMMARY_8GIB {name} samples={samples} {metric}_us[p50,p95,max]={:?}",
+                    [
+                        times[samples / 2],
+                        times[samples * 95 / 100],
+                        times[samples - 1]
+                    ],
+                );
+            }
+        }
     }
 
     #[test]

@@ -113,3 +113,34 @@ uses a fresh buffer each tick, never an abandoned writable buffer; exact request
 replays resend only the cached reply without reading or writing again. This adds
 no seccomp allowances: the capture thread already admits GET_DIRTY_LOG and pwrite64,
 and MADV_FREE remains denied on every VMM thread.
+
+### An 8 GiB summary scans words, not candidate pages
+
+The userspace scan checks its deadline every 256 words and after the last word.
+Host-write masks come from an independent deep copy of `AtomicBitmap`, using the
+same extraction pattern as `snapshot_dirty_log`: only the disposable copy is
+reset; live host/KVM/pending/reported state is untouched. Source-preservation and
+rewrite-between-query tests protect that distinction. CREATE is unchanged.
+
+Run `cargo test -p vmm --release --target x86_64-unknown-linux-musl --lib
+test_free_summary_userspace_cost_8gib -- --nocapture --test-threads=1` to compare
+the old per-page loop with the production word loop. It allocates only bitmap
+metadata for an 8 GiB guest (32768 words); sparse means 2048 candidate pages,
+and host/pending/KVM masks are empty. Each release run compares 40 results per
+case for equality and prints p50/p95/max wall and thread-CPU microseconds.
+
+On a 2.60 GHz Xeon orb, one musl release run measured:
+
+| Candidates | Old p50 wall/CPU (µs) | New p50 wall/CPU (µs) | New p95 wall/CPU (µs) | New max wall/CPU (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| All 2097152 | 2450/2451 | 532/533 | 579/579 | 621/622 |
+| Sparse 2048 | 835/836 | 528/529 | 567/573 | 593/594 |
+| Zero | 835/835 | 531/532 | 571/571 | 770/771 |
+
+These are observed userspace costs including mask copying and output allocation,
+not hard latency bounds or an end-to-end KVM measurement. A 1 ms scan allowance
+covers these samples, but a **5 ms initial wire budget** is recommended for
+scheduling, GET_DIRTY_LOG, descriptor checks and output writes. The former 2 ms
+budget cannot accommodate even the old all-free loop. The smallest sustainable
+end-to-end budget still needs measurement on a healthy production KVM host;
+the 250 ms wire cap and advisory timeout/refusal semantics are unchanged.
