@@ -4,8 +4,10 @@
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use utils::time::{ClockType, get_time_us};
 
@@ -199,6 +201,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Quiesce => (0, &[0]),
         MsgType::WriteVmstate => (0, &[1]),
         MsgType::Resume => (4, &[0]),
+        MsgType::FreeSummary => (8, &[1]),
         _ => return Err(ChannelError::Malformed),
     };
     if body_len != len || !counts.contains(&fd_count) {
@@ -288,7 +291,37 @@ impl CaptureService {
             MsgType::Quiesce => self.quiesce(request_id),
             MsgType::WriteVmstate => self.write_vmstate(incoming),
             MsgType::Resume => self.resume(request_id, protocol::parse_u32(&incoming.body)?),
+            MsgType::FreeSummary => self.free_summary(incoming),
             _ => Err(ChannelError::Malformed),
+        }
+    }
+
+    fn free_summary(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
+        let budget = protocol::parse_free_summary_budget(&incoming.body)?;
+        let deadline = Instant::now() + Duration::from_micros(budget);
+        let request_id = incoming.header.request_id;
+        let [fd] = <[_; 1]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+        let result = serve_free_summary(
+            BackendState::load(),
+            &File::from(fd),
+            &self.channel.regions,
+            deadline,
+            || {
+                // Never hold the VMM lock during bitmap reads or IO. A pressure pause must not
+                // wait behind an advisory scan. Busy/poisoned locks are advisory refusals too.
+                let vm = self
+                    .vmm
+                    .try_lock()
+                    .ok()
+                    .and_then(|vmm| vmm.kvm_vm().cloned())
+                    .ok_or(ErrorCode::FreeSummaryUnavailable)?;
+                vm.free_summary_until(deadline)
+                    .map_err(|_| ErrorCode::FreeSummaryUnavailable)
+            },
+        );
+        match result {
+            Ok(pages) => self.reply(request_id, MsgType::FreeSummaryDone, &pages.to_le_bytes()),
+            Err(code) => self.reject(request_id, code, MsgType::FreeSummary),
         }
     }
 
@@ -499,6 +532,88 @@ impl CaptureService {
             version,
         )
     }
+}
+
+/// Validate the entire output before scanning or writing. A failed/expired request may have
+/// partially filled its private buffer, but never reports success; the caller discards that file.
+fn serve_free_summary(
+    state: BackendState,
+    buffer: &File,
+    regions: &[protocol::RegionRecord],
+    deadline: Instant,
+    read: impl FnOnce() -> Result<Vec<Vec<u64>>, ErrorCode>,
+) -> Result<u64, ErrorCode> {
+    if state == BackendState::Quiesced {
+        return Err(ErrorCode::AlreadyQuiesced);
+    }
+    if state != BackendState::Ready {
+        return Err(ErrorCode::FreeSummaryUnavailable);
+    }
+    let check = || {
+        if Instant::now() >= deadline {
+            Err(ErrorCode::FreeSummaryUnavailable)
+        } else {
+            Ok(())
+        }
+    };
+    let mut bytes = 0u64;
+    for region in regions {
+        check()?;
+        if region.size == 0 || region.size % 4096 != 0 {
+            return Err(ErrorCode::FreeSummaryUnavailable);
+        }
+        bytes = bytes
+            .checked_add((region.size / 4096).div_ceil(64) * 8)
+            .filter(|&n| n <= protocol::MAX_FREE_SUMMARY_BYTES)
+            .ok_or(ErrorCode::FreeSummaryUnavailable)?;
+    }
+    validate_buffer_fd(buffer.as_raw_fd(), bytes)?;
+    check()?;
+    let summary = read()?;
+    check()?;
+    if summary.len() != regions.len() {
+        return Err(ErrorCode::FreeSummaryUnavailable);
+    }
+    for (words, region) in summary.iter().zip(regions) {
+        check()?;
+        if words.len() as u64 != (region.size / 4096).div_ceil(64) {
+            return Err(ErrorCode::FreeSummaryUnavailable);
+        }
+    }
+    let mut offset = 0;
+    let mut pages = 0u64;
+    for (words, region) in summary.iter().zip(regions) {
+        let tail = (region.size / 4096) % 64;
+        for (chunk_index, chunk) in words.chunks(512).enumerate() {
+            check()?;
+            let mut encoded = [0u8; 4096];
+            for (index, &word) in chunk.iter().enumerate() {
+                let last = chunk_index * 512 + index + 1 == words.len();
+                let word = if last && tail != 0 {
+                    word & ((1u64 << tail) - 1)
+                } else {
+                    word
+                };
+                pages += u64::from(word.count_ones());
+                encoded[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+            }
+            let mut remaining = &encoded[..chunk.len() * 8];
+            while !remaining.is_empty() {
+                check()?;
+                match buffer.write_at(remaining, offset) {
+                    Ok(0) => return Err(ErrorCode::FreeSummaryUnavailable),
+                    Ok(n) => {
+                        offset += n as u64;
+                        remaining = &remaining[n..];
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => return Err(ErrorCode::FreeSummaryUnavailable),
+                }
+            }
+        }
+    }
+    check()?;
+    Ok(pages)
 }
 
 fn accept_clone_destination(destination: RawFd, scratch: Option<RawFd>) -> Result<(), ErrorCode> {

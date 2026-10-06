@@ -220,8 +220,7 @@ pub fn compile_bpf(
 mod tests {
     use super::*;
 
-    #[test]
-    fn shipped_filters_trap_madv_free_on_every_thread() {
+    fn shipped_filters() -> BTreeMap<String, Vec<u64>> {
         let arch = std::env::consts::ARCH;
         let policy = format!(
             "{}/../../resources/seccomp/{arch}-unknown-linux-musl.json",
@@ -237,6 +236,12 @@ mod tests {
         output.read_to_end(&mut bytes).unwrap();
         let filters: BTreeMap<String, Vec<u64>> = bitcode::deserialize(&bytes).unwrap();
         assert_eq!(filters.len(), 3);
+        filters
+    }
+
+    #[test]
+    fn shipped_filters_trap_madv_free_on_every_thread() {
+        let filters = shipped_filters();
         for name in ["vmm", "vcpu", "api"] {
             let filter = &filters[name];
             // The kernel consumes advice as an int. High register bits must not bypass it.
@@ -246,6 +251,66 @@ mod tests {
         }
         // Positive control: the filter is argument-selective, not a blanket madvise denial.
         assert_advice_action(&filters["vmm"], libc::MADV_NOHUGEPAGE as u64, false);
+    }
+
+    #[test]
+    fn shipped_vmm_filter_allows_free_summary_syscalls() {
+        let filters = shipped_filters();
+        let filter = &filters["vmm"];
+        let prog = libc::sock_fprog {
+            len: u16::try_from(filter.len()).unwrap(),
+            filter: filter.as_ptr().cast::<libc::sock_filter>().cast_mut(),
+        };
+        // SAFETY: the child uses only libc syscalls then _exit, without unwinding or allocation.
+        unsafe {
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                let fd = libc::memfd_create(
+                    c"summary-filter".as_ptr(),
+                    libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                );
+                if fd < 0
+                    || libc::ftruncate(fd, 8) != 0
+                    || libc::fcntl(
+                        fd,
+                        libc::F_ADD_SEALS,
+                        libc::F_SEAL_GROW | libc::F_SEAL_SHRINK,
+                    ) != 0
+                    || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &prog)
+                        != 0
+                {
+                    libc::_exit(90);
+                }
+                let mut stat: libc::stat = std::mem::zeroed();
+                let mut fs: libc::statfs = std::mem::zeroed();
+                // Test the shipped musl syscall, even when this test itself uses glibc,
+                // whose fstat wrapper instead issues newfstatat (not in the musl policy).
+                if libc::syscall(libc::SYS_fstat, fd, &mut stat) != 0
+                    || libc::fstatfs(fd, &mut fs) != 0
+                    || libc::fcntl(fd, libc::F_GETFL) < 0
+                    || libc::fcntl(fd, libc::F_GET_SEALS) < 0
+                    || libc::pwrite(fd, [0u8; 8].as_ptr().cast(), 8, 0) != 8
+                {
+                    libc::_exit(91);
+                }
+                // Invalid fd is intentional: EBADF proves KVM_GET_DIRTY_LOG reached the kernel,
+                // without requiring /dev/kvm. A missing allowance would instead deliver SIGSYS.
+                let result = libc::ioctl(-1, 0x4010_ae42 as libc::c_ulong, std::ptr::null::<u8>());
+                libc::_exit(
+                    if result == -1 && *libc::__errno_location() == libc::EBADF {
+                        0
+                    } else {
+                        92
+                    },
+                );
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &mut status, 0), child);
+            assert!(libc::WIFEXITED(status), "status={status}");
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
     }
 
     fn assert_advice_action(filter: &[u64], advice: u64, trap: bool) {

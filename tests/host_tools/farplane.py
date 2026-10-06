@@ -38,7 +38,7 @@ MAGIC = 0x314D5046
 VERSION = 1
 MAX_DATAGRAM = 65536
 MAX_EXTENTS = 65536
-FEATURE_IDENTITY = "farplane/6"
+FEATURE_IDENTITY = "farplane/8"
 
 HEADER = struct.Struct("<IHHQIIQ")
 HELLO = struct.Struct("<IIHHI32s")
@@ -82,10 +82,10 @@ class Msg(IntEnum):
     RESUMED = 15
     ERROR = 16
     CAPTURE_BUFFERS_ARMED = 17
-    FREE_SUMMARY = 18
-    FREE_SUMMARY_DONE = 19
     REBASE = 20
     REBASED = 21
+    FREE_SUMMARY = 22
+    FREE_SUMMARY_DONE = 23
 
 
 class Err(IntEnum):
@@ -118,6 +118,7 @@ class Err(IntEnum):
     BAD_CLONE_DESTINATION = 25
     DISK_CLONE_FAILED = 26
     REBASE_FAILED = 27
+    FREE_SUMMARY_UNAVAILABLE = 28
 
 
 F_ADD_SEALS = 1033
@@ -1010,15 +1011,19 @@ class Pagemaster:
             raw,
         )
 
-    def free_summary(self):
-        """The reply, and the reported-free pages no capture holds and nothing wrote since."""
-        half = self.dirty_bitmap_bytes // 2
+    def free_summary(self, budget_micros=250000):
+        """The reply and all unchanged reported-free pages; failed buffers are discarded."""
+        size = sum(((r["size"] // 4096 + 63) // 64) * 8 for r in self.ready_regions)
         fd = sealed_memfd(
-            "farplane-free-summary", half, seals=BUFFER_SEALS, read_only=False
+            "farplane-free-summary", size, seals=BUFFER_SEALS, read_only=False
         )
         try:
-            reply = self.request(Msg.FREE_SUMMARY, fds=[fd])
-            raw = os.pread(fd, half, 0)
+            reply = self.request(
+                Msg.FREE_SUMMARY, body=struct.pack("<Q", budget_micros), fds=[fd]
+            )
+            if reply.error is not None:
+                return reply, None
+            raw = os.pread(fd, size, 0)
         finally:
             os.close(fd)
         return reply, DirtyBitmap(

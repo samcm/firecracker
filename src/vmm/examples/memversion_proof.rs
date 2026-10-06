@@ -524,7 +524,7 @@ impl Vm {
         let hello = protocol::recv_frame(&socket)?;
         assert_eq!(hello.header.msg(), MsgType::Hello);
         assert!(hello.fds.is_empty());
-        assert_eq!(&hello.body[16..26], b"farplane/7");
+        assert_eq!(&hello.body[16..48], &protocol::feature_identity_padded());
         assert_eq!(
             u16::from_le_bytes(hello.body[10..12].try_into()?),
             if restore_mode { 2 } else { 1 }

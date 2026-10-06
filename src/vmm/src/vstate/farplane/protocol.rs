@@ -25,7 +25,11 @@ pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this protocol, quiesce semantics and vmstate format. A warm image
 /// baked by another identity is refused rather than restored: the capture command order and the
 /// vmstate the epoch produces are part of what this string names.
-pub const FEATURE_IDENTITY: &str = "farplane/7";
+pub const FEATURE_IDENTITY: &str = "farplane/8";
+/// Maximum output of an advisory free summary, including per-region word padding.
+pub const MAX_FREE_SUMMARY_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum cooperative work budget for one advisory free summary.
+pub const MAX_FREE_SUMMARY_MICROS: u64 = 250_000;
 /// Size of one region record.
 pub const REGION_RECORD_LEN: usize = 16;
 /// Size of the region record reported by `backend_ready`.
@@ -75,14 +79,14 @@ pub enum MsgType {
     Error = 16,
     /// Firecracker confirms the capture buffers are armed.
     CaptureBuffersArmed = 17,
-    /// Pagemaster asks which reported-free pages no capture holds and nothing has written since.
-    FreeSummary = 18,
-    /// Firecracker confirms the summary was written into the descriptor the request carried.
-    FreeSummaryDone = 19,
     /// Pagemaster asks for unchanged private guest pages to be mapped from a generation instead.
     Rebase = 20,
     /// Firecracker reports what a `rebase` mapped.
     Rebased = 21,
+    /// Pagemaster requests an advisory free summary with a bounded work budget.
+    FreeSummary = 22,
+    /// Every bitmap word was written; the body is its LE u64 popcount, with no descriptors.
+    FreeSummaryDone = 23,
 }
 
 impl MsgType {
@@ -101,7 +105,9 @@ impl MsgType {
             15 => Some(Self::Resumed),
             16 => Some(Self::Error),
             17 => Some(Self::CaptureBuffersArmed),
-            // Reserved /6 tags must never be interpreted as /7 commands.
+            22 => Some(Self::FreeSummary),
+            23 => Some(Self::FreeSummaryDone),
+            // Reserved /6 tags, including 18-21, must never be interpreted as /8 commands.
             _ => None,
         }
     }
@@ -167,6 +173,8 @@ pub enum ErrorCode {
     DiskCloneFailed = 26,
     /// A `rebase` could not stop every guest-memory writer; the source was handed back unchanged.
     RebaseFailed = 27,
+    /// An advisory free summary was busy, expired, too large, or could not be read/written.
+    FreeSummaryUnavailable = 28,
 }
 
 /// Architecture Firecracker is running on.
@@ -527,6 +535,15 @@ pub fn parse_u32(body: &[u8]) -> Result<u32, ChannelError> {
     Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
 }
 
+/// Parses the bounded, nonzero microsecond budget of a FreeSummary request.
+pub fn parse_free_summary_budget(body: &[u8]) -> Result<u64, ChannelError> {
+    let budget = u64::from_le_bytes(body.try_into().map_err(|_| ChannelError::Malformed)?);
+    if !(1..=MAX_FREE_SUMMARY_MICROS).contains(&budget) {
+        return Err(ChannelError::Malformed);
+    }
+    Ok(budget)
+}
+
 /// Parsed `backing_plan` body.
 #[derive(Debug)]
 pub struct BackingPlanBody {
@@ -850,6 +867,9 @@ mod tests {
         assert_eq!(ErrorCode::BadCloneDestination as u32, 25);
         assert_eq!(ErrorCode::DiskCloneFailed as u32, 26);
         assert_eq!(ErrorCode::RebaseFailed as u32, 27);
+        assert_eq!(ErrorCode::FreeSummaryUnavailable as u32, 28);
+        assert_eq!(MsgType::FreeSummary as u16, 22);
+        assert_eq!(MsgType::FreeSummaryDone as u16, 23);
     }
 
     /// The `hello` frame is the only place the feature identity crosses to pagemaster, so its
@@ -876,6 +896,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/7");
+        assert_eq!(FEATURE_IDENTITY, "farplane/8");
     }
 }

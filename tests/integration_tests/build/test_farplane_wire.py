@@ -7,8 +7,11 @@ protocol. These tests need no microVM: they compare the fake against the Rust so
 against the frame fixture both languages decode.
 """
 
+import os
 import re
+import struct
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -44,7 +47,7 @@ def rust_enum(name):
 
 def test_feature_identity_agrees_with_rust():
     """The fake refuses a `hello` whose identity is not this one, so it has to match."""
-    assert fp.FEATURE_IDENTITY == "farplane/6"
+    assert fp.FEATURE_IDENTITY == "farplane/8"
     assert rust_constant("FEATURE_IDENTITY") == fp.FEATURE_IDENTITY
 
 
@@ -96,3 +99,38 @@ def test_message_types_agree_with_rust():
     rust = rust_enum("MsgType")
     fake = {member.name: int(member) for member in fp.Msg}
     assert fake == rust
+
+
+def test_free_summary_uses_geometry_budget_and_discards_failed_buffer():
+    """The /8 fake supplies one fresh bounded bitmap; failed contents never become credit."""
+    regions = [{"guest_addr": 0, "size": 65 * 4096}]
+    owned = []
+
+    def request(msg, body, fds):
+        assert msg == fp.Msg.FREE_SUMMARY == 22
+        assert body == struct.pack("<Q", 12345)
+        assert len(fds) == 1
+        fd = fds[0]
+        assert os.fstat(fd).st_size == 16
+        assert fp.seals_of(fd) & fp.BUFFER_SEALS == fp.BUFFER_SEALS
+        # Keep an independent reference so the next call must have a different inode.
+        owned.append(os.dup(fd))
+        os.pwrite(fd, struct.pack("<QQ", 0, 1), 0)
+        return fp.Reply(fp.Msg.FREE_SUMMARY_DONE, struct.pack("<Q", 1), [], None)
+
+    fake = SimpleNamespace(ready_regions=regions, request=request)
+    try:
+        _, bitmap = fp.Pagemaster.free_summary(fake, 12345)
+        assert bitmap.set_pages() == [64 * 4096]
+        _, bitmap = fp.Pagemaster.free_summary(fake, 12345)
+        assert bitmap.count() == 1
+        assert os.fstat(owned[0]).st_ino != os.fstat(owned[1]).st_ino
+        fake.request = lambda *args, **kwargs: fp.Reply(
+            fp.Msg.ERROR, b"", [], (fp.Err.FREE_SUMMARY_UNAVAILABLE, fp.Msg.FREE_SUMMARY)
+        )
+        reply, bitmap = fp.Pagemaster.free_summary(fake)
+        assert reply.error[0] == 28
+        assert bitmap is None
+    finally:
+        for fd in owned:
+            os.close(fd)

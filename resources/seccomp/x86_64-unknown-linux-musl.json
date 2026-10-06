@@ -531,7 +531,7 @@
             },
             {
                 "syscall": "ioctl",
-                "comment": "Used to harvest the guest dirty log during a capture",
+                "comment": "Read-only manual-protection dirty-log query for capture and bounded FreeSummary",
                 "args": [
                     {
                         "index": 1,
@@ -544,7 +544,7 @@
             },
             {
                 "syscall": "ioctl",
-                "comment": "Used to clear the guest dirty log after harvesting it during a capture",
+                "comment": "Used by free-page reporting and dirty-log retirement, never by FreeSummary",
                 "args": [
                     {
                         "index": 1,

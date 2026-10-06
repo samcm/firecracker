@@ -81,3 +81,35 @@ exclude advice 8; `shipped_filters_trap_madv_free_on_every_thread` installs the
 compiled native policy and verifies SIGSYS for vmm, vcpu and api, including advice
 with nonzero high register bits, plus an allowed NOHUGEPAGE control. Guest RAM is
 NOHUGEPAGE before first touch and pinned on fault; running guests never discard it.
+
+## Farplane/8 free summaries do not alter capture or the guard
+
+FreeSummary (22) carries one LE u64 budget of 1–250000 microseconds and one
+read-write, grow/shrink-sealed memfd. FreeSummaryDone (23) has one LE u64 popcount
+and no descriptors; tags 18–21 remain reserved. Each backend-ready region contributes
+ceil((size/4096)/64) LE u64 words in guest-address order. The full geometry-derived
+size is validated before any write, is capped at 4 MiB, and includes zero words
+and zeroed tail bits. The unchanged BackendReady tail and CREATE ABI are retained.
+
+The summary is **reported minus pending, live KVM and host writes**, not the legacy
+uncaptured subset. Pagemaster intersects it with its earlier source-only pagemap
+walk to determine ownership. Free reports clear their own KVM bits even before
+the first whole-slot harvest, so summaries must inspect live KVM bits regardless
+of the slot-wide `kvm_log_armed` marker.
+
+VM creation requires MANUAL_DIRTY_LOG_PROTECT2 with MANUAL_PROTECT_ENABLE and
+INITIALLY_SET; enable failure aborts startup. Thus GET_DIRTY_LOG is observational,
+not a fetch-and-clear. No summary closes dispatch, pauses or drains the guest,
+clears dirty evidence, changes mappings or residency, or creates a version.
+The capture thread clones the KVM VM under a VMM try-lock, then releases that
+guard before reading. Bookkeeping locks also use try-locks. Deadline checks occur
+between regions, within bitmap loops, and between bounded positional writes.
+An in-flight kernel syscall is not preempted by this cooperative deadline.
+
+Quiesced queries return AlreadyQuiesced; busy, expired, oversized or failed reads
+and writes return advisory FreeSummaryUnavailable (28), not channel failure.
+Partial output is never reported successful and must be discarded. Pagemaster
+uses a fresh buffer each tick, never an abandoned writable buffer; exact request-ID
+replays resend only the cached reply without reading or writing again. This adds
+no seccomp allowances: the capture thread already admits GET_DIRTY_LOG and pwrite64,
+and MADV_FREE remains denied on every VMM thread.

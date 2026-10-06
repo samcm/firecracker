@@ -570,3 +570,47 @@ fn oversized_datagram_arriving_truncated_is_rejected() {
         Err(ChannelError::Malformed | ChannelError::Truncated)
     ));
 }
+
+#[test]
+fn free_summary_v8_wire_budget_and_descriptor_roundtrip() {
+    let (tx, rx) = seqpacket_pair();
+    let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
+    for budget in [1u64, protocol::MAX_FREE_SUMMARY_MICROS] {
+        protocol::send_frame(
+            &tx,
+            MsgType::FreeSummary,
+            budget,
+            &budget.to_le_bytes(),
+            &[file.as_file().as_raw_fd()],
+        )
+        .unwrap();
+        let request = protocol::recv_frame(&rx).unwrap();
+        assert_eq!(request.header.msg_type, 22);
+        assert_eq!(request.fds.len(), 1);
+        assert_eq!(
+            protocol::parse_free_summary_budget(&request.body).unwrap(),
+            budget
+        );
+        protocol::send_frame(
+            &rx,
+            MsgType::FreeSummaryDone,
+            budget,
+            &65u64.to_le_bytes(),
+            &[],
+        )
+        .unwrap();
+        let reply = protocol::recv_frame(&tx).unwrap();
+        assert_eq!(reply.header.msg_type, 23);
+        assert_eq!(reply.body, 65u64.to_le_bytes());
+        assert!(reply.fds.is_empty());
+    }
+    for budget in [0u64, protocol::MAX_FREE_SUMMARY_MICROS + 1, u64::MAX] {
+        assert!(matches!(
+            protocol::parse_free_summary_budget(&budget.to_le_bytes()),
+            Err(ChannelError::Malformed)
+        ));
+    }
+    for len in [0, 7, 9, 16] {
+        protocol::parse_free_summary_budget(&vec![1; len]).unwrap_err();
+    }
+}

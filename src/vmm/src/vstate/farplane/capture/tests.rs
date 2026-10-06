@@ -8,7 +8,8 @@ use super::*;
 
 fn memfd(name: &std::ffi::CStr, size: u64) -> OwnedFd {
     // SAFETY: name is NUL terminated and outlives the call.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     assert!(fd >= 0);
     // SAFETY: this newly created descriptor has no other owner.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -253,12 +254,13 @@ fn exact_command_checks_descriptor_identity_order_message_and_body() {
 }
 
 #[test]
-fn descriptor_counts_and_bodies_match_v7() {
+fn descriptor_counts_and_bodies_match_v8() {
     for (msg, len, counts) in [
         (MsgType::CaptureBuffers, 0, vec![1, 2]),
         (MsgType::WriteVmstate, 0, vec![1]),
         (MsgType::Quiesce, 0, vec![0]),
         (MsgType::Resume, 4, vec![0]),
+        (MsgType::FreeSummary, 8, vec![1]),
     ] {
         for count in 0..=4 {
             assert_eq!(
@@ -407,4 +409,366 @@ fn the_scratch_clone_reproduces_the_disk_and_reports_its_duration() {
 #[test]
 fn the_clone_request_is_the_number_the_seccomp_policies_admit() {
     assert_eq!(libc::FICLONE, 0x4004_9409);
+}
+
+fn summary_buffer(size: u64) -> File {
+    let fd = memfd(c"summary", size);
+    assert_eq!(
+        // SAFETY: we own this memfd; only its size is sealed so the query can fill it.
+        unsafe {
+            libc::fcntl(
+                fd.as_raw_fd(),
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_GROW | libc::F_SEAL_SHRINK,
+            )
+        },
+        0
+    );
+    File::from(fd)
+}
+
+fn summary_regions() -> [protocol::RegionRecord; 2] {
+    [
+        protocol::RegionRecord {
+            guest_addr: 0,
+            size: 65 * 4096,
+        },
+        protocol::RegionRecord {
+            guest_addr: 0x1_0000_0000,
+            size: 4096,
+        },
+    ]
+}
+
+fn summary_deadline() -> Instant {
+    Instant::now() + Duration::from_micros(protocol::MAX_FREE_SUMMARY_MICROS)
+}
+
+#[test]
+fn free_summary_writes_every_word_including_zeros_and_masks_region_tails() {
+    let file = summary_buffer(32);
+    file.write_all_at(&[0xff; 32], 0).unwrap();
+    assert_eq!(
+        serve_free_summary(
+            BackendState::Ready,
+            &file,
+            &summary_regions(),
+            summary_deadline(),
+            || Ok(vec![vec![0, u64::MAX], vec![1]])
+        ),
+        Ok(2)
+    );
+    let mut bytes = [0; 32];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    let expected: Vec<u8> = [0u64, 1, 1, u64::MAX]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect();
+    assert_eq!(bytes.as_slice(), expected);
+}
+
+#[test]
+fn free_summary_rejects_short_unsealed_nonmemfd_and_readonly_before_reading() {
+    let regions = summary_regions();
+    let short = summary_buffer(23);
+    let unsealed = File::from(memfd(c"unsealed", 24));
+    let ordinary = TempFile::new().unwrap().into_file();
+    let sealed = summary_buffer(24);
+    let readonly = File::open(format!("/proc/self/fd/{}", sealed.as_raw_fd())).unwrap();
+    for (file, code) in [
+        (&short, ErrorCode::BufferTooSmall),
+        (&unsealed, ErrorCode::FdNotSealed),
+        (&ordinary, ErrorCode::FdNotMemfd),
+        (&readonly, ErrorCode::FdNotSealed),
+    ] {
+        assert_eq!(
+            serve_free_summary(
+                BackendState::Ready,
+                file,
+                &regions,
+                summary_deadline(),
+                || panic!("invalid output must not read KVM")
+            ),
+            Err(code)
+        );
+    }
+}
+
+#[test]
+fn free_summary_caps_geometry_before_reading_and_accepts_exact_limit() {
+    let file = summary_buffer(protocol::MAX_FREE_SUMMARY_BYTES);
+    let mut region = protocol::RegionRecord {
+        guest_addr: 0,
+        size: protocol::MAX_FREE_SUMMARY_BYTES * 8 * 4096,
+    };
+    assert_eq!(
+        serve_free_summary(
+            BackendState::Ready,
+            &file,
+            &[region],
+            summary_deadline(),
+            || Ok(vec![vec![
+                0;
+                u64_to_usize(protocol::MAX_FREE_SUMMARY_BYTES) / 8
+            ]])
+        ),
+        Ok(0)
+    );
+    region.size += 4096;
+    assert_eq!(
+        serve_free_summary(
+            BackendState::Ready,
+            &file,
+            &[region],
+            summary_deadline(),
+            || panic!("over-cap geometry must not read")
+        ),
+        Err(ErrorCode::FreeSummaryUnavailable)
+    );
+    region.size = u64::MAX;
+    assert_eq!(
+        serve_free_summary(
+            BackendState::Ready,
+            &file,
+            &[region],
+            summary_deadline(),
+            || panic!("invalid geometry must not read")
+        ),
+        Err(ErrorCode::FreeSummaryUnavailable)
+    );
+}
+
+#[test]
+fn free_summary_busy_quiesced_expired_and_read_failures_are_advisory() {
+    let file = summary_buffer(24);
+    for (state, code) in [
+        (BackendState::Quiesced, ErrorCode::AlreadyQuiesced),
+        (BackendState::Registered, ErrorCode::FreeSummaryUnavailable),
+    ] {
+        assert_eq!(
+            serve_free_summary(
+                state,
+                &file,
+                &summary_regions(),
+                summary_deadline(),
+                || panic!("unavailable backend must not read")
+            ),
+            Err(code)
+        );
+    }
+    assert_eq!(
+        serve_free_summary(
+            BackendState::Ready,
+            &file,
+            &summary_regions(),
+            Instant::now(),
+            || panic!("expired request must not read")
+        ),
+        Err(ErrorCode::FreeSummaryUnavailable)
+    );
+    assert_eq!(
+        serve_free_summary(
+            BackendState::Ready,
+            &file,
+            &summary_regions(),
+            summary_deadline(),
+            || Err(ErrorCode::FreeSummaryUnavailable)
+        ),
+        Err(ErrorCode::FreeSummaryUnavailable)
+    );
+    // Read overruns the deadline: no successful reply and not even a first output word.
+    file.write_all_at(&[0xff; 24], 0).unwrap();
+    let deadline = Instant::now() + Duration::from_millis(1);
+    assert_eq!(
+        serve_free_summary(
+            BackendState::Ready,
+            &file,
+            &summary_regions(),
+            deadline,
+            || {
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(vec![vec![0, 0], vec![0]])
+            }
+        ),
+        Err(ErrorCode::FreeSummaryUnavailable)
+    );
+    let mut bytes = [0; 24];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(bytes, [0xff; 24]);
+    assert_eq!(
+        serve_free_summary(
+            BackendState::Ready,
+            &file,
+            &summary_regions(),
+            summary_deadline(),
+            || Ok(vec![vec![0], vec![0]])
+        ),
+        Err(ErrorCode::FreeSummaryUnavailable)
+    );
+    // A late seal makes positional IO fail: still an advisory refusal, never partial success.
+    assert_eq!(
+        serve_free_summary(
+            BackendState::Ready,
+            &file,
+            &summary_regions(),
+            summary_deadline(),
+            || {
+                assert_eq!(
+                    // SAFETY: this test owns the buffer and intentionally withdraws write access.
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_WRITE) },
+                    0
+                );
+                Ok(vec![vec![0, 0], vec![0]])
+            }
+        ),
+        Err(ErrorCode::FreeSummaryUnavailable)
+    );
+}
+
+#[test]
+fn free_summary_exact_replay_never_rewrites_the_buffer() {
+    let file = summary_buffer(24);
+    let fd: OwnedFd = file.try_clone().unwrap().into();
+    let body = protocol::MAX_FREE_SUMMARY_MICROS.to_le_bytes();
+    let key = CommandKey::of(MsgType::FreeSummary, &body, &[fd]);
+    let count = serve_free_summary(
+        BackendState::Ready,
+        &file,
+        &summary_regions(),
+        summary_deadline(),
+        || Ok(vec![vec![0, 1], vec![0]]),
+    )
+    .unwrap();
+    let mut replies = ReplyCache::default();
+    replies.record(
+        1,
+        key.clone(),
+        MsgType::FreeSummaryDone,
+        count.to_le_bytes().to_vec(),
+        None,
+    );
+    file.write_all_at(&[0xa5; 24], 0).unwrap();
+    let FrameDisposition::Replay(msg, body, None) = replies.disposition(1, &key) else {
+        panic!("not replayed")
+    };
+    let (tx, rx) = UnixStream::pair().unwrap();
+    send_reply(&tx, msg, 1, &body, None).unwrap();
+    let reply = protocol::recv_frame(&rx).unwrap();
+    assert_eq!(reply.header.msg(), MsgType::FreeSummaryDone);
+    assert_eq!(reply.body, 1u64.to_le_bytes());
+    assert!(reply.fds.is_empty());
+    let mut bytes = [0; 24];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(bytes, [0xa5; 24]);
+}
+
+/// Uses the real command dispatcher and KVM but no guest image. Like the release lane, run the
+/// suite with --test-threads=1: backend state and the dispatch gate belong to the whole process.
+#[test]
+fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
+    use vm_memory::GuestAddress;
+
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("SKIP: real capture dispatcher requires /dev/kvm");
+        return;
+    }
+    let vmm = Arc::new(Mutex::new(crate::builder::tests::default_vmm()));
+    let vm = vmm.lock().unwrap().kvm_vm().unwrap().clone();
+    vm.baseline_dirty_log().unwrap();
+    vm.report_free(GuestAddress(64 * 4096), 64 * 4096).unwrap();
+    let (sock, peer) = UnixStream::pair().unwrap();
+    let mut service = CaptureService {
+        channel: MemoryChannel {
+            sock,
+            regions: vec![protocol::RegionRecord {
+                guest_addr: 0,
+                size: 128 * 1024 * 1024,
+            }],
+        },
+        vmm: vmm.clone(),
+        vm_info: VmInfo::default(),
+        buffers: None,
+        order: EpochOrder::default(),
+        replies: ReplyCache::default(),
+        pending: None,
+    };
+    let file = summary_buffer(4096);
+    let budget = protocol::MAX_FREE_SUMMARY_MICROS.to_le_bytes();
+    let previous_state = BackendState::load();
+    BackendState::Ready.store();
+    let request = |service: &mut CaptureService, msg, id, body: &[u8], fds: &[RawFd]| {
+        protocol::send_frame(&peer, msg, id, body, fds).unwrap();
+        service.serve_one().unwrap();
+        protocol::recv_frame(&peer).unwrap()
+    };
+    let reply = request(
+        &mut service,
+        MsgType::FreeSummary,
+        1,
+        &budget,
+        &[file.as_raw_fd()],
+    );
+    assert_eq!(reply.header.msg(), MsgType::FreeSummaryDone);
+    assert_eq!(reply.body, 64u64.to_le_bytes());
+    assert!(reply.fds.is_empty());
+    file.write_all_at(&[0xa5; 4096], 0).unwrap();
+    let replay = request(
+        &mut service,
+        MsgType::FreeSummary,
+        1,
+        &budget,
+        &[file.as_raw_fd()],
+    );
+    assert_eq!(replay.body, reply.body);
+    let mut bytes = [0; 4096];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(bytes, [0xa5; 4096]);
+    let guard = vmm.lock().unwrap();
+    let busy = request(
+        &mut service,
+        MsgType::FreeSummary,
+        2,
+        &budget,
+        &[file.as_raw_fd()],
+    );
+    assert_eq!(
+        busy.body[..4],
+        (ErrorCode::FreeSummaryUnavailable as u32).to_le_bytes()
+    );
+    drop(guard);
+    let paused = request(&mut service, MsgType::Quiesce, 3, &[], &[]);
+    assert_eq!(paused.header.msg(), MsgType::Quiesced);
+    let refused = request(
+        &mut service,
+        MsgType::FreeSummary,
+        4,
+        &budget,
+        &[file.as_raw_fd()],
+    );
+    assert_eq!(
+        refused.body[..4],
+        (ErrorCode::AlreadyQuiesced as u32).to_le_bytes()
+    );
+    let resumed = request(&mut service, MsgType::Resume, 5, &0u32.to_le_bytes(), &[]);
+    assert_eq!(resumed.header.msg(), MsgType::Resumed);
+    let after = request(
+        &mut service,
+        MsgType::FreeSummary,
+        6,
+        &budget,
+        &[file.as_raw_fd()],
+    );
+    assert_eq!(after.header.msg(), MsgType::FreeSummaryDone);
+    assert_eq!(after.body, 64u64.to_le_bytes());
+    assert_eq!(BackendState::load(), BackendState::Ready);
+    assert!(!dispatch::gate().is_closed());
+    for (id, body, fds) in [
+        (7, vec![0; 7], vec![file.as_raw_fd()]),
+        (8, budget.to_vec(), vec![]),
+        (9, 0u64.to_le_bytes().to_vec(), vec![file.as_raw_fd()]),
+    ] {
+        protocol::send_frame(&peer, MsgType::FreeSummary, id, &body, &fds).unwrap();
+        assert!(matches!(service.serve_one(), Err(ChannelError::Malformed)));
+    }
+    previous_state.store();
 }

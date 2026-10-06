@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
@@ -145,6 +146,8 @@ pub enum VmError {
     ManualDirtyLogProtect(kvm_ioctls::Error),
     /// Harvested bitmap does not match the guest geometry
     DirtyBitmapShape,
+    /// Advisory free summary is busy, expired, or exceeds its bounded bitmap capacity
+    FreeSummaryUnavailable,
     /// ResourceAllocator error: {0}
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
@@ -635,52 +638,83 @@ impl KvmVm {
         Ok(keep)
     }
 
-    /// The uncaptured pages the guest has not written since it reported them, per region in
-    /// ascending guest address order. Reading the log neither clears nor re-protects it.
+    /// All reported-free pages the guest has not written since reporting, per region in ascending
+    /// guest address order. Pagemaster determines retained-version ownership separately. Reading
+    /// the log neither clears nor re-protects it and does not change capture bookkeeping.
     ///
-    /// Before a slot's first clear its KVM bits are the initial all-dirty state, so a rewrite
-    /// there shows only through the host and returned bits.
+    /// A report clears its own pages even before the slot's first full harvest. Always inspect
+    /// live KVM bits: skipping them until `kvm_log_armed` would credit an early guest rewrite.
     pub fn free_summary(&self) -> Result<Vec<Vec<u64>>, VmError> {
-        let pending = self.pending_dirty_union();
-        let free = self.free_pages();
+        self.free_summary_until(
+            Instant::now()
+                + Duration::from_micros(crate::vstate::farplane::protocol::MAX_FREE_SUMMARY_MICROS),
+        )
+    }
+
+    /// Advisory, read-only query with a cooperative deadline. Never waits on bookkeeping locks;
+    /// checks the deadline between regions and every bitmap word. A kernel ioctl itself is not
+    /// preemptible by this userspace deadline. Manual dirty protection is mandatory at VM creation.
+    pub fn free_summary_until(&self, deadline: Instant) -> Result<Vec<Vec<u64>>, VmError> {
+        let check = || {
+            if Instant::now() >= deadline {
+                Err(VmError::FreeSummaryUnavailable)
+            } else {
+                Ok(())
+            }
+        };
+        let mut bytes = 0u64;
+        for region in self.guest_memory().iter() {
+            check()?;
+            bytes = bytes
+                .checked_add((region.len() / 4096).div_ceil(64) * 8)
+                .filter(|&n| n <= crate::vstate::farplane::protocol::MAX_FREE_SUMMARY_BYTES)
+                .ok_or(VmError::FreeSummaryUnavailable)?;
+        }
         let mut summary = Vec::with_capacity(self.guest_memory().num_regions());
         for region in self.guest_memory().iter() {
+            check()?;
+            let pending = self
+                .common
+                .pending_dirty_union
+                .try_lock()
+                .map_err(|_| VmError::FreeSummaryUnavailable)?;
+            let free = self
+                .common
+                .free_pages
+                .try_lock()
+                .map_err(|_| VmError::FreeSummaryUnavailable)?;
             let (Some(returned), Some(record)) =
                 (pending.get(&region.slot), free.get(&region.slot))
             else {
                 return Err(VmError::DirtyBitmapShape);
             };
-            let kvm_bits = if record.kvm_log_armed {
-                let bits = self
-                    .fd()
-                    .get_dirty_log(region.slot, u64_to_usize(region.len()))
-                    .map_err(VmError::GetDirtyLog)?;
-                if bits.len() != returned.len() {
-                    return Err(VmError::DirtyBitmapShape);
-                }
-                Some(bits)
-            } else {
-                None
-            };
+            let kvm_bits = self
+                .fd()
+                .get_dirty_log(region.slot, u64_to_usize(region.len()))
+                .map_err(VmError::GetDirtyLog)?;
+            check()?;
+            if kvm_bits.len() != returned.len() || record.reported.len() != returned.len() {
+                return Err(VmError::DirtyBitmapShape);
+            }
             let host_writes = region.inner.bitmap().as_ref();
-            let mut words = record.uncaptured.clone();
-            for (index, word) in words.iter_mut().enumerate() {
-                *word &= !returned[index];
-                if let Some(bits) = &kvm_bits {
-                    *word &= !bits[index];
-                }
-                let mut remaining = *word;
+            let mut words = Vec::with_capacity(record.reported.len());
+            for (index, &reported) in record.reported.iter().enumerate() {
+                check()?;
+                let mut word = reported & !returned[index] & !kvm_bits[index];
+                let mut remaining = word;
                 while remaining != 0 {
                     let bit = remaining.trailing_zeros();
                     remaining &= remaining - 1;
                     let page = index * 64 + bit as usize;
                     if host_writes.is_some_and(|bits| bits.is_bit_set(page)) {
-                        *word &= !(1u64 << bit);
+                        word &= !(1u64 << bit);
                     }
                 }
+                words.push(word);
             }
             summary.push(words);
         }
+        check()?;
         Ok(summary)
     }
 
@@ -1196,7 +1230,11 @@ pub(crate) mod tests {
         vm.guest_memory()
             .mark_dirty(addr(65), u64_to_usize(page_size));
         assert_eq!(vm.report_free(addr(64), 64 * page_size).unwrap(), 64);
-        assert_eq!(set_pages(&vm.free_summary().unwrap()[0]), vec![65]);
+        // Include clean, already-captured reports too; ownership is a pagemap intersection.
+        assert_eq!(
+            set_pages(&vm.free_summary().unwrap()[0]),
+            (64..128).collect::<Vec<_>>()
+        );
 
         // Writes after the report take pages back: the summary drops them at once, and the
         // harvest that reports them retires them from the free set.
@@ -1204,7 +1242,8 @@ pub(crate) mod tests {
             .mark_dirty(addr(65), u64_to_usize(page_size));
         vm.guest_memory()
             .mark_dirty(addr(66), u64_to_usize(page_size));
-        assert!(set_pages(&vm.free_summary().unwrap()[0]).is_empty());
+        let unchanged = std::iter::once(64).chain(67..128).collect::<Vec<_>>();
+        assert_eq!(set_pages(&vm.free_summary().unwrap()[0]), unchanged);
         let snapshot = vm.snapshot_dirty_log().unwrap();
         assert_eq!(set_pages(&snapshot[0]), vec![65, 66]);
         vm.clear_dirty_log(&snapshot).unwrap();
@@ -1212,7 +1251,97 @@ pub(crate) mod tests {
             set_pages(&vm.snapshot_free_log().unwrap()[0]),
             std::iter::once(64).chain(67..128).collect::<Vec<_>>()
         );
-        assert!(set_pages(&vm.free_summary().unwrap()[0]).is_empty());
+        assert_eq!(set_pages(&vm.free_summary().unwrap()[0]), unchanged);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_free_summary_excludes_guest_rewrites_between_queries() {
+        use vm_memory::Bytes;
+
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("SKIP: guest rewrite proof requires /dev/kvm");
+            return;
+        }
+        for after_harvest in [false, true] {
+            let vm = setup_vm_with_memory(128 * 4096);
+            // Real-mode guest writes GPA 0x40000 (page 64), then halts. This bypasses the
+            // host bitmap: only KVM can tell the summary about this write.
+            vm.guest_memory()
+                .write_slice(
+                    &[
+                        0xb8, 0x00, 0x40, 0x8e, 0xd8, 0xc6, 0x06, 0x00, 0x00, 0xa5, 0xf4,
+                    ],
+                    GuestAddress(0x1000),
+                )
+                .unwrap();
+            let mut vcpu = vm.fd().create_vcpu(0).unwrap();
+            let mut sregs = vcpu.get_sregs().unwrap();
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            vcpu.set_sregs(&sregs).unwrap();
+            vcpu.set_regs(&kvm_bindings::kvm_regs {
+                rip: 0x1000,
+                rflags: 2,
+                ..Default::default()
+            })
+            .unwrap();
+            if after_harvest {
+                let dirty = vm.snapshot_dirty_log().unwrap();
+                vm.clear_dirty_log(&dirty).unwrap();
+            }
+            vm.guest_memory()
+                .mark_dirty(GuestAddress(64 * 4096), 3 * 4096);
+            assert_eq!(
+                vm.report_free(GuestAddress(64 * 4096), 64 * 4096).unwrap(),
+                64
+            );
+            assert_eq!(vm.free_pages()[&0].kvm_log_armed, after_harvest);
+            let first = set_pages(&vm.free_summary().unwrap()[0]);
+            assert!(first.contains(&64) && first.contains(&65) && first.contains(&66));
+            assert!(matches!(vcpu.run().unwrap(), kvm_ioctls::VcpuExit::Hlt));
+            let second = set_pages(&vm.free_summary().unwrap()[0]);
+            assert!(!second.contains(&64), "after_harvest={after_harvest}");
+            assert!(second.contains(&65));
+            // A second GET must not clear the rewrite evidence and resurrect the credit.
+            assert_eq!(set_pages(&vm.free_summary().unwrap()[0]), second);
+            vm.guest_memory().mark_dirty(GuestAddress(65 * 4096), 1);
+            vm.union_dirty_log(&[vec![0, 1 << 2]]).unwrap();
+            let last = set_pages(&vm.free_summary().unwrap()[0]);
+            assert!(!last.contains(&64) && !last.contains(&65) && !last.contains(&66));
+            let dirty = vm.snapshot_dirty_log().unwrap();
+            assert_eq!(
+                dirty[0][1] & 7,
+                7,
+                "summary must not consume dirty evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn test_free_summary_deadline_and_busy_bookkeeping_refuse_without_waiting() {
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("SKIP: bookkeeping contention proof requires /dev/kvm");
+            return;
+        }
+        let vm = setup_vm_with_memory(128 * 4096);
+        assert!(matches!(
+            vm.free_summary_until(Instant::now()),
+            Err(VmError::FreeSummaryUnavailable)
+        ));
+        let pending = vm.pending_dirty_union();
+        assert!(matches!(
+            vm.free_summary(),
+            Err(VmError::FreeSummaryUnavailable)
+        ));
+        drop(pending);
+        let free = vm.free_pages();
+        assert!(matches!(
+            vm.free_summary(),
+            Err(VmError::FreeSummaryUnavailable)
+        ));
+        drop(free);
+        vm.free_summary().unwrap();
     }
 
     #[test]
