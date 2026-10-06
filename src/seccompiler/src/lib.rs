@@ -297,7 +297,7 @@ mod tests {
                 }
                 // Invalid fd is intentional: EBADF proves KVM_GET_DIRTY_LOG reached the kernel,
                 // without requiring /dev/kvm. A missing allowance would instead deliver SIGSYS.
-                let result = libc::ioctl(-1, 0x4010_ae42 as libc::c_ulong, std::ptr::null::<u8>());
+                let result = libc::ioctl(-1, 0x4010_ae42, std::ptr::null::<u8>());
                 libc::_exit(
                     if result == -1 && *libc::__errno_location() == libc::EBADF {
                         0
