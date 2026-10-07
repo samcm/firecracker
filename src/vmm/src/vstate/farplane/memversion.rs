@@ -408,7 +408,8 @@ const MV_MAP_PRIVATE: u32 = 1;
 const MV_MAP_LAZY: u32 = 4;
 /// Cleared once a kernel refuses MV_MAP_LAZY, so later regions map eagerly
 /// without another refused ioctl.
-static LAZY_IMPORT: AtomicBool = AtomicBool::new(true);
+// Research variant for the lazy/eager A/B: import eagerly, as a kernel without MV_MAP_LAZY.
+static LAZY_IMPORT: AtomicBool = AtomicBool::new(false);
 
 fn map_with(version: BorrowedFd<'_>, region: u32, addr: u64, flags: u32) -> io::Result<()> {
     let request = Map {
