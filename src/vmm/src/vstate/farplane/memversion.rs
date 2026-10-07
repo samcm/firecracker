@@ -9,7 +9,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use vmm_sys_util::ioctl::{ioctl, ioctl_with_mut_ref, ioctl_with_ref};
-use vmm_sys_util::{ioctl_io_nr, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr};
+use vmm_sys_util::{ioctl_io_nr, ioctl_iow_nr, ioctl_iowr_nr};
 
 use super::protocol::RegionRecord;
 
@@ -466,6 +466,12 @@ pub(crate) struct TrackInfo {
     /// Pages written since the standing version: what the next fold copies.
     pub dirty_pages: u64,
     pub standing_id: u64,
+    /// In: MV_TRACK_INFO_RETAINED to also count retained_pages.
+    pub flags: u32,
+    pub reserved: u32,
+    /// Pages the standing chain maps that this process no longer maps
+    /// (diagnostic: a background walk of the chain).
+    pub retained_pages: u64,
 }
 
 /// A version's v2 description: its place in a chain and what this level holds.
@@ -490,8 +496,9 @@ pub(crate) struct Info2 {
 ioctl_iowr_nr!(MV_IOC_INFO2, 0x56, 0x43, Info2);
 ioctl_io_nr!(MV_IOC_FLATTEN, 0x56, 0x44);
 ioctl_iow_nr!(MV_IOC_TRACK, 0x56, 0x45, Track);
-ioctl_ior_nr!(MV_IOC_TRACK_INFO, 0x56, 0x46, TrackInfo);
+ioctl_iowr_nr!(MV_IOC_TRACK_INFO, 0x56, 0x46, TrackInfo);
 ioctl_iow_nr!(MV_IOC_TRACK_REBASE, 0x56, 0x47, i32);
+ioctl_iow_nr!(MV_IOC_TRACK_DROP, 0x56, 0x48, u32);
 
 /// How a CREATE treats the caller's tracked mm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -526,6 +533,7 @@ pub(crate) fn track(
 }
 
 pub(crate) fn track_info(device: BorrowedFd<'_>) -> io::Result<TrackInfo> {
+    // flags stay 0: the retained walk is a diagnostic the commands never need.
     let mut info = TrackInfo::default();
     // SAFETY: info is a live, writable struct of the exact request size.
     if unsafe { ioctl_with_mut_ref(&device, MV_IOC_TRACK_INFO(), &mut info) } != 0 {
@@ -577,6 +585,17 @@ pub(crate) fn flatten(version: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     }
     // SAFETY: successful FLATTEN transfers exactly this newly allocated fd to the caller.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Stops tracking this process's guest memory and releases its standing version. Later
+/// captures copy whole until the guest is tracked again.
+pub(crate) fn untrack(device: BorrowedFd<'_>) -> io::Result<()> {
+    let flags: u32 = 0;
+    // SAFETY: the request reads one live u32.
+    if unsafe { ioctl_with_ref(&device, MV_IOC_TRACK_DROP(), &flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Replaces the tracker's standing version with `flat`, a FLATTEN of it.
@@ -803,7 +822,7 @@ mod tests {
                 size_of::<TrackInfo>(),
                 size_of::<Info2>()
             ),
-            (16, 24, 88)
+            (16, 40, 88)
         );
         assert_eq!(std::mem::offset_of!(Track, base_fd), 12);
         assert_eq!(std::mem::offset_of!(Info2, id), 40);
@@ -815,10 +834,14 @@ mod tests {
                 MV_IOC_FLATTEN(),
                 MV_IOC_TRACK(),
                 MV_IOC_TRACK_INFO(),
-                MV_IOC_TRACK_REBASE()
+                MV_IOC_TRACK_REBASE(),
+                MV_IOC_TRACK_DROP()
             ),
-            (0xc0585643, 0x5644, 0x40105645, 0x80185646, 0x40045647)
+            (
+                0xc0585643, 0x5644, 0x40105645, 0xc0285646, 0x40045647, 0x40045648
+            )
         );
+        assert_eq!(std::mem::offset_of!(TrackInfo, retained_pages), 32);
     }
 
     #[test]
@@ -869,6 +892,7 @@ mod tests {
             Some(libc::EINVAL)
         );
         assert_eq!(track_info(null.as_fd()).unwrap_err().raw_os_error(), enotty);
+        assert_eq!(untrack(null.as_fd()).unwrap_err().raw_os_error(), enotty);
         assert_eq!(info2(null.as_fd()).unwrap_err().raw_os_error(), enotty);
         assert_eq!(flatten(null.as_fd()).unwrap_err().raw_os_error(), enotty);
         assert_eq!(

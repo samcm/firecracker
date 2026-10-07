@@ -792,11 +792,16 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     }
     assert_eq!(
         (
+            ErrorCode::UntrackFailed as u32,
             ErrorCode::TrackFailed as u32,
             ErrorCode::RefreshFailed as u32
         ),
-        (31, 32)
+        (30, 31, 32)
     );
+    assert_eq!(MsgType::Untrack as u16, 25);
+    assert_eq!(MsgType::from_u16(25), Some(MsgType::Untrack));
+    validate_command(MsgType::Untrack, 0, 0).unwrap();
+    validate_command(MsgType::Untrack, 0, 1).unwrap_err();
     // Track carries the device, and the imported version for a lazy import; Refresh nothing.
     validate_command(MsgType::Track, 0, 1).unwrap();
     validate_command(MsgType::Track, 0, 2).unwrap();
@@ -813,6 +818,7 @@ fn track_and_refresh_frames_numbers_and_bodies() {
         depth: 2,
         dirty_pages: 0x0102_0304_0506_0708,
         standing_id: 9,
+        ..Default::default()
     });
     assert_eq!(body.len(), 24);
     assert_eq!(body[..8], [1, 0, 0, 0, 2, 0, 0, 0]);
