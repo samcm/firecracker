@@ -592,6 +592,19 @@ pub struct BackingPlanBody {
     pub regions: Vec<RegionRecord>,
     /// Exact producer digest from immutable snapshot provenance, present on restore only.
     pub expected_producer: Option<[u8; 32]>,
+    /// The bring-up hot set an earlier child of the lineage recorded, present on a restore whose
+    /// flags say so: the pre-COW budget in bytes and the encoded set. Only the framing is checked
+    /// here; the set is a hint, and one that does not decode is dropped where it is used.
+    pub hot_set: Option<HotSetTail>,
+}
+
+/// The optional tail of a restore plan: what to warm before the vCPUs first run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotSetTail {
+    /// Most bytes the child may copy privately ahead of the guest's writes.
+    pub precow_budget: u64,
+    /// The encoded hot set.
+    pub encoded: Vec<u8>,
 }
 
 impl BackingPlanBody {
@@ -602,6 +615,8 @@ impl BackingPlanBody {
 
     /// Flag bit stating a vmstate descriptor rides on the frame.
     pub const FLAG_VMSTATE: u32 = 1;
+    /// Flag bit stating a hot-set tail follows the producer digest. Valid on a restore only.
+    pub const FLAG_HOT_SET: u32 = 2;
 }
 
 /// Parses a `backing_plan` body.
@@ -613,12 +628,20 @@ pub fn parse_backing_plan(body: &[u8]) -> Result<BackingPlanBody, ChannelError> 
     let region_count = u32::from_le_bytes(body[4..8].try_into().unwrap());
     let extent_count = u32::from_le_bytes(body[8..12].try_into().unwrap());
     let flags = u32::from_le_bytes(body[12..16].try_into().unwrap());
-    if flags & !BackingPlanBody::FLAG_VMSTATE != 0 || extent_count != 0 {
+    if flags & !(BackingPlanBody::FLAG_VMSTATE | BackingPlanBody::FLAG_HOT_SET) != 0
+        || extent_count != 0
+    {
         return Err(ChannelError::Malformed);
     }
     let restore = flags & BackingPlanBody::FLAG_VMSTATE != 0;
-    let expected = 16 + region_count as usize * REGION_RECORD_LEN + usize::from(restore) * 32;
-    if body.len() != expected {
+    let hot = flags & BackingPlanBody::FLAG_HOT_SET != 0;
+    if hot && !restore {
+        return Err(ChannelError::Malformed);
+    }
+    let fixed = 16 + region_count as usize * REGION_RECORD_LEN + usize::from(restore) * 32;
+    // The hot-set tail is its budget and at least an empty encoding's worth of bytes; how long
+    // the encoding is, the encoding itself says.
+    if (!hot && body.len() != fixed) || (hot && body.len() <= fixed + 8) {
         return Err(ChannelError::Malformed);
     }
     let mut regions = Vec::with_capacity(region_count as usize);
@@ -633,6 +656,10 @@ pub fn parse_backing_plan(body: &[u8]) -> Result<BackingPlanBody, ChannelError> 
         flags,
         regions,
         expected_producer: restore.then(|| body[off..off + 32].try_into().unwrap()),
+        hot_set: hot.then(|| HotSetTail {
+            precow_budget: u64::from_le_bytes(body[fixed..fixed + 8].try_into().unwrap()),
+            encoded: body[fixed + 8..].to_vec(),
+        }),
     })
 }
 
@@ -826,11 +853,58 @@ mod tests {
         body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
-        body.extend_from_slice(&0b10u32.to_le_bytes());
+        body.extend_from_slice(&0b100u32.to_le_bytes());
         assert!(matches!(
             parse_backing_plan(&body),
             Err(ChannelError::Malformed)
         ));
+    }
+
+    #[test]
+    fn backing_plan_hot_set_tail_rides_only_on_a_restore() {
+        let plan = |flags: u32, tail: &[u8]| {
+            let mut body = [1u32, 1, 0, flags]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            body.extend_from_slice(
+                &RegionRecord {
+                    guest_addr: 0,
+                    size: 4096,
+                }
+                .encode(),
+            );
+            if flags & BackingPlanBody::FLAG_VMSTATE != 0 {
+                body.extend_from_slice(&[0xab; 32]);
+            }
+            body.extend_from_slice(tail);
+            body
+        };
+        let mut tail = 0x0123_4567_89ab_cdefu64.to_le_bytes().to_vec();
+        tail.extend_from_slice(b"FPHS-encoded");
+        let restore = BackingPlanBody::FLAG_VMSTATE | BackingPlanBody::FLAG_HOT_SET;
+        let parsed = parse_backing_plan(&plan(restore, &tail)).unwrap();
+        assert_eq!(parsed.expected_producer, Some([0xab; 32]));
+        assert_eq!(
+            parsed.hot_set,
+            Some(HotSetTail {
+                precow_budget: 0x0123_4567_89ab_cdef,
+                encoded: b"FPHS-encoded".to_vec(),
+            })
+        );
+        // A restore without the flag carries no tail, and one with the flag needs more than
+        // the budget.
+        assert_eq!(
+            parse_backing_plan(&plan(BackingPlanBody::FLAG_VMSTATE, &[]))
+                .unwrap()
+                .hot_set,
+            None
+        );
+        assert!(parse_backing_plan(&plan(BackingPlanBody::FLAG_VMSTATE, &tail)).is_err());
+        assert!(parse_backing_plan(&plan(restore, &tail[..8])).is_err());
+        assert!(parse_backing_plan(&plan(restore, &[])).is_err());
+        // A cold boot has no lineage to have recorded a set.
+        assert!(parse_backing_plan(&plan(BackingPlanBody::FLAG_HOT_SET, &tail)).is_err());
     }
 
     #[test]

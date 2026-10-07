@@ -522,6 +522,19 @@ pub fn build_microvm_from_snapshot(
         device_manager,
     };
 
+    // The vCPU state is restored and nothing has run: warm the stage-2 tables over the hot set
+    // until resume. Started before this thread is confined, like the channel's thread below.
+    if let Some(hot_set) = FarplaneBackend::take_hot_set() {
+        start_bring_up_prefault(
+            &kvm_vm,
+            &vcpus[0],
+            hot_set,
+            seccomp_filters
+                .get("vmm")
+                .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?,
+        );
+    }
+
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     kvm_vm.start_vcpus(
         vcpus,
@@ -559,6 +572,46 @@ pub fn build_microvm_from_snapshot(
     debug!("event_end: build microvm from snapshot");
 
     Ok(vmm)
+}
+
+/// Starts the bring-up prefault over a hot set an earlier child of this lineage recorded. The set
+/// is a hint: one that does not decode, or a worker that cannot start, leaves the guest to fault
+/// its pages the ordinary way, and the restore goes on.
+fn start_bring_up_prefault(
+    kvm_vm: &KvmVm,
+    vcpu: &crate::vstate::vcpu::Vcpu,
+    hot_set: crate::vstate::farplane::protocol::HotSetTail,
+    filter: &Arc<crate::seccomp::BpfProgram>,
+) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use crate::logger::warn;
+    use crate::vstate::farplane::prefault;
+
+    let Some(entries) = prefault::decode_entries(&hot_set.encoded) else {
+        warn!("Bring-up prefault: the hot set does not decode; it is ignored");
+        return;
+    };
+    let (ranges, dropped) = prefault::resolve(kvm_vm.guest_memory(), entries);
+    if dropped > 0 {
+        warn!("Bring-up prefault: {dropped} hot-set entries lie outside guest memory");
+    }
+    // SAFETY: F_DUPFD_CLOEXEC duplicates a descriptor this process holds open.
+    let dup = unsafe { libc::fcntl(vcpu.kvm_vcpu.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        warn!(
+            "Bring-up prefault: no vCPU descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    // SAFETY: `dup` is a descriptor this function just created and nothing else owns.
+    let vcpu_fd = unsafe { OwnedFd::from_raw_fd(dup) };
+    if let Err(err) =
+        prefault::Prefaulter::start(vcpu_fd, ranges, hot_set.precow_budget, filter.clone())
+    {
+        warn!("Bring-up prefault did not start: {err}");
+    }
 }
 
 /// 64 bytes due to alignment requirement in 3.1 of https://www.kernel.org/doc/html/v5.8/virt/kvm/devices/vcpu.html#attribute-kvm-arm-vcpu-pvtime-ipa
