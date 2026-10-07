@@ -5,7 +5,7 @@
 //! The companion integration stub is resources/memversion.h, not the research ioctl ABI.
 
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use vmm_sys_util::ioctl::{ioctl, ioctl_with_mut_ref, ioctl_with_ref};
@@ -442,11 +442,9 @@ pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io
 // ABI v2: incremental versions. Every v1 request keeps its v1 meaning; a v1 kernel refuses
 // each of these with ENOTTY (unknown request) or EINVAL (unknown CREATE flag).
 
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
 /// The caller's mm is tracked; the version is the standing version plus only the pages
 /// written since it, and becomes the new standing version.
 const MV_CREATE_TRACKED: u32 = 1;
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
 /// With MV_CREATE_TRACKED: the source keeps running. A page that may be pinned stays
 /// unfolded rather than failing the call; at the depth bound the call fails with E2BIG.
 const MV_CREATE_LIVE: u32 = 2;
@@ -495,7 +493,6 @@ ioctl_iow_nr!(MV_IOC_TRACK, 0x56, 0x45, Track);
 ioctl_ior_nr!(MV_IOC_TRACK_INFO, 0x56, 0x46, TrackInfo);
 ioctl_iow_nr!(MV_IOC_TRACK_REBASE, 0x56, 0x47, i32);
 
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
 /// How a CREATE treats the caller's tracked mm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fold {
@@ -505,7 +502,6 @@ pub(crate) enum Fold {
     Live,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
 /// Tracks the caller's guest regions from now on. `base` is the version every page not
 /// yet faulted in equals (the lazily imported version), or `None` for a booted guest
 /// whose untouched memory is zero. Call before the guest runs.
@@ -529,7 +525,6 @@ pub(crate) fn track(
     Ok(())
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
 pub(crate) fn track_info(device: BorrowedFd<'_>) -> io::Result<TrackInfo> {
     let mut info = TrackInfo::default();
     // SAFETY: info is a live, writable struct of the exact request size.
@@ -539,7 +534,6 @@ pub(crate) fn track_info(device: BorrowedFd<'_>) -> io::Result<TrackInfo> {
     Ok(info)
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
 /// CREATE over the tracked standing version. The returned version is the new standing
 /// version; the tracker holds its own reference.
 pub(crate) fn create_tracked(
@@ -563,7 +557,6 @@ pub(crate) fn create_tracked(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
 pub(crate) fn info2(version: BorrowedFd<'_>) -> io::Result<Info2> {
     let mut info = Info2::default();
     // SAFETY: info is a live, writable struct of the exact request size; regions stays null,
@@ -574,7 +567,6 @@ pub(crate) fn info2(version: BorrowedFd<'_>) -> io::Result<Info2> {
     Ok(info)
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
 /// A new flat version with the same content as `version`. Reads only immutable versions,
 /// so it needs no source lock and pauses nothing.
 pub(crate) fn flatten(version: BorrowedFd<'_>) -> io::Result<OwnedFd> {
@@ -587,7 +579,6 @@ pub(crate) fn flatten(version: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
 /// Replaces the tracker's standing version with `flat`, a FLATTEN of it.
 pub(crate) fn rebase(device: BorrowedFd<'_>, flat: BorrowedFd<'_>) -> io::Result<()> {
     let fd: i32 = flat.as_raw_fd();
@@ -596,6 +587,61 @@ pub(crate) fn rebase(device: BorrowedFd<'_>, flat: BorrowedFd<'_>) -> io::Result
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Tracks the guest whose memory was imported from `base`, if any. A guest imported eagerly
+/// (a kernel or version that refused the lazy import) is tracked without a base: every present
+/// page starts dirty and the first fold copies it, as a v1 capture would.
+pub(crate) fn track_guest(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    base: Option<BorrowedFd<'_>>,
+) -> io::Result<()> {
+    track_guest_with(base.is_some(), |with_base| {
+        track(device, regions, if with_base { base } else { None })
+    })
+}
+
+fn track_guest_with(
+    has_base: bool,
+    mut track: impl FnMut(bool) -> io::Result<()>,
+) -> io::Result<()> {
+    match track(has_base) {
+        Err(err) if has_base && err.raw_os_error() == Some(libc::EINVAL) => track(false),
+        other => other,
+    }
+}
+
+/// Refreshes the standing version while the guest runs: folds the pages written since it,
+/// without free-page exclusions (a running guest may write an excluded page; the next
+/// quiesced fold applies them). At the depth bound the standing version is flattened and
+/// rebased first, still without pausing anything. Returns the new standing version.
+pub(crate) fn refresh(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    standing: Option<BorrowedFd<'_>>,
+) -> io::Result<OwnedFd> {
+    refresh_with(
+        || create_tracked(device, regions, &[], Fold::Live),
+        || {
+            let standing = standing.ok_or_else(|| io::Error::from_raw_os_error(libc::E2BIG))?;
+            let flat = flatten(standing)?;
+            rebase(device, flat.as_fd())
+        },
+    )
+}
+
+fn refresh_with(
+    mut fold: impl FnMut() -> io::Result<OwnedFd>,
+    flatten_and_rebase: impl FnOnce() -> io::Result<()>,
+) -> io::Result<OwnedFd> {
+    match fold() {
+        Err(err) if err.raw_os_error() == Some(libc::E2BIG) => {
+            flatten_and_rebase()?;
+            fold()
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -831,6 +877,78 @@ mod tests {
                 .raw_os_error(),
             enotty
         );
+    }
+
+    #[test]
+    fn track_falls_back_to_no_base_only_for_a_refused_base() {
+        let einval = || Err(io::Error::from_raw_os_error(libc::EINVAL));
+        // An eagerly imported guest refuses its base; tracked without one.
+        let mut calls = vec![];
+        track_guest_with(true, |base| {
+            calls.push(base);
+            if base { einval() } else { Ok(()) }
+        })
+        .unwrap();
+        assert_eq!(calls, [true, false]);
+        // A booted guest has no base to drop: EINVAL is final.
+        let mut calls = vec![];
+        let err = track_guest_with(false, |base| {
+            calls.push(base);
+            einval()
+        })
+        .unwrap_err();
+        assert_eq!(
+            (calls, err.raw_os_error()),
+            (vec![false], Some(libc::EINVAL))
+        );
+        // Any other refusal is final: no silent untracked retry.
+        let mut calls = vec![];
+        track_guest_with(true, |base| {
+            calls.push(base);
+            Err(io::Error::from_raw_os_error(libc::EBUSY))
+        })
+        .unwrap_err();
+        assert_eq!(calls, [true]);
+    }
+
+    #[test]
+    fn refresh_flattens_only_at_the_depth_bound_and_retries_once() {
+        let version = || Ok(std::fs::File::open("/dev/null")?.into());
+        let e2big = || Err(io::Error::from_raw_os_error(libc::E2BIG));
+        let mut folds = 0;
+        refresh_with(
+            || {
+                folds += 1;
+                version()
+            },
+            || panic!("flattened below the bound"),
+        )
+        .unwrap();
+        assert_eq!(folds, 1);
+        let (mut folds, mut flattened) = (0, 0);
+        refresh_with(
+            || {
+                folds += 1;
+                if folds == 1 { e2big() } else { version() }
+            },
+            || {
+                flattened += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!((folds, flattened), (2, 1));
+        // A failed flatten fails the refresh without folding again.
+        let mut folds = 0;
+        refresh_with(
+            || {
+                folds += 1;
+                e2big()
+            },
+            || Err(io::Error::from_raw_os_error(libc::ENOMEM)),
+        )
+        .unwrap_err();
+        assert_eq!(folds, 1);
     }
 
     #[test]
