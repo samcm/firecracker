@@ -726,16 +726,28 @@ fn track_guest_with(
     }
 }
 
+/// The kernel's chain bound (MV_MAX_DEPTH): a fold over a standing version this deep is
+/// refused when live and copies the whole guest when quiesced.
+const MAX_DEPTH: u32 = 5;
+
 /// Refreshes the standing version while the guest runs: folds the pages written since it,
 /// without free-page exclusions (a running guest may write an excluded page; the next
-/// quiesced fold applies them). At the depth bound the standing version is flattened and
-/// rebased first, still without pausing anything. Returns the new standing version.
+/// quiesced fold applies them). Returns the new standing version.
+///
+/// The capture after a refresh folds over it, one level deeper. So a refresh whose result
+/// would leave that capture at the bound first flattens the standing version and rebases onto
+/// it, while the guest still runs: otherwise the capture copies the whole guest inside the
+/// freeze. A live fold refused at the bound (E2BIG) flattens and retries too.
 pub(crate) fn refresh(
     device: BorrowedFd<'_>,
     regions: &[Region],
     standing: Option<BorrowedFd<'_>>,
 ) -> io::Result<OwnedFd> {
+    let depth = standing
+        .map(|fd| info2(fd).map(|info| info.depth))
+        .transpose()?;
     refresh_with(
+        depth,
         || create_tracked(device, regions, &[], Fold::Live),
         || {
             let standing = standing.ok_or_else(|| io::Error::from_raw_os_error(libc::E2BIG))?;
@@ -746,9 +758,16 @@ pub(crate) fn refresh(
 }
 
 fn refresh_with(
+    standing_depth: Option<u32>,
     mut fold: impl FnMut() -> io::Result<OwnedFd>,
     flatten_and_rebase: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<OwnedFd> {
+    // This refresh lands at depth + 1 and the next capture at depth + 2, which must stay
+    // below the bound to fold.
+    if standing_depth.is_some_and(|depth| depth + 2 >= MAX_DEPTH) {
+        flatten_and_rebase()?;
+        return fold();
+    }
     match fold() {
         Err(err) if err.raw_os_error() == Some(libc::E2BIG) => {
             flatten_and_rebase()?;
@@ -1057,6 +1076,7 @@ mod tests {
         let e2big = || Err(io::Error::from_raw_os_error(libc::E2BIG));
         let mut folds = 0;
         refresh_with(
+            Some(MAX_DEPTH - 3),
             || {
                 folds += 1;
                 version()
@@ -1067,6 +1087,7 @@ mod tests {
         assert_eq!(folds, 1);
         let (mut folds, mut flattened) = (0, 0);
         refresh_with(
+            None,
             || {
                 folds += 1;
                 if folds == 1 { e2big() } else { version() }
@@ -1081,6 +1102,7 @@ mod tests {
         // A failed flatten fails the refresh without folding again.
         let mut folds = 0;
         refresh_with(
+            None,
             || {
                 folds += 1;
                 e2big()
@@ -1088,6 +1110,41 @@ mod tests {
             || Err(io::Error::from_raw_os_error(libc::ENOMEM)),
         )
         .unwrap_err();
+        assert_eq!(folds, 1);
+    }
+
+    #[test]
+    fn refresh_flattens_before_the_next_capture_would_reach_the_bound() {
+        let version = || Ok(std::fs::File::open("/dev/null")?.into());
+        // At MAX_DEPTH - 2 the refresh lands at MAX_DEPTH - 1 and the capture at the bound:
+        // flatten first, then fold once, never the E2BIG path.
+        for depth in [MAX_DEPTH - 2, MAX_DEPTH - 1, MAX_DEPTH] {
+            let (mut folds, mut flattened) = (0, 0);
+            refresh_with(
+                Some(depth),
+                || {
+                    folds += 1;
+                    version()
+                },
+                || {
+                    flattened += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!((folds, flattened), (1, 1), "depth {depth}");
+        }
+        // One shallower: the capture after it still folds, so nothing is flattened.
+        let mut folds = 0;
+        refresh_with(
+            Some(MAX_DEPTH - 3),
+            || {
+                folds += 1;
+                version()
+            },
+            || panic!("flattened while the next capture can still fold"),
+        )
+        .unwrap();
         assert_eq!(folds, 1);
     }
 
