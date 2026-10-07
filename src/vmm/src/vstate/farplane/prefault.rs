@@ -38,60 +38,16 @@ const KVM_PRE_FAULT_MEMORY: libc::c_ulong = 0xC040_AED5;
 /// `MADV_POPULATE_WRITE`, Linux 5.14.
 const MADV_POPULATE_WRITE: libc::c_int = 23;
 
-/// Most entries an FPHS v1 set may carry.
-pub const MAX_ENTRIES: u32 = 2048;
-/// Most pages an FPHS v1 set may name.
-pub const MAX_PAGES: u64 = 65_536;
-/// Flag bit of an entry whose pages the recording child wrote.
-const FLAG_WRITTEN: u32 = 1;
-
 /// Decodes an FPHS v1 hot set into (gpa, size, written) entries, or `None` for anything that is
 /// not exactly a canonical set.
-// TODO(hot-set): delegate to the recorder's `hot_set::HotSet::decode` once it lands; the format
-// is the one agreed for farplane/9 and this decoder must not outlive that.
 pub fn decode_entries(encoded: &[u8]) -> Option<Vec<(u64, u64, bool)>> {
-    let header = encoded.get(..16)?;
-    if &header[..4] != b"FPHS" {
-        return None;
-    }
-    let field = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
-    let (version, count, pages_total) = (field(4), field(8), field(12));
-    if version != 1 || count > MAX_ENTRIES || u64::from(pages_total) > MAX_PAGES {
-        return None;
-    }
-    let body = &encoded[16..];
-    if body.len() != usize::try_from(count).ok()? * 24 {
-        return None;
-    }
-    let mut entries = Vec::with_capacity(body.len() / 24);
-    let mut pages = 0u64;
-    let mut previous: Option<(u64, bool)> = None;
-    for raw in body.chunks_exact(24) {
-        let gpa = u64::from_le_bytes(raw[0..8].try_into().unwrap());
-        let size = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-        let flags = u32::from_le_bytes(raw[16..20].try_into().unwrap());
-        let reserved = u32::from_le_bytes(raw[20..24].try_into().unwrap());
-        let end = gpa.checked_add(size)?;
-        if flags & !FLAG_WRITTEN != 0
-            || reserved != 0
-            || gpa % PAGE_BYTES != 0
-            || size % PAGE_BYTES != 0
-            || size == 0
-        {
-            return None;
-        }
-        let written = flags & FLAG_WRITTEN != 0;
-        // Sorted and disjoint; adjacent only where the flags differ, since equal flags coalesce.
-        if let Some((previous_end, previous_written)) = previous
-            && (gpa < previous_end || (gpa == previous_end && written == previous_written))
-        {
-            return None;
-        }
-        previous = Some((end, written));
-        pages += size / PAGE_BYTES;
-        entries.push((gpa, size, written));
-    }
-    (pages == u64::from(pages_total)).then_some(entries)
+    let set = super::hot_set::HotSet::decode(encoded).ok()?;
+    Some(
+        set.ranges()
+            .iter()
+            .map(|r| (r.gpa, r.size, r.flags & super::hot_set::FLAG_WRITTEN != 0))
+            .collect(),
+    )
 }
 
 /// One hot-set range resolved against this VM's guest memory.
@@ -377,68 +333,6 @@ mod tests {
             self.prefaulted.push((gpa, len));
             Ok(())
         }
-    }
-
-    fn encode(entries: &[(u64, u64, u32, u32)], pages_total: u32) -> Vec<u8> {
-        let mut out = b"FPHS".to_vec();
-        out.extend_from_slice(&1u32.to_le_bytes());
-        out.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_le_bytes());
-        out.extend_from_slice(&pages_total.to_le_bytes());
-        for (gpa, size, flags, reserved) in entries {
-            out.extend_from_slice(&gpa.to_le_bytes());
-            out.extend_from_slice(&size.to_le_bytes());
-            out.extend_from_slice(&flags.to_le_bytes());
-            out.extend_from_slice(&reserved.to_le_bytes());
-        }
-        out
-    }
-
-    #[test]
-    fn decode_accepts_only_a_canonical_set() {
-        let p = PAGE_BYTES;
-        let good = [
-            (0x1000, 2 * p, 1, 0),
-            (0x3000, p, 0, 0),
-            (0x8000, 3 * p, 1, 0),
-        ];
-        assert_eq!(
-            decode_entries(&encode(&good, 6)),
-            Some(vec![
-                (0x1000, 2 * p, true),
-                (0x3000, p, false),
-                (0x8000, 3 * p, true)
-            ])
-        );
-        let refused: [(&str, Vec<u8>); 9] = [
-            ("pages_total mismatch", encode(&good, 7)),
-            ("unknown flag", encode(&[(0, p, 2, 0)], 1)),
-            ("reserved set", encode(&[(0, p, 0, 1)], 1)),
-            ("unaligned", encode(&[(0x800, p, 0, 0)], 1)),
-            ("empty entry", encode(&[(0, 0, 0, 0)], 0)),
-            (
-                "unsorted",
-                encode(&[(0x3000, p, 0, 0), (0x1000, p, 0, 0)], 2),
-            ),
-            (
-                "overlap",
-                encode(&[(0x1000, 2 * p, 0, 0), (0x2000, p, 1, 0)], 3),
-            ),
-            (
-                "uncoalesced",
-                encode(&[(0x1000, p, 1, 0), (0x2000, p, 1, 0)], 2),
-            ),
-            ("truncated", encode(&good, 6)[..60].to_vec()),
-        ];
-        for (name, encoded) in refused {
-            assert_eq!(decode_entries(&encoded), None, "{name}");
-        }
-        let mut bad_magic = encode(&good, 6);
-        bad_magic[0] = b'X';
-        assert_eq!(decode_entries(&bad_magic), None);
-        let mut over_cap = encode(&[], 0);
-        over_cap[8..12].copy_from_slice(&(MAX_ENTRIES + 1).to_le_bytes());
-        over_cap.resize(16 + 24 * (MAX_ENTRIES as usize + 1), 0);
-        assert_eq!(decode_entries(&over_cap), None);
     }
 
     fn range(gpa: u64, pages: u64, written: bool) -> PrefaultRange {

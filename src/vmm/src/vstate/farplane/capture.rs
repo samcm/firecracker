@@ -18,7 +18,7 @@ use super::backend::{
 use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
 use super::{dispatch, memversion};
 use crate::Vmm;
-use crate::logger::{IncMetric, METRICS, error, info};
+use crate::logger::{IncMetric, METRICS, error, info, warn};
 use crate::persist::{MicrovmState, VmInfo};
 use crate::snapshot::Snapshot;
 use crate::utils::{u64_to_usize, usize_to_u64};
@@ -205,6 +205,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Track => (0, &[1, 2]),
         MsgType::Refresh => (0, &[0]),
         MsgType::Untrack => (0, &[0]),
+        MsgType::RecordHotSet => (0, &[0]),
         _ => return Err(ChannelError::Malformed),
     };
     if body_len != len || !counts.contains(&fd_count) {
@@ -327,8 +328,33 @@ impl CaptureService {
             MsgType::Track => self.track(incoming),
             MsgType::Refresh => self.refresh(request_id),
             MsgType::Untrack => self.untrack(request_id),
+            MsgType::RecordHotSet => self.record_hot_set(request_id),
             _ => Err(ChannelError::Malformed),
         }
+    }
+
+    /// Reports the pages this child's bring-up touched, for later children of the lineage to
+    /// prefault. The set is a hint, so a set this process cannot record is an empty answer, not
+    /// a refusal; the scan reads page tables only and never holds the VMM lock.
+    fn record_hot_set(&mut self, request_id: u64) -> Result<(), ChannelError> {
+        let vm = self
+            .vmm
+            .try_lock()
+            .ok()
+            .and_then(|vmm| vmm.kvm_vm().cloned());
+        let encoded = match vm.map(|vm| super::hot_set::record(vm.guest_memory())) {
+            Some(Ok(Some(set))) => set.encode(),
+            Some(Ok(None)) => Vec::new(),
+            Some(Err(err)) => {
+                warn!("Bring-up hot set could not be recorded: {err}");
+                Vec::new()
+            }
+            None => {
+                warn!("Bring-up hot set: the VM is busy or gone");
+                Vec::new()
+            }
+        };
+        self.reply(request_id, MsgType::HotSetRecorded, &encoded)
     }
 
     fn free_summary(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
