@@ -99,6 +99,9 @@ pub struct VmCommon {
     /// What the guest reported free, keyed by kvm slot. Locked only after `pending_dirty_union`,
     /// never before it, so a report and a harvest see one consistent pair.
     free_pages: Mutex<HashMap<u32, FreePages>>,
+    /// Whether slots registered from now on start with a clear KVM dirty log, which then speaks
+    /// for the guest from registration, rather than KVM's initial all-dirty state.
+    dirty_log_starts_clear: bool,
 }
 
 /// The pages of one slot the guest reported free, word for word with the slot's dirty bitmap.
@@ -247,6 +250,7 @@ impl KvmVm {
             vcpus_exit_evt,
             pending_dirty_union: Mutex::new(HashMap::new()),
             free_pages: Mutex::new(HashMap::new()),
+            dirty_log_starts_clear: false,
         })
     }
 
@@ -497,7 +501,7 @@ impl KvmVm {
             FreePages {
                 reported: vec![0u64; words],
                 uncaptured: vec![0u64; words],
-                kvm_log_armed: false,
+                kvm_log_armed: self.common.dirty_log_starts_clear,
             },
         );
         self.common.guest_memory = new_guest_memory;
@@ -953,6 +957,32 @@ impl KvmVm {
                 record.kvm_log_armed = true;
             }
         }
+        Ok(())
+    }
+
+    /// Makes every slot registered from now on start with a clear KVM dirty log, so the log speaks
+    /// for the guest from registration and needs no [`KvmVm::baseline_dirty_log`].
+    ///
+    /// KVM reads `KVM_DIRTY_LOG_INITIALLY_SET` when it allocates a slot's dirty bitmap: without it
+    /// the bitmap starts clear and every SPTE the guest later makes writable is logged. That is
+    /// exactly the state a baseline reaches, without a clear over every page of the geometry,
+    /// which costs time linear in guest memory. Only a VM whose memory no userspace loader wrote
+    /// may use it, which is a restored VM; it must be called before the first slot is registered.
+    pub fn start_dirty_log_clear(&mut self) -> Result<(), VmError> {
+        if self.guest_memory().num_regions() != 0 {
+            return Err(VmError::DirtyBitmapShape);
+        }
+        let mut cap = kvm_enable_cap {
+            cap: KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
+            ..Default::default()
+        };
+        cap.args[0] = u64::from(KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE);
+        // SAFETY: the ioctl reads `cap`, which is a fully initialized capability request.
+        let ret = unsafe { ioctl_with_ref(self.fd(), KVM_ENABLE_CAP(), &cap) };
+        if ret != 0 {
+            return Err(VmError::ManualDirtyLogProtect(errno::Error::last()));
+        }
+        self.common.dirty_log_starts_clear = true;
         Ok(())
     }
 
@@ -1764,6 +1794,42 @@ pub(crate) mod tests {
         let snapshot = vm.snapshot_dirty_log().unwrap();
         vm.clear_dirty_log(&snapshot).unwrap();
         assert_eq!(set_pages(&vm), vec![Vec::<usize>::new(), Vec::new()]);
+    }
+
+    /// A restored VM's slots start with a clear KVM log: the state a baseline reaches, with no
+    /// clear over the geometry, and still reporting what the host accumulator holds.
+    #[test]
+    fn test_farplane_restored_slots_start_with_a_clear_log() {
+        let page_size = host_page_size();
+        let mut vm = setup_vm();
+        vm.start_dirty_log_clear().unwrap();
+        vm.register_memory_regions(crate::test_utils::multi_region_mem_raw(&[
+            (GuestAddress(0), 4 * page_size),
+            (GuestAddress(0x10_0000), 2 * page_size),
+        ]))
+        .unwrap();
+        let set_pages = |vm: &KvmVm| -> Vec<Vec<usize>> {
+            let snapshot = vm.snapshot_dirty_log().unwrap();
+            vm.guest_memory()
+                .iter()
+                .zip(&snapshot)
+                .map(|(region, words)| {
+                    let pages = u64_to_usize(region.len()).div_ceil(page_size);
+                    (0..pages)
+                        .filter(|page| words[page / 64] & (1 << (page % 64)) != 0)
+                        .collect()
+                })
+                .collect()
+        };
+        assert_eq!(set_pages(&vm), vec![Vec::<usize>::new(), Vec::new()]);
+        assert!(vm.free_pages().values().all(|record| record.kvm_log_armed));
+
+        let second_page = GuestAddress(u64::try_from(page_size).unwrap());
+        vm.guest_memory().mark_dirty(second_page, page_size);
+        assert_eq!(set_pages(&vm), vec![vec![1], Vec::new()]);
+
+        // Once a slot exists its bitmap was already allocated under the old setting.
+        assert!(vm.start_dirty_log_clear().is_err());
     }
 
     #[test]
