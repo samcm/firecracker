@@ -216,6 +216,7 @@ pub fn restore_from_snapshot(
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
     let (guest_memory, microvm_state) = FarplaneBackend::construct_restore()
         .map_err(|err| RestoreFromSnapshotError::GuestMemory(err.to_string()))?;
+    crate::vstate::farplane::phases::mark("construct_restore_return");
 
     let vcpu_count = microvm_state
         .vcpu_states
@@ -236,6 +237,7 @@ pub fn restore_from_snapshot(
         .map_err(BuildMicrovmFromSnapshotError::VmUpdateConfig)?;
 
     snapshot_state_sanity_check(&microvm_state)?;
+    crate::vstate::farplane::phases::mark("machine_config");
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
