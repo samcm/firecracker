@@ -210,6 +210,9 @@ pub enum ErrorCode {
     /// The standing version could not be refreshed; the guest runs on and the next fork folds
     /// more.
     RefreshFailed = 32,
+    /// A retry of a request whose answer carried a version, after a newer request acknowledged
+    /// that answer: the version descriptor is no longer held, so the answer cannot be replayed.
+    ReplayUnavailable = 33,
 }
 
 /// Architecture Firecracker is running on.
@@ -903,6 +906,7 @@ mod tests {
         assert_eq!(ErrorCode::DiskCloneFailed as u32, 26);
         assert_eq!(ErrorCode::RebaseFailed as u32, 27);
         assert_eq!(ErrorCode::FreeSummaryUnavailable as u32, 28);
+        assert_eq!(ErrorCode::ReplayUnavailable as u32, 33);
         assert_eq!(MsgType::FreeSummary as u16, 22);
         assert_eq!(MsgType::FreeSummaryDone as u16, 23);
         assert_eq!(MsgType::Drives as u16, 24);

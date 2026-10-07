@@ -91,6 +91,61 @@ fn exact_id_retains_version_across_epoch_reset() {
 }
 
 #[test]
+fn next_request_releases_answered_versions_and_a_late_retry_is_refused() {
+    let device = memfd(c"device", 0);
+    let key = CommandKey::of(MsgType::WriteVmstate, &[], std::slice::from_ref(&device));
+    let plain = CommandKey::of(MsgType::Resume, &1u32.to_le_bytes(), &[]);
+    let version = Arc::new(memfd(c"version", 0));
+    let mut replies = ReplyCache::default();
+    replies.record(
+        1,
+        key.clone(),
+        MsgType::VmstateWritten,
+        vec![7],
+        Some(version.clone()),
+    );
+    replies.record(2, plain.clone(), MsgType::Resumed, vec![], None);
+    // Until a newer request arrives, the answer and its version replay exactly.
+    assert_eq!(Arc::strong_count(&version), 2);
+    assert!(matches!(
+        replies.disposition(1, &key),
+        FrameDisposition::Replay(MsgType::VmstateWritten, _, Some(_))
+    ));
+    // A new request acknowledges every earlier answer: the cache lets the version go...
+    assert!(matches!(
+        replies.disposition(3, &plain),
+        FrameDisposition::Serve
+    ));
+    replies.acknowledge_before(3);
+    assert_eq!(Arc::strong_count(&version), 1);
+    // ...so a retry of it is refused with a typed error, never replayed without its fd.
+    assert!(matches!(
+        replies.disposition(1, &key),
+        FrameDisposition::ReplayUnavailable
+    ));
+    // An answer that carried no version still replays, and a reused id is still refused.
+    assert!(matches!(
+        replies.disposition(2, &plain),
+        FrameDisposition::Replay(MsgType::Resumed, _, None)
+    ));
+    assert!(matches!(
+        replies.disposition(1, &plain),
+        FrameDisposition::Reused
+    ));
+    // Only answers older than the new request are released.
+    let later = Arc::new(memfd(c"later", 0));
+    replies.record(
+        4,
+        key.clone(),
+        MsgType::VmstateWritten,
+        vec![8],
+        Some(later.clone()),
+    );
+    replies.acknowledge_before(4);
+    assert_eq!(Arc::strong_count(&later), 2);
+}
+
+#[test]
 fn failed_create_publishes_nothing_exact_failure_replays_new_id_retries() {
     let mut order = EpochOrder::default();
     let device = memfd(c"not-a-memversion-device", 0);

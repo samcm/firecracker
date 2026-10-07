@@ -107,12 +107,16 @@ struct CachedReply {
     msg: MsgType,
     body: Vec<u8>,
     version: Option<Arc<OwnedFd>>,
+    /// The answer carried a version this cache no longer holds: replaying it would drop the
+    /// descriptor, so a retry is refused instead.
+    version_released: bool,
 }
 
 #[derive(Debug)]
 enum FrameDisposition {
     Serve,
     Replay(MsgType, Vec<u8>, Option<Arc<OwnedFd>>),
+    ReplayUnavailable,
     Reused,
 }
 
@@ -131,6 +135,9 @@ impl ReplyCache {
             .find(|answer| answer.request_id == request_id)
         {
             if command.is_exactly(&answer.command) {
+                if answer.version_released {
+                    return FrameDisposition::ReplayUnavailable;
+                }
                 return FrameDisposition::Replay(
                     answer.msg,
                     answer.body.clone(),
@@ -143,6 +150,17 @@ impl ReplyCache {
             return FrameDisposition::Reused;
         }
         FrameDisposition::Serve
+    }
+    /// Pagemaster sends one command at a time and the next only once the previous resolved,
+    /// so a new request acknowledges every earlier answer: their version descriptors are
+    /// released here, and with them the last reference this process holds to a generation
+    /// memory plane has let go. Otherwise each would live until 64 later answers evicted it.
+    fn acknowledge_before(&mut self, request_id: u64) {
+        for answer in self.answers.iter_mut() {
+            if answer.request_id < request_id && answer.version.take().is_some() {
+                answer.version_released = true;
+            }
+        }
     }
     fn record(
         &mut self,
@@ -166,6 +184,7 @@ impl ReplyCache {
             msg,
             body,
             version,
+            version_released: false,
         });
         self.highest = self.highest.max(request_id);
     }
@@ -308,9 +327,18 @@ impl CaptureService {
         validate_command(msg, incoming.body.len(), incoming.fds.len())?;
         let command = CommandKey::of(msg, &incoming.body, &incoming.fds);
         match self.replies.disposition(request_id, &command) {
-            FrameDisposition::Serve => {}
+            FrameDisposition::Serve => self.replies.acknowledge_before(request_id),
             FrameDisposition::Replay(msg, body, version) => {
                 return send_reply(&self.channel.sock, msg, request_id, &body, version.as_ref());
+            }
+            FrameDisposition::ReplayUnavailable => {
+                return protocol::send_frame(
+                    &self.channel.sock,
+                    MsgType::Error,
+                    request_id,
+                    &protocol::encode_error(ErrorCode::ReplayUnavailable, msg, ""),
+                    &[],
+                );
             }
             FrameDisposition::Reused => {
                 return protocol::send_frame(
