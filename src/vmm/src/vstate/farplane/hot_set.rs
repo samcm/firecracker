@@ -24,7 +24,6 @@ use std::os::unix::fs::FileExt;
 
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 use vmm_sys_util::ioctl::ioctl_with_mut_ref;
-use vmm_sys_util::ioctl_iowr_nr;
 
 use crate::vstate::memory::GuestMemoryMmap;
 
@@ -228,8 +227,14 @@ const PAGE_IS_PRESENT: u64 = 1 << 3;
 // Bit 56 of a /proc/<pid>/pagemap entry: the page's precise mapcount is 1.
 const PM_MMAP_EXCLUSIVE: u64 = 1 << 56;
 const SCAN_BATCH: usize = 512;
-// _IOWR('f', 16, struct pm_scan_arg) = 0xc0606610
-ioctl_iowr_nr!(PAGEMAP_SCAN, 0x66, 16, PmScanArg);
+// _IOWR('f', 16, struct pm_scan_arg) = 0xc0606610; private, as the macro's function is pub.
+mod request {
+    use vmm_sys_util::ioctl_iowr_nr;
+
+    use super::PmScanArg;
+    ioctl_iowr_nr!(PAGEMAP_SCAN, 0x66, 16, PmScanArg);
+}
+use request::PAGEMAP_SCAN;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -579,7 +584,7 @@ mod tests {
     fn pagemap_scan_request_matches_the_uapi() {
         // _IOWR('f', 16, struct pm_scan_arg): a 96-byte argument.
         assert_eq!(std::mem::size_of::<PmScanArg>(), 96);
-        assert_eq!(u64::from(PAGEMAP_SCAN()), 0xc060_6610);
+        assert_eq!(PAGEMAP_SCAN(), 0xc060_6610);
     }
 
     #[test]
