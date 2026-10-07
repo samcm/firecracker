@@ -163,24 +163,28 @@ impl Drop for DispatchHold<'_> {
 /// The gate the microVM's event loop and the capture service share.
 static GATE: DispatchGate = DispatchGate::new();
 
-/// Writer half of the event loop's wake-up eventfd. Set once, by the first dispatch slice, which
-/// registers the reader half with its event manager.
+/// The event loop's wake-up eventfd. Created once, by the first dispatch slice, which registers it
+/// with its event manager. One descriptor serves both ends: the first slice runs after the seccomp
+/// filter is installed, and the filter admits eventfd2 but not the fcntl a duplicate would need.
 static KICK: OnceLock<EventFd> = OnceLock::new();
 
-/// Reader half of the wake-up eventfd: its only job is to end an idle epoll wait.
+/// The event loop's end of the wake-up eventfd: its only job is to end an idle epoll wait.
 #[derive(Debug)]
-struct GateKick {
-    fd: EventFd,
-}
+struct GateKick;
 
 impl MutEventSubscriber for GateKick {
     fn process(&mut self, _events: Events, _ops: &mut EventOps) {
         // Nonblocking: a spurious or coalesced wake reads nothing and costs nothing.
-        let _ = self.fd.read();
+        if let Some(kick) = KICK.get() {
+            let _ = kick.read();
+        }
     }
 
     fn init(&mut self, ops: &mut EventOps) {
-        if let Err(err) = ops.add(Events::new(&self.fd, EventSet::IN)) {
+        let Some(kick) = KICK.get() else {
+            return;
+        };
+        if let Err(err) = ops.add(Events::new(kick, EventSet::IN)) {
             error!("Farplane gate could not register its wake-up eventfd: {err}");
         }
     }
@@ -192,12 +196,10 @@ fn register_kick(event_manager: &mut EventManager) {
     if KICK.get().is_some() {
         return;
     }
-    let registered =
-        EventFd::new(EFD_NONBLOCK).and_then(|fd| fd.try_clone().map(|writer| (fd, writer)));
-    match registered {
-        Ok((fd, writer)) => {
-            if KICK.set(writer).is_ok() {
-                event_manager.add_subscriber(Arc::new(Mutex::new(GateKick { fd })));
+    match EventFd::new(EFD_NONBLOCK) {
+        Ok(fd) => {
+            if KICK.set(fd).is_ok() {
+                event_manager.add_subscriber(Arc::new(Mutex::new(GateKick)));
             }
         }
         Err(err) => error!("Farplane gate could not create its wake-up eventfd: {err}"),
