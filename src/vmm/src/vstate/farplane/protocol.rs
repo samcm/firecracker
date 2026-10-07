@@ -96,6 +96,10 @@ pub enum MsgType {
     /// Pagemaster asks for the guest's memory to stop being tracked, releasing the standing
     /// version. Firecracker answers with `tracked` (tracked=0).
     Untrack = 25,
+    /// Pagemaster asks which guest pages this child touched since resume. The body is empty.
+    RecordHotSet = 26,
+    /// Firecracker answers with an FPHS v1 hot set, or an empty body when none is available.
+    HotSetRecorded = 27,
     /// Pagemaster hands over the memversion device, and the imported version for a lazily
     /// imported guest, and asks for the guest's memory to be tracked from now on.
     Track = 28,
@@ -129,6 +133,8 @@ impl MsgType {
             23 => Some(Self::FreeSummaryDone),
             24 => Some(Self::Drives),
             25 => Some(Self::Untrack),
+            26 => Some(Self::RecordHotSet),
+            27 => Some(Self::HotSetRecorded),
             28 => Some(Self::Track),
             29 => Some(Self::Tracked),
             30 => Some(Self::Refresh),
@@ -860,6 +866,32 @@ mod tests {
         ));
     }
 
+    /// The exact bytes the Go encoder produces in fcmem's TestRestorePlanCarriesAHotSet.
+    #[test]
+    fn backing_plan_hot_set_tail_vector() {
+        let hex = concat!(
+            "0700000001000000000000000300000000000000000000000000100000000000",
+            "00000000000000000000000000000000000000000000000000000000000000ab",
+            "0000000100000000",
+            "465048530100000002000000030000000010000000000000002000000000000001000000000000000080000000000000001000000000000000000000",
+            "00000000",
+        );
+        let body: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let plan = parse_backing_plan(&body).unwrap();
+        let tail = plan.hot_set.unwrap();
+        assert_eq!(tail.precow_budget, 16 << 20);
+        let set = crate::vstate::farplane::hot_set::HotSet::decode(&tail.encoded).unwrap();
+        let ranges: Vec<_> = set
+            .ranges()
+            .iter()
+            .map(|r| (r.gpa, r.size, r.flags))
+            .collect();
+        assert_eq!(ranges, vec![(0x1000, 0x2000, 1), (0x8000, 0x1000, 0)]);
+    }
+
     #[test]
     fn backing_plan_hot_set_tail_rides_only_on_a_restore() {
         let plan = |flags: u32, tail: &[u8]| {
@@ -980,6 +1012,10 @@ mod tests {
         assert_eq!(MsgType::FreeSummary as u16, 22);
         assert_eq!(MsgType::FreeSummaryDone as u16, 23);
         assert_eq!(MsgType::Drives as u16, 24);
+        assert_eq!(MsgType::RecordHotSet as u16, 26);
+        assert_eq!(MsgType::HotSetRecorded as u16, 27);
+        assert_eq!(MsgType::from_u16(26), Some(MsgType::RecordHotSet));
+        assert_eq!(MsgType::from_u16(27), Some(MsgType::HotSetRecorded));
         assert_eq!(ErrorCode::BadDrive as u32, 29);
     }
 
