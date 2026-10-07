@@ -347,6 +347,9 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
         self.device_manager.kick_virtio_devices();
+        // The bring-up prefault and KVM_RUN take the same vCPU lock: what it did not reach by
+        // now faults the ordinary way.
+        crate::vstate::farplane::prefault::Prefaulter::stop();
         kvm_vm.resume_vcpus()?;
         self.set_vm_state(VmState::Running);
         Ok(())

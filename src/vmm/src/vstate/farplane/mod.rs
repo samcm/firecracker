@@ -12,6 +12,8 @@ pub mod drives;
 /// The guest pages a fork child touched between resume and running.
 pub mod hot_set;
 pub(crate) mod memversion;
+/// Bring-up prefault of a restored child over an earlier child's hot set.
+pub mod prefault;
 /// Wire format of the pagemaster memory channel.
 pub mod protocol;
 

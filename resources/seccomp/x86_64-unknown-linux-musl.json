@@ -266,6 +266,32 @@
             },
             {
                 "syscall": "madvise",
+                "comment": "Used by the bring-up prefault to copy a lineage's hot written pages before the vCPUs first run",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 23,
+                        "comment": "libc::MADV_POPULATE_WRITE"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Used by the bring-up prefault to map a lineage's hot pages into the stage-2 tables before the vCPUs first run",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3225464533,
+                        "comment": "KVM_PRE_FAULT_MEMORY"
+                    }
+                ]
+            },
+            {
+                "syscall": "madvise",
                 "comment": "Used by aws-lc during random number generation. It marks a memory page with MADV_WIPEONFORK to be able to detect forks.",
                 "args": [
                     {

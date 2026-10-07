@@ -42,6 +42,8 @@ static SOCKET_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// The connection made at startup, before any sandbox is known; the handshake takes it.
 static CONNECTION: Mutex<Option<Connection>> = Mutex::new(None);
 static CHANNEL: Mutex<Option<MemoryChannel>> = Mutex::new(None);
+/// The hot set the restore plan carried, until the builder starts the bring-up prefault.
+static HOT_SET: Mutex<Option<protocol::HotSetTail>> = Mutex::new(None);
 static SOURCE_COMMIT: OnceLock<&'static str> = OnceLock::new();
 
 /// Reported when no executable published its build commit, which is every process that is not the
@@ -246,6 +248,11 @@ impl FarplaneBackend {
             return Err(err.into());
         }
         Ok(())
+    }
+
+    /// Takes the hot set a restore plan carried, if any, for the bring-up prefault.
+    pub fn take_hot_set() -> Option<protocol::HotSetTail> {
+        HOT_SET.lock().expect("Poisoned lock").take()
     }
 
     /// Takes the channel established by the handshake, so it can be driven by the event loop.
@@ -546,6 +553,7 @@ fn commit_plan(
         &[],
     )?;
 
+    *HOT_SET.lock().expect("Poisoned lock") = plan.hot_set;
     *CHANNEL.lock().expect("Poisoned lock") = Some(MemoryChannel {
         sock,
         regions: plan.regions,
