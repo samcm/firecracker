@@ -691,8 +691,8 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
-                        "val": 2149078598,
-                        "comment": "MV_TRACK_INFO (0x80185646)"
+                        "val": 3223868998,
+                        "comment": "MV_TRACK_INFO (0xc0285646)"
                     }
                 ]
             },
@@ -706,6 +706,19 @@
                         "op": "eq",
                         "val": 1074026055,
                         "comment": "MV_TRACK_REBASE (0x40045647)"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Stop tracking guest memory and release the standing memversion version",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074026056,
+                        "comment": "MV_TRACK_DROP (0x40045648)"
                     }
                 ]
             },
