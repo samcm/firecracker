@@ -446,15 +446,15 @@ pub fn build_microvm_from_snapshot(
         .create_vcpus(vm_resources.machine_config.vcpu_count)
         .map_err(StartMicrovmError::KvmVm)?;
 
+    // A restored VM's memory was written by no userspace loader, so its slots start with a clear
+    // KVM dirty log and this VM's first harvest reports only post-restore writes, with no clear
+    // over the whole geometry. Registered before the vCPU state restore on purpose: the guest
+    // pages KVM writes on its behalf (kvmclock, steal time) have to reach that harvest, as do the
+    // device-restore and VMGenID writes, which the host accumulator tracks independently.
+    vm.start_dirty_log_clear()
+        .map_err(StartMicrovmError::KvmVm)?;
     vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
         .map_err(StartMicrovmError::KvmVm)?;
-
-    // The slots are committed, so KVM's initially-set state now describes nothing this VM did.
-    // Retire it before anything writes guest memory, so this VM's first harvest reports only
-    // post-restore writes. Placed before the vCPU state restore on purpose: the guest pages KVM
-    // writes on its behalf (kvmclock, steal time) have to survive into that harvest, as do the
-    // device-restore and VMGenID writes, which the host accumulator tracks independently.
-    vm.baseline_dirty_log().map_err(StartMicrovmError::KvmVm)?;
 
     #[cfg(target_arch = "x86_64")]
     {
