@@ -291,7 +291,7 @@ fn present(
         };
         // SAFETY: arg points at a live, correctly sized pm_scan_arg whose vec is a live buffer of
         // vec_len page_regions; the kernel writes only those and arg.walk_end.
-        let filled = unsafe { libc::ioctl(pagemap.as_raw_fd(), PAGEMAP_SCAN, &mut arg) };
+        let filled = unsafe { libc::ioctl(pagemap.as_raw_fd(), PAGEMAP_SCAN as _, &mut arg) };
         if filled < 0 {
             let err = io::Error::last_os_error();
             return match err.raw_os_error() {
