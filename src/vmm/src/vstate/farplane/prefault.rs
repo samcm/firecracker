@@ -18,7 +18,7 @@
 //! joins, and whatever was not reached by then faults normally.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -218,10 +218,10 @@ impl PrefaultOps for KvmOps {
             // SAFETY: the descriptor is a vCPU of this VM, and `range` is a live
             // kvm_pre_fault_memory that KVM reads and updates.
             let ret = unsafe {
-                libc::ioctl(
-                    self.vcpu.as_raw_fd(),
-                    KVM_PRE_FAULT_MEMORY as _,
-                    &mut range as *mut kvm_bindings::kvm_pre_fault_memory,
+                vmm_sys_util::ioctl::ioctl_with_mut_ref(
+                    &self.vcpu,
+                    KVM_PRE_FAULT_MEMORY,
+                    &mut range,
                 )
             };
             if ret < 0 {
