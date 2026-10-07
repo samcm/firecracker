@@ -205,7 +205,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Track => (0, &[1, 2]),
         MsgType::Refresh => (0, &[0]),
         MsgType::Untrack => (0, &[0]),
-        MsgType::RecordHotSet => (0, &[0]),
+        MsgType::RecordHotSet => (0, &[1]),
         _ => return Err(ChannelError::Malformed),
     };
     if body_len != len || !counts.contains(&fd_count) {
@@ -328,7 +328,7 @@ impl CaptureService {
             MsgType::Track => self.track(incoming),
             MsgType::Refresh => self.refresh(request_id),
             MsgType::Untrack => self.untrack(request_id),
-            MsgType::RecordHotSet => self.record_hot_set(request_id),
+            MsgType::RecordHotSet => self.record_hot_set(incoming),
             _ => Err(ChannelError::Malformed),
         }
     }
@@ -338,7 +338,12 @@ impl CaptureService {
     /// caps) is an empty answer. A recorder that fails is refused with `hot_set_failed`, logged
     /// as a warning and counted, so a broken recorder is never mistaken for an empty set. The
     /// scan reads page tables only and never holds the VMM lock.
-    fn record_hot_set(&mut self, request_id: u64) -> Result<(), ChannelError> {
+    /// The memory plane lends the memversion device with the request; it answers RESIDENT
+    /// about this process's own mm and is dropped before the reply.
+    fn record_hot_set(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
+        let request_id = incoming.header.request_id;
+        let [device] =
+            <[_; 1]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
         let vm = self
             .vmm
             .try_lock()
@@ -350,7 +355,8 @@ impl CaptureService {
             return self.reject(request_id, ErrorCode::HotSetFailed, MsgType::RecordHotSet);
         };
         let mut skipped = Vec::new();
-        let recorded = super::hot_set::record(vm.guest_memory(), &mut skipped);
+        let recorded = super::hot_set::record(vm.guest_memory(), device.as_fd(), &mut skipped);
+        drop(device);
         for err in &skipped {
             warn!("Bring-up hot set skipped a guest region: {err}");
             METRICS.farplane.hot_set_failures.inc();

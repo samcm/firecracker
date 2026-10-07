@@ -6,7 +6,6 @@
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use vmm_sys_util::ioctl::{ioctl, ioctl_with_mut_ref, ioctl_with_ref};
@@ -437,7 +436,6 @@ pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io
             other => {
                 if other.is_ok() {
                     IMPORTED_LAZILY.store(true, Ordering::Relaxed);
-                    keep_resident_handle(version);
                 }
                 return other;
             }
@@ -448,34 +446,6 @@ pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io
         IMPORTED_EAGERLY.store(true, Ordering::Relaxed);
     }
     mapped
-}
-
-/// A memversion descriptor kept past the import for `resident`: the kernel answers RESIDENT
-/// on any version fd, and only about the caller's own mm, so the first lazily imported version
-/// is as good a handle as the device.
-static RESIDENT_HANDLE: OnceLock<OwnedFd> = OnceLock::new();
-
-fn keep_resident_handle(version: BorrowedFd<'_>) {
-    if RESIDENT_HANDLE.get().is_none()
-        && let Ok(owned) = version.try_clone_to_owned()
-    {
-        let _ = RESIDENT_HANDLE.set(owned);
-    }
-}
-
-/// Test-only: the device is a RESIDENT handle too, for a process that imported no version.
-#[cfg(test)]
-pub(crate) fn use_device_as_resident_handle() -> bool {
-    if RESIDENT_HANDLE.get().is_some() {
-        return true;
-    }
-    match std::fs::File::open("/dev/memversion_v1") {
-        Ok(device) => {
-            let _ = RESIDENT_HANDLE.set(OwnedFd::from(device));
-            true
-        }
-        Err(_) => false,
-    }
 }
 
 /// MV_IOC_RESIDENT (ABI v2): which pages of [addr, addr + len) of this process's own mm are
@@ -499,10 +469,11 @@ ioctl_iowr_nr!(MV_IOC_RESIDENT, 0x56, 0x49, Resident);
 pub(crate) const RESIDENT_MAX_LEN: u64 = 1 << 30;
 
 /// Fills `present` and `written` (one bit per 4 KiB page from `addr`, least significant first)
-/// for the range, which must be page aligned and at most [`RESIDENT_MAX_LEN`]. `Ok(None)` when
-/// this process holds no version or the kernel predates RESIDENT (ENOTTY); every other errno is
-/// a failure.
+/// for the range, which must be page aligned and at most [`RESIDENT_MAX_LEN`]. `handle` is any
+/// memversion descriptor (the device or a version); the kernel reports only on this process's
+/// own mm. `Ok(None)` when the kernel predates RESIDENT (ENOTTY); every other errno is a failure.
 pub(crate) fn resident(
+    handle: BorrowedFd<'_>,
     addr: u64,
     len: u64,
     present: &mut [u64],
@@ -512,9 +483,6 @@ pub(crate) fn resident(
     if len == 0 || len > RESIDENT_MAX_LEN || present.len() < words || written.len() < words {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let Some(handle) = RESIDENT_HANDLE.get() else {
-        return Ok(None);
-    };
     let mut request = Resident {
         addr,
         len,
@@ -524,7 +492,7 @@ pub(crate) fn resident(
     };
     // SAFETY: the request is live and correctly sized; its two pointers name live buffers of at
     // least ceil(len / 4096 / 64) words each, which is all the kernel writes.
-    if unsafe { ioctl_with_mut_ref(handle, MV_IOC_RESIDENT(), &mut request) } != 0 {
+    if unsafe { ioctl_with_mut_ref(&handle, MV_IOC_RESIDENT(), &mut request) } != 0 {
         let err = io::Error::last_os_error();
         return match err.raw_os_error() {
             Some(libc::ENOTTY) => Ok(None),
@@ -928,20 +896,15 @@ mod tests {
     }
 
     #[test]
-    fn resident_without_a_version_is_unavailable_and_bad_ranges_are_refused() {
+    fn resident_refuses_bad_ranges_before_the_kernel() {
         let mut present = [0u64; 1];
         let mut written = [0u64; 1];
-        if RESIDENT_HANDLE.get().is_none() {
-            assert!(
-                resident(0x1000, 4096, &mut present, &mut written)
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        resident(0x1000, 0, &mut present, &mut written).unwrap_err();
-        resident(0x1000, RESIDENT_MAX_LEN + 4096, &mut present, &mut written).unwrap_err();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        resident(null.as_fd(), 0x1000, 0, &mut present, &mut written).unwrap_err();
+        resident(null.as_fd(), 0x1000, RESIDENT_MAX_LEN + 4096, &mut present, &mut written)
+            .unwrap_err();
         // 65 pages need two words.
-        resident(0x1000, 65 * 4096, &mut present, &mut written).unwrap_err();
+        resident(null.as_fd(), 0x1000, 65 * 4096, &mut present, &mut written).unwrap_err();
     }
 
     #[test]

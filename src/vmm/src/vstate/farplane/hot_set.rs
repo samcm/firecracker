@@ -19,6 +19,7 @@
 //! sorted, non-overlapping and coalesced only across equal flags.
 
 use std::io;
+use std::os::fd::BorrowedFd;
 
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 
@@ -245,6 +246,7 @@ pub enum RecordError {
 /// kernel refuses as non-anonymous is skipped and reported in `skipped`.
 pub fn record_regions(
     regions: &[HostRegion],
+    handle: BorrowedFd<'_>,
     skipped: &mut Vec<RecordError>,
 ) -> Result<Option<HotSet>, RecordError> {
     let step = super::memversion::RESIDENT_MAX_LEN;
@@ -257,7 +259,7 @@ pub fn record_regions(
         let mut offset = 0;
         while offset < region.len {
             let len = (region.len - offset).min(step);
-            match super::memversion::resident(region.host + offset, len, &mut present, &mut written)
+            match super::memversion::resident(handle, region.host + offset, len, &mut present, &mut written)
             {
                 Ok(Some(_)) => {}
                 Ok(None) => return Ok(None),
@@ -301,6 +303,7 @@ pub fn record_regions(
 /// imported page is present without having been touched.
 pub fn record(
     memory: &GuestMemoryMmap,
+    handle: BorrowedFd<'_>,
     skipped: &mut Vec<RecordError>,
 ) -> Result<Option<HotSet>, RecordError> {
     if !super::memversion::imported_only_lazily() {
@@ -314,11 +317,13 @@ pub fn record(
             len: region.len(),
         })
         .collect();
-    record_regions(&regions, skipped)
+    record_regions(&regions, handle, skipped)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsFd;
+
     use super::*;
 
     const ANY: &[(u64, u64)] = &[(0, u64::MAX)];
@@ -522,7 +527,8 @@ mod tests {
             // SAFETY: the first byte of a live region of this test's guest memory.
             unsafe { std::ptr::write_volatile(region.as_ptr(), 1) };
         });
-        assert_eq!(record(&memory, &mut Vec::new()).unwrap(), None);
+        let device = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(record(&memory, device.as_fd(), &mut Vec::new()).unwrap(), None);
     }
 
     /// Needs a kernel with MV_IOC_RESIDENT and /dev/memversion_v1 (its handle here). Skips
@@ -580,13 +586,13 @@ mod tests {
             },
         ];
         let required = std::env::var_os("FARPLANE_REQUIRE_RESIDENT").is_some();
-        if !super::super::memversion::use_device_as_resident_handle() {
+        let Ok(device) = std::fs::File::open("/dev/memversion_v1") else {
             assert!(!required, "no /dev/memversion_v1 on a kernel that must have it");
             eprintln!("skipped: no /dev/memversion_v1");
             return;
-        }
+        };
         let mut skipped = Vec::new();
-        let Some(set) = record_regions(&regions, &mut skipped).unwrap() else {
+        let Some(set) = record_regions(&regions, device.as_fd(), &mut skipped).unwrap() else {
             assert!(!required, "RESIDENT unavailable on a kernel that must have it");
             eprintln!("skipped: no MV_IOC_RESIDENT on this kernel");
             return;
@@ -609,7 +615,7 @@ mod tests {
         // A page touched after recording is in the next record, not this one.
         write(b, 701);
         assert_eq!(
-            record_regions(&regions, &mut skipped).unwrap().unwrap().pages(),
+            record_regions(&regions, device.as_fd(), &mut skipped).unwrap().unwrap().pages(),
             set.pages() + 1
         );
     }
