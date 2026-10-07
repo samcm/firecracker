@@ -568,17 +568,21 @@ impl VirtioBlock {
         }
     }
 
-    /// Drains every in-flight request and flushes the backing store, so nothing this device
-    /// started can still write guest memory once it returns.
+    /// Drains every in-flight request, so nothing this device started can still write guest
+    /// memory or hold a guest page once it returns. Only a `Writeback` drive also syncs its
+    /// backing store: an `Unsafe` drive promises the guest no durability, and a reflink clone
+    /// writes back and waits for the source range itself, so a sync there buys nothing but a
+    /// device cache flush inside the pause.
     pub fn drain_writes(&mut self) -> Result<(), VirtioBlockError> {
         if !self.is_activated() {
             return Ok(());
         }
 
-        self.disk
-            .file_engine
-            .drain_and_flush(false)
-            .map_err(VirtioBlockError::FileEngine)?;
+        match self.cache_type {
+            CacheType::Unsafe => self.disk.file_engine.drain(false),
+            CacheType::Writeback => self.disk.file_engine.drain_and_flush(false),
+        }
+        .map_err(VirtioBlockError::FileEngine)?;
         if let FileEngine::Async(ref _engine) = self.disk.file_engine {
             self.process_async_completion_queue();
         }
