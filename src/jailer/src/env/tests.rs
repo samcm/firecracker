@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::undocumented_unsafe_blocks)]
 
+use std::mem::MaybeUninit;
+use std::os::unix::fs::MetadataExt;
+
 use super::*;
 use crate::build_arg_parser;
 
