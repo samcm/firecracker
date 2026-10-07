@@ -445,6 +445,7 @@ impl<'a> PrebootApiController<'a> {
         load_params: &LoadSnapshotParams,
     ) -> Result<VmmData, LoadSnapshotError> {
         let load_start_us = get_time_us(ClockType::Monotonic);
+        crate::vstate::farplane::phases::mark("start");
 
         if self.boot_path {
             let err = LoadSnapshotError::LoadSnapshotNotAllowed;
@@ -478,6 +479,8 @@ impl<'a> PrebootApiController<'a> {
         }
         // Set the VM
         self.built_vmm = Some(vmm);
+        crate::vstate::farplane::phases::mark("api_done");
+        crate::vstate::farplane::phases::report("RESTORE_PHASES_US");
 
         debug!(
             "'load snapshot' VMM action took {} us.",
