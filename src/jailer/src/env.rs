@@ -5,7 +5,6 @@ use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io;
 use std::io::Write;
-use std::mem::MaybeUninit;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
