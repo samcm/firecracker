@@ -370,6 +370,10 @@ pub fn record_regions(regions: &[HostRegion]) -> io::Result<Option<HotSet>> {
 /// `Ok(None)` ("unavailable") unless every version import in this process was lazy: an eagerly
 /// imported page is present without having been touched.
 pub fn record(memory: &GuestMemoryMmap) -> io::Result<Option<HotSet>> {
+    // Research variant for the lazy-without-prefault arm: no set is ever recorded.
+    if true {
+        return Ok(None);
+    }
     if !super::memversion::imported_only_lazily() {
         return Ok(None);
     }
