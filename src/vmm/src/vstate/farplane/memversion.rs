@@ -1,15 +1,15 @@
 // Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Frozen v1 UAPI. Firecracker borrows the device capability from pagemaster; never opens it.
+//! Frozen v1 UAPI plus the additive ABI v2 requests (incremental versions). Firecracker borrows the device capability from pagemaster; never opens it.
 //! The companion integration stub is resources/memversion.h, not the research ioctl ABI.
 
 use std::io;
-use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref};
-use vmm_sys_util::{ioctl_iow_nr, ioctl_iowr_nr};
+use vmm_sys_util::ioctl::{ioctl, ioctl_with_mut_ref, ioctl_with_ref};
+use vmm_sys_util::{ioctl_io_nr, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr};
 
 use super::protocol::RegionRecord;
 
@@ -373,6 +373,15 @@ fn create_with(
     exclusions: &[Exclusion],
     ioctl: impl FnOnce(&mut Create) -> io::Result<()>,
 ) -> io::Result<OwnedFd> {
+    create_flags_with(regions, exclusions, 0, ioctl)
+}
+
+fn create_flags_with(
+    regions: &[Region],
+    exclusions: &[Exclusion],
+    flags: u32,
+    ioctl: impl FnOnce(&mut Create) -> io::Result<()>,
+) -> io::Result<OwnedFd> {
     if regions.is_empty() || regions.len() > MAX_REGIONS || exclusions.len() > MAX_EXCLUSIONS {
         return Err(invalid());
     }
@@ -381,7 +390,7 @@ fn create_with(
         exclusions: exclusions.as_ptr() as u64,
         nr_regions: u32::try_from(regions.len()).unwrap(),
         nr_exclusions: u32::try_from(exclusions.len()).unwrap(),
-        flags: 0,
+        flags,
         fd: -1,
     };
     ioctl(&mut request)?;
@@ -428,6 +437,165 @@ pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io
         }
     }
     map_with(version, region, addr, MV_MAP_PRIVATE)
+}
+
+// ABI v2: incremental versions. Every v1 request keeps its v1 meaning; a v1 kernel refuses
+// each of these with ENOTTY (unknown request) or EINVAL (unknown CREATE flag).
+
+#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
+/// The caller's mm is tracked; the version is the standing version plus only the pages
+/// written since it, and becomes the new standing version.
+const MV_CREATE_TRACKED: u32 = 1;
+#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
+/// With MV_CREATE_TRACKED: the source keeps running. A page that may be pinned stays
+/// unfolded rather than failing the call; at the depth bound the call fails with E2BIG.
+const MV_CREATE_LIVE: u32 = 2;
+
+#[repr(C)]
+#[derive(Debug)]
+struct Track {
+    regions: u64,
+    nr_regions: u32,
+    base_fd: i32,
+}
+
+/// Dirty state of the caller's tracked mm.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TrackInfo {
+    pub tracked: u32,
+    pub depth: u32,
+    /// Pages written since the standing version: what the next fold copies.
+    pub dirty_pages: u64,
+    pub standing_id: u64,
+}
+
+/// A version's v2 description: its place in a chain and what this level holds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Info2 {
+    pub abi: u32,
+    pub nr_regions: u32,
+    pub regions: u64,
+    pub present_pages: u64,
+    pub excluded_pages: u64,
+    pub new_pages: u64,
+    pub id: u64,
+    pub base_id: u64,
+    pub content_id: u64,
+    pub depth: u32,
+    pub nr_zero_runs: u32,
+    pub own_pages: u64,
+    pub folded_pages: u64,
+}
+
+ioctl_iowr_nr!(MV_IOC_INFO2, 0x56, 0x43, Info2);
+ioctl_io_nr!(MV_IOC_FLATTEN, 0x56, 0x44);
+ioctl_iow_nr!(MV_IOC_TRACK, 0x56, 0x45, Track);
+ioctl_ior_nr!(MV_IOC_TRACK_INFO, 0x56, 0x46, TrackInfo);
+ioctl_iow_nr!(MV_IOC_TRACK_REBASE, 0x56, 0x47, i32);
+
+#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
+/// How a CREATE treats the caller's tracked mm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fold {
+    /// Quiesced source: fold every page written since the standing version.
+    Quiesced,
+    /// Running source (background refresh): fold what is not possibly pinned.
+    Live,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
+/// Tracks the caller's guest regions from now on. `base` is the version every page not
+/// yet faulted in equals (the lazily imported version), or `None` for a booted guest
+/// whose untouched memory is zero. Call before the guest runs.
+pub(crate) fn track(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    base: Option<BorrowedFd<'_>>,
+) -> io::Result<()> {
+    if regions.is_empty() || regions.len() > MAX_REGIONS {
+        return Err(invalid());
+    }
+    let request = Track {
+        regions: regions.as_ptr() as u64,
+        nr_regions: u32::try_from(regions.len()).unwrap(),
+        base_fd: base.map_or(-1, |fd| fd.as_raw_fd()),
+    };
+    // SAFETY: request points at an immutable live slice; the kernel only reads it.
+    if unsafe { ioctl_with_ref(&device, MV_IOC_TRACK(), &request) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
+pub(crate) fn track_info(device: BorrowedFd<'_>) -> io::Result<TrackInfo> {
+    let mut info = TrackInfo::default();
+    // SAFETY: info is a live, writable struct of the exact request size.
+    if unsafe { ioctl_with_mut_ref(&device, MV_IOC_TRACK_INFO(), &mut info) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
+/// CREATE over the tracked standing version. The returned version is the new standing
+/// version; the tracker holds its own reference.
+pub(crate) fn create_tracked(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    exclusions: &[Exclusion],
+    fold: Fold,
+) -> io::Result<OwnedFd> {
+    let flags = match fold {
+        Fold::Quiesced => MV_CREATE_TRACKED,
+        Fold::Live => MV_CREATE_TRACKED | MV_CREATE_LIVE,
+    };
+    create_flags_with(regions, exclusions, flags, |request| {
+        // SAFETY: request points at immutable live slices, and its output fd is writable.
+        let result = unsafe { ioctl_with_mut_ref(&device, MV_IOC_CREATE(), request) };
+        if result != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
+pub(crate) fn info2(version: BorrowedFd<'_>) -> io::Result<Info2> {
+    let mut info = Info2::default();
+    // SAFETY: info is a live, writable struct of the exact request size; regions stays null,
+    // so the kernel writes no region array.
+    if unsafe { ioctl_with_mut_ref(&version, MV_IOC_INFO2(), &mut info) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
+/// A new flat version with the same content as `version`. Reads only immutable versions,
+/// so it needs no source lock and pauses nothing.
+pub(crate) fn flatten(version: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    // SAFETY: the request takes no argument; a non-negative result is a new CLOEXEC fd.
+    let fd = unsafe { ioctl(&version, MV_IOC_FLATTEN()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful FLATTEN transfers exactly this newly allocated fd to the caller.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Wired by the Track and Refresh commands.
+/// Replaces the tracker's standing version with `flat`, a FLATTEN of it.
+pub(crate) fn rebase(device: BorrowedFd<'_>, flat: BorrowedFd<'_>) -> io::Result<()> {
+    let fd: i32 = flat.as_raw_fd();
+    // SAFETY: the request reads one live i32.
+    if unsafe { ioctl_with_ref(&device, MV_IOC_TRACK_REBASE(), &fd) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -578,6 +746,91 @@ mod tests {
         );
         assert_eq!(std::mem::offset_of!(Create, fd), 28);
         assert_eq!(std::mem::offset_of!(Info, regions), 8);
+    }
+
+    #[test]
+    fn abi_v2_layout_and_numbers() {
+        // Sizes and offsets of research/907-memversion/fork-speed/patch/stage4-uapi.h.
+        assert_eq!(
+            (
+                size_of::<Track>(),
+                size_of::<TrackInfo>(),
+                size_of::<Info2>()
+            ),
+            (16, 24, 88)
+        );
+        assert_eq!(std::mem::offset_of!(Track, base_fd), 12);
+        assert_eq!(std::mem::offset_of!(Info2, id), 40);
+        assert_eq!(std::mem::offset_of!(Info2, depth), 64);
+        assert_eq!(std::mem::offset_of!(Info2, own_pages), 72);
+        assert_eq!(
+            (
+                MV_IOC_INFO2(),
+                MV_IOC_FLATTEN(),
+                MV_IOC_TRACK(),
+                MV_IOC_TRACK_INFO(),
+                MV_IOC_TRACK_REBASE()
+            ),
+            (0xc0585643, 0x5644, 0x40105645, 0x80185646, 0x40045647)
+        );
+    }
+
+    #[test]
+    fn tracked_create_flags_and_v2_requests_on_a_non_device() {
+        let regions = [Region {
+            addr: GUEST_RAM_BASE,
+            len: 4096,
+        }];
+        for (fold, flags) in [
+            (Fold::Quiesced, MV_CREATE_TRACKED),
+            (Fold::Live, MV_CREATE_TRACKED | MV_CREATE_LIVE),
+        ] {
+            let want = flags;
+            let fd = create_flags_with(&regions, &[], flags, |request| {
+                assert_eq!(
+                    (request.flags, request.nr_regions, request.fd),
+                    (want, 1, -1)
+                );
+                request.fd = std::fs::File::open("/dev/null")?.into_raw_fd();
+                Ok(())
+            })
+            .unwrap();
+            drop(fd);
+            let null = std::fs::File::open("/dev/null").unwrap();
+            assert_eq!(
+                create_tracked(null.as_fd(), &regions, &[], fold)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ENOTTY)
+            );
+        }
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let enotty = Some(libc::ENOTTY);
+        assert_eq!(
+            track(null.as_fd(), &regions, None)
+                .unwrap_err()
+                .raw_os_error(),
+            enotty
+        );
+        assert_eq!(
+            track(null.as_fd(), &regions, Some(null.as_fd()))
+                .unwrap_err()
+                .raw_os_error(),
+            enotty
+        );
+        assert_eq!(
+            track(null.as_fd(), &[], None).unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(track_info(null.as_fd()).unwrap_err().raw_os_error(), enotty);
+        assert_eq!(info2(null.as_fd()).unwrap_err().raw_os_error(), enotty);
+        assert_eq!(flatten(null.as_fd()).unwrap_err().raw_os_error(), enotty);
+        assert_eq!(
+            rebase(null.as_fd(), null.as_fd())
+                .unwrap_err()
+                .raw_os_error(),
+            enotty
+        );
     }
 
     #[test]
