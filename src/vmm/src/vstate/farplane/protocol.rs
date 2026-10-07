@@ -87,6 +87,9 @@ pub enum MsgType {
     FreeSummary = 22,
     /// Every bitmap word was written; the body is its LE u64 popcount, with no descriptors.
     FreeSummaryDone = 23,
+    /// Pagemaster asks for the guest's memory to stop being tracked, releasing the standing
+    /// version. Firecracker answers with `tracked` (tracked=0).
+    Untrack = 25,
     /// Pagemaster hands over the memversion device, and the imported version for a lazily
     /// imported guest, and asks for the guest's memory to be tracked from now on.
     Track = 28,
@@ -118,6 +121,7 @@ impl MsgType {
             17 => Some(Self::CaptureBuffersArmed),
             22 => Some(Self::FreeSummary),
             23 => Some(Self::FreeSummaryDone),
+            25 => Some(Self::Untrack),
             28 => Some(Self::Track),
             29 => Some(Self::Tracked),
             30 => Some(Self::Refresh),
@@ -190,6 +194,8 @@ pub enum ErrorCode {
     RebaseFailed = 27,
     /// An advisory free summary was busy, expired, too large, or could not be read/written.
     FreeSummaryUnavailable = 28,
+    /// The guest's memory could not be untracked; the standing version is still held.
+    UntrackFailed = 30,
     /// The guest's memory could not be tracked; captures copy it whole.
     TrackFailed = 31,
     /// The standing version could not be refreshed; the guest runs on and the next fork folds

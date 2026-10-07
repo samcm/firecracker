@@ -204,6 +204,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::FreeSummary => (8, &[1]),
         MsgType::Track => (0, &[1, 2]),
         MsgType::Refresh => (0, &[0]),
+        MsgType::Untrack => (0, &[0]),
         _ => return Err(ChannelError::Malformed),
     };
     if body_len != len || !counts.contains(&fd_count) {
@@ -325,6 +326,7 @@ impl CaptureService {
             MsgType::FreeSummary => self.free_summary(incoming),
             MsgType::Track => self.track(incoming),
             MsgType::Refresh => self.refresh(request_id),
+            MsgType::Untrack => self.untrack(request_id),
             _ => Err(ChannelError::Malformed),
         }
     }
@@ -438,6 +440,30 @@ impl CaptureService {
                 self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh)
             }
         }
+    }
+
+    /// Stops tracking and releases the standing version, the cheapest memory a pressure path
+    /// can give back without pausing the guest. The versions stay alive while anything else
+    /// holds them; pagemaster releases their charge on the kernel's last-holder receipt, not on
+    /// this reply. Untracking an untracked guest reports the same state.
+    fn untrack(&mut self, request_id: u64) -> Result<(), ChannelError> {
+        if BackendState::load() != BackendState::Ready {
+            return self.reject(request_id, ErrorCode::UntrackFailed, MsgType::Untrack);
+        }
+        if let Some(tracker) = self.tracker.as_ref() {
+            if let Err(err) = memversion::untrack(tracker.as_fd()) {
+                error!("Farplane could not untrack guest memory: {err}");
+                return self.reject(request_id, ErrorCode::UntrackFailed, MsgType::Untrack);
+            }
+            self.tracker = None;
+            self.standing = None;
+            info!("Farplane untracked guest memory");
+        }
+        self.reply(
+            request_id,
+            MsgType::Tracked,
+            &encode_track_info(&memversion::TrackInfo::default()),
+        )
     }
 
     fn arm_buffers(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
