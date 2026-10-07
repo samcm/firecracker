@@ -334,27 +334,39 @@ impl CaptureService {
     }
 
     /// Reports the pages this child's bring-up touched, for later children of the lineage to
-    /// prefault. The set is a hint, so a set this process cannot record is an empty answer, not
-    /// a refusal; the scan reads page tables only and never holds the VMM lock.
+    /// prefault. A set this process cannot have (an eager import, an old kernel, a set over the
+    /// caps) is an empty answer. A recorder that fails is refused with `hot_set_failed`, logged
+    /// as a warning and counted, so a broken recorder is never mistaken for an empty set. The
+    /// scan reads page tables only and never holds the VMM lock.
     fn record_hot_set(&mut self, request_id: u64) -> Result<(), ChannelError> {
         let vm = self
             .vmm
             .try_lock()
             .ok()
             .and_then(|vmm| vmm.kvm_vm().cloned());
-        let encoded = match vm.map(|vm| super::hot_set::record(vm.guest_memory())) {
-            Some(Ok(Some(set))) => set.encode(),
-            Some(Ok(None)) => Vec::new(),
-            Some(Err(err)) => {
-                warn!("Bring-up hot set could not be recorded: {err}");
-                Vec::new()
-            }
-            None => {
-                warn!("Bring-up hot set: the VM is busy or gone");
-                Vec::new()
-            }
+        let Some(vm) = vm else {
+            warn!("Bring-up hot set: the VM is busy or gone");
+            METRICS.farplane.hot_set_failures.inc();
+            return self.reject(request_id, ErrorCode::HotSetFailed, MsgType::RecordHotSet);
         };
-        self.reply(request_id, MsgType::HotSetRecorded, &encoded)
+        let mut skipped = Vec::new();
+        let recorded = super::hot_set::record(vm.guest_memory(), &mut skipped);
+        for err in &skipped {
+            warn!("Bring-up hot set skipped a guest region: {err}");
+            METRICS.farplane.hot_set_failures.inc();
+        }
+        match recorded {
+            Ok(Some(set)) => {
+                METRICS.farplane.hot_set_pages.add(set.pages());
+                self.reply(request_id, MsgType::HotSetRecorded, &set.encode())
+            }
+            Ok(None) => self.reply(request_id, MsgType::HotSetRecorded, &[]),
+            Err(err) => {
+                warn!("Bring-up hot set could not be recorded: {err}");
+                METRICS.farplane.hot_set_failures.inc();
+                self.reject(request_id, ErrorCode::HotSetFailed, MsgType::RecordHotSet)
+            }
+        }
     }
 
     fn free_summary(&mut self, incoming: Incoming) -> Result<(), ChannelError> {

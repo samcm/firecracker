@@ -216,6 +216,8 @@ pub enum ErrorCode {
     /// The standing version could not be refreshed; the guest runs on and the next fork folds
     /// more.
     RefreshFailed = 32,
+    /// The bring-up hot set could not be recorded; an empty answer means only that none exists.
+    HotSetFailed = 33,
 }
 
 /// Architecture Firecracker is running on.
@@ -1017,6 +1019,7 @@ mod tests {
         assert_eq!(MsgType::from_u16(26), Some(MsgType::RecordHotSet));
         assert_eq!(MsgType::from_u16(27), Some(MsgType::HotSetRecorded));
         assert_eq!(ErrorCode::BadDrive as u32, 29);
+        assert_eq!(ErrorCode::HotSetFailed as u32, 33);
     }
 
     /// The `hello` frame is the only place the feature identity crosses to pagemaster, so its

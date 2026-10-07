@@ -774,6 +774,10 @@ pub struct FarplaneMetrics {
     pub disk_clone_agg: LatencyAggregateMetrics,
     /// Number of scratch disk reflinks that failed and refused the quiesce.
     pub disk_clone_failures: SharedIncMetric,
+    /// Number of bring-up hot set recordings that failed, and guest regions a recording skipped.
+    pub hot_set_failures: SharedIncMetric,
+    /// Pages named by the bring-up hot sets this process recorded.
+    pub hot_set_pages: SharedIncMetric,
 }
 impl FarplaneMetrics {
     /// Const default construction.
@@ -782,6 +786,8 @@ impl FarplaneMetrics {
             disk_clones: SharedIncMetric::new(),
             disk_clone_agg: LatencyAggregateMetrics::new(),
             disk_clone_failures: SharedIncMetric::new(),
+            hot_set_failures: SharedIncMetric::new(),
+            hot_set_pages: SharedIncMetric::new(),
         }
     }
 }

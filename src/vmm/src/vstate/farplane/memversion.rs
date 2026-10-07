@@ -6,6 +6,7 @@
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use vmm_sys_util::ioctl::{ioctl, ioctl_with_mut_ref, ioctl_with_ref};
@@ -436,6 +437,7 @@ pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io
             other => {
                 if other.is_ok() {
                     IMPORTED_LAZILY.store(true, Ordering::Relaxed);
+                    keep_resident_handle(version);
                 }
                 return other;
             }
@@ -446,6 +448,90 @@ pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io
         IMPORTED_EAGERLY.store(true, Ordering::Relaxed);
     }
     mapped
+}
+
+/// A memversion descriptor kept past the import for `resident`: the kernel answers RESIDENT
+/// on any version fd, and only about the caller's own mm, so the first lazily imported version
+/// is as good a handle as the device.
+static RESIDENT_HANDLE: OnceLock<OwnedFd> = OnceLock::new();
+
+fn keep_resident_handle(version: BorrowedFd<'_>) {
+    if RESIDENT_HANDLE.get().is_none()
+        && let Ok(owned) = version.try_clone_to_owned()
+    {
+        let _ = RESIDENT_HANDLE.set(owned);
+    }
+}
+
+/// Test-only: the device is a RESIDENT handle too, for a process that imported no version.
+#[cfg(test)]
+pub(crate) fn use_device_as_resident_handle() -> bool {
+    if RESIDENT_HANDLE.get().is_some() {
+        return true;
+    }
+    match std::fs::File::open("/dev/memversion_v1") {
+        Ok(device) => {
+            let _ = RESIDENT_HANDLE.set(OwnedFd::from(device));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// MV_IOC_RESIDENT (ABI v2): which pages of [addr, addr + len) of this process's own mm are
+/// present, and which of those are its private copies (written).
+#[repr(C)]
+#[derive(Debug, Default)]
+struct Resident {
+    addr: u64,
+    len: u64,
+    present: u64,
+    written: u64,
+    nr_present: u64,
+    nr_written: u64,
+    flags: u32,
+    reserved: u32,
+}
+
+ioctl_iowr_nr!(MV_IOC_RESIDENT, 0x56, 0x49, Resident);
+
+/// The largest range one RESIDENT call reports on.
+pub(crate) const RESIDENT_MAX_LEN: u64 = 1 << 30;
+
+/// Fills `present` and `written` (one bit per 4 KiB page from `addr`, least significant first)
+/// for the range, which must be page aligned and at most [`RESIDENT_MAX_LEN`]. `Ok(None)` when
+/// this process holds no version or the kernel predates RESIDENT (ENOTTY); every other errno is
+/// a failure.
+pub(crate) fn resident(
+    addr: u64,
+    len: u64,
+    present: &mut [u64],
+    written: &mut [u64],
+) -> io::Result<Option<(u64, u64)>> {
+    let words = usize::try_from(len.div_ceil(4096).div_ceil(64)).map_err(io::Error::other)?;
+    if len == 0 || len > RESIDENT_MAX_LEN || present.len() < words || written.len() < words {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let Some(handle) = RESIDENT_HANDLE.get() else {
+        return Ok(None);
+    };
+    let mut request = Resident {
+        addr,
+        len,
+        present: present.as_mut_ptr() as u64,
+        written: written.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    // SAFETY: the request is live and correctly sized; its two pointers name live buffers of at
+    // least ceil(len / 4096 / 64) words each, which is all the kernel writes.
+    if unsafe { ioctl_with_mut_ref(handle, MV_IOC_RESIDENT(), &mut request) } != 0 {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ENOTTY) => Ok(None),
+            _ => Err(err),
+        };
+    }
+    Ok(Some((request.nr_present, request.nr_written)))
 }
 
 /// Set once this process imported a version region lazily, and once eagerly.
@@ -830,6 +916,32 @@ mod tests {
         );
         assert_eq!(std::mem::offset_of!(Create, fd), 28);
         assert_eq!(std::mem::offset_of!(Info, regions), 8);
+    }
+
+    #[test]
+    fn resident_layout_and_number() {
+        // struct mv_resident in stage-4 patch b305d9af: 56 bytes, _IOWR('V', 0x49).
+        assert_eq!(size_of::<Resident>(), 56);
+        assert_eq!(std::mem::offset_of!(Resident, nr_present), 32);
+        assert_eq!(std::mem::offset_of!(Resident, flags), 48);
+        assert_eq!(MV_IOC_RESIDENT(), 0xc038_5649);
+    }
+
+    #[test]
+    fn resident_without_a_version_is_unavailable_and_bad_ranges_are_refused() {
+        let mut present = [0u64; 1];
+        let mut written = [0u64; 1];
+        if RESIDENT_HANDLE.get().is_none() {
+            assert!(
+                resident(0x1000, 4096, &mut present, &mut written)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        resident(0x1000, 0, &mut present, &mut written).unwrap_err();
+        resident(0x1000, RESIDENT_MAX_LEN + 4096, &mut present, &mut written).unwrap_err();
+        // 65 pages need two words.
+        resident(0x1000, 65 * 4096, &mut present, &mut written).unwrap_err();
     }
 
     #[test]

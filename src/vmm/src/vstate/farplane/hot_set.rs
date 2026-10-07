@@ -18,12 +18,9 @@
 //! `count` entries of u64 gpa, u64 size, u32 flags, u32 reserved. Entries are page-aligned,
 //! sorted, non-overlapping and coalesced only across equal flags.
 
-use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
 
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
-use vmm_sys_util::ioctl::ioctl_with_mut_ref;
 
 use crate::vstate::memory::GuestMemoryMmap;
 
@@ -222,45 +219,6 @@ impl HotSet {
     }
 }
 
-// PAGEMAP_SCAN (Linux 6.7, include/uapi/linux/fs.h); the libc crate does not carry it.
-const PAGE_IS_PRESENT: u64 = 1 << 3;
-// Bit 56 of a /proc/<pid>/pagemap entry: the page's precise mapcount is 1.
-const PM_MMAP_EXCLUSIVE: u64 = 1 << 56;
-const SCAN_BATCH: usize = 512;
-// _IOWR('f', 16, struct pm_scan_arg) = 0xc0606610; private, as the macro's function is pub.
-mod request {
-    use vmm_sys_util::ioctl_iowr_nr;
-
-    use super::PmScanArg;
-    ioctl_iowr_nr!(PAGEMAP_SCAN, 0x66, 16, PmScanArg);
-}
-use request::PAGEMAP_SCAN;
-
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-struct PageRegion {
-    start: u64,
-    end: u64,
-    categories: u64,
-}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-struct PmScanArg {
-    size: u64,
-    flags: u64,
-    start: u64,
-    end: u64,
-    walk_end: u64,
-    vec: u64,
-    vec_len: u64,
-    max_pages: u64,
-    category_inverted: u64,
-    category_mask: u64,
-    category_anyof_mask: u64,
-    return_mask: u64,
-}
-
 /// One guest-memory region of this process: its guest-physical base, host address and length.
 #[derive(Debug, Clone, Copy)]
 pub struct HostRegion {
@@ -272,94 +230,66 @@ pub struct HostRegion {
     pub len: u64,
 }
 
-/// The present host ranges of [start, end) in this process, in address order. `Ok(None)` when
-/// the kernel lacks PAGEMAP_SCAN; stops early with `Ok(Some(_))` past `max_pages`.
-fn present(
-    pagemap: &File,
-    start: u64,
-    end: u64,
-    max_pages: u64,
-) -> io::Result<Option<Vec<(u64, u64)>>> {
-    let mut out = Vec::new();
-    let mut pages = 0u64;
-    let mut buf = [PageRegion::default(); SCAN_BATCH];
-    let mut cursor = start;
-    while cursor < end {
-        let mut arg = PmScanArg {
-            size: std::mem::size_of::<PmScanArg>() as u64,
-            start: cursor,
-            end,
-            vec: buf.as_mut_ptr() as u64,
-            vec_len: SCAN_BATCH as u64,
-            category_mask: PAGE_IS_PRESENT,
-            return_mask: PAGE_IS_PRESENT,
-            ..Default::default()
-        };
-        // SAFETY: arg points at a live, correctly sized pm_scan_arg whose vec is a live buffer of
-        // vec_len page_regions; the kernel writes only those and arg.walk_end.
-        let filled = unsafe { ioctl_with_mut_ref(pagemap, PAGEMAP_SCAN(), &mut arg) };
-        if filled < 0 {
-            let err = io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(libc::ENOTTY) | Some(libc::EINVAL) if out.is_empty() && cursor == start => {
-                    Ok(None)
-                }
-                _ => Err(err),
-            };
-        }
-        for region in &buf[..usize::try_from(filled).unwrap()] {
-            out.push((region.start, region.end));
-            pages += (region.end - region.start) / PAGE_SIZE;
-        }
-        if pages > max_pages {
-            return Ok(Some(out));
-        }
-        if arg.walk_end <= cursor {
-            return Err(io::Error::other("PAGEMAP_SCAN made no progress"));
-        }
-        cursor = arg.walk_end;
-    }
-    Ok(Some(out))
+/// Why a hot set could not be recorded. Unavailability (an eager import, an old kernel, a set
+/// over the caps) is not an error: it is `Ok(None)`.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum RecordError {
+    /// RESIDENT failed on a guest region: {0}
+    Resident(io::Error),
+    /// RESIDENT refused a guest region as not anonymous memory, a geometry bug: {0:#x}
+    NotAnonymous(u64),
 }
 
-/// The hot set of `regions` in this process. `Ok(None)` when the kernel cannot scan or the set
-/// exceeds [`MAX_PAGES`] (as every eagerly mapped guest above 256 MiB does).
-pub fn record_regions(regions: &[HostRegion]) -> io::Result<Option<HotSet>> {
-    let pagemap = File::open("/proc/self/pagemap")?;
+/// The hot set of `regions` in this process, from RESIDENT in steps of at most 1 GiB.
+/// `Ok(None)` when the kernel predates RESIDENT or the set exceeds [`MAX_PAGES`]. A region the
+/// kernel refuses as non-anonymous is skipped and reported in `skipped`.
+pub fn record_regions(
+    regions: &[HostRegion],
+    skipped: &mut Vec<RecordError>,
+) -> Result<Option<HotSet>, RecordError> {
+    let step = super::memversion::RESIDENT_MAX_LEN;
+    let words_per_step = usize::try_from(step / PAGE_SIZE / 64).unwrap();
+    let mut present = vec![0u64; words_per_step];
+    let mut written = vec![0u64; words_per_step];
     let mut ranges = Vec::new();
     let mut pages = 0u64;
-    for region in regions {
-        let Some(present) = present(
-            &pagemap,
-            region.host,
-            region.host + region.len,
-            MAX_PAGES - pages,
-        )?
-        else {
-            return Ok(None);
-        };
-        for (start, end) in present {
-            let n = (end - start) / PAGE_SIZE;
-            pages += n;
-            if pages > MAX_PAGES {
-                return Ok(None);
+    'regions: for region in regions {
+        let mut offset = 0;
+        while offset < region.len {
+            let len = (region.len - offset).min(step);
+            match super::memversion::resident(region.host + offset, len, &mut present, &mut written)
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(None),
+                Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+                    skipped.push(RecordError::NotAnonymous(region.gpa));
+                    continue 'regions;
+                }
+                Err(err) => return Err(RecordError::Resident(err)),
             }
-            // One pagemap entry (u64) per page: which of these pages are mapped exclusively.
-            let mut entries = vec![0u8; usize::try_from(n * 8).unwrap()];
-            pagemap.read_exact_at(&mut entries, start / PAGE_SIZE * 8)?;
-            for (i, entry) in entries.chunks_exact(8).enumerate() {
-                let entry = u64::from_le_bytes(entry.try_into().unwrap());
-                let offset = start - region.host + i as u64 * PAGE_SIZE;
-                ranges.push(HotRange {
-                    gpa: region.gpa + offset,
-                    size: PAGE_SIZE,
-                    flags: if entry & PM_MMAP_EXCLUSIVE != 0 {
-                        FLAG_WRITTEN
-                    } else {
-                        0
-                    },
-                });
+            let step_pages = len / PAGE_SIZE;
+            for (word_index, word) in present.iter().enumerate() {
+                let mut bits = *word;
+                while bits != 0 {
+                    let bit = u64::from(bits.trailing_zeros());
+                    bits &= bits - 1;
+                    let page = word_index as u64 * 64 + bit;
+                    if page >= step_pages {
+                        break;
+                    }
+                    pages += 1;
+                    if pages > MAX_PAGES {
+                        return Ok(None);
+                    }
+                    let is_written = written[word_index] & (1 << bit) != 0;
+                    ranges.push(HotRange {
+                        gpa: region.gpa + offset + page * PAGE_SIZE,
+                        size: PAGE_SIZE,
+                        flags: if is_written { FLAG_WRITTEN } else { 0 },
+                    });
+                }
             }
+            offset += len;
         }
     }
     let spans: Vec<(u64, u64)> = regions.iter().map(|r| (r.gpa, r.gpa + r.len)).collect();
@@ -369,7 +299,10 @@ pub fn record_regions(regions: &[HostRegion]) -> io::Result<Option<HotSet>> {
 /// The hot set of this VM's guest memory, recorded once the child has reached running.
 /// `Ok(None)` ("unavailable") unless every version import in this process was lazy: an eagerly
 /// imported page is present without having been touched.
-pub fn record(memory: &GuestMemoryMmap) -> io::Result<Option<HotSet>> {
+pub fn record(
+    memory: &GuestMemoryMmap,
+    skipped: &mut Vec<RecordError>,
+) -> Result<Option<HotSet>, RecordError> {
     if !super::memversion::imported_only_lazily() {
         return Ok(None);
     }
@@ -381,7 +314,7 @@ pub fn record(memory: &GuestMemoryMmap) -> io::Result<Option<HotSet>> {
             len: region.len(),
         })
         .collect();
-    record_regions(&regions)
+    record_regions(&regions, skipped)
 }
 
 #[cfg(test)]
@@ -581,13 +514,6 @@ mod tests {
     }
 
     #[test]
-    fn pagemap_scan_request_matches_the_uapi() {
-        // _IOWR('f', 16, struct pm_scan_arg): a 96-byte argument.
-        assert_eq!(std::mem::size_of::<PmScanArg>(), 96);
-        assert_eq!(PAGEMAP_SCAN(), 0xc060_6610);
-    }
-
-    #[test]
     fn unavailable_without_a_lazy_import() {
         // This test process imported no version: guest memory touched here is present without
         // being a bring-up, so there is no hot set to report.
@@ -596,11 +522,11 @@ mod tests {
             // SAFETY: the first byte of a live region of this test's guest memory.
             unsafe { std::ptr::write_volatile(region.as_ptr(), 1) };
         });
-        assert_eq!(record(&memory).unwrap(), None);
+        assert_eq!(record(&memory, &mut Vec::new()).unwrap(), None);
     }
 
-    /// Needs PAGEMAP_SCAN (Linux 6.7+). Skips on older kernels unless
-    /// FARPLANE_REQUIRE_PAGEMAP_SCAN is set, which the kernel-qualified run sets.
+    /// Needs a kernel with MV_IOC_RESIDENT and /dev/memversion_v1 (its handle here). Skips
+    /// elsewhere unless FARPLANE_REQUIRE_RESIDENT is set, which the kernel-qualified run sets.
     #[test]
     fn records_exactly_the_touched_pages_with_written_flags() {
         const A_PAGES: u64 = 2048; // 8 MiB: spans PMD boundaries
@@ -653,14 +579,19 @@ mod tests {
                 len: B_PAGES * PAGE_SIZE,
             },
         ];
-        let Some(set) = record_regions(&regions).unwrap() else {
-            assert!(
-                std::env::var_os("FARPLANE_REQUIRE_PAGEMAP_SCAN").is_none(),
-                "PAGEMAP_SCAN unavailable on a kernel that must have it"
-            );
-            eprintln!("skipped: no PAGEMAP_SCAN on this kernel");
+        let required = std::env::var_os("FARPLANE_REQUIRE_RESIDENT").is_some();
+        if !super::super::memversion::use_device_as_resident_handle() {
+            assert!(!required, "no /dev/memversion_v1 on a kernel that must have it");
+            eprintln!("skipped: no /dev/memversion_v1");
+            return;
+        }
+        let mut skipped = Vec::new();
+        let Some(set) = record_regions(&regions, &mut skipped).unwrap() else {
+            assert!(!required, "RESIDENT unavailable on a kernel that must have it");
+            eprintln!("skipped: no MV_IOC_RESIDENT on this kernel");
             return;
         };
+        assert!(skipped.is_empty(), "{skipped:?}");
         let p = |page: u64| page * PAGE_SIZE;
         assert_eq!(
             set.ranges(),
@@ -678,7 +609,7 @@ mod tests {
         // A page touched after recording is in the next record, not this one.
         write(b, 701);
         assert_eq!(
-            record_regions(&regions).unwrap().unwrap().pages(),
+            record_regions(&regions, &mut skipped).unwrap().unwrap().pages(),
             set.pages() + 1
         );
     }
