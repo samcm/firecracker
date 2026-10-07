@@ -513,19 +513,20 @@ mod tests {
         // memory envelope is charged for.
         const PAGES: u64 = 256;
         let size = PAGES * PAGE_BYTES;
+        let len = usize::try_from(size).unwrap();
         // SAFETY: plain syscalls on descriptors and a mapping this test owns.
         let addr = unsafe {
             let fd = libc::memfd_create(c"prefault-test".as_ptr(), 0);
             assert!(fd >= 0);
-            assert_eq!(libc::ftruncate(fd, size as libc::off_t), 0);
-            let buf = vec![0x5Au8; size as usize];
+            assert_eq!(libc::ftruncate(fd, libc::off_t::try_from(size).unwrap()), 0);
+            let buf = vec![0x5Au8; len];
             assert_eq!(
                 libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), 0),
-                size as isize
+                isize::try_from(size).unwrap()
             );
             let addr = libc::mmap(
                 std::ptr::null_mut(),
-                size as usize,
+                len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE,
                 fd,
@@ -537,7 +538,7 @@ mod tests {
         };
         // Read everything first, so every page is mapped shared and the copies are what remains.
         // SAFETY: the mapping is `size` bytes long and readable.
-        let sum: u64 = unsafe { std::slice::from_raw_parts(addr as *const u8, size as usize) }
+        let sum: u64 = unsafe { std::slice::from_raw_parts(addr as *const u8, len) }
             .iter()
             .map(|b| u64::from(*b))
             .sum();
@@ -562,7 +563,7 @@ mod tests {
             },
             PrefaultRange {
                 gpa: 100 * PAGE_BYTES,
-                host: addr + 100 * PAGE_BYTES as usize,
+                host: addr + usize::try_from(100 * PAGE_BYTES).unwrap(),
                 size: 156 * PAGE_BYTES,
                 written: true,
             },
@@ -573,12 +574,12 @@ mod tests {
         assert_eq!(copied_bytes(addr), budget);
         // The copies hold the file's content: pre-COW changes no byte the guest sees.
         // SAFETY: as above.
-        let sum: u64 = unsafe { std::slice::from_raw_parts(addr as *const u8, size as usize) }
+        let sum: u64 = unsafe { std::slice::from_raw_parts(addr as *const u8, len) }
             .iter()
             .map(|b| u64::from(*b))
             .sum();
         assert_eq!(sum, 0x5A * size);
         // SAFETY: unmapping the mapping this test created.
-        unsafe { libc::munmap(addr as *mut libc::c_void, size as usize) };
+        unsafe { libc::munmap(addr as *mut libc::c_void, len) };
     }
 }

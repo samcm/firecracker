@@ -932,11 +932,11 @@ mod tests {
                 .hot_set,
             None
         );
-        assert!(parse_backing_plan(&plan(BackingPlanBody::FLAG_VMSTATE, &tail)).is_err());
-        assert!(parse_backing_plan(&plan(restore, &tail[..8])).is_err());
-        assert!(parse_backing_plan(&plan(restore, &[])).is_err());
+        parse_backing_plan(&plan(BackingPlanBody::FLAG_VMSTATE, &tail)).unwrap_err();
+        parse_backing_plan(&plan(restore, &tail[..8])).unwrap_err();
+        parse_backing_plan(&plan(restore, &[])).unwrap_err();
         // A cold boot has no lineage to have recorded a set.
-        assert!(parse_backing_plan(&plan(BackingPlanBody::FLAG_HOT_SET, &tail)).is_err());
+        parse_backing_plan(&plan(BackingPlanBody::FLAG_HOT_SET, &tail)).unwrap_err();
     }
 
     #[test]
