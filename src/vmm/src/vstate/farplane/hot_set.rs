@@ -306,6 +306,10 @@ pub fn record(
     handle: BorrowedFd<'_>,
     skipped: &mut Vec<RecordError>,
 ) -> Result<Option<HotSet>, RecordError> {
+    // Research variant for the lazy-without-prefault arm: no set is ever recorded.
+    if true {
+        return Ok(None);
+    }
     if !super::memversion::imported_only_lazily() {
         return Ok(None);
     }
