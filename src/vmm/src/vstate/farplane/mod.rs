@@ -9,6 +9,8 @@ pub mod capture;
 pub mod dispatch;
 /// Drive images handed over at claim to a Firecracker started before its sandbox was known.
 pub mod drives;
+/// The guest pages a fork child touched between resume and running.
+pub mod hot_set;
 pub(crate) mod memversion;
 /// Wire format of the pagemaster memory channel.
 pub mod protocol;

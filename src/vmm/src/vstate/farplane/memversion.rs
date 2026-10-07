@@ -433,10 +433,29 @@ pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io
             }
             // A version this kernel cannot import lazily still imports eagerly.
             Err(err) if err.raw_os_error() == Some(libc::EOPNOTSUPP) => {}
-            other => return other,
+            other => {
+                if other.is_ok() {
+                    IMPORTED_LAZILY.store(true, Ordering::Relaxed);
+                }
+                return other;
+            }
         }
     }
-    map_with(version, region, addr, MV_MAP_PRIVATE)
+    let mapped = map_with(version, region, addr, MV_MAP_PRIVATE);
+    if mapped.is_ok() {
+        IMPORTED_EAGERLY.store(true, Ordering::Relaxed);
+    }
+    mapped
+}
+
+/// Set once this process imported a version region lazily, and once eagerly.
+static IMPORTED_LAZILY: AtomicBool = AtomicBool::new(false);
+static IMPORTED_EAGERLY: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process's guest memory came from version imports, every one of them lazy: only
+/// then are its present pages the pages it touched (see `hot_set`).
+pub(crate) fn imported_only_lazily() -> bool {
+    IMPORTED_LAZILY.load(Ordering::Relaxed) && !IMPORTED_EAGERLY.load(Ordering::Relaxed)
 }
 
 // ABI v2: incremental versions. Every v1 request keeps its v1 meaning; a v1 kernel refuses
