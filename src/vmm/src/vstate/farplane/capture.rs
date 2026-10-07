@@ -363,9 +363,14 @@ impl CaptureService {
             }
             _ => return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Quiesce),
         }
+        // Each stage's end, in microseconds from the quiesce request, for one timing line.
+        let started = Instant::now();
+        let at = || u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         // Wait for in-flight handlers before taking the VMM lock they may need.
         dispatch::gate().close();
+        let gate_us = at();
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
+        let lock_us = at();
         let were_running = vmm.instance_info.state == VmState::Running;
         if were_running && let Err(err) = vmm.pause_vm() {
             error!("Farplane quiesce could not pause the vCPUs: {err}");
@@ -373,6 +378,7 @@ impl CaptureService {
             dispatch::gate().open();
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
+        let pause_us = at();
         if let Err(err) = vmm.drain_guest_memory_writers() {
             error!("Farplane quiesce could not stop every guest-memory writer: {err}");
             hand_back_source(vmm, were_running);
@@ -402,9 +408,14 @@ impl CaptureService {
                 }
             }
         }
+        let drain_clone_us = at();
         drop(vmm);
         self.order.open();
         BackendState::Quiesced.store();
+        info!(
+            "Farplane quiesce timing gate_close_us={gate_us} vmm_lock_us={lock_us} \
+             vcpu_pause_us={pause_us} drain_and_clone_us={drain_clone_us} were_running={were_running}"
+        );
         self.reply(
             request_id,
             MsgType::Quiesced,

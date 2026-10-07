@@ -1,9 +1,14 @@
 // Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
+use vmm_sys_util::epoll::EventSet;
+use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 use crate::EventManager;
+use crate::logger::error;
 
 /// Stops event dispatch for the whole of a capture epoch.
 ///
@@ -96,6 +101,16 @@ impl DispatchGate {
         state.closed = true;
         state.closing += 1;
         self.changed.notify_all();
+        // A slice in flight may be idle in epoll_wait, which holds the gate until the next device
+        // event or the slice timeout. Wake it: the slice then dispatches whatever is ready, sees
+        // nothing else to wait for, and drops its hold. This shortens only the idle wait; every
+        // callback still finishes before close returns, and none starts until open.
+        if state.dispatching > 0
+            && let Some(kick) = KICK.get()
+            && let Err(err) = kick.write(1)
+        {
+            error!("Farplane gate could not wake the event loop: {err}");
+        }
         while state.dispatching > 0 {
             state = self.changed.wait(state).expect("Poisoned lock");
         }
@@ -148,6 +163,47 @@ impl Drop for DispatchHold<'_> {
 /// The gate the microVM's event loop and the capture service share.
 static GATE: DispatchGate = DispatchGate::new();
 
+/// Writer half of the event loop's wake-up eventfd. Set once, by the first dispatch slice, which
+/// registers the reader half with its event manager.
+static KICK: OnceLock<EventFd> = OnceLock::new();
+
+/// Reader half of the wake-up eventfd: its only job is to end an idle epoll wait.
+#[derive(Debug)]
+struct GateKick {
+    fd: EventFd,
+}
+
+impl MutEventSubscriber for GateKick {
+    fn process(&mut self, _events: Events, _ops: &mut EventOps) {
+        // Nonblocking: a spurious or coalesced wake reads nothing and costs nothing.
+        let _ = self.fd.read();
+    }
+
+    fn init(&mut self, ops: &mut EventOps) {
+        if let Err(err) = ops.add(Events::new(&self.fd, EventSet::IN)) {
+            error!("Farplane gate could not register its wake-up eventfd: {err}");
+        }
+    }
+}
+
+/// Registers the wake-up eventfd with the event loop once. Without it, `close` still works and
+/// waits for the idle slice to time out or for the next device event, as before.
+fn register_kick(event_manager: &mut EventManager) {
+    if KICK.get().is_some() {
+        return;
+    }
+    let registered =
+        EventFd::new(EFD_NONBLOCK).and_then(|fd| fd.try_clone().map(|writer| (fd, writer)));
+    match registered {
+        Ok((fd, writer)) => {
+            if KICK.set(writer).is_ok() {
+                event_manager.add_subscriber(Arc::new(Mutex::new(GateKick { fd })));
+            }
+        }
+        Err(err) => error!("Farplane gate could not create its wake-up eventfd: {err}"),
+    }
+}
+
 /// Returns the gate the event loop and the capture service share.
 pub fn gate() -> &'static DispatchGate {
     &GATE
@@ -166,6 +222,7 @@ const DISPATCH_SLICE_MS: i32 = 100;
 /// The hold lives exactly as long as the slice: `close` waits for a slice that has started, and a
 /// slice that has not started waits for the epoch to end.
 pub fn dispatch_slice(event_manager: &mut EventManager) -> event_manager::Result<usize> {
+    register_kick(event_manager);
     GATE.run_outside_epoch(|| event_manager.run_with_timeout(DISPATCH_SLICE_MS))
 }
 
@@ -332,5 +389,38 @@ mod tests {
         resumed_rx.recv().unwrap();
         startup.join().unwrap();
         assert!(*vmm_lock.lock().expect("Poisoned lock"));
+    }
+
+    /// A capture's close wakes an event loop idle in epoll_wait instead of waiting for the next
+    /// device event or the slice timeout, and still returns only after that slice dropped its
+    /// hold. The slice here would otherwise sleep for ten seconds.
+    #[test]
+    fn close_wakes_an_idle_slice() {
+        let gate = Arc::new(DispatchGate::new());
+        let (ready_tx, ready_rx) = channel();
+        let slice_gate = gate.clone();
+        let event_loop = std::thread::spawn(move || {
+            let mut event_manager = EventManager::new().unwrap();
+            register_kick(&mut event_manager);
+            ready_tx.send(()).unwrap();
+            let _hold = slice_gate.enter();
+            event_manager.run_with_timeout(10_000).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        // Wait until the slice holds the gate, then for it to reach epoll_wait.
+        while gate.state.lock().unwrap().dispatching == 0 {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        gate.close();
+        let waited = started.elapsed();
+        assert_eq!(gate.state.lock().unwrap().dispatching, 0);
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "close waited {waited:?}"
+        );
+        gate.open();
+        event_loop.join().unwrap();
     }
 }
