@@ -163,7 +163,7 @@ impl<Data> Snapshot<Data> {
             header: SnapshotHdr {
                 magic: SNAPSHOT_MAGIC_ID,
                 version: SNAPSHOT_VERSION.clone(),
-                feature_identity: crate::vstate::farplane::FEATURE_IDENTITY.to_string(),
+                feature_identity: crate::vstate::farplane::protocol::VMSTATE_IDENTITY.to_string(),
             },
             data,
         }
@@ -201,9 +201,9 @@ impl<Data: DeserializeOwned> Snapshot<Data> {
 
         // Checked with the rest of the header, which is before the state is handed to a caller:
         // guest memory is mapped from a plan the caller only builds once this returns.
-        if snapshot.header.feature_identity != crate::vstate::farplane::FEATURE_IDENTITY {
+        if snapshot.header.feature_identity != crate::vstate::farplane::protocol::VMSTATE_IDENTITY {
             return Err(SnapshotError::IncompatibleFeatureIdentity {
-                expected: crate::vstate::farplane::FEATURE_IDENTITY.to_string(),
+                expected: crate::vstate::farplane::protocol::VMSTATE_IDENTITY.to_string(),
                 found: snapshot.header.feature_identity.clone(),
             });
         }
@@ -283,7 +283,7 @@ mod tests {
         let snapshot = Snapshot::new(MicrovmState::default());
         assert_eq!(
             snapshot.header.feature_identity,
-            crate::vstate::farplane::FEATURE_IDENTITY
+            crate::vstate::farplane::protocol::VMSTATE_IDENTITY
         );
         assert_eq!(snapshot.header.feature_identity, "farplane/8");
 

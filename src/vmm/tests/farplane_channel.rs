@@ -33,6 +33,43 @@ fn handshake_lock() -> MutexGuard<'static, ()> {
     HANDSHAKE.lock().unwrap_or_else(|err| err.into_inner())
 }
 
+/// A sealed, read-only memfd: an image every root slot contract accepts.
+fn sealed_root_image() -> OwnedFd {
+    let fd = unsafe { libc::memfd_create(c"root".as_ptr().cast(), libc::MFD_ALLOW_SEALING) };
+    assert!(fd >= 0, "memfd_create: {}", last_error());
+    assert_eq!(unsafe { libc::ftruncate(fd, 4096) }, 0);
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) }, 0);
+    let path = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+    let read_only = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    assert!(read_only >= 0, "reopen: {}", last_error());
+    unsafe { libc::close(fd) };
+    unsafe { OwnedFd::from_raw_fd(read_only) }
+}
+
+/// Points the backend at `path` and connects it, as Firecracker does at startup. The drive
+/// images a real claim hands over first are installed once per process, so every handshake
+/// here starts where a claimed Firecracker's does.
+fn connect_backend(path: &Path) {
+    static DRIVES: std::sync::Once = std::sync::Once::new();
+    DRIVES.call_once(|| {
+        // The drive slots are this process's own descriptor numbers; the jailer reserves them
+        // for Firecracker, and nothing in this test binary may already hold them.
+        for slot in [4, 5] {
+            assert_eq!(
+                unsafe { libc::fcntl(slot, libc::F_GETFD) },
+                -1,
+                "fd {slot} is taken"
+            );
+            let null = std::fs::File::open("/dev/null").unwrap();
+            assert_eq!(unsafe { libc::dup2(null.as_raw_fd(), slot) }, slot);
+        }
+        vmm::vstate::farplane::drives::install(sealed_root_image(), None).unwrap();
+    });
+    FarplaneBackend::set_socket_path(path.to_path_buf());
+    FarplaneBackend::connect().expect("connect the memory channel");
+}
+
 fn page_size() -> u64 {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
 }
@@ -173,7 +210,7 @@ fn cold_boot_multiregion_ready_ack_and_mapping_lifetime() {
     let dir = TempDir::new().unwrap();
     let path = dir.as_path().join("pagemaster.sock");
     let listener = listen_seqpacket(&path);
-    FarplaneBackend::set_socket_path(path);
+    connect_backend(&path);
     let pm = thread::spawn(move || {
         let sock = accept(&listener);
         check_hello(&sock, Mode::Boot);
@@ -275,7 +312,7 @@ fn reject_plan(mode: Mode, body: Vec<u8>, fds: Vec<OwnedFd>) -> (BackendError, O
     let dir = TempDir::new().unwrap();
     let path = dir.as_path().join("pagemaster.sock");
     let listener = listen_seqpacket(&path);
-    FarplaneBackend::set_socket_path(path);
+    connect_backend(&path);
     let pm = thread::spawn(move || {
         let sock = accept(&listener);
         check_hello(&sock, mode);
@@ -612,5 +649,105 @@ fn free_summary_v8_wire_budget_and_descriptor_roundtrip() {
     }
     for len in [0, 7, 9, 16] {
         protocol::parse_free_summary_budget(&vec![1; len]).unwrap_err();
+    }
+}
+
+/// A Firecracker started before its sandbox is known receives the drive images on the channel it
+/// connected at startup, ahead of any drive configuration or handshake, and refuses an image its
+/// slot's contract does not accept. Each case runs in a fresh process: installation happens once
+/// per process and takes over the process's own drive slots.
+#[test]
+fn drives_frame_installs_images_before_the_handshake() {
+    const CHILD: &str = "FARPLANE_DRIVES_FRAME_CASE";
+    let Some(case) = std::env::var_os(CHILD) else {
+        for case in ["sealed", "writable", "count"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "drives_frame_installs_images_before_the_handshake",
+                ])
+                .env(CHILD, case)
+                .status()
+                .unwrap();
+            assert!(status.success(), "case {case}: {status}");
+        }
+        return;
+    };
+    for slot in [4, 5] {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(unsafe { libc::dup2(null.as_raw_fd(), slot) }, slot);
+    }
+    let dir = TempDir::new().unwrap();
+    let path = dir.as_path().join("pagemaster.sock");
+    let listener = listen_seqpacket(&path);
+    FarplaneBackend::set_socket_path(path);
+    FarplaneBackend::connect().unwrap();
+    let case = case.into_string().unwrap();
+    let (root, count) = match case.as_str() {
+        "sealed" => (sealed_root_image(), 1u32),
+        "writable" => {
+            let fd = unsafe { libc::memfd_create(c"root".as_ptr().cast(), 0) };
+            assert_eq!(unsafe { libc::ftruncate(fd, 4096) }, 0);
+            (unsafe { OwnedFd::from_raw_fd(fd) }, 1)
+        }
+        "count" => (sealed_root_image(), 2),
+        _ => unreachable!(),
+    };
+    let root_inode = {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(
+            unsafe { libc::fstat(root.as_raw_fd(), stat.as_mut_ptr()) },
+            0
+        );
+        unsafe { stat.assume_init() }.st_ino
+    };
+    let pm = thread::spawn(move || {
+        let sock = accept(&listener);
+        protocol::send_frame(
+            &sock,
+            MsgType::Drives,
+            0,
+            &count.to_le_bytes(),
+            &[root.as_raw_fd()],
+        )
+        .unwrap();
+        // A refusal is answered on the channel; an installation is not.
+        sock.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        protocol::recv_frame(&sock).ok()
+    });
+    let result = FarplaneBackend::ensure_drives();
+    let reply = pm.join().unwrap();
+    match case.as_str() {
+        "sealed" => {
+            result.unwrap();
+            assert!(reply.is_none());
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(unsafe { libc::fstat(4, stat.as_mut_ptr()) }, 0);
+            assert_eq!(unsafe { stat.assume_init() }.st_ino, root_inode);
+            // A sandbox without a disk keeps the read-only placeholder in the scratch slot.
+            let flags = unsafe { libc::fcntl(5, libc::F_GETFL) };
+            assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+            // Installation happens once.
+            FarplaneBackend::ensure_drives().unwrap();
+        }
+        "writable" => {
+            assert!(matches!(result, Err(BackendError::Drives(_))), "{result:?}");
+            let reply = reply.expect("a refusal is reported to pagemaster");
+            assert_eq!(reply.header.msg_type, MsgType::Error as u16);
+            assert_eq!(
+                u32::from_le_bytes(reply.body[..4].try_into().unwrap()),
+                ErrorCode::BadDrive as u32
+            );
+            assert!(!vmm::vstate::farplane::drives::installed());
+        }
+        "count" => {
+            assert!(
+                result.is_err(),
+                "a count that disagrees with the rights was accepted"
+            );
+            assert!(!vmm::vstate::farplane::drives::installed());
+        }
+        _ => unreachable!(),
     }
 }

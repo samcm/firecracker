@@ -104,6 +104,8 @@ pub enum VmmActionError {
     ConfigureCpu(#[from] GuestConfigError),
     /// Drive config error: {0}
     DriveConfig(#[from] DriveError),
+    /// Drive images could not be received: {0}
+    DriveImages(String),
     /// Entropy config error: {0}
     EntropyConfig(#[from] EntropyDeviceError),
     /// Internal VMM error: {0}
@@ -353,6 +355,10 @@ impl<'a> PrebootApiController<'a> {
 
     fn insert_block_device(&mut self, cfg: BlockDeviceConfig) -> Result<VmmData, VmmActionError> {
         self.boot_path = true;
+        // A drive is backed by an image pagemaster hands over at claim, so it is received before
+        // the drive's descriptor is checked.
+        crate::vstate::farplane::FarplaneBackend::ensure_drives()
+            .map_err(|err| VmmActionError::DriveImages(err.to_string()))?;
         self.vm_resources
             .set_block_device(cfg)
             .map(|()| VmmData::Empty)
