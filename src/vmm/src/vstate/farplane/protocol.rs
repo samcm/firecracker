@@ -93,6 +93,17 @@ pub enum MsgType {
     /// Pagemaster hands over the drive images: the read-only root image and, for a sandbox with
     /// a disk, its read-write scratch disk. The body is the LE u32 descriptor count.
     Drives = 24,
+    /// Pagemaster hands over the memversion device, and the imported version for a lazily
+    /// imported guest, and asks for the guest's memory to be tracked from now on.
+    Track = 28,
+    /// Firecracker reports the tracker: LE u32 tracked, u32 depth, u64 dirty pages, u64
+    /// standing version id.
+    Tracked = 29,
+    /// Pagemaster asks for the standing version to be refreshed while the guest runs.
+    Refresh = 30,
+    /// Firecracker returns the new standing version: LE u64 own pages, u64 new pages,
+    /// u32 depth, u32 zero runs, u64 folded pages.
+    Refreshed = 31,
 }
 
 impl MsgType {
@@ -114,6 +125,10 @@ impl MsgType {
             22 => Some(Self::FreeSummary),
             23 => Some(Self::FreeSummaryDone),
             24 => Some(Self::Drives),
+            28 => Some(Self::Track),
+            29 => Some(Self::Tracked),
+            30 => Some(Self::Refresh),
+            31 => Some(Self::Refreshed),
             // Reserved /6 tags, including 18-21, must never be interpreted as /8 commands.
             _ => None,
         }
@@ -184,6 +199,11 @@ pub enum ErrorCode {
     FreeSummaryUnavailable = 28,
     /// A drive image handed over with `drives` is unusable for its slot.
     BadDrive = 29,
+    /// The guest's memory could not be tracked; captures copy it whole.
+    TrackFailed = 31,
+    /// The standing version could not be refreshed; the guest runs on and the next fork folds
+    /// more.
+    RefreshFailed = 32,
 }
 
 /// Architecture Firecracker is running on.

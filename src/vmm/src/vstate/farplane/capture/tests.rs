@@ -691,6 +691,8 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         order: EpochOrder::default(),
         replies: ReplyCache::default(),
         pending: None,
+        tracker: None,
+        standing: None,
     };
     let file = summary_buffer(4096);
     let budget = protocol::MAX_FREE_SUMMARY_MICROS.to_le_bytes();
@@ -771,4 +773,62 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         assert!(matches!(service.serve_one(), Err(ChannelError::Malformed)));
     }
     previous_state.store();
+}
+
+#[test]
+fn track_and_refresh_frames_numbers_and_bodies() {
+    assert_eq!(
+        [
+            MsgType::Track,
+            MsgType::Tracked,
+            MsgType::Refresh,
+            MsgType::Refreshed
+        ]
+        .map(|msg| msg as u16),
+        [28, 29, 30, 31]
+    );
+    for value in 28..=31 {
+        assert_eq!(MsgType::from_u16(value).unwrap() as u16, value);
+    }
+    assert_eq!(
+        (
+            ErrorCode::TrackFailed as u32,
+            ErrorCode::RefreshFailed as u32
+        ),
+        (31, 32)
+    );
+    // Track carries the device, and the imported version for a lazy import; Refresh nothing.
+    validate_command(MsgType::Track, 0, 1).unwrap();
+    validate_command(MsgType::Track, 0, 2).unwrap();
+    validate_command(MsgType::Track, 0, 0).unwrap_err();
+    validate_command(MsgType::Track, 4, 1).unwrap_err();
+    validate_command(MsgType::Refresh, 0, 0).unwrap();
+    validate_command(MsgType::Refresh, 0, 1).unwrap_err();
+    // Replies are commands only Firecracker sends.
+    validate_command(MsgType::Tracked, 24, 0).unwrap_err();
+    validate_command(MsgType::Refreshed, 32, 1).unwrap_err();
+
+    let body = encode_track_info(&memversion::TrackInfo {
+        tracked: 1,
+        depth: 2,
+        dirty_pages: 0x0102_0304_0506_0708,
+        standing_id: 9,
+    });
+    assert_eq!(body.len(), 24);
+    assert_eq!(body[..8], [1, 0, 0, 0, 2, 0, 0, 0]);
+    assert_eq!(body[8..16], 0x0102_0304_0506_0708u64.to_le_bytes());
+    assert_eq!(body[16..], 9u64.to_le_bytes());
+    let body = encode_refreshed(&memversion::Info2 {
+        own_pages: 5,
+        new_pages: 6,
+        depth: 3,
+        nr_zero_runs: 4,
+        folded_pages: 7,
+        ..Default::default()
+    });
+    assert_eq!(body.len(), 32);
+    assert_eq!(body[..8], 5u64.to_le_bytes());
+    assert_eq!(body[8..16], 6u64.to_le_bytes());
+    assert_eq!(body[16..24], [3, 0, 0, 0, 4, 0, 0, 0]);
+    assert_eq!(body[24..], 7u64.to_le_bytes());
 }
