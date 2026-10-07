@@ -308,24 +308,46 @@ pub(crate) fn exclusions(
         if free[index].len() != words || dirty[index].len() != words {
             return Err(invalid());
         }
-        let mut run = None;
-        for p in 0..=pages {
-            let word = usize::try_from(p / 64).map_err(|_| invalid())?;
-            let excluded =
-                p < pages && (free[index][word] & !dirty[index][word]) & (1 << (p % 64)) != 0;
-            if excluded {
-                run.get_or_insert(p);
-            } else if let Some(start) = run.take() {
-                if out.len() == MAX_EXCLUSIONS {
-                    return Err(invalid());
-                }
-                out.push(Exclusion {
-                    region: u32::try_from(index).map_err(|_| invalid())?,
-                    reserved: 0,
-                    offset: start * page,
-                    len: (p - start) * page,
-                });
+        let region_index = u32::try_from(index).map_err(|_| invalid())?;
+        let mut push = |start: u64, end: u64| {
+            if out.len() == MAX_EXCLUSIONS {
+                return Err(invalid());
             }
+            out.push(Exclusion {
+                region: region_index,
+                reserved: 0,
+                offset: start * page,
+                len: (end - start) * page,
+            });
+            Ok(())
+        };
+        // Word by word, jumping between run edges: the capture freeze pays for the runs, not
+        // for every guest page.
+        let mut run = None;
+        for (word, (free, dirty)) in free[index].iter().zip(&dirty[index]).enumerate() {
+            let base = word as u64 * 64;
+            let mut bits = free & !dirty;
+            if pages - base < 64 {
+                bits &= (1u64 << (pages - base)) - 1;
+            }
+            let mut bit = 0u32;
+            loop {
+                // The next run start outside a run, the next run end inside one.
+                let edges = if run.is_none() { bits } else { !bits };
+                let ahead = edges.checked_shr(bit).unwrap_or(0);
+                if ahead == 0 {
+                    break;
+                }
+                bit += ahead.trailing_zeros();
+                let at = base + u64::from(bit);
+                match run.take() {
+                    None => run = Some(at),
+                    Some(start) => push(start, at)?,
+                }
+            }
+        }
+        if let Some(start) = run {
+            push(start, pages)?;
         }
     }
     Ok(out)
@@ -1067,6 +1089,92 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(folds, 1);
+    }
+
+    /// The page-by-page derivation the word-wise `exclusions` replaced: the reference.
+    fn exclusions_per_page(
+        regions: &[Region],
+        free: &[Vec<u64>],
+        dirty: &[Vec<u64>],
+    ) -> io::Result<Vec<Exclusion>> {
+        let page = 4096u64;
+        let mut out = Vec::new();
+        for (index, region) in regions.iter().enumerate() {
+            let pages = region.len / page;
+            let mut run = None;
+            for p in 0..=pages {
+                let word = usize::try_from(p / 64).unwrap();
+                let excluded =
+                    p < pages && (free[index][word] & !dirty[index][word]) & (1 << (p % 64)) != 0;
+                if excluded {
+                    run.get_or_insert(p);
+                } else if let Some(start) = run.take() {
+                    if out.len() == MAX_EXCLUSIONS {
+                        return Err(invalid());
+                    }
+                    out.push(Exclusion {
+                        region: u32::try_from(index).unwrap(),
+                        reserved: 0,
+                        offset: start * page,
+                        len: (p - start) * page,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn word_wise_exclusions_equal_the_per_page_reference(
+            shape in proptest::collection::vec(
+                (1u64..300, proptest::collection::vec((proptest::num::u64::ANY, proptest::num::u64::ANY), 5)),
+                1..4,
+            )
+        ) {
+            let mut regions = Vec::new();
+            let (mut free, mut dirty) = (Vec::new(), Vec::new());
+            let mut addr = GUEST_RAM_BASE;
+            for (pages, words) in &shape {
+                regions.push(Region { addr, len: pages * 4096 });
+                addr += (pages + 512) * 4096;
+                // Every word, including bits past the region's last page, is random.
+                let n = usize::try_from(pages.div_ceil(64)).unwrap();
+                free.push(words[..n].iter().map(|w| w.0 | (w.0 >> 3)).collect::<Vec<_>>());
+                dirty.push(words[..n].iter().map(|w| w.1 & (w.1 >> 1) & (w.1 >> 2)).collect::<Vec<_>>());
+            }
+            proptest::prop_assert_eq!(
+                exclusions(&regions, &free, &dirty).unwrap(),
+                exclusions_per_page(&regions, &free, &dirty).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn exclusions_over_the_cap_fail_as_before() {
+        // Alternating pages: one run per two pages, 65,537 runs.
+        let pages = 2 * (MAX_EXCLUSIONS as u64 + 1);
+        let regions = [Region {
+            addr: GUEST_RAM_BASE,
+            len: pages * 4096,
+        }];
+        let words = usize::try_from(pages.div_ceil(64)).unwrap();
+        let free = [vec![0x5555_5555_5555_5555u64; words]];
+        let dirty = [vec![0u64; words]];
+        exclusions_per_page(&regions, &free, &dirty).unwrap_err();
+        exclusions(&regions, &free, &dirty).unwrap_err();
+        // One run fewer is accepted by both, identically.
+        let regions = [Region {
+            addr: GUEST_RAM_BASE,
+            len: (pages - 2) * 4096,
+        }];
+        let words = usize::try_from((pages - 2).div_ceil(64)).unwrap();
+        let free = [vec![0x5555_5555_5555_5555u64; words]];
+        let dirty = [vec![0u64; words]];
+        assert_eq!(
+            exclusions(&regions, &free, &dirty).unwrap(),
+            exclusions_per_page(&regions, &free, &dirty).unwrap()
+        );
     }
 
     #[test]
