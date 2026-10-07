@@ -126,6 +126,7 @@ use vstate::vcpu::{self, VcpuSendEventError};
 
 use crate::cpu_config::templates::CpuConfiguration;
 use crate::devices::virtio::block::BlockError;
+use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::net::Net;
@@ -198,6 +199,8 @@ pub const HTTP_MAX_PAYLOAD_SIZE: usize = 51200;
 /// have permissions to open the KVM fd).
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VmmError {
+    /// A capture refuses Writeback drive {0}: it would flush the device cache in the pause.
+    CaptureWritebackDrive(String),
     #[cfg(target_arch = "aarch64")]
     /// Invalid command line error.
     Cmdline,
@@ -474,14 +477,23 @@ impl Vmm {
     /// block IO can still land in guest memory, so draining it closes the capture epoch.
     pub fn drain_guest_memory_writers(&mut self) -> Result<(), VmmError> {
         let mut drives = Vec::new();
+        let mut writeback = None;
         self.device_manager
             .for_each_virtio_device(|device_type, device| {
                 if device_type == VirtioDeviceType::Block
                     && let Some(block) = device.as_any().downcast_ref::<Block>()
                 {
+                    if block.config().cache_type == CacheType::Writeback {
+                        writeback = Some(block.id().to_string());
+                    }
                     drives.push(block.id().to_string());
                 }
             });
+        // Configuration refuses Writeback for inherited descriptors; a restored vmstate carries
+        // its own cache type, so the capture checks the devices it actually drains.
+        if let Some(drive) = writeback {
+            return Err(VmmError::CaptureWritebackDrive(drive));
+        }
         for drive in drives {
             self.device_manager
                 .with_virtio_device(&drive, |block: &mut Block| block.drain_writes())??;

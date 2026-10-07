@@ -924,6 +924,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_capture_refuses_a_writeback_drive() {
+        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
+        for (cache_type, refused) in [(CacheType::Unsafe, false), (CacheType::Writeback, true)] {
+            let block_configs = vec![
+                CustomBlockConfig::new(String::from("root"), true, None, true, CacheType::Unsafe),
+                CustomBlockConfig::new(String::from("scratch"), false, None, false, cache_type),
+            ];
+            let mut vmm = default_vmm();
+            let mut cmdline = default_kernel_cmdline();
+            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            match vmm.drain_guest_memory_writers() {
+                Err(VmmError::CaptureWritebackDrive(drive)) if refused => {
+                    assert_eq!(drive, "scratch")
+                }
+                Ok(()) if !refused => {}
+                other => panic!("{cache_type:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn test_attach_block_devices() {
         let mut event_manager = EventManager::new().expect("Unable to create EventManager");
 
