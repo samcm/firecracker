@@ -441,13 +441,16 @@ pub fn build_microvm_from_snapshot(
     // Set up KVM VM and register memory regions.
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm).map_err(StartMicrovmError::KvmVm)?;
+    crate::vstate::farplane::phases::mark("kvm_vm");
 
     let mut vcpus = vm
         .create_vcpus(vm_resources.machine_config.vcpu_count)
         .map_err(StartMicrovmError::KvmVm)?;
+    crate::vstate::farplane::phases::mark("vcpus_created");
 
     vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
         .map_err(StartMicrovmError::KvmVm)?;
+    crate::vstate::farplane::phases::mark("memslots");
 
     // The slots are committed, so KVM's initially-set state now describes nothing this VM did.
     // Retire it before anything writes guest memory, so this VM's first harvest reports only
@@ -455,6 +458,7 @@ pub fn build_microvm_from_snapshot(
     // writes on its behalf (kvmclock, steal time) have to survive into that harvest, as do the
     // device-restore and VMGenID writes, which the host accumulator tracks independently.
     vm.baseline_dirty_log().map_err(StartMicrovmError::KvmVm)?;
+    crate::vstate::farplane::phases::mark("dirty_baseline");
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -488,9 +492,11 @@ pub fn build_microvm_from_snapshot(
         vm.restore_state(&mpidrs, &microvm_state.vm_state)?;
     }
 
+    crate::vstate::farplane::phases::mark("vcpu_state");
     // Restore kvm vm state.
     #[cfg(target_arch = "x86_64")]
     vm.restore_state(&microvm_state.vm_state, clock_realtime)?;
+    crate::vstate::farplane::phases::mark("vm_state");
 
     // Restore the boot source config paths.
     vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
@@ -512,6 +518,7 @@ pub fn build_microvm_from_snapshot(
     #[allow(unused_mut)]
     let mut device_manager =
         DeviceManager::restore(device_ctor_args, &microvm_state.device_states)?;
+    crate::vstate::farplane::phases::mark("devices");
 
     let vmm = Vmm {
         instance_info: instance_info.clone(),
@@ -530,6 +537,7 @@ pub fn build_microvm_from_snapshot(
             .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
             .clone(),
     )?;
+    crate::vstate::farplane::phases::mark("vcpu_threads");
 
     let vmm = Arc::new(Mutex::new(vmm));
     vmm.lock().unwrap().set_vm_state(VmState::Paused);
@@ -556,6 +564,7 @@ pub fn build_microvm_from_snapshot(
             .get("vmm")
             .ok_or(BuildMicrovmFromSnapshotError::MissingVmmSeccompFilters)?,
     )?;
+    crate::vstate::farplane::phases::mark("capture_service_and_seccomp");
     debug!("event_end: build microvm from snapshot");
 
     Ok(vmm)

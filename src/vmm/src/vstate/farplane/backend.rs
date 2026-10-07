@@ -358,6 +358,7 @@ fn handshake(
     arch_regions: &[RegionRecord],
 ) -> Result<(Vec<GuestRegionMmap>, Option<MicrovmState>), BackendError> {
     FarplaneBackend::ensure_drives()?;
+    super::phases::mark("drives");
     let Connection { sock, peer_pid } = CONNECTION
         .lock()
         .expect("Poisoned lock")
@@ -377,8 +378,10 @@ fn handshake(
         arch_regions,
     );
     protocol::send_frame(&sock, MsgType::Hello, 0, &hello, &[])?;
+    super::phases::mark("hello_sent");
 
     let incoming = protocol::recv_frame(&sock)?;
+    super::phases::mark("plan_received");
     if incoming.header.msg() != MsgType::BackingPlan {
         return Err(BackendError::Channel(ChannelError::Malformed));
     }
@@ -412,6 +415,7 @@ fn commit_plan(
         return Err(BackendError::Channel(ChannelError::FdCountMismatch));
     }
 
+    super::phases::mark("plan_parsed");
     let geometry = memversion::geometry(&plan.regions)
         .map_err(BackendError::Map)
         .inspect_err(|_| reject(&sock, &incoming, ErrorCode::GeometryMismatch))?;
@@ -461,6 +465,7 @@ fn commit_plan(
         }
     };
 
+    super::phases::mark("vmstate_parsed");
     if let Some(state) = &restored_state {
         state
             .device_states
@@ -482,11 +487,13 @@ fn commit_plan(
             })?;
     }
 
+    super::phases::mark("write_guard_checked");
     let mapped = memversion::map_regions(&geometry, incoming.fds.first().map(AsFd::as_fd))
         .map_err(|err| BackendError::Map(io::Error::other(err)))
         .inspect_err(|_| {
             reject(&sock, &incoming, ErrorCode::MapFailed);
         })?;
+    super::phases::mark("mapped");
     for region in &mapped {
         region
             .lock_on_fault()
@@ -496,6 +503,7 @@ fn commit_plan(
             })?;
     }
     BackendState::Registered.store();
+    super::phases::mark("locked");
 
     let ready_regions: Vec<BackendReadyRegion> = plan
         .regions
@@ -523,6 +531,7 @@ fn commit_plan(
     );
     protocol::send_frame(&sock, MsgType::BackendReady, 0, &body, &[])?;
     BackendState::Ready.store();
+    super::phases::mark("backend_ready_sent");
 
     // Pagemaster verifies the reported geometry, then acknowledges
     // with a bare `resume` before the guest is allowed to execute.
@@ -534,6 +543,7 @@ fn commit_plan(
     {
         return Err(BackendError::Channel(ChannelError::Malformed));
     }
+    super::phases::mark("pagemaster_ack");
     protocol::send_frame(
         &sock,
         MsgType::Resumed,
