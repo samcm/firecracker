@@ -6,6 +6,7 @@
 
 use std::io;
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref};
 use vmm_sys_util::{ioctl_iow_nr, ioctl_iowr_nr};
@@ -391,11 +392,19 @@ fn create_with(
     Ok(unsafe { OwnedFd::from_raw_fd(request.fd) })
 }
 
-/// Caller releases only its own reservation immediately before this NOREPLACE operation.
-pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io::Result<()> {
+const MV_MAP_PRIVATE: u32 = 1;
+/// With MV_MAP_PRIVATE: the kernel installs no PTEs; each page resolves from
+/// the version on first fault. Kernels without it refuse the flag with EINVAL
+/// before touching the address space.
+const MV_MAP_LAZY: u32 = 4;
+/// Cleared once a kernel refuses MV_MAP_LAZY, so later regions map eagerly
+/// without another refused ioctl.
+static LAZY_IMPORT: AtomicBool = AtomicBool::new(true);
+
+fn map_with(version: BorrowedFd<'_>, region: u32, addr: u64, flags: u32) -> io::Result<()> {
     let request = Map {
         region,
-        flags: 1,
+        flags,
         addr,
     };
     // SAFETY: the fixed-size request remains live; the kernel rejects occupied destinations.
@@ -403,6 +412,22 @@ pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Caller releases only its own reservation immediately before this NOREPLACE operation.
+/// Imports lazily where the kernel supports it, otherwise eagerly.
+pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io::Result<()> {
+    if LAZY_IMPORT.load(Ordering::Relaxed) {
+        match map_with(version, region, addr, MV_MAP_PRIVATE | MV_MAP_LAZY) {
+            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+                LAZY_IMPORT.store(false, Ordering::Relaxed);
+            }
+            // A version this kernel cannot import lazily still imports eagerly.
+            Err(err) if err.raw_os_error() == Some(libc::EOPNOTSUPP) => {}
+            other => return other,
+        }
+    }
+    map_with(version, region, addr, MV_MAP_PRIVATE)
 }
 
 #[cfg(test)]
