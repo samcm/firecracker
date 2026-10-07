@@ -117,6 +117,9 @@ pub struct FarplaneState {
     pub capture_buffers_armed: bool,
     /// Compatibility identity of this binary's memory protocol.
     pub feature_identity: String,
+    /// Identity of the vmstate this binary writes and restores, which moves only with its layout
+    /// and quiesce semantics, never with the memory protocol.
+    pub vmstate_identity: String,
     /// Commit of the source tree this binary was built from.
     pub source_commit: String,
 }
@@ -140,6 +143,7 @@ impl FarplaneState {
             vcpus: vcpus.to_string(),
             capture_buffers_armed: CAPTURE_BUFFERS_ARMED.load(Ordering::Acquire),
             feature_identity: protocol::FEATURE_IDENTITY.to_string(),
+            vmstate_identity: protocol::VMSTATE_IDENTITY.to_string(),
             source_commit: source_commit().to_string(),
         }
     }
@@ -975,6 +979,7 @@ mod tests {
                 vcpus: "stale".to_string(),
                 capture_buffers_armed: !CAPTURE_BUFFERS_ARMED.load(Ordering::Acquire),
                 feature_identity: "stale".to_string(),
+                vmstate_identity: "stale".to_string(),
                 source_commit: "stale".to_string(),
             },
         }
@@ -989,5 +994,15 @@ mod tests {
             FarplaneState::observe().capture_buffers_armed
         );
         assert_eq!(observed.feature_identity, protocol::FEATURE_IDENTITY);
+        assert_eq!(observed.vmstate_identity, protocol::VMSTATE_IDENTITY);
+    }
+
+    /// The vmstate identity is its own fact: a memory-protocol bump must not change what a
+    /// capture records about its vmstate, so the two identities are distinct values.
+    #[test]
+    fn test_farplane_vmstate_and_channel_identities_are_distinct() {
+        assert_ne!(protocol::VMSTATE_IDENTITY, protocol::FEATURE_IDENTITY);
+        assert_eq!(protocol::VMSTATE_IDENTITY, "farplane/8");
+        assert_eq!(protocol::FEATURE_IDENTITY, "farplane/9");
     }
 }

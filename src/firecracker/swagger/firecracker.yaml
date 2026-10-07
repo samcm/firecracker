@@ -813,6 +813,7 @@ definitions:
       - vcpus
       - capture_buffers_armed
       - feature_identity
+      - vmstate_identity
       - source_commit
     properties:
       backend_state:
@@ -841,11 +842,19 @@ definitions:
         type: boolean
       feature_identity:
         description:
-          Compatibility identity of the memory channel protocol, quiesce semantics
-          and vmstate format.
+          Compatibility identity of the memory channel protocol. It moves with the
+          channel alone.
         type: string
         enum:
-          - "farplane/6"
+          - "farplane/9"
+      vmstate_identity:
+        description:
+          Identity of the vmstate this binary writes and restores, which moves only
+          with the vmstate layout and its quiesce semantics, never with the memory
+          channel. A capture records this value.
+        type: string
+        enum:
+          - "farplane/8"
       source_commit:
         description:
           Commit of the source tree this binary was built from, the same value
