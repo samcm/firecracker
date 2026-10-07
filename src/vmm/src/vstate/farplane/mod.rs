@@ -7,6 +7,8 @@ pub mod backend;
 pub mod capture;
 /// Exclusion that stops event dispatch for the whole of a capture epoch.
 pub mod dispatch;
+/// Drive images handed over at claim to a Firecracker started before its sandbox was known.
+pub mod drives;
 pub(crate) mod memversion;
 /// Wire format of the pagemaster memory channel.
 pub mod protocol;

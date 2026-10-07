@@ -22,10 +22,13 @@ pub const MAX_SCM_FDS: usize = 253;
 /// window of requests in flight: an identifier older than this cannot be answered from memory and
 /// is refused instead.
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
-/// Compatibility identity of this protocol, quiesce semantics and vmstate format. A warm image
-/// baked by another identity is refused rather than restored: the capture command order and the
-/// vmstate the epoch produces are part of what this string names.
-pub const FEATURE_IDENTITY: &str = "farplane/8";
+/// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
+/// the handshake and the capture command order a peer must speak.
+pub const FEATURE_IDENTITY: &str = "farplane/9";
+/// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
+/// it was captured under. It changes only when those do, so a channel change alone leaves every
+/// stored vmstate restorable.
+pub const VMSTATE_IDENTITY: &str = "farplane/8";
 /// Maximum output of an advisory free summary, including per-region word padding.
 pub const MAX_FREE_SUMMARY_BYTES: u64 = 4 * 1024 * 1024;
 /// Maximum cooperative work budget for one advisory free summary.
@@ -87,6 +90,9 @@ pub enum MsgType {
     FreeSummary = 22,
     /// Every bitmap word was written; the body is its LE u64 popcount, with no descriptors.
     FreeSummaryDone = 23,
+    /// Pagemaster hands over the drive images: the read-only root image and, for a sandbox with
+    /// a disk, its read-write scratch disk. The body is the LE u32 descriptor count.
+    Drives = 24,
 }
 
 impl MsgType {
@@ -107,6 +113,7 @@ impl MsgType {
             17 => Some(Self::CaptureBuffersArmed),
             22 => Some(Self::FreeSummary),
             23 => Some(Self::FreeSummaryDone),
+            24 => Some(Self::Drives),
             // Reserved /6 tags, including 18-21, must never be interpreted as /8 commands.
             _ => None,
         }
@@ -175,6 +182,8 @@ pub enum ErrorCode {
     RebaseFailed = 27,
     /// An advisory free summary was busy, expired, too large, or could not be read/written.
     FreeSummaryUnavailable = 28,
+    /// A drive image handed over with `drives` is unusable for its slot.
+    BadDrive = 29,
 }
 
 /// Architecture Firecracker is running on.
@@ -870,6 +879,8 @@ mod tests {
         assert_eq!(ErrorCode::FreeSummaryUnavailable as u32, 28);
         assert_eq!(MsgType::FreeSummary as u16, 22);
         assert_eq!(MsgType::FreeSummaryDone as u16, 23);
+        assert_eq!(MsgType::Drives as u16, 24);
+        assert_eq!(ErrorCode::BadDrive as u32, 29);
     }
 
     /// The `hello` frame is the only place the feature identity crosses to pagemaster, so its
@@ -896,6 +907,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/8");
+        assert_eq!(FEATURE_IDENTITY, "farplane/9");
     }
 }
