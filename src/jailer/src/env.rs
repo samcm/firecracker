@@ -5,7 +5,6 @@ use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io;
 use std::io::Write;
-use std::mem::MaybeUninit;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -37,17 +36,8 @@ const FOLDER_HIERARCHY: [&str; 4] = ["/", "/dev", "/dev/net", "/run"];
 const FOLDER_PERMISSIONS: u32 = 0o700;
 const PID_FILE_EXTENSION: &str = ".pid";
 
-/// Filesystem magic of the internal shmem mount every memfd lives on.
-const TMPFS_MAGIC: u64 = 0x0102_1994;
-/// Filesystem magic of hugetlbfs, where a memfd created with `MFD_HUGETLB` lives.
-const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
-const REQUIRED_IMAGE_SEALS: libc::c_int =
-    libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-/// Permission bits that grant write access to an image, none of which a regular one may carry.
-const IMAGE_WRITE_MODE_BITS: libc::mode_t = libc::S_IWUSR | libc::S_IWGRP | libc::S_IWOTH;
-/// Bits that change the meaning of an inode beyond its permissions. A block device image is
-/// neither a program to gain privileges from nor a directory, so all three are refused.
-const IMAGE_SPECIAL_MODE_BITS: libc::mode_t = libc::S_ISUID | libc::S_ISGID | libc::S_ISVTX;
+/// What the drive slots hold until pagemaster hands Firecracker its drive images.
+const DEV_NULL: &CStr = c"/dev/null";
 
 fn dup2(old_fd: RawFd, new_fd: RawFd) -> Result<(), JailerError> {
     // SAFETY: both arguments are descriptor numbers and the return code is checked.
@@ -78,20 +68,6 @@ fn move_off_reserved_fds(fd: RawFd) -> Result<RawFd, JailerError> {
     Ok(moved)
 }
 
-/// Renumbers `fd` to `target` and makes sure the jailed binary inherits it: a descriptor that is
-/// already at `target` keeps whatever `FD_CLOEXEC` it was opened with, so the flag is cleared
-/// explicitly rather than relying on `dup2`.
-fn place_fd(fd: RawFd, target: RawFd) -> Result<(), JailerError> {
-    if fd != target {
-        dup2(fd, target)?;
-        close(fd)?;
-    }
-    // SAFETY: `target` is a descriptor this process owns and the return code is checked.
-    SyscallReturnCode(unsafe { libc::fcntl(target, libc::F_SETFD, 0) })
-        .into_empty_result()
-        .map_err(JailerError::Dup2)
-}
-
 #[derive(Debug)]
 pub struct Env {
     id: String,
@@ -105,9 +81,6 @@ pub struct Env {
     jailer_cpu_time_us: u64,
     extra_args: Vec<String>,
     resource_limits: ResourceLimits,
-    root_fd: RawFd,
-    scratch_fd: Option<RawFd>,
-    cgroup_join: Option<PathBuf>,
 }
 
 impl Env {
@@ -157,36 +130,10 @@ impl Env {
 
         let netns = arguments.single_value("netns").cloned();
 
-        let root_fd_str = arguments
-            .single_value("root-fd")
-            .ok_or_else(|| JailerError::ArgumentParsing(MissingValue("root-fd".to_string())))?;
-        let root_fd = root_fd_str
-            .parse::<RawFd>()
-            .map_err(|_| JailerError::RootFdArgument(root_fd_str.to_owned()))?;
-
-        let scratch_fd = arguments
-            .single_value("scratch-fd")
-            .map(|fd| {
-                fd.parse::<RawFd>()
-                    .map_err(|_| JailerError::ScratchFdArgument(fd.to_owned()))
-            })
-            .transpose()?;
-
         let mut resource_limits = ResourceLimits::default();
         if let Some(args) = arguments.multiple_values("resource-limit") {
             Env::parse_resource_limits(&mut resource_limits, args)?;
         }
-
-        let cgroup_join = arguments
-            .single_value("cgroup-join")
-            .map(|path| {
-                let path = PathBuf::from(path);
-                if !path.is_absolute() {
-                    return Err(JailerError::CgroupJoinNotAbsolute);
-                }
-                Ok(path)
-            })
-            .transpose()?;
 
         Ok(Env {
             id: id.to_owned(),
@@ -200,9 +147,6 @@ impl Env {
             jailer_cpu_time_us: 0,
             extra_args: arguments.extra_args(),
             resource_limits,
-            root_fd,
-            scratch_fd,
-            cgroup_join,
         })
     }
 
@@ -370,43 +314,24 @@ impl Env {
             .map_err(JailerError::SetNetNs)
     }
 
-    fn join_cgroup(&self) -> Result<(), JailerError> {
-        let Some(path) = &self.cgroup_join else {
-            return Ok(());
-        };
-        let procs = path.join("cgroup.procs");
-        // No fork happens between here and the exec, so this process is the one Firecracker
-        // runs as.
-        fs::write(&procs, id().to_string()).map_err(|err| JailerError::CgroupJoin(procs, err))
-    }
-
-    /// Hands Firecracker the root image as [`ROOT_FILENO`] and, when the caller passes one,
-    /// the writable scratch disk as
-    /// [`SCRATCH_FILENO`]. Every passed descriptor is moved clear of the reserved slots first,
-    /// because the caller is free to pass them in at any number.
-    fn install_inherited_fds(&self) -> Result<(), JailerError> {
-        validate_image_fd("--root-fd", self.root_fd, self.uid())?;
-        if let Some(fd) = self.scratch_fd {
-            validate_scratch_fd("--scratch-fd", fd)?;
-            reject_root_alias(self.root_fd, fd)?;
-        }
-
-        let root_fd = move_off_reserved_fds(self.root_fd)?;
-        let scratch_fd = self.scratch_fd.map(move_off_reserved_fds).transpose()?;
-
-        place_fd(root_fd, ROOT_FILENO)?;
-        match scratch_fd {
-            Some(fd) => place_fd(fd, SCRATCH_FILENO),
-            None => Ok(()),
-        }
-    }
-
-    /// Last descriptor number Firecracker is given, which is the highest one that survives exec.
-    fn highest_reserved_fd(&self) -> libc::c_int {
-        match self.scratch_fd {
-            Some(_) => SCRATCH_FILENO,
-            None => ROOT_FILENO,
-        }
+    /// Reserves the descriptor numbers drives are backed by. Firecracker starts before the sandbox
+    /// it will run is known, so its drive images arrive later over the memory channel and replace
+    /// these placeholders in place. Holding the numbers from the start means no descriptor
+    /// Firecracker opens in the meantime can take one, and a drive configured before its image
+    /// arrives names a read-only empty device that every drive contract refuses.
+    fn reserve_drive_slots(&self) -> Result<(), JailerError> {
+        // SAFETY: `DEV_NULL` is a NUL-terminated path and the return code is checked.
+        let placeholder = SyscallReturnCode(unsafe {
+            libc::open(DEV_NULL.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+        })
+        .into_result()
+        .map_err(JailerError::ReserveDriveSlot)?;
+        // The placeholder is moved clear of both slots first, so `dup2` always renumbers and the
+        // copies never carry the close-on-exec flag the original was opened with.
+        let placeholder = move_off_reserved_fds(placeholder)?;
+        dup2(placeholder, ROOT_FILENO)?;
+        dup2(placeholder, SCRATCH_FILENO)?;
+        close(placeholder)
     }
 
     fn exec_command(&self, chroot_exec_file: PathBuf) -> io::Error {
@@ -515,10 +440,9 @@ impl Env {
             Env::join_netns(path)?;
         }
 
-        self.install_inherited_fds()?;
-        self.join_cgroup()?;
+        self.reserve_drive_slots()?;
         self.resource_limits.install()?;
-        close_inherited_fds(self.highest_reserved_fd())?;
+        close_inherited_fds()?;
 
         #[cfg(target_arch = "aarch64")]
         self.copy_cache_info()?;
@@ -538,242 +462,9 @@ impl Env {
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
         self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
         // Setup may reuse the hole at fd 3. Leave only the contracted descriptors at exec.
-        close_inherited_fds(self.highest_reserved_fd())?;
+        close_inherited_fds()?;
         Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
     }
-}
-
-/// Checks that `fd` is a descriptor the supervisor is contracted to pass: a readable, read-only,
-/// non-empty regular file holding a block device image whose bytes the jail cannot change. The
-/// image itself is never read here.
-///
-/// Two kinds of descriptor satisfy that contract, told apart by whether the inode answers
-/// `F_GET_SEALS`:
-///
-/// * A sealed memfd proves immutability in the kernel. The seals hold for every descriptor to the
-///   inode, so no process changes the bytes, and no process needs to be trusted not to.
-/// * A regular file cannot prove that much. Byte stability of a regular image is the
-///   responsibility of the node or cache owner that published it, and that responsibility is not
-///   transferred to the jailer by any check below. What the jailer does prove is the part it owns:
-///   the confined process cannot obtain write access to the inode, neither through the inherited
-///   descriptor, nor by chmod'ing a file it owns, nor through a setuid or setgid transition. None
-///   of that holds for a jail that keeps uid 0, which is why that jail is refused this arm.
-fn validate_image_fd(flag: &'static str, fd: RawFd, jail_uid: u32) -> Result<(), JailerError> {
-    // SAFETY: `F_GETFL` writes nothing and the return code is checked.
-    let flags = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GETFL) })
-        .into_result()
-        .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
-    // An `O_PATH` descriptor reports an access mode of `O_RDONLY` while referring to the inode
-    // without granting any read at all, so it is rejected explicitly.
-    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
-        return Err(JailerError::ImageFdNotReadOnly(flag));
-    }
-
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `stat` is a valid, aligned, sufficiently sized allocation for a `libc::stat`.
-    SyscallReturnCode(unsafe { libc::fstat(fd, stat.as_mut_ptr()) })
-        .into_empty_result()
-        .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
-    // SAFETY: `fstat` returned success, so it initialized the whole struct.
-    let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(JailerError::ImageFdNotRegularFile(flag));
-    }
-    if stat.st_size == 0 {
-        return Err(JailerError::ImageFdEmpty(flag));
-    }
-
-    // Every shmem and hugetlbfs inode answers `F_GET_SEALS`, memfd or not, and every other
-    // filesystem fails it with EINVAL. That is what selects the arm: an image on tmpfs or
-    // hugetlbfs is held to the sealed memfd contract even when it was created as an ordinary
-    // file, so a plain tmpfs file is refused for the seals it does not carry.
-    // SAFETY: `F_GET_SEALS` writes nothing and the return code is checked.
-    match SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GET_SEALS) }).into_result() {
-        Ok(seals) => validate_sealed_image(flag, fd, seals),
-        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
-            validate_unwritable_image(flag, &stat, jail_uid)
-        }
-        Err(err) => Err(JailerError::ImageFdInspect(flag, err)),
-    }
-}
-
-/// Holds an image on a sealing filesystem to the memfd contract: the seals that make the bytes
-/// unchangeable for every holder of the inode, plus the identity of the two filesystems a memfd
-/// can live on.
-fn validate_sealed_image(
-    flag: &'static str,
-    fd: RawFd,
-    seals: libc::c_int,
-) -> Result<(), JailerError> {
-    // Seals only ever remove abilities, and a kernel with vm.memfd_noexec enabled adds
-    // F_SEAL_EXEC by itself, so anything beyond the required set is accepted.
-    if seals & REQUIRED_IMAGE_SEALS != REQUIRED_IMAGE_SEALS {
-        return Err(JailerError::ImageFdNotSealed(flag));
-    }
-
-    // A memfd lives on the internal shmem mount or on hugetlbfs and nowhere else. Together with
-    // the seals above this proves identity without procfs, which no jail is required to have.
-    // Anything else that answers `F_GET_SEALS`, such as a file on a mounted tmpfs, reaches here
-    // and is refused unless it carries the same seals.
-    let mut fs_stat = MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `fs_stat` is a valid, aligned, sufficiently sized allocation for a `libc::statfs`.
-    SyscallReturnCode(unsafe { libc::fstatfs(fd, fs_stat.as_mut_ptr()) })
-        .into_empty_result()
-        .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
-    // SAFETY: `fstatfs` returned success, so it initialized the whole struct.
-    let fs_stat = unsafe { fs_stat.assume_init() };
-    // `f_type` is a signed word on some targets and an unsigned one on others, so both sides are
-    // widened to a type that holds either representation exactly.
-    let magic = i128::from(fs_stat.f_type);
-    if magic != i128::from(TMPFS_MAGIC) && magic != i128::from(HUGETLBFS_MAGIC) {
-        return Err(JailerError::ImageFdSealedNotShmem(flag));
-    }
-
-    Ok(())
-}
-
-/// Holds an ordinary regular image to the property the jailer can enforce on it: the jailed uid
-/// has no path to write access. That property only exists below root. A jail that keeps uid 0
-/// keeps `CAP_DAC_OVERRIDE` and `CAP_FOWNER`, which defeat both the permission bits and the
-/// ownership of the inode, so uid 0 is held to the sealed memfd arm instead. Below root, write
-/// permission for anyone is refused outright rather than reasoned about, the setuid, setgid and
-/// sticky bits are refused because an image is not a program and not a directory, and an image
-/// the jail owns is refused because ownership carries the right to chmod it writable after this
-/// check.
-fn validate_unwritable_image(
-    flag: &'static str,
-    stat: &libc::stat,
-    jail_uid: u32,
-) -> Result<(), JailerError> {
-    if jail_uid == 0 {
-        return Err(JailerError::ImageFdRegularFileAtRootUid(flag));
-    }
-    if stat.st_mode & IMAGE_WRITE_MODE_BITS != 0 {
-        return Err(JailerError::ImageFdWritablePermissions(flag));
-    }
-    if stat.st_mode & IMAGE_SPECIAL_MODE_BITS != 0 {
-        return Err(JailerError::ImageFdSpecialModeBits(flag));
-    }
-    if stat.st_uid == jail_uid {
-        return Err(JailerError::ImageFdOwnedByJailUid(flag));
-    }
-
-    reject_writable_stream_aliases(flag, stat)
-}
-
-/// Refuses a regular image that a descriptor surviving the exec also holds open for writing.
-///
-/// The checks above prove the jail cannot obtain write access through the inherited image
-/// descriptor itself, nor through the permissions or the ownership of the inode. A second open file
-/// description on the same inode is neither of those: it carries its own access mode, granted
-/// before this process narrowed anything, and `fstat` on the image says nothing about it.
-///
-/// The standard streams are the whole set of descriptors that reach Firecracker without the jailer
-/// choosing what they refer to: `close_inherited_fds` keeps them so the jailed process can log,
-/// fd 3 is closed, and [`ROOT_FILENO`] and
-/// [`SCRATCH_FILENO`] are overwritten by the descriptors it places there or closed with the rest.
-/// So a caller that points a standard stream at the image inode with an access mode that includes
-/// writing is the one way a writable alias survives into the jail, and that is refused here.
-///
-/// Only the root image is held to this: the jail is meant to write the scratch disk.
-fn reject_writable_stream_aliases(
-    flag: &'static str,
-    stat: &libc::stat,
-) -> Result<(), JailerError> {
-    for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
-        let mut alias = MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `alias` is a valid, aligned, sufficiently sized allocation for a `libc::stat`.
-        match SyscallReturnCode(unsafe { libc::fstat(fd, alias.as_mut_ptr()) }).into_empty_result()
-        {
-            Ok(()) => {}
-            // A standard stream the caller left closed refers to no inode, so it aliases nothing.
-            Err(err) if err.raw_os_error() == Some(libc::EBADF) => continue,
-            Err(err) => return Err(JailerError::ImageFdInspect(flag, err)),
-        }
-        // SAFETY: `fstat` returned success, so it initialized the whole struct.
-        let alias = unsafe { alias.assume_init() };
-        if alias.st_dev != stat.st_dev || alias.st_ino != stat.st_ino {
-            continue;
-        }
-
-        // SAFETY: `F_GETFL` writes nothing and the return code is checked.
-        let flags = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GETFL) })
-            .into_result()
-            .map_err(|err| JailerError::ImageFdInspect(flag, err))?;
-        // An `O_PATH` descriptor grants no access at all, whatever access mode it reports.
-        if flags & libc::O_PATH == 0 && flags & libc::O_ACCMODE != libc::O_RDONLY {
-            return Err(JailerError::ImageFdWritableStreamAlias(flag, fd));
-        }
-    }
-
-    Ok(())
-}
-
-/// Checks that `fd` is the descriptor the supervisor is contracted to pass for the scratch disk:
-/// a non-empty regular file on the node's filesystem, opened read-write for direct I/O. The inode
-/// is meant to be writable by the jail, so no permission, ownership or mode bit is read.
-fn validate_scratch_fd(flag: &'static str, fd: RawFd) -> Result<(), JailerError> {
-    // SAFETY: `F_GETFL` writes nothing and the return code is checked.
-    let flags = SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GETFL) })
-        .into_result()
-        .map_err(|err| JailerError::ScratchFdInspect(flag, err))?;
-    // An `O_PATH` descriptor reports an access mode of `O_RDONLY` while referring to the inode
-    // without granting any access at all, so it is rejected explicitly.
-    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE != libc::O_RDWR {
-        return Err(JailerError::ScratchFdNotReadWrite(flag));
-    }
-    // `O_APPEND` moves every write to the end of the file, wherever the guest aimed it.
-    if flags & libc::O_APPEND != 0 {
-        return Err(JailerError::ScratchFdAppend(flag));
-    }
-
-    let stat = inode_of(fd).map_err(|err| JailerError::ScratchFdInspect(flag, err))?;
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(JailerError::ScratchFdNotRegularFile(flag));
-    }
-    if stat.st_size == 0 {
-        return Err(JailerError::ScratchFdEmpty(flag));
-    }
-
-    // Every shmem and hugetlbfs inode answers `F_GET_SEALS` and every other filesystem fails it
-    // with EINVAL, so an answer means the disk is the node's memory and not its filesystem.
-    // SAFETY: `F_GET_SEALS` writes nothing and the return code is checked.
-    match SyscallReturnCode(unsafe { libc::fcntl(fd, libc::F_GET_SEALS) }).into_result() {
-        Ok(_) => return Err(JailerError::ScratchFdSealingFilesystem(flag)),
-        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {}
-        Err(err) => return Err(JailerError::ScratchFdInspect(flag, err)),
-    }
-
-    // The guest's reads and writes reach the disk itself, so the host holds no second copy of a
-    // sandbox's data in its page cache.
-    if flags & libc::O_DIRECT == 0 {
-        return Err(JailerError::ScratchFdNotDirect(flag));
-    }
-
-    Ok(())
-}
-
-/// Refuses a scratch descriptor that names the root image inode. A caller could open one inode
-/// twice, read-only for the root slot and writable for the scratch slot, and the guest would
-/// reach the immutable root image through the writes it makes to its own disk.
-fn reject_root_alias(root_fd: RawFd, scratch_fd: RawFd) -> Result<(), JailerError> {
-    let root = inode_of(root_fd).map_err(|err| JailerError::ImageFdInspect("--root-fd", err))?;
-    let scratch =
-        inode_of(scratch_fd).map_err(|err| JailerError::ScratchFdInspect("--scratch-fd", err))?;
-    if root.st_dev == scratch.st_dev && root.st_ino == scratch.st_ino {
-        return Err(JailerError::ScratchFdAliasesRoot);
-    }
-
-    Ok(())
-}
-
-/// The inode `fd` refers to.
-fn inode_of(fd: RawFd) -> Result<libc::stat, io::Error> {
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `stat` is a valid, aligned, sufficiently sized allocation for a `libc::stat`.
-    SyscallReturnCode(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }).into_empty_result()?;
-    // SAFETY: `fstat` returned success, so it initialized the whole struct.
-    Ok(unsafe { stat.assume_init() })
 }
 
 #[cfg(test)]

@@ -202,6 +202,9 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::WriteVmstate => (0, &[1]),
         MsgType::Resume => (4, &[0]),
         MsgType::FreeSummary => (8, &[1]),
+        MsgType::Track => (0, &[1, 2]),
+        MsgType::Refresh => (0, &[0]),
+        MsgType::Untrack => (0, &[0]),
         _ => return Err(ChannelError::Malformed),
     };
     if body_len != len || !counts.contains(&fd_count) {
@@ -220,6 +223,33 @@ pub struct CaptureService {
     order: EpochOrder,
     replies: ReplyCache,
     pending: Option<(u64, CommandKey)>,
+    /// The memversion device once the guest's memory is tracked: captures then fold only
+    /// what changed, and refreshes run without a pause.
+    tracker: Option<OwnedFd>,
+    /// The last version a tracked capture or refresh produced, which the kernel's tracker
+    /// also holds; kept to flatten it at the depth bound.
+    standing: Option<Arc<OwnedFd>>,
+}
+
+/// The `tracked` reply body.
+fn encode_track_info(info: &memversion::TrackInfo) -> Vec<u8> {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&info.tracked.to_le_bytes());
+    body.extend_from_slice(&info.depth.to_le_bytes());
+    body.extend_from_slice(&info.dirty_pages.to_le_bytes());
+    body.extend_from_slice(&info.standing_id.to_le_bytes());
+    body
+}
+
+/// The `refreshed` reply body.
+fn encode_refreshed(info: &memversion::Info2) -> Vec<u8> {
+    let mut body = Vec::with_capacity(32);
+    body.extend_from_slice(&info.own_pages.to_le_bytes());
+    body.extend_from_slice(&info.new_pages.to_le_bytes());
+    body.extend_from_slice(&info.depth.to_le_bytes());
+    body.extend_from_slice(&info.nr_zero_runs.to_le_bytes());
+    body.extend_from_slice(&info.folded_pages.to_le_bytes());
+    body
 }
 
 impl CaptureService {
@@ -246,6 +276,8 @@ impl CaptureService {
                     order: EpochOrder::default(),
                     replies: ReplyCache::default(),
                     pending: None,
+                    tracker: None,
+                    standing: None,
                 };
                 loop {
                     if BackendState::load() == BackendState::ChannelFailed {
@@ -292,6 +324,9 @@ impl CaptureService {
             MsgType::WriteVmstate => self.write_vmstate(incoming),
             MsgType::Resume => self.resume(request_id, protocol::parse_u32(&incoming.body)?),
             MsgType::FreeSummary => self.free_summary(incoming),
+            MsgType::Track => self.track(incoming),
+            MsgType::Refresh => self.refresh(request_id),
+            MsgType::Untrack => self.untrack(request_id),
             _ => Err(ChannelError::Malformed),
         }
     }
@@ -323,6 +358,112 @@ impl CaptureService {
             Ok(pages) => self.reply(request_id, MsgType::FreeSummaryDone, &pages.to_le_bytes()),
             Err(code) => self.reject(request_id, code, MsgType::FreeSummary),
         }
+    }
+
+    /// Tracks the guest's memory from now on. Runs while the guest runs: the kernel walks the
+    /// present pages once under the mmap write lock, which stalls only guest faults. A second
+    /// request reports the existing tracker.
+    fn track(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
+        let request_id = incoming.header.request_id;
+        if BackendState::load() != BackendState::Ready {
+            return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
+        }
+        let mut fds = incoming.fds.into_iter();
+        let device = fds.next().ok_or(ChannelError::FdCountMismatch)?;
+        let base = fds.next();
+        if self.tracker.is_none() {
+            let started = Instant::now();
+            if let Err(err) = memversion::geometry(&self.channel.regions).and_then(|regions| {
+                memversion::track_guest(device.as_fd(), &regions, base.as_ref().map(AsFd::as_fd))
+            }) {
+                error!("Farplane could not track guest memory: {err}");
+                return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
+            }
+            info!(
+                "Farplane tracks guest memory (base={}) after {} us",
+                base.is_some(),
+                started.elapsed().as_micros()
+            );
+            self.tracker = Some(device);
+        }
+        let tracker = self.tracker.as_ref().expect("tracker set above");
+        match memversion::track_info(tracker.as_fd()) {
+            Ok(info) => self.reply(request_id, MsgType::Tracked, &encode_track_info(&info)),
+            Err(err) => {
+                error!("Farplane could not read the memory tracker: {err}");
+                self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track)
+            }
+        }
+    }
+
+    /// Folds what the guest wrote since the standing version into a new one, without a pause.
+    /// The result is a base for the next fork's fold, never a capture: a running guest has no
+    /// consistent instant. Optional: a refusal leaves the guest running and the next fork
+    /// folds more.
+    fn refresh(&mut self, request_id: u64) -> Result<(), ChannelError> {
+        let Some(tracker) = self.tracker.as_ref() else {
+            return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
+        };
+        if BackendState::load() != BackendState::Ready {
+            return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
+        }
+        let started = Instant::now();
+        let refreshed = memversion::geometry(&self.channel.regions)
+            .and_then(|regions| {
+                memversion::refresh(
+                    tracker.as_fd(),
+                    &regions,
+                    self.standing.as_ref().map(|fd| fd.as_fd()),
+                )
+            })
+            .and_then(|version| Ok((memversion::info2(version.as_fd())?, version)));
+        match refreshed {
+            Ok((info, version)) => {
+                info!(
+                    "Farplane refreshed the standing version in {} us: own={} folded={} depth={}",
+                    started.elapsed().as_micros(),
+                    info.own_pages,
+                    info.folded_pages,
+                    info.depth
+                );
+                let version = Arc::new(version);
+                self.standing = Some(version.clone());
+                self.answer_with_version(
+                    request_id,
+                    MsgType::Refreshed,
+                    encode_refreshed(&info),
+                    Some(version),
+                )
+            }
+            Err(err) => {
+                error!("Farplane could not refresh the standing version: {err}");
+                self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh)
+            }
+        }
+    }
+
+    /// Stops tracking and releases the standing version, the cheapest memory a pressure path
+    /// can give back without pausing the guest. The versions stay alive while anything else
+    /// holds them; pagemaster releases their charge on the kernel's last-holder receipt, not on
+    /// this reply. Untracking an untracked guest reports the same state.
+    fn untrack(&mut self, request_id: u64) -> Result<(), ChannelError> {
+        if BackendState::load() != BackendState::Ready {
+            return self.reject(request_id, ErrorCode::UntrackFailed, MsgType::Untrack);
+        }
+        if let Some(tracker) = self.tracker.as_ref() {
+            if let Err(err) = memversion::untrack(tracker.as_fd()) {
+                error!("Farplane could not untrack guest memory: {err}");
+                return self.reject(request_id, ErrorCode::UntrackFailed, MsgType::Untrack);
+            }
+            self.tracker = None;
+            self.standing = None;
+            info!("Farplane untracked guest memory");
+        }
+        self.reply(
+            request_id,
+            MsgType::Tracked,
+            &encode_track_info(&memversion::TrackInfo::default()),
+        )
     }
 
     fn arm_buffers(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
@@ -363,9 +504,14 @@ impl CaptureService {
             }
             _ => return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Quiesce),
         }
+        // Each stage's end, in microseconds from the quiesce request, for one timing line.
+        let started = Instant::now();
+        let at = || u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         // Wait for in-flight handlers before taking the VMM lock they may need.
         dispatch::gate().close();
+        let gate_us = at();
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
+        let lock_us = at();
         let were_running = vmm.instance_info.state == VmState::Running;
         if were_running && let Err(err) = vmm.pause_vm() {
             error!("Farplane quiesce could not pause the vCPUs: {err}");
@@ -373,6 +519,7 @@ impl CaptureService {
             dispatch::gate().open();
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
+        let pause_us = at();
         if let Err(err) = vmm.drain_guest_memory_writers() {
             error!("Farplane quiesce could not stop every guest-memory writer: {err}");
             hand_back_source(vmm, were_running);
@@ -402,9 +549,14 @@ impl CaptureService {
                 }
             }
         }
+        let drain_clone_us = at();
         drop(vmm);
         self.order.open();
         BackendState::Quiesced.store();
+        info!(
+            "Farplane quiesce timing gate_close_us={gate_us} vmm_lock_us={lock_us} \
+             vcpu_pause_us={pause_us} drain_and_clone_us={drain_clone_us} were_running={were_running}"
+        );
         self.reply(
             request_id,
             MsgType::Quiesced,
@@ -432,6 +584,7 @@ impl CaptureService {
             vm_info,
             buffers,
             order,
+            tracker,
             ..
         } = self;
         let result = serve_write_vmstate(order, || {
@@ -449,7 +602,22 @@ impl CaptureService {
                 let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
                 let regions = memversion::geometry(&channel.regions)?;
                 let exclusions = memversion::exclusions(&regions, &free, &dirty)?;
-                memversion::create(device.as_fd(), &regions, &exclusions)
+                if tracker.is_none() {
+                    return memversion::create(device.as_fd(), &regions, &exclusions);
+                }
+                // A tracked source folds only the pages written since the standing version.
+                // A failed fold leaves the tracker marking everything, so a whole copy is
+                // still exact and the next fold catches up.
+                memversion::create_tracked(
+                    device.as_fd(),
+                    &regions,
+                    &exclusions,
+                    memversion::Fold::Quiesced,
+                )
+                .or_else(|err| {
+                    error!("Farplane tracked capture fell back to a whole copy: {err}");
+                    memversion::create(device.as_fd(), &regions, &exclusions)
+                })
             })()
             .map_err(|err| {
                 error!("Farplane capture could not create the memory version: {err}");
@@ -460,12 +628,24 @@ impl CaptureService {
             Ok((bytes, version))
         });
         match result {
-            Ok((bytes, version)) => self.answer_with_version(
-                request_id,
-                MsgType::VmstateWritten,
-                bytes.to_le_bytes().to_vec(),
-                Some(version),
-            ),
+            Ok((bytes, version)) => {
+                let answered = self.answer_with_version(
+                    request_id,
+                    MsgType::VmstateWritten,
+                    bytes.to_le_bytes().to_vec(),
+                    Some(version.clone()),
+                );
+                // After the reply: only the version the tracker now stands on is a refresh's
+                // flatten source, not a whole copy made after a failed fold.
+                if let Some(tracker) = &self.tracker
+                    && let Ok(track) = memversion::track_info(tracker.as_fd())
+                    && memversion::info2(version.as_fd())
+                        .is_ok_and(|info| info.id == track.standing_id)
+                {
+                    self.standing = Some(version);
+                }
+                answered
+            }
             Err(code) => self.reject(request_id, code, MsgType::WriteVmstate),
         }
     }

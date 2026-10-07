@@ -9,7 +9,9 @@ use vmm::EventManager;
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::{CacheType, ROOT_DESCRIPTOR_FILENO, SCRATCH_DESCRIPTOR_FILENO};
 use vmm::resources::VmResources;
-use vmm::rpc_interface::{LoadSnapshotError, PrebootApiController, VmmAction, VmmActionError};
+use vmm::rpc_interface::{
+    LoadSnapshotError, PrebootApiController, VmmAction, VmmActionError, VmmData,
+};
 use vmm::seccomp::get_empty_filters;
 use vmm::vmm_config::boot_source::BootSourceConfig;
 use vmm::vmm_config::drive::BlockDeviceConfig;
@@ -89,6 +91,18 @@ fn test_build_and_boot_microvm_without_boot_source() {
 }
 
 fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &str) {
+    verify_load_snap_disallowed_after(res, res_name, |result| {
+        result.unwrap();
+    });
+}
+
+/// `check` judges the boot-path request itself; LoadSnapshot must be refused afterwards
+/// whether or not that request succeeded, because any boot-path request commits to booting.
+fn verify_load_snap_disallowed_after(
+    res: VmmAction,
+    res_name: &str,
+    check: impl FnOnce(Result<VmmData, VmmActionError>),
+) {
     let mut event_manager = EventManager::new().unwrap();
     let empty_seccomp_filters = get_empty_filters();
     let mut vm_resources = VmResources::default();
@@ -100,7 +114,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         &mut event_manager,
     );
 
-    preboot_api_controller.handle_preboot_request(res).unwrap();
+    check(preboot_api_controller.handle_preboot_request(res));
 
     // Load snapshot should no longer be allowed.
     let req = VmmAction::LoadSnapshot(LoadSnapshotParams { resume_vm: false });
@@ -138,8 +152,15 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         file_engine_type: None,
     };
 
+    // A drive's image arrives over the farplane memory channel, which this test does not
+    // connect: the insert is refused for that alone, after it has committed to booting.
     let req = VmmAction::InsertBlockDevice(config);
-    verify_load_snap_disallowed_after_boot_resources(req, "InsertBlockDevice");
+    verify_load_snap_disallowed_after(req, "InsertBlockDevice", |result| {
+        assert!(
+            matches!(result, Err(VmmActionError::DriveImages(_))),
+            "{result:?}"
+        );
+    });
 
     let req = VmmAction::InsertNetworkDevice(NetworkInterfaceConfig {
         iface_id: String::new(),

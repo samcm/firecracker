@@ -87,6 +87,8 @@ enum MainError {
     LockWorkingSet(io::Error),
     /// Missing required --farplane-mem-socket
     MissingFarplaneSocket,
+    /// Could not connect the pagemaster memory channel: {0}
+    FarplaneConnect(vmm::vstate::farplane::BackendError),
     /// RunWithApiError error: {0}
     RunWithApi(ApiServerError),
     /// RunWithoutApiError error: {0}
@@ -321,6 +323,9 @@ fn main_exec() -> Result<(), MainError> {
         .single_value("farplane-mem-socket")
         .ok_or(MainError::MissingFarplaneSocket)?;
     vmm::vstate::farplane::FarplaneBackend::set_socket_path(PathBuf::from(farplane_socket));
+    // Firecracker is started before its sandbox is known. The memory channel is connected now so
+    // that a claim finds it waiting; pagemaster sends nothing on it until the claim arrives.
+    vmm::vstate::farplane::FarplaneBackend::connect().map_err(MainError::FarplaneConnect)?;
 
     // It's safe to unwrap here because the field's been provided with a default value.
     let instance_id = arguments.single_value("id").unwrap();

@@ -1,14 +1,15 @@
 // Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Frozen v1 UAPI. Firecracker borrows the device capability from pagemaster; never opens it.
+//! Frozen v1 UAPI plus the additive ABI v2 requests (incremental versions). Firecracker borrows the device capability from pagemaster; never opens it.
 //! The companion integration stub is resources/memversion.h, not the research ioctl ABI.
 
 use std::io;
-use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref};
-use vmm_sys_util::{ioctl_iow_nr, ioctl_iowr_nr};
+use vmm_sys_util::ioctl::{ioctl, ioctl_with_mut_ref, ioctl_with_ref};
+use vmm_sys_util::{ioctl_io_nr, ioctl_iow_nr, ioctl_iowr_nr};
 
 use super::protocol::RegionRecord;
 
@@ -372,6 +373,15 @@ fn create_with(
     exclusions: &[Exclusion],
     ioctl: impl FnOnce(&mut Create) -> io::Result<()>,
 ) -> io::Result<OwnedFd> {
+    create_flags_with(regions, exclusions, 0, ioctl)
+}
+
+fn create_flags_with(
+    regions: &[Region],
+    exclusions: &[Exclusion],
+    flags: u32,
+    ioctl: impl FnOnce(&mut Create) -> io::Result<()>,
+) -> io::Result<OwnedFd> {
     if regions.is_empty() || regions.len() > MAX_REGIONS || exclusions.len() > MAX_EXCLUSIONS {
         return Err(invalid());
     }
@@ -380,7 +390,7 @@ fn create_with(
         exclusions: exclusions.as_ptr() as u64,
         nr_regions: u32::try_from(regions.len()).unwrap(),
         nr_exclusions: u32::try_from(exclusions.len()).unwrap(),
-        flags: 0,
+        flags,
         fd: -1,
     };
     ioctl(&mut request)?;
@@ -391,11 +401,19 @@ fn create_with(
     Ok(unsafe { OwnedFd::from_raw_fd(request.fd) })
 }
 
-/// Caller releases only its own reservation immediately before this NOREPLACE operation.
-pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io::Result<()> {
+const MV_MAP_PRIVATE: u32 = 1;
+/// With MV_MAP_PRIVATE: the kernel installs no PTEs; each page resolves from
+/// the version on first fault. Kernels without it refuse the flag with EINVAL
+/// before touching the address space.
+const MV_MAP_LAZY: u32 = 4;
+/// Cleared once a kernel refuses MV_MAP_LAZY, so later regions map eagerly
+/// without another refused ioctl.
+static LAZY_IMPORT: AtomicBool = AtomicBool::new(true);
+
+fn map_with(version: BorrowedFd<'_>, region: u32, addr: u64, flags: u32) -> io::Result<()> {
     let request = Map {
         region,
-        flags: 1,
+        flags,
         addr,
     };
     // SAFETY: the fixed-size request remains live; the kernel rejects occupied destinations.
@@ -403,6 +421,246 @@ pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Caller releases only its own reservation immediately before this NOREPLACE operation.
+/// Imports lazily where the kernel supports it, otherwise eagerly.
+pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io::Result<()> {
+    if LAZY_IMPORT.load(Ordering::Relaxed) {
+        match map_with(version, region, addr, MV_MAP_PRIVATE | MV_MAP_LAZY) {
+            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+                LAZY_IMPORT.store(false, Ordering::Relaxed);
+            }
+            // A version this kernel cannot import lazily still imports eagerly.
+            Err(err) if err.raw_os_error() == Some(libc::EOPNOTSUPP) => {}
+            other => return other,
+        }
+    }
+    map_with(version, region, addr, MV_MAP_PRIVATE)
+}
+
+// ABI v2: incremental versions. Every v1 request keeps its v1 meaning; a v1 kernel refuses
+// each of these with ENOTTY (unknown request) or EINVAL (unknown CREATE flag).
+
+/// The caller's mm is tracked; the version is the standing version plus only the pages
+/// written since it, and becomes the new standing version.
+const MV_CREATE_TRACKED: u32 = 1;
+/// With MV_CREATE_TRACKED: the source keeps running. A page that may be pinned stays
+/// unfolded rather than failing the call; at the depth bound the call fails with E2BIG.
+const MV_CREATE_LIVE: u32 = 2;
+
+#[repr(C)]
+#[derive(Debug)]
+struct Track {
+    regions: u64,
+    nr_regions: u32,
+    base_fd: i32,
+}
+
+/// Dirty state of the caller's tracked mm.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TrackInfo {
+    pub tracked: u32,
+    pub depth: u32,
+    /// Pages written since the standing version: what the next fold copies.
+    pub dirty_pages: u64,
+    pub standing_id: u64,
+    /// In: MV_TRACK_INFO_RETAINED to also count retained_pages.
+    pub flags: u32,
+    pub reserved: u32,
+    /// Pages the standing chain maps that this process no longer maps
+    /// (diagnostic: a background walk of the chain).
+    pub retained_pages: u64,
+}
+
+/// A version's v2 description: its place in a chain and what this level holds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Info2 {
+    pub abi: u32,
+    pub nr_regions: u32,
+    pub regions: u64,
+    pub present_pages: u64,
+    pub excluded_pages: u64,
+    pub new_pages: u64,
+    pub id: u64,
+    pub base_id: u64,
+    pub content_id: u64,
+    pub depth: u32,
+    pub nr_zero_runs: u32,
+    pub own_pages: u64,
+    pub folded_pages: u64,
+}
+
+ioctl_iowr_nr!(MV_IOC_INFO2, 0x56, 0x43, Info2);
+ioctl_io_nr!(MV_IOC_FLATTEN, 0x56, 0x44);
+ioctl_iow_nr!(MV_IOC_TRACK, 0x56, 0x45, Track);
+ioctl_iowr_nr!(MV_IOC_TRACK_INFO, 0x56, 0x46, TrackInfo);
+ioctl_iow_nr!(MV_IOC_TRACK_REBASE, 0x56, 0x47, i32);
+ioctl_iow_nr!(MV_IOC_TRACK_DROP, 0x56, 0x48, u32);
+
+/// How a CREATE treats the caller's tracked mm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fold {
+    /// Quiesced source: fold every page written since the standing version.
+    Quiesced,
+    /// Running source (background refresh): fold what is not possibly pinned.
+    Live,
+}
+
+/// Tracks the caller's guest regions from now on. `base` is the version every page not
+/// yet faulted in equals (the lazily imported version), or `None` for a booted guest
+/// whose untouched memory is zero. Call before the guest runs.
+pub(crate) fn track(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    base: Option<BorrowedFd<'_>>,
+) -> io::Result<()> {
+    if regions.is_empty() || regions.len() > MAX_REGIONS {
+        return Err(invalid());
+    }
+    let request = Track {
+        regions: regions.as_ptr() as u64,
+        nr_regions: u32::try_from(regions.len()).unwrap(),
+        base_fd: base.map_or(-1, |fd| fd.as_raw_fd()),
+    };
+    // SAFETY: request points at an immutable live slice; the kernel only reads it.
+    if unsafe { ioctl_with_ref(&device, MV_IOC_TRACK(), &request) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn track_info(device: BorrowedFd<'_>) -> io::Result<TrackInfo> {
+    // flags stay 0: the retained walk is a diagnostic the commands never need.
+    let mut info = TrackInfo::default();
+    // SAFETY: info is a live, writable struct of the exact request size.
+    if unsafe { ioctl_with_mut_ref(&device, MV_IOC_TRACK_INFO(), &mut info) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
+/// CREATE over the tracked standing version. The returned version is the new standing
+/// version; the tracker holds its own reference.
+pub(crate) fn create_tracked(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    exclusions: &[Exclusion],
+    fold: Fold,
+) -> io::Result<OwnedFd> {
+    let flags = match fold {
+        Fold::Quiesced => MV_CREATE_TRACKED,
+        Fold::Live => MV_CREATE_TRACKED | MV_CREATE_LIVE,
+    };
+    create_flags_with(regions, exclusions, flags, |request| {
+        // SAFETY: request points at immutable live slices, and its output fd is writable.
+        let result = unsafe { ioctl_with_mut_ref(&device, MV_IOC_CREATE(), request) };
+        if result != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+pub(crate) fn info2(version: BorrowedFd<'_>) -> io::Result<Info2> {
+    let mut info = Info2::default();
+    // SAFETY: info is a live, writable struct of the exact request size; regions stays null,
+    // so the kernel writes no region array.
+    if unsafe { ioctl_with_mut_ref(&version, MV_IOC_INFO2(), &mut info) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
+/// A new flat version with the same content as `version`. Reads only immutable versions,
+/// so it needs no source lock and pauses nothing.
+pub(crate) fn flatten(version: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    // SAFETY: the request takes no argument; a non-negative result is a new CLOEXEC fd.
+    let fd = unsafe { ioctl(&version, MV_IOC_FLATTEN()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful FLATTEN transfers exactly this newly allocated fd to the caller.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Stops tracking this process's guest memory and releases its standing version. Later
+/// captures copy whole until the guest is tracked again.
+pub(crate) fn untrack(device: BorrowedFd<'_>) -> io::Result<()> {
+    let flags: u32 = 0;
+    // SAFETY: the request reads one live u32.
+    if unsafe { ioctl_with_ref(&device, MV_IOC_TRACK_DROP(), &flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Replaces the tracker's standing version with `flat`, a FLATTEN of it.
+pub(crate) fn rebase(device: BorrowedFd<'_>, flat: BorrowedFd<'_>) -> io::Result<()> {
+    let fd: i32 = flat.as_raw_fd();
+    // SAFETY: the request reads one live i32.
+    if unsafe { ioctl_with_ref(&device, MV_IOC_TRACK_REBASE(), &fd) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Tracks the guest whose memory was imported from `base`, if any. A guest imported eagerly
+/// (a kernel or version that refused the lazy import) is tracked without a base: every present
+/// page starts dirty and the first fold copies it, as a v1 capture would.
+pub(crate) fn track_guest(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    base: Option<BorrowedFd<'_>>,
+) -> io::Result<()> {
+    track_guest_with(base.is_some(), |with_base| {
+        track(device, regions, if with_base { base } else { None })
+    })
+}
+
+fn track_guest_with(
+    has_base: bool,
+    mut track: impl FnMut(bool) -> io::Result<()>,
+) -> io::Result<()> {
+    match track(has_base) {
+        Err(err) if has_base && err.raw_os_error() == Some(libc::EINVAL) => track(false),
+        other => other,
+    }
+}
+
+/// Refreshes the standing version while the guest runs: folds the pages written since it,
+/// without free-page exclusions (a running guest may write an excluded page; the next
+/// quiesced fold applies them). At the depth bound the standing version is flattened and
+/// rebased first, still without pausing anything. Returns the new standing version.
+pub(crate) fn refresh(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    standing: Option<BorrowedFd<'_>>,
+) -> io::Result<OwnedFd> {
+    refresh_with(
+        || create_tracked(device, regions, &[], Fold::Live),
+        || {
+            let standing = standing.ok_or_else(|| io::Error::from_raw_os_error(libc::E2BIG))?;
+            let flat = flatten(standing)?;
+            rebase(device, flat.as_fd())
+        },
+    )
+}
+
+fn refresh_with(
+    mut fold: impl FnMut() -> io::Result<OwnedFd>,
+    flatten_and_rebase: impl FnOnce() -> io::Result<()>,
+) -> io::Result<OwnedFd> {
+    match fold() {
+        Err(err) if err.raw_os_error() == Some(libc::E2BIG) => {
+            flatten_and_rebase()?;
+            fold()
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +811,168 @@ mod tests {
         );
         assert_eq!(std::mem::offset_of!(Create, fd), 28);
         assert_eq!(std::mem::offset_of!(Info, regions), 8);
+    }
+
+    #[test]
+    fn abi_v2_layout_and_numbers() {
+        // Sizes and offsets of research/907-memversion/fork-speed/patch/stage4-uapi.h.
+        assert_eq!(
+            (
+                size_of::<Track>(),
+                size_of::<TrackInfo>(),
+                size_of::<Info2>()
+            ),
+            (16, 40, 88)
+        );
+        assert_eq!(std::mem::offset_of!(Track, base_fd), 12);
+        assert_eq!(std::mem::offset_of!(Info2, id), 40);
+        assert_eq!(std::mem::offset_of!(Info2, depth), 64);
+        assert_eq!(std::mem::offset_of!(Info2, own_pages), 72);
+        assert_eq!(
+            (
+                MV_IOC_INFO2(),
+                MV_IOC_FLATTEN(),
+                MV_IOC_TRACK(),
+                MV_IOC_TRACK_INFO(),
+                MV_IOC_TRACK_REBASE(),
+                MV_IOC_TRACK_DROP()
+            ),
+            (
+                0xc0585643, 0x5644, 0x40105645, 0xc0285646, 0x40045647, 0x40045648
+            )
+        );
+        assert_eq!(std::mem::offset_of!(TrackInfo, retained_pages), 32);
+    }
+
+    #[test]
+    fn tracked_create_flags_and_v2_requests_on_a_non_device() {
+        let regions = [Region {
+            addr: GUEST_RAM_BASE,
+            len: 4096,
+        }];
+        for (fold, flags) in [
+            (Fold::Quiesced, MV_CREATE_TRACKED),
+            (Fold::Live, MV_CREATE_TRACKED | MV_CREATE_LIVE),
+        ] {
+            let want = flags;
+            let fd = create_flags_with(&regions, &[], flags, |request| {
+                assert_eq!(
+                    (request.flags, request.nr_regions, request.fd),
+                    (want, 1, -1)
+                );
+                request.fd = std::fs::File::open("/dev/null")?.into_raw_fd();
+                Ok(())
+            })
+            .unwrap();
+            drop(fd);
+            let null = std::fs::File::open("/dev/null").unwrap();
+            assert_eq!(
+                create_tracked(null.as_fd(), &regions, &[], fold)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ENOTTY)
+            );
+        }
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let enotty = Some(libc::ENOTTY);
+        assert_eq!(
+            track(null.as_fd(), &regions, None)
+                .unwrap_err()
+                .raw_os_error(),
+            enotty
+        );
+        assert_eq!(
+            track(null.as_fd(), &regions, Some(null.as_fd()))
+                .unwrap_err()
+                .raw_os_error(),
+            enotty
+        );
+        assert_eq!(
+            track(null.as_fd(), &[], None).unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(track_info(null.as_fd()).unwrap_err().raw_os_error(), enotty);
+        assert_eq!(untrack(null.as_fd()).unwrap_err().raw_os_error(), enotty);
+        assert_eq!(info2(null.as_fd()).unwrap_err().raw_os_error(), enotty);
+        assert_eq!(flatten(null.as_fd()).unwrap_err().raw_os_error(), enotty);
+        assert_eq!(
+            rebase(null.as_fd(), null.as_fd())
+                .unwrap_err()
+                .raw_os_error(),
+            enotty
+        );
+    }
+
+    #[test]
+    fn track_falls_back_to_no_base_only_for_a_refused_base() {
+        let einval = || Err(io::Error::from_raw_os_error(libc::EINVAL));
+        // An eagerly imported guest refuses its base; tracked without one.
+        let mut calls = vec![];
+        track_guest_with(true, |base| {
+            calls.push(base);
+            if base { einval() } else { Ok(()) }
+        })
+        .unwrap();
+        assert_eq!(calls, [true, false]);
+        // A booted guest has no base to drop: EINVAL is final.
+        let mut calls = vec![];
+        let err = track_guest_with(false, |base| {
+            calls.push(base);
+            einval()
+        })
+        .unwrap_err();
+        assert_eq!(
+            (calls, err.raw_os_error()),
+            (vec![false], Some(libc::EINVAL))
+        );
+        // Any other refusal is final: no silent untracked retry.
+        let mut calls = vec![];
+        track_guest_with(true, |base| {
+            calls.push(base);
+            Err(io::Error::from_raw_os_error(libc::EBUSY))
+        })
+        .unwrap_err();
+        assert_eq!(calls, [true]);
+    }
+
+    #[test]
+    fn refresh_flattens_only_at_the_depth_bound_and_retries_once() {
+        let version = || Ok(std::fs::File::open("/dev/null")?.into());
+        let e2big = || Err(io::Error::from_raw_os_error(libc::E2BIG));
+        let mut folds = 0;
+        refresh_with(
+            || {
+                folds += 1;
+                version()
+            },
+            || panic!("flattened below the bound"),
+        )
+        .unwrap();
+        assert_eq!(folds, 1);
+        let (mut folds, mut flattened) = (0, 0);
+        refresh_with(
+            || {
+                folds += 1;
+                if folds == 1 { e2big() } else { version() }
+            },
+            || {
+                flattened += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!((folds, flattened), (2, 1));
+        // A failed flatten fails the refresh without folding again.
+        let mut folds = 0;
+        refresh_with(
+            || {
+                folds += 1;
+                e2big()
+            },
+            || Err(io::Error::from_raw_os_error(libc::ENOMEM)),
+        )
+        .unwrap_err();
+        assert_eq!(folds, 1);
     }
 
     #[test]

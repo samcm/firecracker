@@ -446,15 +446,15 @@ pub fn build_microvm_from_snapshot(
         .create_vcpus(vm_resources.machine_config.vcpu_count)
         .map_err(StartMicrovmError::KvmVm)?;
 
+    // A restored VM's memory was written by no userspace loader, so its slots start with a clear
+    // KVM dirty log and this VM's first harvest reports only post-restore writes, with no clear
+    // over the whole geometry. Registered before the vCPU state restore on purpose: the guest
+    // pages KVM writes on its behalf (kvmclock, steal time) have to reach that harvest, as do the
+    // device-restore and VMGenID writes, which the host accumulator tracks independently.
+    vm.start_dirty_log_clear()
+        .map_err(StartMicrovmError::KvmVm)?;
     vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
         .map_err(StartMicrovmError::KvmVm)?;
-
-    // The slots are committed, so KVM's initially-set state now describes nothing this VM did.
-    // Retire it before anything writes guest memory, so this VM's first harvest reports only
-    // post-restore writes. Placed before the vCPU state restore on purpose: the guest pages KVM
-    // writes on its behalf (kvmclock, steal time) have to survive into that harvest, as do the
-    // device-restore and VMGenID writes, which the host accumulator tracks independently.
-    vm.baseline_dirty_log().map_err(StartMicrovmError::KvmVm)?;
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -921,6 +921,27 @@ pub(crate) mod tests {
         // We can not attach it once more.
         let mut net_builder = NetBuilder::new();
         net_builder.build(network_interface).unwrap_err();
+    }
+
+    #[test]
+    fn test_capture_refuses_a_writeback_drive() {
+        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
+        for (cache_type, refused) in [(CacheType::Unsafe, false), (CacheType::Writeback, true)] {
+            let block_configs = vec![
+                CustomBlockConfig::new(String::from("root"), true, None, true, CacheType::Unsafe),
+                CustomBlockConfig::new(String::from("scratch"), false, None, false, cache_type),
+            ];
+            let mut vmm = default_vmm();
+            let mut cmdline = default_kernel_cmdline();
+            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            match vmm.drain_guest_memory_writers() {
+                Err(VmmError::CaptureWritebackDrive(drive)) if refused => {
+                    assert_eq!(drive, "scratch")
+                }
+                Ok(()) if !refused => {}
+                other => panic!("{cache_type:?}: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -645,6 +645,84 @@
                 ]
             },
             {
+                "syscall": "ioctl",
+                "comment": "Describe a memversion version's chain level (88-byte mv_info2)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3227014723,
+                        "comment": "MV_INFO2 (0xc0585643)"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Flatten the standing memversion version at the depth bound, without a pause",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 22084,
+                        "comment": "MV_FLATTEN (0x5644)"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Track this process's guest memory for incremental captures",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074812485,
+                        "comment": "MV_TRACK (0x40105645)"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Read the memory tracker's dirty count and standing version",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3223868998,
+                        "comment": "MV_TRACK_INFO (0xc0285646)"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Replace the tracker's standing version with its flattened copy",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074026055,
+                        "comment": "MV_TRACK_REBASE (0x40045647)"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Stop tracking guest memory and release the standing memversion version",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074026056,
+                        "comment": "MV_TRACK_DROP (0x40045648)"
+                    }
+                ]
+            },
+            {
                 "syscall": "sched_yield",
                 "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
             },

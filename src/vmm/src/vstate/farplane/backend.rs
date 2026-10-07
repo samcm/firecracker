@@ -39,6 +39,8 @@ pub const VMSTATE_CAPACITY_BYTES: u64 =
 static STATE: AtomicU8 = AtomicU8::new(BackendState::AwaitingPlan as u8);
 static CAPTURE_BUFFERS_ARMED: AtomicBool = AtomicBool::new(false);
 static SOCKET_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// The connection made at startup, before any sandbox is known; the handshake takes it.
+static CONNECTION: Mutex<Option<Connection>> = Mutex::new(None);
 static CHANNEL: Mutex<Option<MemoryChannel>> = Mutex::new(None);
 static SOURCE_COMMIT: OnceLock<&'static str> = OnceLock::new();
 
@@ -113,6 +115,9 @@ pub struct FarplaneState {
     pub capture_buffers_armed: bool,
     /// Compatibility identity of this binary's memory protocol.
     pub feature_identity: String,
+    /// Identity of the vmstate this binary writes and restores, which moves only with its layout
+    /// and quiesce semantics, never with the memory protocol.
+    pub vmstate_identity: String,
     /// Commit of the source tree this binary was built from.
     pub source_commit: String,
 }
@@ -136,6 +141,7 @@ impl FarplaneState {
             vcpus: vcpus.to_string(),
             capture_buffers_armed: CAPTURE_BUFFERS_ARMED.load(Ordering::Acquire),
             feature_identity: protocol::FEATURE_IDENTITY.to_string(),
+            vmstate_identity: protocol::VMSTATE_IDENTITY.to_string(),
             source_commit: source_commit().to_string(),
         }
     }
@@ -158,6 +164,17 @@ pub enum BackendError {
     Vmstate(#[from] crate::snapshot::SnapshotError),
     /// The pagemaster memory channel path was not configured
     MissingSocket,
+    /// The memory channel was not connected at startup, or was already consumed
+    NotConnected,
+    /// Drive images handed over by pagemaster are unusable: {0}
+    Drives(#[from] super::drives::DriveImageError),
+}
+
+/// A connected memory channel whose peer was proven to be pagemaster.
+#[derive(Debug)]
+struct Connection {
+    sock: UnixStream,
+    peer_pid: libc::pid_t,
 }
 
 /// The memory channel, kept for the lifetime of the process.
@@ -182,6 +199,53 @@ impl FarplaneBackend {
     /// Returns the configured channel path.
     pub fn socket_path() -> Option<PathBuf> {
         SOCKET_PATH.lock().expect("Poisoned lock").clone()
+    }
+
+    /// Connects to pagemaster at startup. Firecracker is started before its sandbox is known, so
+    /// the connection waits in pagemaster's backlog until a claim arrives; nothing is sent on it
+    /// until the drive images or the backing are needed.
+    pub fn connect() -> Result<(), BackendError> {
+        let path = Self::socket_path().ok_or(BackendError::MissingSocket)?;
+        let sock = connect_seqpacket(&path)?;
+        set_socket_buffers(&sock)?;
+        let peer = peer_cred(&sock)?;
+        // SAFETY: `geteuid` has no failure mode and no side effects.
+        if peer.uid != unsafe { libc::geteuid() } {
+            return Err(BackendError::Peercred);
+        }
+        *CONNECTION.lock().expect("Poisoned lock") = Some(Connection {
+            sock,
+            peer_pid: peer.pid,
+        });
+        Ok(())
+    }
+
+    /// Receives and installs the sandbox's drive images, unless that already happened. Pagemaster
+    /// sends them before it lets the supervisor configure a drive or start the guest, so the frame
+    /// is already queued when the first caller asks. Every path that touches a drive asks first:
+    /// a drive configuration, a cold boot and a restore.
+    pub fn ensure_drives() -> Result<(), BackendError> {
+        if super::drives::installed() {
+            return Ok(());
+        }
+        let guard = CONNECTION.lock().expect("Poisoned lock");
+        let connection = guard.as_ref().ok_or(BackendError::NotConnected)?;
+        let incoming = protocol::recv_frame(&connection.sock)?;
+        if incoming.header.msg() != MsgType::Drives || incoming.header.request_id != 0 {
+            return Err(BackendError::Channel(ChannelError::Malformed));
+        }
+        let count = protocol::parse_u32(&incoming.body)?;
+        if usize::try_from(count).ok() != Some(incoming.fds.len()) || !(1..=2).contains(&count) {
+            reject(&connection.sock, &incoming, ErrorCode::BadDrive);
+            return Err(BackendError::Channel(ChannelError::FdCountMismatch));
+        }
+        let mut fds = incoming.fds.into_iter();
+        let root = fds.next().expect("the count was checked");
+        if let Err(err) = super::drives::install(root, fds.next()) {
+            send_error(&connection.sock, 0, ErrorCode::BadDrive, MsgType::Drives);
+            return Err(err.into());
+        }
+        Ok(())
     }
 
     /// Takes the channel established by the handshake, so it can be driven by the event loop.
@@ -297,16 +361,13 @@ fn handshake(
     mode: Mode,
     arch_regions: &[RegionRecord],
 ) -> Result<(Vec<GuestRegionMmap>, Option<MicrovmState>), BackendError> {
-    let path = FarplaneBackend::socket_path().ok_or(BackendError::MissingSocket)?;
+    FarplaneBackend::ensure_drives()?;
+    let Connection { sock, peer_pid } = CONNECTION
+        .lock()
+        .expect("Poisoned lock")
+        .take()
+        .ok_or(BackendError::NotConnected)?;
     BackendState::AwaitingPlan.store();
-
-    let sock = connect_seqpacket(&path)?;
-    set_socket_buffers(&sock)?;
-    let peer = peer_cred(&sock)?;
-    // SAFETY: `geteuid` has no failure mode and no side effects.
-    if peer.uid != unsafe { libc::geteuid() } {
-        return Err(BackendError::Peercred);
-    }
 
     let hello = protocol::encode_hello(
         std::process::id(),
@@ -325,7 +386,7 @@ fn handshake(
     if incoming.header.msg() != MsgType::BackingPlan {
         return Err(BackendError::Channel(ChannelError::Malformed));
     }
-    commit_plan(sock, incoming, mode, arch_regions, peer.pid)
+    commit_plan(sock, incoming, mode, arch_regions, peer_pid)
 }
 
 /// Validates the plan, establishes every mapping, and reports the resulting geometry.
@@ -910,6 +971,7 @@ mod tests {
                 vcpus: "stale".to_string(),
                 capture_buffers_armed: !CAPTURE_BUFFERS_ARMED.load(Ordering::Acquire),
                 feature_identity: "stale".to_string(),
+                vmstate_identity: "stale".to_string(),
                 source_commit: "stale".to_string(),
             },
         }
@@ -924,5 +986,15 @@ mod tests {
             FarplaneState::observe().capture_buffers_armed
         );
         assert_eq!(observed.feature_identity, protocol::FEATURE_IDENTITY);
+        assert_eq!(observed.vmstate_identity, protocol::VMSTATE_IDENTITY);
+    }
+
+    /// The vmstate identity is its own fact: a memory-protocol bump must not change what a
+    /// capture records about its vmstate, so the two identities are distinct values.
+    #[test]
+    fn test_farplane_vmstate_and_channel_identities_are_distinct() {
+        assert_ne!(protocol::VMSTATE_IDENTITY, protocol::FEATURE_IDENTITY);
+        assert_eq!(protocol::VMSTATE_IDENTITY, "farplane/8");
+        assert_eq!(protocol::FEATURE_IDENTITY, "farplane/9");
     }
 }
