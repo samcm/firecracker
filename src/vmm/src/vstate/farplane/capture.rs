@@ -660,20 +660,33 @@ impl CaptureService {
             ..
         } = self;
         let result = serve_write_vmstate(order, || {
+            // Each step's microseconds, logged once per capture: the freeze is attributed
+            // from these, not inferred.
+            let started = Instant::now();
+            let mut marks = [0u128; 7];
+            let mut mark = |step: usize| marks[step] = started.elapsed().as_micros();
+            let mut excluded = 0usize;
             // Keep the lock through device preparation, serialization and CREATE.
             let mut vmm = vmm.lock().expect("Poisoned lock");
+            mark(0);
             let state = vmm.save_state(vm_info).map_err(|err| {
                 error!("Farplane capture could not save the microVM state: {err}");
                 ErrorCode::VmstateWriteFailed
             })?;
+            mark(1);
             let bytes = serialize_vmstate(&mut buffers.as_mut().unwrap().vmstate, state)?;
             vmm.mark_virtio_queues_dirty();
+            mark(2);
             let version = (|| -> io::Result<OwnedFd> {
                 let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
                 let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
+                mark(3);
                 let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
+                mark(4);
                 let regions = memversion::geometry(&channel.regions)?;
                 let exclusions = memversion::exclusions(&regions, &free, &dirty)?;
+                excluded = exclusions.len();
+                mark(5);
                 if tracker.is_none() {
                     return memversion::create(device.as_fd(), &regions, &exclusions);
                 }
@@ -695,6 +708,19 @@ impl CaptureService {
                 error!("Farplane capture could not create the memory version: {err}");
                 ErrorCode::VmstateWriteFailed
             })?;
+            mark(6);
+            info!(
+                "Farplane capture timing lock_us={} save_us={} serialize_us={} dirty_log_us={} \
+                 free_log_us={} exclusions_us={} exclusions={excluded} create_us={} total_us={}",
+                marks[0],
+                marks[1] - marks[0],
+                marks[2] - marks[1],
+                marks[3] - marks[2],
+                marks[4] - marks[3],
+                marks[5] - marks[4],
+                marks[6] - marks[5],
+                marks[6],
+            );
             // Deliberately do not clear dirty logs: accumulating evidence is conservative and
             // avoids a fallible step after CREATE. Retirement can be optimized separately.
             Ok((bytes, version))
