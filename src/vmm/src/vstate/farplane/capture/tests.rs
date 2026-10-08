@@ -28,6 +28,7 @@ fn the_vmstate_writer_stops_at_the_advertised_capacity() {
     let mut writer = BoundedWriter {
         inner: &mut file,
         remaining: 8,
+        write_us: 0,
     };
     assert_eq!(writer.write(&[0; 6]).unwrap(), 6);
     assert_eq!(

@@ -663,7 +663,7 @@ impl CaptureService {
             // Each step's microseconds, logged once per capture: the freeze is attributed
             // from these, not inferred.
             let started = Instant::now();
-            let mut marks = [0u128; 7];
+            let mut marks = [0u128; 8];
             let mut mark = |step: usize| marks[step] = started.elapsed().as_micros();
             let mut excluded = 0usize;
             // Keep the lock through device preparation, serialization and CREATE.
@@ -674,12 +674,15 @@ impl CaptureService {
                 ErrorCode::VmstateWriteFailed
             })?;
             mark(1);
-            let bytes = serialize_vmstate(&mut buffers.as_mut().unwrap().vmstate, state)?;
-            vmm.mark_virtio_queues_dirty();
+            let (bytes, write_us) =
+                serialize_vmstate(&mut buffers.as_mut().unwrap().vmstate, state)?;
             mark(2);
+            vmm.mark_virtio_queues_dirty();
+            mark(7);
             let version = (|| -> io::Result<OwnedFd> {
                 let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
                 let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
+                // The dirty-log step runs from the queue marking to here.
                 mark(3);
                 let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
                 mark(4);
@@ -710,12 +713,14 @@ impl CaptureService {
             })?;
             mark(6);
             info!(
-                "Farplane capture timing lock_us={} save_us={} serialize_us={} dirty_log_us={} \
+                "Farplane capture timing lock_us={} save_us={} serialize_us={} \
+                 serialize_write_us={write_us} mark_queues_us={} dirty_log_us={} \
                  free_log_us={} exclusions_us={} exclusions={excluded} create_us={} total_us={}",
                 marks[0],
                 marks[1] - marks[0],
                 marks[2] - marks[1],
-                marks[3] - marks[2],
+                marks[7] - marks[2],
+                marks[3] - marks[7],
                 marks[4] - marks[3],
                 marks[5] - marks[4],
                 marks[6] - marks[5],
@@ -752,7 +757,9 @@ impl CaptureService {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Resume);
         }
+        let started = Instant::now();
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
+        let locked = started.elapsed().as_micros();
         if run_vcpus > 0
             && vmm.instance_info.state != VmState::Running
             && let Err(err) = vmm.resume_vm()
@@ -761,18 +768,31 @@ impl CaptureService {
             drop(vmm);
             return self.reject(request_id, ErrorCode::ResumeFailed, MsgType::Resume);
         }
+        let resumed = started.elapsed().as_micros();
         let running = vmm.instance_info.state == VmState::Running;
         drop(vmm);
         self.buffers = None;
+        let dropped = started.elapsed().as_micros();
         self.order.open();
         set_capture_buffers_armed(false);
         BackendState::Ready.store();
         dispatch::gate().open();
-        self.reply(
+        let opened = started.elapsed().as_micros();
+        let answered = self.reply(
             request_id,
             MsgType::Resumed,
             &u32::from(running).to_le_bytes(),
-        )
+        );
+        info!(
+            "Farplane resume timing lock_us={locked} resume_us={} buffers_us={} gate_us={} \
+             reply_us={} total_us={}",
+            resumed - locked,
+            dropped - resumed,
+            opened - dropped,
+            started.elapsed().as_micros() - opened,
+            started.elapsed().as_micros(),
+        );
+        answered
     }
 
     fn reply(&mut self, request_id: u64, msg: MsgType, body: &[u8]) -> Result<(), ChannelError> {
@@ -922,25 +942,32 @@ fn clone_scratch(destination: RawFd, scratch: RawFd) -> Result<u64, io::Error> {
     Ok(get_time_us(ClockType::Monotonic) - started)
 }
 
-fn serialize_vmstate(buffer: &mut File, state: MicrovmState) -> Result<u64, ErrorCode> {
+/// Serializes `state` into `buffer` and returns its length and the microseconds spent inside
+/// the buffer's writes (the rest of serialization is the encoder).
+fn serialize_vmstate(buffer: &mut File, state: MicrovmState) -> Result<(u64, u128), ErrorCode> {
     buffer
         .seek(SeekFrom::Start(0))
         .map_err(|_| ErrorCode::VmstateWriteFailed)?;
     let mut bounded = BoundedWriter {
         inner: buffer,
         remaining: u64_to_usize(VMSTATE_CAPACITY_BYTES),
+        write_us: 0,
     };
     Snapshot::new(state)
         .save(&mut bounded)
         .map_err(|_| ErrorCode::VmstateWriteFailed)?;
     bounded.flush().map_err(|_| ErrorCode::VmstateWriteFailed)?;
-    Ok(VMSTATE_CAPACITY_BYTES - usize_to_u64(bounded.remaining))
+    Ok((
+        VMSTATE_CAPACITY_BYTES - usize_to_u64(bounded.remaining),
+        bounded.write_us,
+    ))
 }
 
 #[derive(Debug)]
 struct BoundedWriter<'a> {
     inner: &'a mut File,
     remaining: usize,
+    write_us: u128,
 }
 
 impl Write for BoundedWriter<'_> {
@@ -948,7 +975,9 @@ impl Write for BoundedWriter<'_> {
         if buf.len() > self.remaining {
             return Err(io::Error::from_raw_os_error(libc::EFBIG));
         }
+        let started = Instant::now();
         let written = self.inner.write(buf)?;
+        self.write_us += started.elapsed().as_micros();
         self.remaining -= written;
         Ok(written)
     }
