@@ -838,3 +838,81 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     assert_eq!(body[16..24], [3, 0, 0, 0, 4, 0, 0, 0]);
     assert_eq!(body[24..], 7u64.to_le_bytes());
 }
+
+/// A capture holds the real bytes of every page its guest reported free, not zeros. It drives
+/// the production path end to end: a KVM guest over a memversion source mapping reports pages
+/// free, capture creates the version on the memversion device, and the version is imported at
+/// the source's address, as a child imports it, once the source is gone. Needs /dev/kvm and
+/// /dev/memversion_v1, which every Farplane node and build host provides.
+#[test]
+fn a_capture_holds_the_bytes_of_pages_the_guest_reported_free() {
+    use vm_memory::GuestAddress;
+
+    use crate::vstate::memory::GuestRegionMmap;
+    use crate::vstate::vm::tests::setup_vm;
+
+    let device = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/memversion_v1")
+        .expect("open the memversion device");
+    let page = crate::arch::host_page_size() as u64;
+    let pages = 256u64;
+    // A guest range no other test in this binary maps.
+    let record = protocol::RegionRecord {
+        guest_addr: 0x7_0000_0000,
+        size: pages * page,
+    };
+    let records = std::slice::from_ref(&record);
+    let geometry = memversion::geometry(records).unwrap();
+    let base = usize::try_from(geometry[0].addr).unwrap();
+    let byte_of = |p: u64| (0x5a ^ p.to_le_bytes()[0]) | 1;
+    let page_at = |p: u64| (base + u64_to_usize(p * page)) as *mut u8;
+
+    let mapping = memversion::map_regions(&geometry, None)
+        .unwrap()
+        .pop()
+        .unwrap();
+    for p in 0..pages {
+        // SAFETY: the mapping is this test's, readable and writable for every page.
+        unsafe { std::ptr::write_bytes(page_at(p), byte_of(p), u64_to_usize(page)) };
+    }
+    let mut vm = setup_vm();
+    vm.register_memory_regions(vec![
+        GuestRegionMmap::from_external(mapping, GuestAddress(record.guest_addr)).unwrap(),
+    ])
+    .unwrap();
+    // The guest reports pages 64..192 free and writes nothing after.
+    assert_eq!(
+        vm.report_free(GuestAddress(record.guest_addr + 64 * page), 128 * page)
+            .unwrap(),
+        128
+    );
+    let free = vm.snapshot_free_log().unwrap();
+    assert_eq!((free[0][1], free[0][2]), (u64::MAX, u64::MAX));
+    assert_eq!((free[0][0], free[0][3]), (0, 0));
+
+    let version = create_version(device.as_fd(), records, false).unwrap();
+    // The source goes, so the version can take its address the way a child imports it.
+    drop(vm);
+    memversion::map_private(version.as_fd(), 0, geometry[0].addr).unwrap();
+    let _view = memversion::Mapping {
+        addr: base,
+        len: u64_to_usize(record.size),
+    };
+    for p in 0..pages {
+        // SAFETY: the imported version is readable for every page of the region.
+        let bytes = unsafe { std::slice::from_raw_parts(page_at(p), u64_to_usize(page)) };
+        let want = byte_of(p);
+        assert!(
+            bytes.iter().all(|&b| b == want),
+            "page {p} ({}) holds {:#x}, want {want:#x}",
+            if (64..192).contains(&p) {
+                "reported free"
+            } else {
+                "in use"
+            },
+            bytes[0],
+        );
+    }
+}

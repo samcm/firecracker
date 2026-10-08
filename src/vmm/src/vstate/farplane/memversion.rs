@@ -292,6 +292,8 @@ pub(crate) fn geometry(regions: &[RegionRecord]) -> io::Result<Vec<Region>> {
 
 /// Exclude only reported-free pages with no subsequent KVM, ring or host write evidence.
 /// If fragmentation exceeds the ABI limit, fail before CREATE; never truncate the bitmap.
+// Capture passes no exclusions: a reported-free page keeps its bytes in the version.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn exclusions(
     regions: &[Region],
     free: &[Vec<u64>],
