@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -443,15 +443,7 @@ impl CaptureService {
             })?;
             let bytes = serialize_vmstate(&mut buffers.as_mut().unwrap().vmstate, state)?;
             vmm.mark_virtio_queues_dirty();
-            let version = (|| -> io::Result<OwnedFd> {
-                let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
-                let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
-                let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
-                let regions = memversion::geometry(&channel.regions)?;
-                let exclusions = memversion::exclusions(&regions, &free, &dirty)?;
-                memversion::create(device.as_fd(), &regions, &exclusions)
-            })()
-            .map_err(|err| {
+            let version = create_version(device.as_fd(), &channel.regions).map_err(|err| {
                 error!("Farplane capture could not create the memory version: {err}");
                 ErrorCode::VmstateWriteFailed
             })?;
@@ -642,6 +634,17 @@ fn clone_scratch(destination: RawFd, scratch: RawFd) -> Result<u64, io::Error> {
         return Err(io::Error::last_os_error());
     }
     Ok(get_time_us(ClockType::Monotonic) - started)
+}
+
+/// Creates the capture's memory version over every guest page, excluding none. A page the guest
+/// reported free keeps its bytes in the version like any other page; free-page reporting only
+/// informs residency accounting.
+fn create_version(
+    device: BorrowedFd<'_>,
+    regions: &[protocol::RegionRecord],
+) -> io::Result<OwnedFd> {
+    let regions = memversion::geometry(regions)?;
+    memversion::create(device, &regions, &[])
 }
 
 fn serialize_vmstate(buffer: &mut File, state: MicrovmState) -> Result<u64, ErrorCode> {
