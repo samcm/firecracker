@@ -761,6 +761,19 @@
                 ]
             },
             {
+                "syscall": "ioctl",
+                "comment": "Report which pages of this process's own imported guest memory are present and written, for the bring-up hot set (fc_farplane)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3224917577,
+                        "comment": "MV_RESIDENT (0xc0385649)"
+                    }
+                ]
+            },
+            {
                 "syscall": "sched_yield",
                 "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
             },

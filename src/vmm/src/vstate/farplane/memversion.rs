@@ -936,6 +936,47 @@ mod tests {
         assert_eq!(MV_IOC_RESIDENT(), 0xc038_5649);
     }
 
+    /// Every memversion request this process issues runs on a thread confined by the `vmm`
+    /// filter (the event loop and the `fc_farplane` channel thread), where a request the filter
+    /// does not name kills Firecracker with SIGSYS. RESIDENT once shipped without its rule: the
+    /// first lazily imported child asked to record its hot set lost its VMM at running.
+    #[test]
+    fn every_memversion_request_is_allowed_by_the_vmm_filter() {
+        let requests = [
+            ("MV_IOC_CREATE", MV_IOC_CREATE()),
+            ("MV_IOC_MAP", MV_IOC_MAP()),
+            ("MV_IOC_INFO", MV_IOC_INFO()),
+            ("MV_IOC_INFO2", MV_IOC_INFO2()),
+            ("MV_IOC_FLATTEN", MV_IOC_FLATTEN()),
+            ("MV_IOC_TRACK", MV_IOC_TRACK()),
+            ("MV_IOC_TRACK_INFO", MV_IOC_TRACK_INFO()),
+            ("MV_IOC_TRACK_REBASE", MV_IOC_TRACK_REBASE()),
+            ("MV_IOC_TRACK_DROP", MV_IOC_TRACK_DROP()),
+            ("MV_IOC_RESIDENT", MV_IOC_RESIDENT()),
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/seccomp");
+        for arch in ["x86_64", "aarch64"] {
+            let path = dir.join(format!("{arch}-unknown-linux-musl.json"));
+            let policy: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let allowed: Vec<u64> = policy["vmm"]["filter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|rule| rule["syscall"] == "ioctl")
+                .flat_map(|rule| rule["args"].as_array().cloned().unwrap_or_default())
+                .filter(|arg| arg["index"] == 1 && arg["op"] == "eq")
+                .filter_map(|arg| arg["val"].as_u64())
+                .collect();
+            for (name, request) in requests {
+                assert!(
+                    allowed.contains(&request),
+                    "{arch} vmm filter does not allow {name} ({request:#x})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn resident_refuses_bad_ranges_before_the_kernel() {
         let mut present = [0u64; 1];

@@ -353,7 +353,7 @@ for arch, token in [('x86_64', 0xc000003e), ('aarch64', 0xc00000b7)]:
             elif code == 0x05: pc += k
             elif code == 0x06: return k == ALLOW
             else: raise AssertionError(hex(code))
-    for op in [0xc0205640, 0x40105641, 0xc0285642]:
+    for op in [0xc0205640, 0x40105641, 0xc0285642, 0xc0385649]:
         assert permits('ioctl', [9, op]), (arch, hex(op))
         assert permits('ioctl', [9, op | (0xdeadbeef << 32)]), (arch, hex(op))
     for op in [43520, 3222841919, 3223366144, 0xc0205642, 0xc0285643, 0xc0205641, 0]:
