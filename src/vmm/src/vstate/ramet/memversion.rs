@@ -500,6 +500,28 @@ ioctl_iowr_nr!(MV_IOC_TRACK_INFO, 0x56, 0x46, TrackInfo);
 ioctl_iow_nr!(MV_IOC_TRACK_REBASE, 0x56, 0x47, i32);
 ioctl_iow_nr!(MV_IOC_TRACK_DROP, 0x56, 0x48, u32);
 
+/// The longest range one MV_IOC_RESIDENT request reports.
+pub(crate) const MV_RESIDENT_MAX_LEN: u64 = 1 << 30;
+
+/// Residency of a page-aligned range of the caller's own mm. `present` and `written` point at
+/// u64-word bitmaps, one bit per page, least significant first, which the kernel writes in full;
+/// `written` may be null. A written page is mapped exclusively by the caller: its private copy,
+/// not a version's page.
+#[repr(C)]
+#[derive(Debug, Default)]
+struct Resident {
+    addr: u64,
+    len: u64,
+    present: u64,
+    written: u64,
+    nr_present: u64,
+    nr_written: u64,
+    flags: u32,
+    reserved: u32,
+}
+
+ioctl_iowr_nr!(MV_IOC_RESIDENT, 0x56, 0x49, Resident);
+
 /// How a CREATE treats the caller's tracked mm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fold {
@@ -540,6 +562,123 @@ pub(crate) fn track_info(device: BorrowedFd<'_>) -> io::Result<TrackInfo> {
         return Err(io::Error::last_os_error());
     }
     Ok(info)
+}
+
+/// The pages of each region this process has written since the standing version, as one
+/// bitmap per region shaped like the dirty log: for a tracked source every such page is mapped
+/// exclusively by it. Reads at most [`MV_RESIDENT_MAX_LEN`] per request.
+pub(crate) fn written_pages(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+) -> io::Result<Vec<Vec<u64>>> {
+    written_pages_with(regions, |addr, len, present, written| {
+        let mut request = Resident {
+            addr,
+            len,
+            present: present.as_mut_ptr() as u64,
+            written: written.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        // SAFETY: request is live and writable, and both bitmaps hold one bit per page of the
+        // range for the entire synchronous ioctl.
+        if unsafe { ioctl_with_mut_ref(&device, MV_IOC_RESIDENT(), &mut request) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
+/// Splits each region into RESIDENT ranges and assembles their `written` bitmaps. `resident`
+/// gets a range's address and length and its `present` and `written` words.
+fn written_pages_with(
+    regions: &[Region],
+    mut resident: impl FnMut(u64, u64, &mut [u64], &mut [u64]) -> io::Result<()>,
+) -> io::Result<Vec<Vec<u64>>> {
+    let page = crate::arch::host_page_size() as u64;
+    let chunk_pages = MV_RESIDENT_MAX_LEN / page;
+    // A range then starts on a bitmap word, so its words concatenate into the region's.
+    if !chunk_pages.is_multiple_of(64) {
+        return Err(invalid());
+    }
+    let words_of = |pages: u64| usize::try_from(pages.div_ceil(64)).map_err(|_| invalid());
+    regions
+        .iter()
+        .map(|region| {
+            if region.len == 0 || !region.len.is_multiple_of(page) {
+                return Err(invalid());
+            }
+            let pages = region.len / page;
+            let mut written = vec![0u64; words_of(pages)?];
+            let mut present = vec![0u64; words_of(chunk_pages.min(pages))?];
+            let mut first = 0;
+            while first < pages {
+                let count = chunk_pages.min(pages - first);
+                let words = words_of(count)?;
+                let start = words_of(first)?;
+                resident(
+                    region.addr + first * page,
+                    count * page,
+                    &mut present[..words],
+                    &mut written[start..start + words],
+                )?;
+                first += count;
+            }
+            // Bits past the region's last page describe no guest page.
+            if !pages.is_multiple_of(64) {
+                *written.last_mut().expect("nonempty region") &= (1u64 << (pages % 64)) - 1;
+            }
+            Ok(written)
+        })
+        .collect()
+}
+
+/// The pages a quiesced tracked CREATE would newly retain: those written since the standing
+/// version (`written`, from [`written_pages`]) that are outside its `exclusions`.
+pub(crate) fn newly_retained(
+    regions: &[Region],
+    mut written: Vec<Vec<u64>>,
+    exclusions: &[Exclusion],
+) -> io::Result<u64> {
+    let page = crate::arch::host_page_size() as u64;
+    if written.len() != regions.len() {
+        return Err(invalid());
+    }
+    for (region, words) in regions.iter().zip(&written) {
+        if u64::try_from(words.len()).map_err(|_| invalid())? != (region.len / page).div_ceil(64) {
+            return Err(invalid());
+        }
+    }
+    for exclusion in exclusions {
+        let index = usize::try_from(exclusion.region).map_err(|_| invalid())?;
+        let (Some(region), Some(words)) = (regions.get(index), written.get_mut(index)) else {
+            return Err(invalid());
+        };
+        let end = exclusion
+            .offset
+            .checked_add(exclusion.len)
+            .ok_or_else(invalid)?;
+        if !exclusion.offset.is_multiple_of(page) || !end.is_multiple_of(page) || end > region.len {
+            return Err(invalid());
+        }
+        let mut first = exclusion.offset / page;
+        let last = end / page;
+        while first < last {
+            let bit = first % 64;
+            let count = (64 - bit).min(last - first);
+            let mask = if count == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << count) - 1) << bit
+            };
+            words[usize::try_from(first / 64).map_err(|_| invalid())?] &= !mask;
+            first += count;
+        }
+    }
+    Ok(written
+        .iter()
+        .flatten()
+        .map(|word| u64::from(word.count_ones()))
+        .sum())
 }
 
 /// CREATE over the tracked standing version. The returned version is the new standing
@@ -842,6 +981,131 @@ mod tests {
             )
         );
         assert_eq!(std::mem::offset_of!(TrackInfo, retained_pages), 32);
+        // struct mv_resident of the fpmv3 uapi.
+        assert_eq!(size_of::<Resident>(), 56);
+        assert_eq!(std::mem::offset_of!(Resident, written), 24);
+        assert_eq!(std::mem::offset_of!(Resident, nr_written), 40);
+        assert_eq!(std::mem::offset_of!(Resident, flags), 48);
+        assert_eq!(MV_IOC_RESIDENT(), 0xc0385649);
+        assert_eq!(MV_RESIDENT_MAX_LEN, 1 << 30);
+    }
+
+    #[test]
+    fn written_pages_read_each_region_in_resident_chunks() {
+        let page = crate::arch::host_page_size() as u64;
+        let chunk = MV_RESIDENT_MAX_LEN / page;
+        let regions = [
+            Region {
+                addr: GUEST_RAM_BASE,
+                len: MV_RESIDENT_MAX_LEN + 3 * page,
+            },
+            Region {
+                addr: GUEST_RAM_BASE + (2 << 30),
+                len: 5 * page,
+            },
+        ];
+        // Pages each side of the 1 GiB boundary, the region's last page, and two in region 1.
+        let written_at = [
+            GUEST_RAM_BASE,
+            GUEST_RAM_BASE + (chunk - 1) * page,
+            GUEST_RAM_BASE + chunk * page,
+            GUEST_RAM_BASE + (chunk + 2) * page,
+            regions[1].addr + page,
+            regions[1].addr + 4 * page,
+        ];
+        let mut calls = Vec::new();
+        let written = written_pages_with(&regions, |addr, len, present, written| {
+            calls.push((addr, len));
+            let words = usize::try_from((len / page).div_ceil(64)).unwrap();
+            assert_eq!((present.len(), written.len()), (words, words));
+            for at in written_at
+                .iter()
+                .filter(|at| (addr..addr + len).contains(at))
+            {
+                let bit = (at - addr) / page;
+                written[usize::try_from(bit / 64).unwrap()] |= 1 << (bit % 64);
+            }
+            // A kernel may set bits past the range; they describe no guest page.
+            if !(len / page).is_multiple_of(64) {
+                *written.last_mut().unwrap() |= 1 << 63;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                (regions[0].addr, MV_RESIDENT_MAX_LEN),
+                (regions[0].addr + MV_RESIDENT_MAX_LEN, 3 * page),
+                (regions[1].addr, 5 * page),
+            ]
+        );
+        let pages = |words: &Vec<u64>| -> Vec<u64> {
+            (0..words.len() as u64 * 64)
+                .filter(|p| words[usize::try_from(p / 64).unwrap()] & (1 << (p % 64)) != 0)
+                .collect()
+        };
+        assert_eq!(pages(&written[0]), vec![0, chunk - 1, chunk, chunk + 2]);
+        assert_eq!(pages(&written[1]), vec![1, 4]);
+
+        // Exclusions over written and unwritten pages: one straddles the boundary, one covers
+        // region 1's page 1 (but not region 0's), one covers only unwritten pages.
+        let exclusion = |region, first: u64, count: u64| Exclusion {
+            region,
+            reserved: 0,
+            offset: first * page,
+            len: count * page,
+        };
+        let excluded = [
+            exclusion(0, chunk - 2, 4),
+            exclusion(1, 0, 2),
+            exclusion(1, 2, 2),
+        ];
+        assert_eq!(
+            newly_retained(&regions, written.clone(), &excluded).unwrap(),
+            3
+        );
+        assert_eq!(newly_retained(&regions, written.clone(), &[]).unwrap(), 6);
+        // A run spanning whole words clears only its own pages.
+        let all = vec![
+            vec![u64::MAX; written[0].len() - 1]
+                .into_iter()
+                .chain([0b111])
+                .collect(),
+            vec![0b11111],
+        ];
+        assert_eq!(
+            newly_retained(&regions, all, &[exclusion(0, 1, chunk + 1)]).unwrap(),
+            chunk + 3 + 5 - (chunk + 1)
+        );
+        for bad in [
+            exclusion(2, 0, 1),
+            exclusion(1, 4, 2),
+            Exclusion {
+                offset: 1,
+                ..exclusion(1, 0, 1)
+            },
+        ] {
+            newly_retained(&regions, written.clone(), &[bad]).unwrap_err();
+        }
+        newly_retained(&regions, written[..1].to_vec(), &[]).unwrap_err();
+        newly_retained(&regions, vec![written[0].clone(), vec![0; 2]], &[]).unwrap_err();
+
+        // A failed range fails the whole read: the caller never guesses a count.
+        let mut seen = 0;
+        written_pages_with(&regions, |_, _, _, _| {
+            seen += 1;
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .unwrap_err();
+        assert_eq!(seen, 1);
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(
+            written_pages(null.as_fd(), &regions[1..])
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOTTY)
+        );
     }
 
     #[test]

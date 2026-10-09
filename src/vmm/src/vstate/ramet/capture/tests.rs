@@ -876,19 +876,49 @@ fn track_starts_only_while_running_and_reports_while_quiesced() {
 }
 
 #[test]
+fn only_a_quiesced_dirty_count_over_the_bound_is_counted_exactly() {
+    use BackendState::{Quiesced, Ready};
+    let info = memversion::TrackInfo {
+        tracked: 1,
+        dirty_pages: 100,
+        ..Default::default()
+    };
+    assert!(counts_retained(Quiesced, &info, 99));
+    // A count that fits pays nothing inside the freeze: it is reported as the upper bound.
+    assert!(!counts_retained(Quiesced, &info, 100));
+    assert!(!counts_retained(Quiesced, &info, u64::MAX));
+    // A running guest has no consistent instant to count at.
+    assert!(!counts_retained(Ready, &info, 0));
+    let untracked = memversion::TrackInfo { tracked: 0, ..info };
+    assert!(!counts_retained(Quiesced, &untracked, 0));
+}
+
+#[test]
 fn untrack_releases_every_answered_version() {
     let device = memfd(c"device", 0);
     let create = CommandKey::of(MsgType::WriteVmstate, &[], std::slice::from_ref(&device));
     let untrack = CommandKey::of(MsgType::Untrack, &[], &[]);
     let version = Arc::new(memfd(c"refused", 0));
     let mut replies = ReplyCache::default();
-    replies.record(4, create.clone(), MsgType::VmstateWritten, vec![7], Some(version.clone()));
+    replies.record(
+        4,
+        create.clone(),
+        MsgType::VmstateWritten,
+        vec![7],
+        Some(version.clone()),
+    );
     // The Untrack after a refused capture is a new request: the refused version's descriptor
     // is let go before the tracker is, and no cached answer can hand it out again.
-    assert!(matches!(replies.disposition(5, &untrack), FrameDisposition::Serve));
+    assert!(matches!(
+        replies.disposition(5, &untrack),
+        FrameDisposition::Serve
+    ));
     replies.acknowledge_before(5);
     assert_eq!(Arc::strong_count(&version), 1);
-    assert!(matches!(replies.disposition(4, &create), FrameDisposition::ReplayUnavailable));
+    assert!(matches!(
+        replies.disposition(4, &create),
+        FrameDisposition::ReplayUnavailable
+    ));
 }
 
 #[test]
@@ -922,24 +952,57 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     validate_command(MsgType::Track, 0, 1).unwrap();
     validate_command(MsgType::Track, 0, 2).unwrap();
     validate_command(MsgType::Track, 0, 0).unwrap_err();
-    validate_command(MsgType::Track, 4, 1).unwrap_err();
+    // Its body is empty or one u64 bound.
+    validate_command(MsgType::Track, 8, 1).unwrap();
+    validate_command(MsgType::Track, 8, 2).unwrap();
+    validate_command(MsgType::Track, 8, 0).unwrap_err();
+    for len in [1, 4, 7, 9, 16] {
+        validate_command(MsgType::Track, len, 1).unwrap_err();
+    }
+    assert_eq!(protocol::parse_track_bound(&[]).unwrap(), u64::MAX);
+    assert_eq!(
+        protocol::parse_track_bound(&0x0102_0304_0506_0708u64.to_le_bytes()).unwrap(),
+        0x0102_0304_0506_0708
+    );
+    for len in [1, 4, 7, 9, 16] {
+        protocol::parse_track_bound(&vec![0; len]).unwrap_err();
+    }
     validate_command(MsgType::Refresh, 0, 0).unwrap();
     validate_command(MsgType::Refresh, 0, 1).unwrap_err();
     // Replies are commands only Firecracker sends.
-    validate_command(MsgType::Tracked, 24, 0).unwrap_err();
+    validate_command(MsgType::Tracked, 32, 0).unwrap_err();
     validate_command(MsgType::Refreshed, 32, 1).unwrap_err();
 
-    let body = encode_track_info(&memversion::TrackInfo {
+    let tracked = memversion::TrackInfo {
         tracked: 1,
         depth: 2,
         dirty_pages: 0x0102_0304_0506_0708,
         standing_id: 9,
-        ..Default::default()
-    });
-    assert_eq!(body.len(), 24);
+        flags: 3,
+        reserved: 4,
+        retained_pages: 5,
+    };
+    let body = encode_tracked(&tracked, 0x1112_1314_1516_1718);
+    assert_eq!(body.len(), 32);
     assert_eq!(body[..8], [1, 0, 0, 0, 2, 0, 0, 0]);
     assert_eq!(body[8..16], 0x0102_0304_0506_0708u64.to_le_bytes());
-    assert_eq!(body[16..], 9u64.to_le_bytes());
+    assert_eq!(body[16..24], 9u64.to_le_bytes());
+    assert_eq!(body[24..], 0x1112_1314_1516_1718u64.to_le_bytes());
+    // An untracked reply, as Untrack sends, is zero after `tracked` whatever it was given.
+    assert_eq!(
+        encode_tracked(&memversion::TrackInfo::default(), 0),
+        vec![0; 32]
+    );
+    assert_eq!(
+        encode_tracked(
+            &memversion::TrackInfo {
+                tracked: 0,
+                ..tracked
+            },
+            7
+        ),
+        vec![0; 32]
+    );
     let body = encode_refreshed(&memversion::Info2 {
         own_pages: 5,
         new_pages: 6,

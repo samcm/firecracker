@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -237,18 +237,18 @@ fn send_and_record(
 }
 
 fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<(), ChannelError> {
-    let (len, counts): (usize, &[usize]) = match msg {
-        MsgType::CaptureBuffers => (0, &[1, 2]),
-        MsgType::Quiesce => (0, &[0]),
-        MsgType::WriteVmstate => (0, &[1]),
-        MsgType::Resume => (4, &[0]),
-        MsgType::FreeSummary => (8, &[1]),
-        MsgType::Track => (0, &[1, 2]),
-        MsgType::Refresh => (0, &[0]),
-        MsgType::Untrack => (0, &[0]),
+    let (lens, counts): (&[usize], &[usize]) = match msg {
+        MsgType::CaptureBuffers => (&[0], &[1, 2]),
+        MsgType::Quiesce => (&[0], &[0]),
+        MsgType::WriteVmstate => (&[0], &[1]),
+        MsgType::Resume => (&[4], &[0]),
+        MsgType::FreeSummary => (&[8], &[1]),
+        MsgType::Track => (&[0, 8], &[1, 2]),
+        MsgType::Refresh => (&[0], &[0]),
+        MsgType::Untrack => (&[0], &[0]),
         _ => return Err(ChannelError::Malformed),
     };
-    if body_len != len || !counts.contains(&fd_count) {
+    if !lens.contains(&body_len) || !counts.contains(&fd_count) {
         return Err(ChannelError::Malformed);
     }
     Ok(())
@@ -272,14 +272,26 @@ pub struct CaptureService {
     standing: Option<Arc<OwnedFd>>,
 }
 
-/// The `tracked` reply body.
-fn encode_track_info(info: &memversion::TrackInfo) -> Vec<u8> {
-    let mut body = Vec::with_capacity(24);
+/// The 32-byte `tracked` reply body. An untracked reply is zero after `tracked`.
+fn encode_tracked(info: &memversion::TrackInfo, included_pages: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(32);
     body.extend_from_slice(&info.tracked.to_le_bytes());
+    if info.tracked == 0 {
+        body.resize(32, 0);
+        return body;
+    }
     body.extend_from_slice(&info.depth.to_le_bytes());
     body.extend_from_slice(&info.dirty_pages.to_le_bytes());
     body.extend_from_slice(&info.standing_id.to_le_bytes());
+    body.extend_from_slice(&included_pages.to_le_bytes());
     body
+}
+
+/// Whether a Track reply counts exactly what the next CREATE would newly retain. Only a
+/// capture's freeze needs it, and only when the dirty count does not already fit the bound:
+/// otherwise the dirty count is the reported upper bound and the freeze pays nothing.
+fn counts_retained(state: BackendState, info: &memversion::TrackInfo, bound: u64) -> bool {
+    state == BackendState::Quiesced && info.tracked != 0 && info.dirty_pages > bound
 }
 
 /// The `refreshed` reply body.
@@ -415,9 +427,15 @@ impl CaptureService {
     /// request reports the existing tracker, also while the guest is quiesced for a capture:
     /// that report allocates nothing and is what memory plane refuses an over-budget capture by,
     /// before CREATE moves the standing version. Starting a tracker needs a running guest.
+    ///
+    /// The reply's included pages is what that capture would charge: while quiesced, a dirty
+    /// count over the request's bound is replaced by the exact count CREATE would newly retain,
+    /// which leaves out pages the guest reported free and has not written since.
     fn track(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
-        if track_mode(BackendState::load(), self.tracker.is_some()) == TrackMode::Refuse {
+        let bound = protocol::parse_track_bound(&incoming.body)?;
+        let state = BackendState::load();
+        if track_mode(state, self.tracker.is_some()) == TrackMode::Refuse {
             return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
         }
         let mut fds = incoming.fds.into_iter();
@@ -439,13 +457,53 @@ impl CaptureService {
             self.tracker = Some(device);
         }
         let tracker = self.tracker.as_ref().expect("tracker set above");
-        match memversion::track_info(tracker.as_fd()) {
-            Ok(info) => self.reply(request_id, MsgType::Tracked, &encode_track_info(&info)),
+        let info = match memversion::track_info(tracker.as_fd()) {
+            Ok(info) => info,
             Err(err) => {
                 error!("Ramet could not read the memory tracker: {err}");
-                self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track)
+                return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
             }
-        }
+        };
+        let included = if counts_retained(state, &info, bound) {
+            let started = Instant::now();
+            match self.newly_retained(tracker.as_fd()) {
+                Ok(pages) => {
+                    info!(
+                        "Ramet counted {pages} of {} dirty pages for CREATE in {} us",
+                        info.dirty_pages,
+                        started.elapsed().as_micros()
+                    );
+                    pages
+                }
+                Err(err) => {
+                    error!("Ramet could not count the pages CREATE would retain: {err}");
+                    return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
+                }
+            }
+        } else {
+            info.dirty_pages
+        };
+        self.reply(
+            request_id,
+            MsgType::Tracked,
+            &encode_tracked(&info, included),
+        )
+    }
+
+    /// The pages a quiesced tracked CREATE would newly retain now: those written since the
+    /// standing version, less the exclusions `write_vmstate` would pass, built the same way
+    /// under the VMM lock. Both log snapshots are reads; neither retires dirty evidence.
+    fn newly_retained(&self, tracker: BorrowedFd<'_>) -> io::Result<u64> {
+        let regions = memversion::geometry(&self.channel.regions)?;
+        let exclusions = {
+            let vmm = self.vmm.lock().expect("Poisoned lock");
+            let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
+            let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
+            let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
+            memversion::exclusions(&regions, &free, &dirty)?
+        };
+        let written = memversion::written_pages(tracker, &regions)?;
+        memversion::newly_retained(&regions, written, &exclusions)
     }
 
     /// Folds what the guest wrote since the standing version into a new one, without a pause.
@@ -514,7 +572,7 @@ impl CaptureService {
         self.reply(
             request_id,
             MsgType::Tracked,
-            &encode_track_info(&memversion::TrackInfo::default()),
+            &encode_tracked(&memversion::TrackInfo::default(), 0),
         )
     }
 

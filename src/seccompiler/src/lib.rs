@@ -298,11 +298,22 @@ mod tests {
                 // Invalid fd is intentional: EBADF proves KVM_GET_DIRTY_LOG reached the kernel,
                 // without requiring /dev/kvm. A missing allowance would instead deliver SIGSYS.
                 let result = libc::ioctl(-1, 0x4010_ae42, std::ptr::null::<u8>());
+                if result != -1 || *libc::__errno_location() != libc::EBADF {
+                    libc::_exit(92);
+                }
+                // MV_IOC_RESIDENT, which the capture thread issues inside a capture's freeze.
+                // A raw syscall: musl's ioctl takes the request as a (too narrow) int.
+                let result = libc::syscall(
+                    libc::SYS_ioctl,
+                    -1_i64,
+                    0xc038_5649_u64,
+                    std::ptr::null::<u8>(),
+                );
                 libc::_exit(
                     if result == -1 && *libc::__errno_location() == libc::EBADF {
                         0
                     } else {
-                        92
+                        93
                     },
                 );
             }
