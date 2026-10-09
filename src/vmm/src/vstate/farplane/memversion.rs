@@ -1862,7 +1862,19 @@ mod tests {
         let excluded: u64 = built.runs.iter().map(|x| x.len / page).sum();
 
         let version = create(device.as_fd(), &regions, &built.runs).unwrap();
-        let info = info2(version.as_fd()).unwrap();
+        // The v1 counts, which every device ABI answers (INFO2 is ABI 2 only).
+        let mut described = [Region::default(); MAX_REGIONS];
+        let mut info = Info {
+            abi: 1,
+            nr_regions: u32::try_from(MAX_REGIONS).unwrap(),
+            regions: described.as_mut_ptr() as u64,
+            present_pages: 0,
+            excluded_pages: 0,
+            new_pages: 0,
+        };
+        // SAFETY: info and its region array stay writable for the synchronous ioctl.
+        let described_ok = unsafe { ioctl_with_mut_ref(&version, MV_IOC_INFO(), &mut info) };
+        assert_eq!(described_ok, 0, "{}", io::Error::last_os_error());
         assert_eq!(info.excluded_pages, excluded, "{info:?}");
         // Every other page, the dropped run's included, is captured and newly retained: it is
         // what pagemaster charges the capture for.
