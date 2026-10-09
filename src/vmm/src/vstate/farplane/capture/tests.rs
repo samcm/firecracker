@@ -939,16 +939,6 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     for value in 28..=31 {
         assert_eq!(MsgType::from_u16(value).unwrap() as u16, value);
     }
-    // TrackSample (farplane/10) is 34: 32 and 33 belong to Rearm on another branch, and an older
-    // Firecracker refuses an unknown tag by failing its channel, so the tag is never reused.
-    assert_eq!(MsgType::TrackSample as u16, 34);
-    assert_eq!(MsgType::from_u16(34), Some(MsgType::TrackSample));
-    for unused in [26, 27, 32, 33, 35] {
-        assert_eq!(MsgType::from_u16(unused), None);
-    }
-    validate_command(MsgType::TrackSample, 0, 0).unwrap();
-    validate_command(MsgType::TrackSample, 8, 0).unwrap_err();
-    validate_command(MsgType::TrackSample, 0, 1).unwrap_err();
     assert_eq!(
         (
             ErrorCode::UntrackFailed as u32,

@@ -887,35 +887,6 @@ fn included_pages_with(
     Ok(Included::Kernel(info, request.included_pages))
 }
 
-/// The kernel's count of what a quiesced CREATE with `exclusions` would fold, taken while the
-/// guest runs, or `None` on a kernel without MV_IOC_TRACK_INFO2 (ENOTTY). Never walks the guest:
-/// an estimate taken outside a freeze has no use for the residency count.
-pub(crate) fn track_sample(
-    device: BorrowedFd<'_>,
-    regions: &[Region],
-    exclusions: &[Exclusion],
-) -> io::Result<Option<(TrackInfo, u64)>> {
-    match included_pages_with(
-        exclusions,
-        |request| {
-            // SAFETY: as in `included_pages`.
-            if unsafe { ioctl_with_mut_ref(&device, MV_IOC_TRACK_INFO2(), request) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        },
-        || Err(io::Error::from_raw_os_error(libc::ENOTTY)),
-    ) {
-        Ok(Included::Kernel(info, pages)) => Ok(Some((info, pages))),
-        Ok(Included::Resident(_)) => unreachable!("the residency count is never taken"),
-        Err(err) if err.raw_os_error() == Some(libc::ENOTTY) => {
-            let _ = regions;
-            Ok(None)
-        }
-        Err(err) => Err(err),
-    }
-}
-
 /// CREATE over the tracked standing version. The returned version is the new standing
 /// version; the tracker holds its own reference.
 pub(crate) fn create_tracked(
@@ -1334,17 +1305,6 @@ mod tests {
                 .raw_os_error(),
             Some(libc::ENOTTY)
         );
-    }
-
-    #[test]
-    fn a_running_sample_is_the_kernels_count_or_no_sample_never_a_walk() {
-        let regions = [Region {
-            addr: GUEST_RAM_BASE,
-            len: 4096,
-        }];
-        // A kernel without TRACK_INFO2 answers ENOTTY: no sample, and no residency walk.
-        let null = std::fs::File::open("/dev/null").unwrap();
-        assert_eq!(track_sample(null.as_fd(), &regions, &[]).unwrap(), None);
     }
 
     #[test]
