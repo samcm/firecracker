@@ -42,6 +42,23 @@ impl EpochOrder {
     }
 }
 
+/// What a Track request may do in a backend state: start a tracker only while the guest runs,
+/// and report an existing one while it runs or is quiesced for a capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackMode {
+    Start,
+    Report,
+    Refuse,
+}
+
+fn track_mode(state: BackendState, tracked: bool) -> TrackMode {
+    match (state, tracked) {
+        (BackendState::Ready, false) => TrackMode::Start,
+        (BackendState::Ready | BackendState::Quiesced, true) => TrackMode::Report,
+        _ => TrackMode::Refuse,
+    }
+}
+
 /// Serialization and CREATE are one operation. Failed operations publish nothing and may retry
 /// under a new request ID; successful operations never run twice in the same epoch.
 fn serve_write_vmstate(
@@ -395,10 +412,12 @@ impl CaptureService {
 
     /// Tracks the guest's memory from now on. Runs while the guest runs: the kernel walks the
     /// present pages once under the mmap write lock, which stalls only guest faults. A second
-    /// request reports the existing tracker.
+    /// request reports the existing tracker, also while the guest is quiesced for a capture:
+    /// that report allocates nothing and is what memory plane refuses an over-budget capture by,
+    /// before CREATE moves the standing version. Starting a tracker needs a running guest.
     fn track(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
-        if BackendState::load() != BackendState::Ready {
+        if track_mode(BackendState::load(), self.tracker.is_some()) == TrackMode::Refuse {
             return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
         }
         let mut fds = incoming.fds.into_iter();

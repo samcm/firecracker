@@ -866,6 +866,32 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
 }
 
 #[test]
+fn track_starts_only_while_running_and_reports_while_quiesced() {
+    use BackendState::{Quiesced, Ready};
+    assert_eq!(track_mode(Ready, false), TrackMode::Start);
+    assert_eq!(track_mode(Ready, true), TrackMode::Report);
+    // A capture's freeze may read the tracker, which allocates nothing, but never start one.
+    assert_eq!(track_mode(Quiesced, true), TrackMode::Report);
+    assert_eq!(track_mode(Quiesced, false), TrackMode::Refuse);
+}
+
+#[test]
+fn untrack_releases_every_answered_version() {
+    let device = memfd(c"device", 0);
+    let create = CommandKey::of(MsgType::WriteVmstate, &[], std::slice::from_ref(&device));
+    let untrack = CommandKey::of(MsgType::Untrack, &[], &[]);
+    let version = Arc::new(memfd(c"refused", 0));
+    let mut replies = ReplyCache::default();
+    replies.record(4, create.clone(), MsgType::VmstateWritten, vec![7], Some(version.clone()));
+    // The Untrack after a refused capture is a new request: the refused version's descriptor
+    // is let go before the tracker is, and no cached answer can hand it out again.
+    assert!(matches!(replies.disposition(5, &untrack), FrameDisposition::Serve));
+    replies.acknowledge_before(5);
+    assert_eq!(Arc::strong_count(&version), 1);
+    assert!(matches!(replies.disposition(4, &create), FrameDisposition::ReplayUnavailable));
+}
+
+#[test]
 fn track_and_refresh_frames_numbers_and_bodies() {
     assert_eq!(
         [
