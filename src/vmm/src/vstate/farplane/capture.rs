@@ -59,12 +59,37 @@ fn track_mode(state: BackendState, tracked: bool) -> TrackMode {
     }
 }
 
+/// A refused WriteVMState: its code, and the cause the reply's detail names.
+#[derive(Debug, PartialEq, Eq)]
+struct VmstateRefusal {
+    code: ErrorCode,
+    detail: String,
+}
+
+impl VmstateRefusal {
+    /// `step: err`, cut to the reply's detail field on a character boundary.
+    fn failed(step: &str, err: impl std::fmt::Display) -> Self {
+        let mut detail = format!("{step}: {err}");
+        if detail.len() > protocol::ERROR_DETAIL_LEN {
+            let mut end = protocol::ERROR_DETAIL_LEN;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+        Self {
+            code: ErrorCode::VmstateWriteFailed,
+            detail,
+        }
+    }
+}
+
 /// Serialization and CREATE are one operation. Failed operations publish nothing and may retry
 /// under a new request ID; successful operations never run twice in the same epoch.
 fn serve_write_vmstate(
     order: &mut EpochOrder,
-    capture: impl FnOnce() -> Result<(u64, OwnedFd), ErrorCode>,
-) -> Result<(u64, Arc<OwnedFd>), ErrorCode> {
+    capture: impl FnOnce() -> Result<(u64, OwnedFd), VmstateRefusal>,
+) -> Result<(u64, Arc<OwnedFd>), VmstateRefusal> {
     if let Some(result) = &order.result {
         return Ok(result.clone());
     }
@@ -702,7 +727,7 @@ impl CaptureService {
             let mut vmm = vmm.lock().expect("Poisoned lock");
             let state = vmm.save_state(vm_info).map_err(|err| {
                 error!("Farplane capture could not save the microVM state: {err}");
-                ErrorCode::VmstateWriteFailed
+                VmstateRefusal::failed("save_state", err)
             })?;
             let bytes = serialize_vmstate(&mut buffers.as_mut().unwrap().vmstate, state)?;
             vmm.mark_virtio_queues_dirty();
@@ -731,7 +756,7 @@ impl CaptureService {
             })()
             .map_err(|err| {
                 error!("Farplane capture could not create the memory version: {err}");
-                ErrorCode::VmstateWriteFailed
+                VmstateRefusal::failed("memory version", err)
             })?;
             // Deliberately do not clear dirty logs: accumulating evidence is conservative and
             // avoids a fallible step after CREATE. Retirement can be optimized separately.
@@ -756,7 +781,12 @@ impl CaptureService {
                 }
                 answered
             }
-            Err(code) => self.reject(request_id, code, MsgType::WriteVmstate),
+            Err(refusal) => self.reject_with(
+                request_id,
+                refusal.code,
+                MsgType::WriteVmstate,
+                &refusal.detail,
+            ),
         }
     }
 
@@ -796,10 +826,19 @@ impl CaptureService {
         code: ErrorCode,
         op: MsgType,
     ) -> Result<(), ChannelError> {
+        self.reject_with(request_id, code, op, "")
+    }
+    fn reject_with(
+        &mut self,
+        request_id: u64,
+        code: ErrorCode,
+        op: MsgType,
+        detail: &str,
+    ) -> Result<(), ChannelError> {
         self.answer(
             request_id,
             MsgType::Error,
-            protocol::encode_error(code, op, ""),
+            protocol::encode_error(code, op, detail),
         )
     }
     fn answer(&mut self, request_id: u64, msg: MsgType, body: Vec<u8>) -> Result<(), ChannelError> {
@@ -934,19 +973,33 @@ fn clone_scratch(destination: RawFd, scratch: RawFd) -> Result<u64, io::Error> {
     Ok(get_time_us(ClockType::Monotonic) - started)
 }
 
-fn serialize_vmstate(buffer: &mut File, state: MicrovmState) -> Result<u64, ErrorCode> {
+fn serialize_vmstate(buffer: &mut File, state: MicrovmState) -> Result<u64, VmstateRefusal> {
+    serialize_vmstate_within(buffer, state, VMSTATE_CAPACITY_BYTES)
+}
+
+fn serialize_vmstate_within(
+    buffer: &mut File,
+    state: MicrovmState,
+    capacity: u64,
+) -> Result<u64, VmstateRefusal> {
+    let failed = |step: &str, err: &dyn std::fmt::Display| {
+        error!("Farplane capture could not serialize the microVM state ({step}): {err}");
+        VmstateRefusal::failed(step, err)
+    };
     buffer
         .seek(SeekFrom::Start(0))
-        .map_err(|_| ErrorCode::VmstateWriteFailed)?;
+        .map_err(|err| failed("vmstate seek", &err))?;
     let mut bounded = BoundedWriter {
         inner: buffer,
-        remaining: u64_to_usize(VMSTATE_CAPACITY_BYTES),
+        remaining: u64_to_usize(capacity),
     };
     Snapshot::new(state)
         .save(&mut bounded)
-        .map_err(|_| ErrorCode::VmstateWriteFailed)?;
-    bounded.flush().map_err(|_| ErrorCode::VmstateWriteFailed)?;
-    Ok(VMSTATE_CAPACITY_BYTES - usize_to_u64(bounded.remaining))
+        .map_err(|err| failed("vmstate save", &err))?;
+    bounded
+        .flush()
+        .map_err(|err| failed("vmstate flush", &err))?;
+    Ok(capacity - usize_to_u64(bounded.remaining))
 }
 
 #[derive(Debug)]
