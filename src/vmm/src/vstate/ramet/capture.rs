@@ -152,6 +152,11 @@ impl ReplyCache {
         body: Vec<u8>,
         version: Option<Arc<OwnedFd>>,
     ) {
+        // A peer resends only the request it waits on, its newest. Once a newer one is recorded
+        // no older answer is replayed, so an older version is not kept: it would pin every page
+        // its source has rewritten since. Its ID is then refused as reused, never served again.
+        self.answers
+            .retain(|answer| answer.version.is_none() || answer.request_id >= request_id);
         if self.answers.len() == protocol::MAX_RETRYABLE_REQUESTS {
             self.answers.pop_front();
         }

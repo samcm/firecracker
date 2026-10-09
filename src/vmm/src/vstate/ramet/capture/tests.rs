@@ -165,6 +165,41 @@ fn an_answer_whose_send_failed_retains_reply_and_fd() {
 }
 
 #[test]
+fn a_newer_answer_releases_an_older_version_and_refuses_its_id() {
+    let mut replies = ReplyCache::default();
+    let version = Arc::new(memfd(c"version", 0));
+    let weak = Arc::downgrade(&version);
+    replies.record(
+        1,
+        command(MsgType::WriteVmstate),
+        MsgType::VmstateWritten,
+        vec![],
+        Some(version),
+    );
+    // The same request again still finds its version.
+    assert!(matches!(
+        replies.disposition(1, &command(MsgType::WriteVmstate)),
+        FrameDisposition::Replay(_, _, Some(_))
+    ));
+    replies.record(
+        2,
+        command(MsgType::Resume),
+        MsgType::Resumed,
+        vec![],
+        None,
+    );
+    assert!(weak.upgrade().is_none(), "an answered version outlived the next request");
+    assert!(matches!(
+        replies.disposition(1, &command(MsgType::WriteVmstate)),
+        FrameDisposition::Reused
+    ));
+    assert!(matches!(
+        replies.disposition(2, &command(MsgType::Resume)),
+        FrameDisposition::Replay(MsgType::Resumed, _, None)
+    ));
+}
+
+#[test]
 fn eviction_drops_ownership_and_refuses_old_id() {
     let mut replies = ReplyCache::default();
     let version = Arc::new(memfd(c"version", 0));
