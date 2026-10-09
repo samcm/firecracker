@@ -846,7 +846,7 @@ definitions:
           channel alone.
         type: string
         enum:
-          - "ramet/1"
+          - "ramet/2"
       vmstate_identity:
         description:
           Identity of the vmstate this binary writes and restores, which moves only

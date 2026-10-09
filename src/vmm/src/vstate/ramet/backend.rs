@@ -1007,6 +1007,6 @@ mod tests {
     fn test_ramet_vmstate_and_channel_identities_are_distinct() {
         assert_ne!(protocol::VMSTATE_IDENTITY, protocol::FEATURE_IDENTITY);
         assert_eq!(protocol::VMSTATE_IDENTITY, "ramet-vmstate/1");
-        assert_eq!(protocol::FEATURE_IDENTITY, "ramet/1");
+        assert_eq!(protocol::FEATURE_IDENTITY, "ramet/2");
     }
 }

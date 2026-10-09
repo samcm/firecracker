@@ -348,6 +348,16 @@ pub(crate) fn exclusions(
     exclusions_within(regions, free, dirty, exclusion_cap())
 }
 
+/// The exclusions of a free summary: its words are already reported-free pages with no write
+/// evidence, the capture's `free & !dirty`, so they are the free log against an empty dirty log.
+pub(crate) fn exclusions_from_free(
+    regions: &[Region],
+    summary: &[Vec<u64>],
+) -> io::Result<Exclusions> {
+    let clean: Vec<Vec<u64>> = summary.iter().map(|words| vec![0; words.len()]).collect();
+    exclusions(regions, summary, &clean)
+}
+
 /// Keeps the `limit` longest of `runs`, ties to the lower address; returns the bytes dropped.
 fn keep_longest(runs: &mut Vec<Exclusion>, limit: usize) -> u64 {
     if runs.len() <= limit {
@@ -887,6 +897,31 @@ fn included_pages_with(
     Ok(Included::Kernel(info, request.included_pages))
 }
 
+/// The kernel's count of what a quiesced CREATE with `exclusions` would fold, taken while the
+/// guest runs, or `None` on a kernel without MV_IOC_TRACK_INFO2 (ENOTTY). Never walks the guest:
+/// an estimate taken outside a freeze has no use for the residency count.
+pub(crate) fn track_sample(
+    device: BorrowedFd<'_>,
+    exclusions: &[Exclusion],
+) -> io::Result<Option<(TrackInfo, u64)>> {
+    match included_pages_with(
+        exclusions,
+        |request| {
+            // SAFETY: as in `included_pages`.
+            if unsafe { ioctl_with_mut_ref(&device, MV_IOC_TRACK_INFO2(), request) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        },
+        || Err(io::Error::from_raw_os_error(libc::ENOTTY)),
+    ) {
+        Ok(Included::Kernel(info, pages)) => Ok(Some((info, pages))),
+        Ok(Included::Resident(_)) => unreachable!("the residency count is never taken"),
+        Err(err) if err.raw_os_error() == Some(libc::ENOTTY) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// CREATE over the tracked standing version. The returned version is the new standing
 /// version; the tracker holds its own reference.
 pub(crate) fn create_tracked(
@@ -1305,6 +1340,75 @@ mod tests {
                 .raw_os_error(),
             Some(libc::ENOTTY)
         );
+    }
+
+    #[test]
+    fn a_free_summarys_exclusions_are_the_captures() {
+        let page = crate::arch::host_page_size() as u64;
+        let regions = [
+            Region {
+                addr: GUEST_RAM_BASE,
+                len: 256 * page,
+            },
+            Region {
+                addr: GUEST_RAM_BASE + (1 << 30),
+                len: 197 * page,
+            },
+        ];
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..500 {
+            let free: Vec<Vec<u64>> = [4, 4]
+                .iter()
+                .map(|&n| (0..n).map(|_| next()).collect())
+                .collect();
+            let dirty: Vec<Vec<u64>> = [4, 4]
+                .iter()
+                .map(|&n| (0..n).map(|_| next() & next()).collect())
+                .collect();
+            // What free_summary_until reports: reported free and no write evidence.
+            let summary: Vec<Vec<u64>> = free
+                .iter()
+                .zip(&dirty)
+                .map(|(f, d)| f.iter().zip(d).map(|(f, d)| f & !d).collect())
+                .collect();
+            assert_eq!(
+                exclusions_from_free(&regions, &summary).unwrap(),
+                exclusions(&regions, &free, &dirty).unwrap()
+            );
+        }
+        exclusions_from_free(&regions, &[vec![0; 4]]).unwrap_err();
+        // More runs than CREATE takes: the summary's reduction is the capture's, and the pages
+        // of the dropped runs stay outside the exclusions, so the kernel counts them included.
+        let words = MAX_EXCLUSIONS / 32 + 2;
+        let big = [Region {
+            addr: GUEST_RAM_BASE,
+            len: u64::try_from(words).unwrap() * 64 * page,
+        }];
+        let free = vec![vec![0x5555_5555_5555_5555u64; words]];
+        let dirty = vec![vec![0u64; words]];
+        let from_summary = exclusions_from_free(&big, &free).unwrap();
+        assert_eq!(from_summary, exclusions(&big, &free, &dirty).unwrap());
+        assert_eq!(
+            (
+                from_summary.runs.len(),
+                from_summary.found,
+                from_summary.dropped_pages
+            ),
+            (MAX_EXCLUSIONS, MAX_EXCLUSIONS * 2 / 2 + 64, 64)
+        );
+    }
+
+    #[test]
+    fn a_running_sample_is_the_kernels_count_or_no_sample_never_a_walk() {
+        // A kernel without TRACK_INFO2 answers ENOTTY: no sample, and no residency walk.
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(track_sample(null.as_fd(), &[]).unwrap(), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
-use std::os::fd::FromRawFd;
+use std::os::fd::{BorrowedFd, FromRawFd};
 
 use vmm_sys_util::tempfile::TempFile;
 
@@ -71,6 +71,110 @@ fn a_long_refusal_is_cut_to_the_detail_field_on_a_character_boundary() {
     assert!(refusal.detail.len() <= protocol::ERROR_DETAIL_LEN);
     assert!(refusal.detail.len() > protocol::ERROR_DETAIL_LEN - 2);
     assert!(refusal.detail.starts_with("memory version: é"));
+}
+
+#[test]
+fn a_free_summary_reply_carries_its_tracked_sample_or_no_count() {
+    let body = encode_free_summary_done(0x0102, 0x0304, 0x0506);
+    assert_eq!(body.len(), 24);
+    assert_eq!(body[..8], 0x0102u64.to_le_bytes());
+    assert_eq!(body[8..16], 0x0304u64.to_le_bytes());
+    assert_eq!(body[16..], 0x0506u64.to_le_bytes());
+    // No count is u64::MAX with no standing version, never a zero a reader could mistake for a
+    // small capture.
+    let (included, standing_id) = NO_TRACKED_SAMPLE;
+    let body = encode_free_summary_done(7, included, standing_id);
+    assert_eq!(body[8..16], [0xff; 8]);
+    assert_eq!(body[16..], [0; 8]);
+    assert_eq!(body[..8], 7u64.to_le_bytes());
+}
+
+#[test]
+fn a_tracked_sample_is_the_kernels_timely_count_or_no_count() {
+    let regions = [protocol::RegionRecord {
+        guest_addr: 0,
+        size: 128 * 4096,
+    }];
+    // Runs at pages 0..3 and 64..66 of the summary's words.
+    let summary = vec![vec![0b111, 0b11]];
+    let device = memfd(c"device", 0);
+    let later = Instant::now() + Duration::from_secs(60);
+    let tracked = |included| {
+        Ok(Some((
+            memversion::TrackInfo {
+                tracked: 1,
+                standing_id: 9,
+                ..Default::default()
+            },
+            included,
+        )))
+    };
+    // The kernel counts against exactly the summary's runs.
+    let sample = sample_tracked(
+        Some(device.as_fd()),
+        &regions,
+        &summary,
+        later,
+        |_, runs| {
+            assert_eq!(
+                runs.iter().map(|x| (x.offset, x.len)).collect::<Vec<_>>(),
+                [(0, 3 * 4096), (64 * 4096, 2 * 4096)]
+            );
+            tracked(41)
+        },
+    );
+    assert_eq!(sample, (41, 9));
+    // Untracked: no count, and the kernel is never asked.
+    let never = |_: BorrowedFd<'_>, _: &[memversion::Exclusion]| -> io::Result<_> {
+        panic!("asked the kernel")
+    };
+    assert_eq!(
+        sample_tracked(None, &regions, &summary, later, never),
+        NO_TRACKED_SAMPLE
+    );
+    // A deadline already gone: no count, and the kernel is never asked.
+    assert_eq!(
+        sample_tracked(
+            Some(device.as_fd()),
+            &regions,
+            &summary,
+            Instant::now(),
+            never
+        ),
+        NO_TRACKED_SAMPLE
+    );
+    // A count that arrives after the deadline is not reported.
+    let soon = Instant::now() + Duration::from_millis(20);
+    let late = sample_tracked(Some(device.as_fd()), &regions, &summary, soon, |_, _| {
+        std::thread::sleep(Duration::from_millis(40));
+        tracked(41)
+    });
+    assert_eq!(late, NO_TRACKED_SAMPLE);
+    // ENOTTY (older kernel), an error, an untracked answer or no standing version: no count.
+    for answer in [
+        Ok(None),
+        Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        Ok(Some((memversion::TrackInfo::default(), 5))),
+        Ok(Some((
+            memversion::TrackInfo {
+                tracked: 1,
+                ..Default::default()
+            },
+            5,
+        ))),
+    ] {
+        assert_eq!(
+            sample_tracked(Some(device.as_fd()), &regions, &summary, later, |_, _| {
+                answer
+            }),
+            NO_TRACKED_SAMPLE
+        );
+    }
+    // A summary that does not fit the geometry: no count.
+    assert_eq!(
+        sample_tracked(Some(device.as_fd()), &regions, &[vec![0]], later, never),
+        NO_TRACKED_SAMPLE
+    );
 }
 
 #[test]
