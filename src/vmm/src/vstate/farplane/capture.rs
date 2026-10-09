@@ -484,11 +484,41 @@ impl CaptureService {
         } else {
             (info, info.dirty_pages)
         };
-        self.reply(
+        let replied = self.reply(
             request_id,
             MsgType::Tracked,
             &encode_tracked(&info, included),
-        )
+        );
+        // SCRATCH (never shipped): after the reply, so the Track-info timing stays clean and the
+        // quiesced state is unchanged, count the same capture the old exact way.
+        if state == BackendState::Quiesced && info.tracked != 0 {
+            let started = Instant::now();
+            let tracker = self.tracker.as_ref().expect("tracker set above");
+            let compared = memversion::geometry(&self.channel.regions).and_then(|regions| {
+                let exclusions = {
+                    let vmm = self.vmm.lock().expect("Poisoned lock");
+                    let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
+                    let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
+                    let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
+                    memversion::exclusions(&regions, &free, &dirty)?
+                };
+                let kernel = memversion::included_pages(tracker.as_fd(), &regions, &exclusions)?;
+                let written = memversion::written_pages(tracker.as_fd(), &regions)?;
+                let residency = memversion::newly_retained(&regions, written, &exclusions)?;
+                Ok((kernel, residency, exclusions.len()))
+            });
+            match compared {
+                Ok((kernel, residency, runs)) => info!(
+                    "Farplane track-compare replied={included} dirty={} bound={bound} \
+                     kernel={kernel:?} residency={residency} equal={} runs={runs} in {} us",
+                    info.dirty_pages,
+                    kernel.pages() == residency,
+                    started.elapsed().as_micros()
+                ),
+                Err(err) => error!("Farplane track-compare failed: {err}"),
+            }
+        }
+        replied
     }
 
     /// The pages a quiesced tracked CREATE would fold now, counted against the exclusions
@@ -745,6 +775,17 @@ impl CaptureService {
                     bytes.to_le_bytes().to_vec(),
                     Some(version.clone()),
                 );
+                // SCRATCH (never shipped): what this CREATE actually folded.
+                if let Ok(info) = memversion::info2(version.as_fd()) {
+                    info!(
+                        "Farplane create-compare tracked={} own={} new={} folded={} depth={}",
+                        self.tracker.is_some(),
+                        info.own_pages,
+                        info.new_pages,
+                        info.folded_pages,
+                        info.depth
+                    );
+                }
                 // After the reply: only the version the tracker now stands on is a refresh's
                 // flatten source, not a whole copy made after a failed fold.
                 if let Some(tracker) = &self.tracker
