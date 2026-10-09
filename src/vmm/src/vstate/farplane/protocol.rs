@@ -110,6 +110,13 @@ pub enum MsgType {
     /// Firecracker returns the new standing version: LE u64 own pages, u64 new pages,
     /// u32 depth, u32 zero runs, u64 folded pages.
     Refreshed = 31,
+    /// Pagemaster hands over a flat version it made with FLATTEN of the standing version, after a
+    /// transient capture published, and asks for the tracker to stand on it instead. No body, one
+    /// descriptor. Firecracker answers `rearmed` with no body and no descriptor, or rejects with
+    /// `rearm_failed` having changed nothing.
+    Rearm = 32,
+    /// Firecracker confirms the tracker stands on the flat version a `rearm` handed over.
+    Rearmed = 33,
 }
 
 impl MsgType {
@@ -136,6 +143,8 @@ impl MsgType {
             29 => Some(Self::Tracked),
             30 => Some(Self::Refresh),
             31 => Some(Self::Refreshed),
+            32 => Some(Self::Rearm),
+            33 => Some(Self::Rearmed),
             // Reserved /6 tags, including 18-21, must never be interpreted as /8 commands.
             _ => None,
         }
@@ -216,6 +225,10 @@ pub enum ErrorCode {
     /// A retry of a request whose answer carried a version, after a newer request acknowledged
     /// that answer: the version descriptor is no longer held, so the answer cannot be replayed.
     ReplayUnavailable = 33,
+    /// The tracker could not be moved onto the flat version: the guest is not running, nothing
+    /// is tracked, or the kernel refused it because the standing version moved. The tracker
+    /// still stands where it stood.
+    RearmFailed = 34,
 }
 
 /// Architecture Firecracker is running on.
