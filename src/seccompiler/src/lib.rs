@@ -309,11 +309,21 @@ mod tests {
                     0xc038_5649_u64,
                     std::ptr::null::<u8>(),
                 );
+                if result != -1 || *libc::__errno_location() != libc::EBADF {
+                    libc::_exit(93);
+                }
+                // MV_IOC_TRACK_INFO2, which counts the same capture without RESIDENT on fpmv4.
+                let result = libc::syscall(
+                    libc::SYS_ioctl,
+                    -1_i64,
+                    0xc040_564a_u64,
+                    std::ptr::null::<u8>(),
+                );
                 libc::_exit(
                     if result == -1 && *libc::__errno_location() == libc::EBADF {
                         0
                     } else {
-                        93
+                        94
                     },
                 );
             }

@@ -292,6 +292,9 @@ pub(crate) fn geometry(regions: &[RegionRecord]) -> io::Result<Vec<Region>> {
 
 /// Exclude only reported-free pages with no subsequent KVM, ring or host write evidence.
 /// If fragmentation exceeds the ABI limit, fail before CREATE; never truncate the bitmap.
+///
+/// Runs inside a capture's freeze, so it works a bitmap word at a time: a word costs one step
+/// plus one per run edge in it, never one per page.
 pub(crate) fn exclusions(
     regions: &[Region],
     free: &[Vec<u64>],
@@ -308,24 +311,51 @@ pub(crate) fn exclusions(
         if free[index].len() != words || dirty[index].len() != words {
             return Err(invalid());
         }
-        let mut run = None;
-        for p in 0..=pages {
-            let word = usize::try_from(p / 64).map_err(|_| invalid())?;
-            let excluded =
-                p < pages && (free[index][word] & !dirty[index][word]) & (1 << (p % 64)) != 0;
-            if excluded {
-                run.get_or_insert(p);
-            } else if let Some(start) = run.take() {
-                if out.len() == MAX_EXCLUSIONS {
-                    return Err(invalid());
-                }
-                out.push(Exclusion {
-                    region: u32::try_from(index).map_err(|_| invalid())?,
-                    reserved: 0,
-                    offset: start * page,
-                    len: (p - start) * page,
-                });
+        let region_index = u32::try_from(index).map_err(|_| invalid())?;
+        let mut push = |start: u64, end: u64| {
+            if out.len() == MAX_EXCLUSIONS {
+                return Err(invalid());
             }
+            out.push(Exclusion {
+                region: region_index,
+                reserved: 0,
+                offset: start * page,
+                len: (end - start) * page,
+            });
+            Ok(())
+        };
+        // The first page of the run still open at the current bit, which may continue from an
+        // earlier word.
+        let mut run = None;
+        for (word, (free, dirty)) in (0u64..).zip(free[index].iter().zip(&dirty[index])) {
+            let first = word * 64;
+            let mut bits = free & !dirty;
+            // Bits past the region's last page describe no guest page.
+            if pages - first < 64 {
+                bits &= (1u64 << (pages - first)) - 1;
+            }
+            let mut at = 0;
+            while at < 64 {
+                // Bits below `at` are consumed; above the word they read as zero.
+                let rest = bits >> at;
+                match run {
+                    None if rest == 0 => break,
+                    None => {
+                        at += rest.trailing_zeros();
+                        run = Some(first + u64::from(at));
+                    }
+                    Some(start) => {
+                        at += rest.trailing_ones();
+                        if at < 64 {
+                            push(start, first + u64::from(at))?;
+                            run = None;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(start) = run {
+            push(start, pages)?;
         }
     }
     Ok(out)
@@ -522,6 +552,31 @@ struct Resident {
 
 ioctl_iowr_nr!(MV_IOC_RESIDENT, 0x56, 0x49, Resident);
 
+/// In: also count `included_pages` against `exclusions`.
+const MV_TRACK_INFO_INCLUDED: u32 = 0x2;
+
+/// `struct mv_track_info2` of the fpmv4 uapi: [`TrackInfo`] plus what a quiesced CREATE with a
+/// given exclusion list would fold. fpmv2 and fpmv3 kernels do not have it and answer ENOTTY.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TrackInfo2 {
+    tracked: u32,
+    depth: u32,
+    dirty_pages: u64,
+    standing_id: u64,
+    flags: u32,
+    nr_exclusions: u32,
+    retained_pages: u64,
+    /// A user pointer to `nr_exclusions` [`Exclusion`]s, validated as CREATE validates them.
+    exclusions: u64,
+    /// With MV_TRACK_INFO_INCLUDED: `dirty_pages` less the dirty pages inside the exclusions.
+    included_pages: u64,
+    reserved: u32,
+    reserved2: u32,
+}
+
+ioctl_iowr_nr!(MV_IOC_TRACK_INFO2, 0x56, 0x4a, TrackInfo2);
+
 /// How a CREATE treats the caller's tracked mm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fold {
@@ -679,6 +734,77 @@ pub(crate) fn newly_retained(
         .flatten()
         .map(|word| u64::from(word.count_ones()))
         .sum())
+}
+
+/// The pages a quiesced tracked CREATE with `exclusions` would fold, and who counted them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Included {
+    /// The kernel, with the tracker state it read under the same lock. O(runs) word operations
+    /// on the tracker's dirty bits: no page walk.
+    Kernel(TrackInfo, u64),
+    /// A kernel without MV_IOC_TRACK_INFO2: the pages MV_IOC_RESIDENT reports written less the
+    /// exclusions ([`newly_retained`]), a walk of every guest page.
+    Resident(u64),
+}
+
+impl Included {
+    pub(crate) fn pages(self) -> u64 {
+        match self {
+            Self::Kernel(_, pages) | Self::Resident(pages) => pages,
+        }
+    }
+}
+
+/// Counts what a quiesced tracked CREATE with `exclusions`, the list it will be given, would
+/// fold. Only a kernel that does not know MV_IOC_TRACK_INFO2 (ENOTTY) is counted by residency;
+/// any other refusal is an error, never a reason to count another way.
+pub(crate) fn included_pages(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    exclusions: &[Exclusion],
+) -> io::Result<Included> {
+    included_pages_with(
+        exclusions,
+        |request| {
+            // SAFETY: request is live and writable, and its exclusion pointer names a live slice
+            // of nr_exclusions entries the kernel only reads, for the entire synchronous ioctl.
+            if unsafe { ioctl_with_mut_ref(&device, MV_IOC_TRACK_INFO2(), request) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        },
+        || newly_retained(regions, written_pages(device, regions)?, exclusions),
+    )
+}
+
+fn included_pages_with(
+    exclusions: &[Exclusion],
+    track_info2: impl FnOnce(&mut TrackInfo2) -> io::Result<()>,
+    resident: impl FnOnce() -> io::Result<u64>,
+) -> io::Result<Included> {
+    if exclusions.len() > MAX_EXCLUSIONS {
+        return Err(invalid());
+    }
+    let mut request = TrackInfo2 {
+        flags: MV_TRACK_INFO_INCLUDED,
+        nr_exclusions: u32::try_from(exclusions.len()).unwrap(),
+        exclusions: exclusions.as_ptr() as u64,
+        ..Default::default()
+    };
+    match track_info2(&mut request) {
+        Err(err) if err.raw_os_error() == Some(libc::ENOTTY) => {
+            return Ok(Included::Resident(resident()?));
+        }
+        result => result?,
+    }
+    let info = TrackInfo {
+        tracked: request.tracked,
+        depth: request.depth,
+        dirty_pages: request.dirty_pages,
+        standing_id: request.standing_id,
+        ..Default::default()
+    };
+    Ok(Included::Kernel(info, request.included_pages))
 }
 
 /// CREATE over the tracked standing version. The returned version is the new standing
@@ -988,6 +1114,117 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Resident, flags), 48);
         assert_eq!(MV_IOC_RESIDENT(), 0xc0385649);
         assert_eq!(MV_RESIDENT_MAX_LEN, 1 << 30);
+        // struct mv_track_info2 of the fpmv4 uapi.
+        assert_eq!(size_of::<TrackInfo2>(), 64);
+        assert_eq!(std::mem::offset_of!(TrackInfo2, flags), 24);
+        assert_eq!(std::mem::offset_of!(TrackInfo2, nr_exclusions), 28);
+        assert_eq!(std::mem::offset_of!(TrackInfo2, retained_pages), 32);
+        assert_eq!(std::mem::offset_of!(TrackInfo2, exclusions), 40);
+        assert_eq!(std::mem::offset_of!(TrackInfo2, included_pages), 48);
+        assert_eq!(std::mem::offset_of!(TrackInfo2, reserved), 56);
+        assert_eq!(MV_IOC_TRACK_INFO2(), 0xc040564a);
+        assert_eq!(MV_TRACK_INFO_INCLUDED, 0x2);
+    }
+
+    #[test]
+    fn included_pages_fall_back_to_residency_only_on_a_kernel_without_track_info2() {
+        let excluded = [
+            Exclusion {
+                region: 0,
+                reserved: 0,
+                offset: 0,
+                len: 4096,
+            },
+            Exclusion {
+                region: 1,
+                reserved: 0,
+                offset: 8192,
+                len: 4096,
+            },
+        ];
+        // fpmv4 counts against the list it is given and reports the tracker beside it.
+        let counted = included_pages_with(
+            &excluded,
+            |request| {
+                assert_eq!(
+                    (request.flags, request.nr_exclusions, request.exclusions),
+                    (MV_TRACK_INFO_INCLUDED, 2, excluded.as_ptr() as u64)
+                );
+                assert_eq!((request.reserved, request.reserved2), (0, 0));
+                request.tracked = 1;
+                request.depth = 3;
+                request.dirty_pages = 700;
+                request.standing_id = 9;
+                request.included_pages = 41;
+                Ok(())
+            },
+            || panic!("walked residency on a kernel that counts"),
+        )
+        .unwrap();
+        assert_eq!(
+            counted,
+            Included::Kernel(
+                TrackInfo {
+                    tracked: 1,
+                    depth: 3,
+                    dirty_pages: 700,
+                    standing_id: 9,
+                    ..Default::default()
+                },
+                41
+            )
+        );
+        assert_eq!(counted.pages(), 41);
+        // fpmv2 and fpmv3 do not know the request: the exact residency count stands in.
+        let mut walks = 0;
+        let counted = included_pages_with(
+            &excluded,
+            |_| Err(io::Error::from_raw_os_error(libc::ENOTTY)),
+            || {
+                walks += 1;
+                Ok(17)
+            },
+        )
+        .unwrap();
+        assert_eq!((counted, walks), (Included::Resident(17), 1));
+        // A failed walk fails the count rather than guessing one.
+        included_pages_with(
+            &excluded,
+            |_| Err(io::Error::from_raw_os_error(libc::ENOTTY)),
+            || Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        )
+        .unwrap_err();
+        // An fpmv4 refusal is a fault on one side, not an older kernel: never counted otherwise.
+        for errno in [libc::EINVAL, libc::EFAULT, libc::ENOMEM, libc::EINTR] {
+            let err = included_pages_with(
+                &excluded,
+                |_| Err(io::Error::from_raw_os_error(errno)),
+                || panic!("fell back on errno {errno}"),
+            )
+            .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(errno));
+        }
+        // More runs than CREATE takes never reach the kernel.
+        let too_many = vec![excluded[0]; MAX_EXCLUSIONS + 1];
+        included_pages_with(
+            &too_many,
+            |_| panic!("asked the kernel"),
+            || panic!("walked residency"),
+        )
+        .unwrap_err();
+        // A non-device answers ENOTTY, so the real request takes the residency path, which a
+        // non-device refuses too.
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let regions = [Region {
+            addr: GUEST_RAM_BASE,
+            len: 4096,
+        }];
+        assert_eq!(
+            included_pages(null.as_fd(), &regions, &[])
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOTTY)
+        );
     }
 
     #[test]
@@ -1289,6 +1526,129 @@ mod tests {
         }])
         .unwrap_err();
         exclusions(&regions, &[vec![1]], &[vec![0]]).unwrap_err();
+    }
+
+    /// The per-page builder the word-wise one replaced: the runs are defined page by page.
+    fn exclusions_by_page(
+        regions: &[Region],
+        free: &[Vec<u64>],
+        dirty: &[Vec<u64>],
+    ) -> Vec<Exclusion> {
+        let page = crate::arch::host_page_size() as u64;
+        let mut out = Vec::new();
+        for (index, region) in regions.iter().enumerate() {
+            let pages = region.len / page;
+            let mut run = None;
+            for p in 0..=pages {
+                let word = usize::try_from(p / 64).unwrap();
+                let excluded =
+                    p < pages && (free[index][word] & !dirty[index][word]) & (1 << (p % 64)) != 0;
+                if excluded {
+                    run.get_or_insert(p);
+                } else if let Some(start) = run.take() {
+                    out.push(Exclusion {
+                        region: u32::try_from(index).unwrap(),
+                        reserved: 0,
+                        offset: start * page,
+                        len: (p - start) * page,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn word_wise_exclusions_match_the_per_page_runs() {
+        let page = crate::arch::host_page_size() as u64;
+        // A whole-word region, one ending mid-word, and one shorter than a word.
+        let regions = [
+            Region {
+                addr: GUEST_RAM_BASE,
+                len: 256 * page,
+            },
+            Region {
+                addr: GUEST_RAM_BASE + (1 << 30),
+                len: 197 * page,
+            },
+            Region {
+                addr: GUEST_RAM_BASE + (2 << 30),
+                len: 5 * page,
+            },
+        ];
+        let words: Vec<usize> = regions
+            .iter()
+            .map(|region| usize::try_from((region.len / page).div_ceil(64)).unwrap())
+            .collect();
+        let check = |free: &[Vec<u64>], dirty: &[Vec<u64>]| {
+            assert_eq!(
+                exclusions(&regions, free, dirty).unwrap(),
+                exclusions_by_page(&regions, free, dirty),
+                "free={free:x?} dirty={dirty:x?}"
+            );
+        };
+        // Runs across word edges, ending on bit 63, starting on bit 0, whole words, single
+        // pages, and free bits past a region's last page (which never extend a run).
+        let shaped = [
+            vec![u64::MAX, u64::MAX, 0, 1 << 63],
+            vec![1 << 63, u64::MAX, 1, u64::MAX],
+            vec![0x5555_5555_5555_5555; 4],
+            vec![0xf000_0000_0000_000f, 0x8000_0000_0000_0001, u64::MAX, 0],
+        ];
+        for free0 in &shaped {
+            for dirty0 in [vec![0; 4], vec![0, 1 << 5, 0, 0], vec![u64::MAX; 4]] {
+                let free = vec![free0.clone(), free0.clone(), vec![u64::MAX]];
+                let dirty = vec![dirty0.clone(), dirty0, vec![0b100]];
+                check(&free, &dirty);
+            }
+        }
+        // And a deterministic spread of random bitmaps, dense and sparse.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..2000 {
+            let mut bitmap = |dense: bool| -> Vec<Vec<u64>> {
+                words
+                    .iter()
+                    .map(|&n| {
+                        (0..n)
+                            .map(|_| match round % 3 {
+                                0 => next(),
+                                1 if dense => next() | next() | next(),
+                                _ => next() & next() & next(),
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let free = bitmap(true);
+            let dirty = bitmap(false);
+            check(&free, &dirty);
+        }
+        // A run limit is still enforced: one more run than CREATE takes fails, never truncates.
+        let alternating = Region {
+            addr: GUEST_RAM_BASE,
+            len: 2 * (MAX_EXCLUSIONS as u64 + 1) * page,
+        };
+        let n = usize::try_from((alternating.len / page).div_ceil(64)).unwrap();
+        let free = vec![vec![0x5555_5555_5555_5555; n]];
+        let dirty = vec![vec![0; n]];
+        exclusions(&[alternating], &free, &dirty).unwrap_err();
+        let fits = Region {
+            len: 2 * MAX_EXCLUSIONS as u64 * page,
+            ..alternating
+        };
+        let n = usize::try_from(fits.len / page / 64).unwrap();
+        assert_eq!(
+            exclusions(&[fits], &[vec![0x5555_5555_5555_5555; n]], &[vec![0; n]])
+                .unwrap()
+                .len(),
+            MAX_EXCLUSIONS
+        );
     }
 
     #[test]

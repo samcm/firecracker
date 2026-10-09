@@ -464,16 +464,22 @@ impl CaptureService {
                 return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
             }
         };
-        let included = if counts_retained(state, &info, bound) {
+        let (info, included) = if counts_retained(state, &info, bound) {
             let started = Instant::now();
-            match self.newly_retained(tracker.as_fd()) {
-                Ok(pages) => {
+            match self.included_pages(tracker.as_fd()) {
+                Ok(included) => {
+                    let (info, by) = match included {
+                        // The kernel's count is against the tracker state it read with it.
+                        memversion::Included::Kernel(fresh, _) => (fresh, "kernel"),
+                        memversion::Included::Resident(_) => (info, "residency"),
+                    };
                     info!(
-                        "Ramet counted {pages} of {} dirty pages for CREATE in {} us",
+                        "Ramet counted {} of {} dirty pages for CREATE by {by} in {} us",
+                        included.pages(),
                         info.dirty_pages,
                         started.elapsed().as_micros()
                     );
-                    pages
+                    (info, included.pages())
                 }
                 Err(err) => {
                     error!("Ramet could not count the pages CREATE would retain: {err}");
@@ -481,7 +487,7 @@ impl CaptureService {
                 }
             }
         } else {
-            info.dirty_pages
+            (info, info.dirty_pages)
         };
         self.reply(
             request_id,
@@ -490,10 +496,10 @@ impl CaptureService {
         )
     }
 
-    /// The pages a quiesced tracked CREATE would newly retain now: those written since the
-    /// standing version, less the exclusions `write_vmstate` would pass, built the same way
-    /// under the VMM lock. Both log snapshots are reads; neither retires dirty evidence.
-    fn newly_retained(&self, tracker: BorrowedFd<'_>) -> io::Result<u64> {
+    /// The pages a quiesced tracked CREATE would fold now, counted against the exclusions
+    /// `write_vmstate` would pass, built the same way under the VMM lock. Both log snapshots
+    /// are reads; neither retires dirty evidence.
+    fn included_pages(&self, tracker: BorrowedFd<'_>) -> io::Result<memversion::Included> {
         let regions = memversion::geometry(&self.channel.regions)?;
         let exclusions = {
             let vmm = self.vmm.lock().expect("Poisoned lock");
@@ -502,8 +508,7 @@ impl CaptureService {
             let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
             memversion::exclusions(&regions, &free, &dirty)?
         };
-        let written = memversion::written_pages(tracker, &regions)?;
-        memversion::newly_retained(&regions, written, &exclusions)
+        memversion::included_pages(tracker, &regions, &exclusions)
     }
 
     /// Folds what the guest wrote since the standing version into a new one, without a pause.
