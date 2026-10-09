@@ -515,6 +515,24 @@ impl Vmm {
         });
     }
 
+    /// The scratch disk's write log, which a capture records into between its pre-phase clone
+    /// and its catch-up.
+    pub fn scratch_write_log(
+        &self,
+    ) -> Option<Arc<crate::devices::virtio::block::virtio::write_log::WriteLog>> {
+        let mut log = None;
+        self.device_manager
+            .for_each_virtio_device(|device_type, device| {
+                if device_type == VirtioDeviceType::Block
+                    && let Some(block) = device.as_any().downcast_ref::<Block>()
+                    && !block.root_device()
+                {
+                    log = Some(block.write_log());
+                }
+            });
+        log
+    }
+
     /// Descriptor of the drive backing the guest's scratch disk, which is the one block device
     /// that is not the root. A guest configured without one has no disk to clone.
     pub fn scratch_descriptor(&self) -> Option<RawFd> {

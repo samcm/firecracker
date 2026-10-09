@@ -18,6 +18,7 @@ use super::backend::{
 use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
 use super::{dispatch, memversion};
 use crate::Vmm;
+use crate::devices::virtio::block::virtio::write_log::WriteLog;
 use crate::logger::{IncMetric, METRICS, error, info};
 use crate::persist::{MicrovmState, VmInfo};
 use crate::snapshot::Snapshot;
@@ -28,7 +29,34 @@ use crate::vmm_config::instance_info::VmState;
 struct CaptureBuffers {
     vmstate: File,
     disk_clone: Option<File>,
+    /// The scratch disk cloned into `disk_clone` at arm, while the guest ran, and the log of
+    /// what it has written since: the freeze then catches up only that.
+    pre_cloned: Option<PreClone>,
 }
+
+/// A scratch clone taken before the freeze. It is never used on its own: the freeze either
+/// catches it up from its write log or replaces it with a whole clone.
+#[derive(Debug)]
+struct PreClone {
+    log: Arc<WriteLog>,
+    /// How long the whole clone took, for the log.
+    clone_us: u64,
+    /// The scratch disk's extent count at the pre-clone, which a whole clone's cost follows.
+    extents: u64,
+}
+
+/// A catch-up runs only while its ranges stay under this share of the file's extents (in
+/// tenths), and never past `CATCH_UP_MAX_RANGES`. Measured on XFS: a whole clone costs 14-18 µs
+/// per extent and a rewritten range 36-55 µs on Zen 2 (9-12 and 23-27 on Zen 4), so the catch-up
+/// beats the whole clone below ~0.35 ranges per extent. Both costs grow alike under load, so the
+/// bound is a ratio rather than a fixed time.
+const CATCH_UP_RANGES_PER_TEN_EXTENTS: u64 = 3;
+/// Ranges no catch-up exceeds: 1024 rewritten ranges already cost ~40 ms on Zen 2.
+const CATCH_UP_MAX_RANGES: u64 = 1024;
+/// Merged ranges a write log holds before it gives up: past this no catch-up fits any clone.
+const WRITE_LOG_MAX_RANGES: usize = 65_536;
+/// Bytes a write log covers before it gives up and the freeze clones whole.
+const WRITE_LOG_MAX_BYTES: u64 = 64 << 20;
 
 /// A successful epoch owns the CREATE result before any reply is attempted.
 #[derive(Debug, Default)]
@@ -742,9 +770,14 @@ impl CaptureService {
         {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
+        let disk_clone = destination.map(File::from);
+        let pre_cloned = disk_clone
+            .as_ref()
+            .and_then(|destination| self.pre_clone(destination.as_raw_fd()));
         self.buffers = Some(CaptureBuffers {
             vmstate: File::from(vmstate),
-            disk_clone: destination.map(File::from),
+            disk_clone,
+            pre_cloned,
         });
         set_capture_buffers_armed(true);
         self.reply(request_id, MsgType::CaptureBuffersArmed, &[])
@@ -752,6 +785,37 @@ impl CaptureService {
 
     fn scratch_descriptor(&self) -> Option<RawFd> {
         self.vmm.lock().expect("Poisoned lock").scratch_descriptor()
+    }
+
+    /// Clones the scratch disk into `destination` while the guest runs, having started its write
+    /// log first: a write that completed before the start is in the file the clone copies, and
+    /// one that completes after it is logged. Any failure leaves no pre-clone, and the freeze
+    /// clones whole as before.
+    fn pre_clone(&self, destination: RawFd) -> Option<PreClone> {
+        let (scratch, log) = {
+            let vmm = self.vmm.lock().expect("Poisoned lock");
+            (vmm.scratch_descriptor()?, vmm.scratch_write_log()?)
+        };
+        log.start(WRITE_LOG_MAX_RANGES, WRITE_LOG_MAX_BYTES);
+        match clone_scratch(destination, scratch)
+            .and_then(|clone_us| Ok((clone_us, extent_count(scratch)?)))
+        {
+            Ok((clone_us, extents)) => {
+                info!("Farplane pre-cloned the scratch disk ({extents} extents) in {clone_us} us");
+                Some(PreClone {
+                    log,
+                    clone_us,
+                    extents,
+                })
+            }
+            Err(err) => {
+                log.stop();
+                error!(
+                    "Farplane could not pre-clone the scratch disk; the freeze clones it: {err}"
+                );
+                None
+            }
+        }
     }
 
     /// Close dispatch, pause, drain, then clone: no guest-memory or disk writer crosses the cut.
@@ -789,14 +853,19 @@ impl CaptureService {
             .as_ref()
             .and_then(|buffers| buffers.disk_clone.as_ref())
             .map(|file| file.as_raw_fd());
+        // A pre-clone is caught up at most once; a retried quiesce clones whole.
+        let pre_cloned = self
+            .buffers
+            .as_mut()
+            .and_then(|buffers| buffers.pre_cloned.take());
         if let Some(destination) = destination {
             match vmm
                 .scratch_descriptor()
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))
-                .and_then(|scratch| clone_scratch(destination, scratch))
+                .and_then(|scratch| finish_scratch_clone(destination, scratch, pre_cloned))
             {
-                Ok(elapsed_us) => {
-                    info!("Farplane quiesce cloned the scratch disk in {elapsed_us} us");
+                Ok((elapsed_us, how)) => {
+                    info!("Farplane quiesce cloned the scratch disk in {elapsed_us} us ({how})");
                     METRICS.farplane.disk_clones.inc();
                     METRICS.farplane.disk_clone_agg.record_us(elapsed_us);
                 }
@@ -1097,6 +1166,162 @@ fn hand_back_source(mut vmm: MutexGuard<'_, Vmm>, were_running: bool) {
     if BackendState::load() != BackendState::ChannelFailed {
         dispatch::gate().open();
     }
+}
+
+/// How the freeze finished the scratch clone, for its log line.
+#[derive(Debug, PartialEq, Eq)]
+enum ScratchCloneHow {
+    /// No pre-clone: the whole clone, as before.
+    Whole,
+    /// The pre-clone's log overflowed, or its ranges would cost more than a whole clone.
+    WholeOverPreClone {
+        ranges: usize,
+        extents: u64,
+        overflowed: bool,
+    },
+    /// The pre-clone caught up from its log.
+    CaughtUp {
+        ranges: usize,
+        extents: u64,
+        pre_clone_us: u64,
+    },
+}
+
+impl std::fmt::Display for ScratchCloneHow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Whole => write!(f, "whole"),
+            Self::WholeOverPreClone {
+                ranges,
+                extents,
+                overflowed,
+            } => write!(
+                f,
+                "whole over pre-clone; ranges={ranges} extents={extents} overflowed={overflowed}"
+            ),
+            Self::CaughtUp {
+                ranges,
+                extents,
+                pre_clone_us,
+            } => write!(
+                f,
+                "caught up; ranges={ranges} extents={extents} pre_clone_us={pre_clone_us}"
+            ),
+        }
+    }
+}
+
+/// Makes `destination` the scratch disk as it stands now, its writers drained: from the
+/// pre-clone's write log when its ranges cost less than a whole clone, else by a whole clone.
+fn finish_scratch_clone(
+    destination: RawFd,
+    scratch: RawFd,
+    pre_cloned: Option<PreClone>,
+) -> Result<(u64, ScratchCloneHow), io::Error> {
+    finish_scratch_clone_with(
+        scratch,
+        pre_cloned,
+        |offset, len| clone_scratch_range(destination, scratch, offset, len),
+        || clone_scratch(destination, scratch),
+    )
+}
+
+fn finish_scratch_clone_with(
+    scratch: RawFd,
+    pre_cloned: Option<PreClone>,
+    mut clone_range: impl FnMut(u64, u64) -> Result<(), io::Error>,
+    clone_whole: impl FnOnce() -> Result<u64, io::Error>,
+) -> Result<(u64, ScratchCloneHow), io::Error> {
+    let Some(PreClone {
+        log,
+        clone_us,
+        extents,
+    }) = pre_cloned
+    else {
+        return Ok((clone_whole()?, ScratchCloneHow::Whole));
+    };
+    let written = log.take();
+    let ranges = written.ranges.len();
+    let affordable = u64::try_from(ranges).unwrap_or(u64::MAX)
+        <= CATCH_UP_MAX_RANGES.min(extents.saturating_mul(CATCH_UP_RANGES_PER_TEN_EXTENTS) / 10);
+    if written.overflowed || !affordable {
+        let how = ScratchCloneHow::WholeOverPreClone {
+            ranges,
+            extents,
+            overflowed: written.overflowed,
+        };
+        return Ok((clone_whole()?, how));
+    }
+    let started = get_time_us(ClockType::Monotonic);
+    // SAFETY: stat is plain data.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: scratch is open and stat is writable for the call.
+    if unsafe { libc::fstat(scratch, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let size = u64::try_from(stat.st_size).map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+    for (start, end) in written.ranges {
+        // A range widened past the file's last block ends at the file's end, which
+        // FICLONERANGE accepts unaligned.
+        let end = end.min(size);
+        if start < end {
+            clone_range(start, end - start)?;
+        }
+    }
+    let elapsed = get_time_us(ClockType::Monotonic) - started;
+    Ok((
+        elapsed,
+        ScratchCloneHow::CaughtUp {
+            ranges,
+            extents,
+            pre_clone_us: clone_us,
+        },
+    ))
+}
+
+/// Clones `len` bytes at `offset` of the scratch disk over the same bytes of `destination`.
+fn clone_scratch_range(
+    destination: RawFd,
+    scratch: RawFd,
+    offset: u64,
+    len: u64,
+) -> Result<(), io::Error> {
+    let range = libc::file_clone_range {
+        src_fd: i64::from(scratch),
+        src_offset: offset,
+        src_length: len,
+        dest_offset: offset,
+    };
+    // SAFETY: both descriptors remain open throughout the ioctl, which only reads `range`.
+    if unsafe { libc::ioctl(destination, libc::FICLONERANGE, &range) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The number of extents of `file`, read by a count-only FIEMAP: no extent records are copied.
+fn extent_count(file: RawFd) -> Result<u64, io::Error> {
+    /// struct fiemap without its trailing extent array.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Fiemap {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped_extents: u32,
+        extent_count: u32,
+        reserved: u32,
+    }
+    const FS_IOC_FIEMAP: libc::c_ulong = 0xc020_660b;
+    let mut request = Fiemap {
+        length: u64::MAX,
+        ..Default::default()
+    };
+    // SAFETY: with extent_count 0 the kernel writes only mapped_extents into the live request.
+    if unsafe { libc::ioctl(file, FS_IOC_FIEMAP, &mut request) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(request.mapped_extents))
 }
 
 fn clone_scratch(destination: RawFd, scratch: RawFd) -> Result<u64, io::Error> {

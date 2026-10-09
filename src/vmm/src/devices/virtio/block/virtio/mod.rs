@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod persist;
 pub mod request;
 pub mod test_utils;
+pub mod write_log;
 
 use std::os::fd::RawFd;
 

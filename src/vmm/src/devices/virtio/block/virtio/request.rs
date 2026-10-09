@@ -96,6 +96,8 @@ pub struct PendingRequest {
     data_len: u32,
     status_addr: GuestAddress,
     desc_idx: u16,
+    /// For a write, the device's write log and the byte offset the write targets.
+    written: Option<(std::sync::Arc<super::write_log::WriteLog>, u64)>,
 }
 
 impl PendingRequest {
@@ -146,11 +148,21 @@ impl PendingRequest {
     }
 
     pub fn finish(
-        self,
+        mut self,
         mem: &GuestMemoryMmap,
         res: Result<u32, IoErr>,
         block_metrics: &BlockDeviceMetrics,
     ) -> FinishedRequest {
+        // Every completed write passes here, synchronous or io_uring, after its data is in the
+        // file: the one place a capture's write log learns of it. A failed write is recorded too,
+        // as far as it may have reached the file.
+        if let Some((log, offset)) = self.written.take() {
+            let reached = match &res {
+                Ok(count) => *count,
+                Err(_) => self.data_len,
+            };
+            log.record(offset, u64::from(reached));
+        }
         let status = match (res, self.r#type) {
             (Ok(transferred_data_len), RequestType::In) => {
                 let status = Status::from_data(self.data_len, transferred_data_len, true);
@@ -365,12 +377,29 @@ impl Request {
         self.sector << SECTOR_SHIFT
     }
 
+    /// The pending request a submission completes. A write carries the device's write log
+    /// whether or not it records now: the log decides at completion, once the data is in the
+    /// file, so a write submitted before a recording starts and completed after it is logged.
+    fn to_pending(
+        &self,
+        desc_idx: u16,
+        read_only: bool,
+        log: &std::sync::Arc<super::write_log::WriteLog>,
+    ) -> PendingRequest {
+        let mut pending = self.to_pending_request(desc_idx);
+        if self.r#type == RequestType::Out && !read_only {
+            pending.written = Some((log.clone(), self.offset()));
+        }
+        pending
+    }
+
     fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
         PendingRequest {
             r#type: self.r#type,
             data_len: self.data_len,
             status_addr: self.status_addr,
             desc_idx,
+            written: None,
         }
     }
 
@@ -382,7 +411,7 @@ impl Request {
         mem: &GuestMemoryMmap,
         block_metrics: &BlockDeviceMetrics,
     ) -> ProcessingResult {
-        let pending = self.to_pending_request(desc_idx);
+        let pending = self.to_pending(desc_idx, read_only, &disk.write_log);
         let res = match self.r#type {
             RequestType::In => {
                 let _metric = block_metrics.read_agg.record_latency_metrics();
@@ -451,8 +480,44 @@ mod tests {
                 data_len: 0,
                 status_addr: Default::default(),
                 desc_idx: 0,
+                written: None,
             }
         }
+    }
+
+    /// A write submitted before a capture's recording starts and completed after it is logged:
+    /// the pre-clone may have copied the file before its data landed.
+    #[test]
+    fn a_write_in_flight_when_recording_starts_is_logged_when_it_completes() {
+        let mem = default_mem();
+        let log = std::sync::Arc::new(super::super::write_log::WriteLog::default());
+        let write = |sector| Request {
+            r#type: RequestType::Out,
+            data_len: 4096,
+            status_addr: GuestAddress(0x1000),
+            sector,
+            data_addr: GuestAddress(0x2000),
+        };
+        let in_flight = write(8).to_pending(1, false, &log);
+        let read = Request {
+            r#type: RequestType::In,
+            ..write(16)
+        }
+        .to_pending(2, false, &log);
+        let read_only = write(24).to_pending(3, true, &log);
+        log.start(64, u64::MAX);
+        let metrics = BlockDeviceMetrics::default();
+        in_flight.finish(&mem, Ok(4096), &metrics);
+        read.finish(&mem, Ok(4096), &metrics);
+        read_only.finish(&mem, Ok(4096), &metrics);
+        // A failed write may have reached the file, so it is logged too.
+        write(32)
+            .to_pending(4, false, &log)
+            .finish(&mem, Err(IoErr::ReadOnlyDevice), &metrics);
+        assert_eq!(
+            log.take().ranges,
+            vec![(8 * 512, 8 * 512 + 4096), (32 * 512, 32 * 512 + 4096)]
+        );
     }
 
     /// An unsuccessful GUP/IO completion still owes guest status and used-ring writes. These
@@ -472,6 +537,7 @@ mod tests {
                 data_len: 4096,
                 status_addr,
                 desc_idx: 3,
+                written: None,
             };
             let finished = pending.finish(
                 &mem,

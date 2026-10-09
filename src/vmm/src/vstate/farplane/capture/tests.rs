@@ -177,6 +177,231 @@ fn a_tracked_sample_is_the_kernels_timely_count_or_no_count() {
     );
 }
 
+fn sized_file(len: u64) -> File {
+    let file = TempFile::new().unwrap().into_file();
+    file.set_len(len).unwrap();
+    file
+}
+
+#[test]
+fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone() {
+    let scratch = sized_file(10 * 4096 + 100);
+    let whole = |calls: &std::cell::Cell<u32>| {
+        calls.set(calls.get() + 1);
+        Ok(7)
+    };
+    let pre_clone = |extents, writes: &[(u64, u64)]| {
+        let log = Arc::new(WriteLog::default());
+        log.start(4, u64::MAX);
+        for (offset, len) in writes {
+            log.record(*offset, *len);
+        }
+        Some(PreClone {
+            log,
+            clone_us: 1,
+            extents,
+        })
+    };
+    let wholes = std::cell::Cell::new(0);
+    let never = |_, _| -> io::Result<()> { panic!("caught up") };
+    // No pre-clone: the whole clone, as before.
+    let (_, how) =
+        finish_scratch_clone_with(scratch.as_raw_fd(), None, never, || whole(&wholes)).unwrap();
+    assert_eq!((how, wholes.get()), (ScratchCloneHow::Whole, 1));
+    // Two ranges are within 0.3 per extent of a 7-extent file: caught up, the range past the
+    // last full block cut at the file's end.
+    let mut ranges = vec![];
+    let (_, how) = finish_scratch_clone_with(
+        scratch.as_raw_fd(),
+        pre_clone(7, &[(0, 1), (10 * 4096 + 50, 10)]),
+        |offset, len| {
+            ranges.push((offset, len));
+            Ok(())
+        },
+        || panic!("cloned whole"),
+    )
+    .unwrap();
+    assert_eq!(
+        how,
+        ScratchCloneHow::CaughtUp {
+            ranges: 2,
+            extents: 7,
+            pre_clone_us: 1
+        }
+    );
+    assert_eq!(ranges, [(0, 4096), (10 * 4096, 100)]);
+    // At 6 extents two ranges exceed 0.3 per extent: the catch-up would cost more than the clone.
+    let (_, how) = finish_scratch_clone_with(
+        scratch.as_raw_fd(),
+        pre_clone(6, &[(0, 1), (10 * 4096 + 50, 10)]),
+        never,
+        || whole(&wholes),
+    )
+    .unwrap();
+    assert_eq!(
+        how,
+        ScratchCloneHow::WholeOverPreClone {
+            ranges: 2,
+            extents: 6,
+            overflowed: false
+        }
+    );
+    // A log that overflowed holds nothing to catch up from.
+    let (_, how) = finish_scratch_clone_with(
+        scratch.as_raw_fd(),
+        pre_clone(
+            1 << 20,
+            &[
+                (0, 1),
+                (2 * 4096, 1),
+                (4 * 4096, 1),
+                (6 * 4096, 1),
+                (8 * 4096, 1),
+            ],
+        ),
+        never,
+        || whole(&wholes),
+    )
+    .unwrap();
+    assert_eq!(
+        how,
+        ScratchCloneHow::WholeOverPreClone {
+            ranges: 0,
+            extents: 1 << 20,
+            overflowed: true
+        }
+    );
+    // However many extents, no catch-up exceeds the range cap.
+    let log = Arc::new(WriteLog::default());
+    log.start(1 << 20, u64::MAX);
+    for range in 0..=CATCH_UP_MAX_RANGES {
+        log.record(range * 2 * 4096, 1);
+    }
+    let (_, how) = finish_scratch_clone_with(
+        scratch.as_raw_fd(),
+        Some(PreClone {
+            log,
+            clone_us: 1,
+            extents: u64::MAX / 10,
+        }),
+        never,
+        || whole(&wholes),
+    )
+    .unwrap();
+    assert!(
+        matches!(how, ScratchCloneHow::WholeOverPreClone { ranges: 1025, .. }),
+        "{how}"
+    );
+    // A failed range fails the freeze's clone: never the pre-clone on its own.
+    finish_scratch_clone_with(
+        scratch.as_raw_fd(),
+        pre_clone(1 << 20, &[(0, 1)]),
+        |_, _| Err(io::Error::from_raw_os_error(libc::EIO)),
+        || panic!("cloned whole"),
+    )
+    .unwrap_err();
+}
+
+/// On a reflink filesystem (FARPLANE_REFLINK_DIR, e.g. XFS on a slot): a pre-clone taken while
+/// a writer runs, caught up from its log after the writer drains, equals a whole clone taken at
+/// that instant, byte for byte. The writer logs each write when it completes, as a block device
+/// does, including one in flight when the log starts and one that ends in the file's partial
+/// last block. Skips without the directory.
+#[test]
+fn a_caught_up_pre_clone_equals_a_whole_clone_at_the_freeze() {
+    use std::io::Read;
+    use std::os::unix::fs::FileExt;
+    let Ok(dir) = std::env::var("FARPLANE_REFLINK_DIR") else {
+        eprintln!("skipped: set FARPLANE_REFLINK_DIR to a reflink filesystem");
+        return;
+    };
+    let path =
+        |name: &str| std::path::Path::new(&dir).join(format!("{name}-{}", std::process::id()));
+    let open = |name: &str| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path(name))
+            .unwrap()
+    };
+    let size = 64 * 1024 * 1024 + 1234;
+    let live = open("live");
+    live.set_len(size).unwrap();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // Fragment the live file: fill it, share it, then rewrite scattered blocks.
+    live.write_all_at(&vec![0x11; usize::try_from(size).unwrap()], 0)
+        .unwrap();
+    let shadow = open("shadow");
+    clone_scratch(shadow.as_raw_fd(), live.as_raw_fd()).unwrap();
+    for _ in 0..3000 {
+        let block = next() % (size / 4096);
+        live.write_all_at(&next().to_le_bytes().repeat(512), block * 4096)
+            .unwrap();
+    }
+    live.sync_all().unwrap();
+    let log = Arc::new(WriteLog::default());
+    let write = |log: &WriteLog, offset: u64, len: u64| {
+        let byte = u8::try_from((offset ^ len) % 251).unwrap() + 1;
+        live.write_all_at(&vec![byte; usize::try_from(len).unwrap()], offset)
+            .unwrap();
+        log.record(offset, len);
+    };
+    // A write submitted before the log starts lands after the pre-clone: its completion logs it.
+    let in_flight = (5 * 4096 + 7, 300);
+    log.start(1 << 20, u64::MAX);
+    let destination = open("destination");
+    let clone_us = clone_scratch(destination.as_raw_fd(), live.as_raw_fd()).unwrap();
+    write(&log, in_flight.0, in_flight.1);
+    for _ in 0..500 {
+        let offset = next() % size;
+        let len = (1 + next() % (256 * 1024)).min(size - offset);
+        write(&log, offset, len);
+    }
+    // A write into the file's partial last block.
+    write(&log, size - 100, 100);
+    live.sync_all().unwrap();
+    let extents = extent_count(live.as_raw_fd()).unwrap();
+    assert!(extents > 2000, "the live file has only {extents} extents");
+    let pre_cloned = Some(PreClone {
+        log,
+        clone_us,
+        extents,
+    });
+    let (_, how) =
+        finish_scratch_clone(destination.as_raw_fd(), live.as_raw_fd(), pre_cloned).unwrap();
+    assert!(matches!(how, ScratchCloneHow::CaughtUp { .. }), "{how}");
+    let reference = open("reference");
+    clone_scratch(reference.as_raw_fd(), live.as_raw_fd()).unwrap();
+    let read = |mut file: &File| {
+        let mut bytes = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut bytes).unwrap();
+        bytes
+    };
+    let (live_bytes, dest_bytes, ref_bytes) = (read(&live), read(&destination), read(&reference));
+    let first_difference = live_bytes.iter().zip(&dest_bytes).position(|(a, b)| a != b);
+    assert_eq!(
+        (dest_bytes.len(), first_difference),
+        (live_bytes.len(), None),
+        "the caught-up destination differs from the live file"
+    );
+    assert!(
+        dest_bytes == ref_bytes,
+        "the caught-up destination differs from a whole clone"
+    );
+    for name in ["live", "shadow", "destination", "reference"] {
+        std::fs::remove_file(path(name)).unwrap();
+    }
+}
+
 #[test]
 fn serialization_and_create_run_once_per_epoch() {
     let mut order = EpochOrder::default();

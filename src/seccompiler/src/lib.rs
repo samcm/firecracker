@@ -312,6 +312,26 @@ mod tests {
                 if result != -1 || *libc::__errno_location() != libc::EBADF {
                     libc::_exit(93);
                 }
+                // FICLONERANGE, which catches a pre-cloned scratch disk up inside the freeze.
+                let result = libc::syscall(
+                    libc::SYS_ioctl,
+                    -1_i64,
+                    0x4020_940d_u64,
+                    std::ptr::null::<u8>(),
+                );
+                if result != -1 || *libc::__errno_location() != libc::EBADF {
+                    libc::_exit(95);
+                }
+                // FS_IOC_FIEMAP, which counts the scratch disk's extents at a pre-clone.
+                let result = libc::syscall(
+                    libc::SYS_ioctl,
+                    -1_i64,
+                    0xc020_660b_u64,
+                    std::ptr::null::<u8>(),
+                );
+                if result != -1 || *libc::__errno_location() != libc::EBADF {
+                    libc::_exit(96);
+                }
                 // MV_IOC_TRACK_INFO2, which counts the same capture without RESIDENT on fpmv4.
                 let result = libc::syscall(
                     libc::SYS_ioctl,

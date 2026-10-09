@@ -570,6 +570,32 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Used to catch the pre-cloned scratch disk up with the ranges written since, during a capture",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1075876877,
+                        "comment": "FICLONERANGE"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Used to count the scratch disk's extents when a capture pre-clones it",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3223348747,
+                        "comment": "FS_IOC_FIEMAP"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "args": [
                     {
                         "index": 1,

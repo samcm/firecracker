@@ -59,6 +59,8 @@ pub struct DiskProperties {
     pub file_engine: FileEngine,
     pub nsectors: u64,
     pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    /// The writes that reached the backing file while a capture records them.
+    pub write_log: std::sync::Arc<super::write_log::WriteLog>,
 }
 
 impl DiskProperties {
@@ -112,6 +114,7 @@ impl DiskProperties {
                 .map_err(VirtioBlockError::FileEngine)?,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id,
+            write_log: Default::default(),
         })
     }
 
