@@ -97,10 +97,13 @@ pub enum MsgType {
     /// version. Firecracker answers with `tracked` (tracked=0).
     Untrack = 25,
     /// Pagemaster hands over the memversion device, and the imported version for a lazily
-    /// imported guest, and asks for the guest's memory to be tracked from now on.
+    /// imported guest, and asks for the guest's memory to be tracked from now on. The body is
+    /// empty or one LE u64 bound in pages (empty means u64::MAX); see `Tracked`.
     Track = 28,
     /// Firecracker reports the tracker: LE u32 tracked, u32 depth, u64 dirty pages, u64
-    /// standing version id.
+    /// standing version id, u64 included pages. Included pages is exactly what the next CREATE
+    /// would newly retain when the guest is quiesced and dirty pages exceed the Track bound, and
+    /// equals dirty pages (an upper bound) otherwise. An untracked reply is zero after `tracked`.
     Tracked = 29,
     /// Pagemaster asks for the standing version to be refreshed while the guest runs.
     Refresh = 30,
@@ -580,6 +583,15 @@ pub fn parse_free_summary_budget(body: &[u8]) -> Result<u64, ChannelError> {
         return Err(ChannelError::Malformed);
     }
     Ok(budget)
+}
+
+/// Parses the bound of a Track request: one LE u64 in pages, or an empty body for no bound.
+pub fn parse_track_bound(body: &[u8]) -> Result<u64, ChannelError> {
+    match body.len() {
+        0 => Ok(u64::MAX),
+        8 => Ok(u64::from_le_bytes(body.try_into().unwrap())),
+        _ => Err(ChannelError::Malformed),
+    }
 }
 
 /// Parsed `backing_plan` body.
