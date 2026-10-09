@@ -290,8 +290,23 @@ pub(crate) fn geometry(regions: &[RegionRecord]) -> io::Result<Vec<Region>> {
         .collect()
 }
 
+/// The runs a capture excludes, and what the run limit left out.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Exclusions {
+    /// Sorted by region then offset, disjoint, at most [`MAX_EXCLUSIONS`]: what CREATE and
+    /// TRACK_INFO2 are both given.
+    pub runs: Vec<Exclusion>,
+    /// The runs the bitmaps hold, `runs.len()` unless the limit dropped some.
+    pub found: usize,
+    /// Free pages in the dropped runs: copied rather than excluded.
+    pub dropped_pages: u64,
+}
+
 /// Exclude only reported-free pages with no subsequent KVM, ring or host write evidence.
-/// If fragmentation exceeds the ABI limit, fail before CREATE; never truncate the bitmap.
+///
+/// More runs than CREATE takes keep the [`MAX_EXCLUSIONS`] longest (ties to the lower address)
+/// and drop the rest: a dropped free page is copied, which is always correct, only more bytes.
+/// The choice is a function of the bitmaps alone, so Track's count and CREATE agree.
 ///
 /// Runs inside a capture's freeze, so it works a bitmap word at a time: a word costs one step
 /// plus one per run edge in it, never one per page.
@@ -299,12 +314,38 @@ pub(crate) fn exclusions(
     regions: &[Region],
     free: &[Vec<u64>],
     dirty: &[Vec<u64>],
-) -> io::Result<Vec<Exclusion>> {
+) -> io::Result<Exclusions> {
+    exclusions_within(regions, free, dirty, MAX_EXCLUSIONS)
+}
+
+/// Keeps the `limit` longest of `runs`, ties to the lower address; returns the bytes dropped.
+fn keep_longest(runs: &mut Vec<Exclusion>, limit: usize) -> u64 {
+    if runs.len() <= limit {
+        return 0;
+    }
+    // A total order (runs are disjoint), so the kept set does not depend on the input order.
+    let rank = |x: &Exclusion| (std::cmp::Reverse(x.len), x.region, x.offset);
+    if limit > 0 {
+        runs.select_nth_unstable_by_key(limit - 1, rank);
+    }
+    let dropped = runs[limit..].iter().map(|x| x.len).sum();
+    runs.truncate(limit);
+    dropped
+}
+
+fn exclusions_within(
+    regions: &[Region],
+    free: &[Vec<u64>],
+    dirty: &[Vec<u64>],
+    limit: usize,
+) -> io::Result<Exclusions> {
     let page = crate::arch::host_page_size() as u64;
     if free.len() != regions.len() || dirty.len() != regions.len() {
         return Err(invalid());
     }
     let mut out = Vec::new();
+    let mut found = 0usize;
+    let mut dropped = 0u64;
     for (index, region) in regions.iter().enumerate() {
         let pages = region.len / page;
         let words = usize::try_from(pages.div_ceil(64)).map_err(|_| invalid())?;
@@ -312,17 +353,18 @@ pub(crate) fn exclusions(
             return Err(invalid());
         }
         let region_index = u32::try_from(index).map_err(|_| invalid())?;
+        // Candidates stay below twice the limit: past it, only the longest can still be kept.
         let mut push = |start: u64, end: u64| {
-            if out.len() == MAX_EXCLUSIONS {
-                return Err(invalid());
-            }
+            found += 1;
             out.push(Exclusion {
                 region: region_index,
                 reserved: 0,
                 offset: start * page,
                 len: (end - start) * page,
             });
-            Ok(())
+            if out.len() >= limit.saturating_mul(2).max(1) {
+                dropped += keep_longest(&mut out, limit);
+            }
         };
         // The first page of the run still open at the current bit, which may continue from an
         // earlier word.
@@ -347,7 +389,7 @@ pub(crate) fn exclusions(
                     Some(start) => {
                         at += rest.trailing_ones();
                         if at < 64 {
-                            push(start, first + u64::from(at))?;
+                            push(start, first + u64::from(at));
                             run = None;
                         }
                     }
@@ -355,10 +397,18 @@ pub(crate) fn exclusions(
             }
         }
         if let Some(start) = run {
-            push(start, pages)?;
+            push(start, pages);
         }
     }
-    Ok(out)
+    dropped += keep_longest(&mut out, limit);
+    if out.len() < found {
+        out.sort_unstable_by_key(|x| (x.region, x.offset));
+    }
+    Ok(Exclusions {
+        runs: out,
+        found,
+        dropped_pages: dropped / page,
+    })
 }
 
 pub(crate) fn info(fd: BorrowedFd<'_>) -> io::Result<Vec<Region>> {
@@ -1495,7 +1545,8 @@ mod tests {
             &[vec![0b11111], vec![1]],
             &[vec![0b00100], vec![0]],
         )
-        .unwrap();
+        .unwrap()
+        .runs;
         assert_eq!(
             runs,
             vec![
@@ -1581,8 +1632,10 @@ mod tests {
             .map(|region| usize::try_from((region.len / page).div_ceil(64)).unwrap())
             .collect();
         let check = |free: &[Vec<u64>], dirty: &[Vec<u64>]| {
+            let built = exclusions(&regions, free, dirty).unwrap();
+            assert_eq!((built.found, built.dropped_pages), (built.runs.len(), 0));
             assert_eq!(
-                exclusions(&regions, free, dirty).unwrap(),
+                built.runs,
                 exclusions_by_page(&regions, free, dirty),
                 "free={free:x?} dirty={dirty:x?}"
             );
@@ -1629,26 +1682,206 @@ mod tests {
             let dirty = bitmap(false);
             check(&free, &dirty);
         }
-        // A run limit is still enforced: one more run than CREATE takes fails, never truncates.
-        let alternating = Region {
+    }
+
+    /// The runs a limit keeps, by brute force: every run, longest first then by address.
+    fn longest_by_page(
+        regions: &[Region],
+        free: &[Vec<u64>],
+        dirty: &[Vec<u64>],
+        limit: usize,
+    ) -> Vec<Exclusion> {
+        let mut all = exclusions_by_page(regions, free, dirty);
+        all.sort_by(|a, b| {
+            b.len
+                .cmp(&a.len)
+                .then((a.region, a.offset).cmp(&(b.region, b.offset)))
+        });
+        all.truncate(limit);
+        all.sort_by_key(|x| (x.region, x.offset));
+        all
+    }
+
+    /// Pages set in `written` outside `runs`, one page at a time.
+    fn retained_by_page(regions: &[Region], written: &[Vec<u64>], runs: &[Exclusion]) -> u64 {
+        let page = crate::arch::host_page_size() as u64;
+        let mut count = 0;
+        for (index, region) in regions.iter().enumerate() {
+            for p in 0..region.len / page {
+                let set = written[index][usize::try_from(p / 64).unwrap()] & (1 << (p % 64)) != 0;
+                let excluded = runs.iter().any(|x| {
+                    x.region as usize == index
+                        && (x.offset / page..(x.offset + x.len) / page).contains(&p)
+                });
+                count += u64::from(set && !excluded);
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn over_the_run_limit_the_longest_runs_are_kept_and_counted_exactly() {
+        let page = crate::arch::host_page_size() as u64;
+        let regions = [
+            Region {
+                addr: GUEST_RAM_BASE,
+                len: 640 * page,
+            },
+            Region {
+                addr: GUEST_RAM_BASE + (1 << 30),
+                len: 197 * page,
+            },
+        ];
+        let words = [10, 4];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..300 {
+            let mut bitmap = |sparse: bool| -> Vec<Vec<u64>> {
+                words
+                    .iter()
+                    .map(|&n| {
+                        (0..n)
+                            .map(|_| {
+                                if sparse {
+                                    next() & next()
+                                } else {
+                                    next() | next()
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let (free, dirty) = (bitmap(false), bitmap(true));
+            let mut written = bitmap(round % 2 == 0);
+            // As written_pages gives it: nothing past a region's last page.
+            *written[1].last_mut().unwrap() &= (1 << (197 % 64)) - 1;
+            let all = exclusions_by_page(&regions, &free, &dirty);
+            // Limits below, at and above the candidate compaction point.
+            for limit in [1, 3, all.len() / 3, all.len() / 2, all.len() - 1, all.len()] {
+                let built = exclusions_within(&regions, &free, &dirty, limit).unwrap();
+                let kept = longest_by_page(&regions, &free, &dirty, limit);
+                assert_eq!(built.runs, kept, "round {round} limit {limit}");
+                assert_eq!(built.found, all.len());
+                let dropped: u64 = all.iter().map(|x| x.len / page).sum::<u64>()
+                    - kept.iter().map(|x| x.len / page).sum::<u64>();
+                assert_eq!(built.dropped_pages, dropped);
+                // What CREATE would retain against the kept runs, as the residency count gives it.
+                assert_eq!(
+                    newly_retained(&regions, written.clone(), &built.runs).unwrap(),
+                    retained_by_page(&regions, &written, &built.runs)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_guest_with_more_runs_than_create_takes_still_captures() {
+        let page = crate::arch::host_page_size() as u64;
+        // One more run than the ABI takes: single pages, 32 to a word, except one 64-page run in
+        // the middle (two words) that the limit must keep. The dropped run is the last single
+        // page, the highest address among the shortest.
+        let words = MAX_EXCLUSIONS as u64 / 32 + 2;
+        let pages = words * 64;
+        let region = Region {
             addr: GUEST_RAM_BASE,
-            len: 2 * (MAX_EXCLUSIONS as u64 + 1) * page,
+            len: pages * page,
         };
-        let n = usize::try_from((alternating.len / page).div_ceil(64)).unwrap();
-        let free = vec![vec![0x5555_5555_5555_5555; n]];
-        let dirty = vec![vec![0; n]];
-        exclusions(&[alternating], &free, &dirty).unwrap_err();
-        let fits = Region {
-            len: 2 * MAX_EXCLUSIONS as u64 * page,
-            ..alternating
-        };
-        let n = usize::try_from(fits.len / page / 64).unwrap();
+        let n = usize::try_from(pages.div_ceil(64)).unwrap();
+        let mut free = vec![0x5555_5555_5555_5555u64; n];
+        free[n / 2] = u64::MAX;
+        free[n / 2 + 1] = 0;
+        let built = exclusions(&[region], &[free.clone()], &[vec![0; n]]).unwrap();
         assert_eq!(
-            exclusions(&[fits], &[vec![0x5555_5555_5555_5555; n]], &[vec![0; n]])
-                .unwrap()
-                .len(),
-            MAX_EXCLUSIONS
+            (built.runs.len(), built.found),
+            (MAX_EXCLUSIONS, MAX_EXCLUSIONS + 1)
         );
+        assert_eq!(built.dropped_pages, 1);
+        assert!(built.runs.iter().any(|x| x.len == 64 * page));
+        assert_eq!(built.runs.last().unwrap().offset, (pages - 4) * page);
+        assert!(!built.runs.iter().any(|x| x.offset == (pages - 2) * page));
+        // CREATE and TRACK_INFO2 both take the list as it is.
+        create_flags_with(&[region], &built.runs, MV_CREATE_TRACKED, |request| {
+            assert_eq!(request.nr_exclusions as usize, MAX_EXCLUSIONS);
+            request.fd = std::fs::File::open("/dev/null")?.into_raw_fd();
+            Ok(())
+        })
+        .unwrap();
+        included_pages_with(
+            &built.runs,
+            |request| {
+                assert_eq!(request.nr_exclusions as usize, MAX_EXCLUSIONS);
+                Ok(())
+            },
+            || panic!("walked residency"),
+        )
+        .unwrap();
+    }
+
+    /// On a memversion host (any device ABI): an untracked CREATE of a guest with more free runs
+    /// than the ABI takes succeeds, and its version holds zero in the kept runs and the source's
+    /// bytes everywhere else, the dropped run included. Skips where the device is absent.
+    #[test]
+    fn a_capture_over_the_run_limit_on_the_host_kernel_copies_the_dropped_runs() {
+        let Ok(device) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/memversion_v1")
+        else {
+            eprintln!("skipped: requires the pinned memversion host");
+            return;
+        };
+        let page = crate::arch::host_page_size() as u64;
+        let words = MAX_EXCLUSIONS as u64 / 32 + 2;
+        let pages = words * 64;
+        let regions = [Region {
+            addr: GUEST_RAM_BASE,
+            len: pages * page,
+        }];
+        let source = map_regions(&regions, None).unwrap();
+        let at = |p: u64| (GUEST_RAM_BASE + p * page) as *mut u64;
+        for p in 0..pages {
+            // SAFETY: every page lies in the live, writable source mapping.
+            unsafe { at(p).write(p + 1) };
+        }
+        let n = usize::try_from(words).unwrap();
+        let mut free = vec![0x5555_5555_5555_5555u64; n];
+        let long = u64::try_from(n / 2).unwrap() * 64;
+        free[n / 2] = u64::MAX;
+        free[n / 2 + 1] = 0;
+        let built = exclusions(&regions, &[free], &[vec![0; n]]).unwrap();
+        assert_eq!(
+            (built.runs.len(), built.found),
+            (MAX_EXCLUSIONS, MAX_EXCLUSIONS + 1)
+        );
+        let excluded: u64 = built.runs.iter().map(|x| x.len / page).sum();
+
+        let version = create(device.as_fd(), &regions, &built.runs).unwrap();
+        let info = info2(version.as_fd()).unwrap();
+        assert_eq!(info.excluded_pages, excluded, "{info:?}");
+        // Every other page, the dropped run's included, is captured and newly retained: it is
+        // what pagemaster charges the capture for.
+        assert_eq!(info.present_pages, pages - excluded, "{info:?}");
+        assert_eq!(info.new_pages, pages - excluded, "{info:?}");
+        drop(source);
+
+        let imported = map_regions(&regions, Some(version.as_fd())).unwrap();
+        // SAFETY: every page lies in the live imported mapping.
+        let read = |p: u64| unsafe { at(p).read() };
+        // A kept single-page run, the long run and the last kept run read zero.
+        for p in [0, long, long + 63, pages - 4] {
+            assert_eq!(read(p), 0, "page {p} was excluded");
+        }
+        // Pages never free, and the dropped run's page, hold the source's bytes.
+        for p in [1, long + 64, pages - 3, pages - 2, pages - 1] {
+            assert_eq!(read(p), p + 1, "page {p} was captured");
+        }
+        drop(imported);
     }
 
     #[test]
