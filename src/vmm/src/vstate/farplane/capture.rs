@@ -37,8 +37,9 @@ struct EpochOrder {
 }
 
 impl EpochOrder {
-    fn open(&mut self) {
+    fn open(&mut self, replies: &mut ReplyCache) {
         self.result = None;
+        replies.release_versions();
     }
 }
 
@@ -158,6 +159,15 @@ impl ReplyCache {
     fn acknowledge_before(&mut self, request_id: u64) {
         for answer in self.answers.iter_mut() {
             if answer.request_id < request_id && answer.version.take().is_some() {
+                answer.version_released = true;
+            }
+        }
+    }
+    /// Reset ends descriptor replay even if no newer request has acknowledged the answer.
+    /// Keep its identity so a late retry is refused, never silently recaptured.
+    fn release_versions(&mut self) {
+        for answer in &mut self.answers {
+            if answer.version.take().is_some() {
                 answer.version_released = true;
             }
         }
@@ -487,6 +497,7 @@ impl CaptureService {
             self.standing = None;
             info!("Farplane untracked guest memory");
         }
+        self.order.open(&mut self.replies);
         self.reply(
             request_id,
             MsgType::Tracked,
@@ -579,7 +590,7 @@ impl CaptureService {
         }
         let drain_clone_us = at();
         drop(vmm);
-        self.order.open();
+        self.order.open(&mut self.replies);
         BackendState::Quiesced.store();
         info!(
             "Farplane quiesce timing gate_close_us={gate_us} vmm_lock_us={lock_us} \
@@ -694,7 +705,7 @@ impl CaptureService {
         let running = vmm.instance_info.state == VmState::Running;
         drop(vmm);
         self.buffers = None;
-        self.order.open();
+        self.order.open(&mut self.replies);
         set_capture_buffers_armed(false);
         BackendState::Ready.store();
         dispatch::gate().open();
