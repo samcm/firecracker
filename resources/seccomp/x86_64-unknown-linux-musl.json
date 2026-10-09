@@ -748,6 +748,19 @@
                 ]
             },
             {
+                "syscall": "ioctl",
+                "comment": "Count the guest pages a quiesced tracked capture would fold, against its exclusions",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3225441866,
+                        "comment": "MV_TRACK_INFO2 (0xc040564a)"
+                    }
+                ]
+            },
+            {
                 "syscall": "sched_yield",
                 "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
             },

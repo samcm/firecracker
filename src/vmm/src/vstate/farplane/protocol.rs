@@ -104,6 +104,7 @@ pub enum MsgType {
     /// standing version id, u64 included pages. Included pages is exactly what the next CREATE
     /// would newly retain when the guest is quiesced and dirty pages exceed the Track bound, and
     /// equals dirty pages (an upper bound) otherwise. An untracked reply is zero after `tracked`.
+    /// An fpmv4 kernel counts it (MV_IOC_TRACK_INFO2); an older one is counted by residency.
     Tracked = 29,
     /// Pagemaster asks for the standing version to be refreshed while the guest runs.
     Refresh = 30,
