@@ -533,7 +533,7 @@ impl CaptureService {
             let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
             memversion::exclusions(&regions, &free, &dirty)?
         };
-        memversion::included_pages(tracker, &regions, &exclusions)
+        memversion::included_pages(tracker, &regions, &exclusions.runs)
     }
 
     /// Folds what the guest wrote since the standing version into a new one, without a pause.
@@ -741,7 +741,17 @@ impl CaptureService {
                 let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
                 let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
                 let regions = memversion::geometry(&channel.regions)?;
-                let exclusions = memversion::exclusions(&regions, &free, &dirty)?;
+                let memversion::Exclusions {
+                    runs: exclusions,
+                    found,
+                    dropped_pages,
+                } = memversion::exclusions(&regions, &free, &dirty)?;
+                // One line per capture, so how close guests come to the run limit is visible.
+                info!(
+                    "Ramet capture excludes {} of {found} free runs; {dropped_pages} free \
+                     pages in dropped runs are copied",
+                    exclusions.len()
+                );
                 if tracker.is_none() {
                     return memversion::create(device.as_fd(), &regions, &exclusions);
                 }
