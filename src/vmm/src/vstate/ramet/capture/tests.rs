@@ -1161,3 +1161,86 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     assert_eq!(body[16..24], [3, 0, 0, 0, 4, 0, 0, 0]);
     assert_eq!(body[24..], 7u64.to_le_bytes());
 }
+
+#[test]
+fn rearm_frames_numbers_and_bodies() {
+    assert_eq!(
+        [MsgType::Rearm, MsgType::Rearmed].map(|msg| msg as u16),
+        [32, 33]
+    );
+    for value in 32..=33 {
+        assert_eq!(MsgType::from_u16(value).unwrap() as u16, value);
+    }
+    assert_eq!(MsgType::from_u16(34), None);
+    assert_eq!(ErrorCode::RearmFailed as u32, 34);
+    // Rearm carries the flat version and nothing else.
+    validate_command(MsgType::Rearm, 0, 1).unwrap();
+    validate_command(MsgType::Rearm, 0, 0).unwrap_err();
+    validate_command(MsgType::Rearm, 0, 2).unwrap_err();
+    validate_command(MsgType::Rearm, 8, 1).unwrap_err();
+    // The reply is one only Firecracker sends.
+    validate_command(MsgType::Rearmed, 0, 0).unwrap_err();
+}
+
+#[test]
+fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("SKIP: real capture dispatcher requires /dev/kvm");
+        return;
+    }
+    let vmm = Arc::new(Mutex::new(crate::builder::tests::default_vmm()));
+    let (sock, peer) = UnixStream::pair().unwrap();
+    let mut service = CaptureService {
+        channel: MemoryChannel {
+            sock,
+            regions: vec![protocol::RegionRecord {
+                guest_addr: 0,
+                size: 128 * 1024 * 1024,
+            }],
+        },
+        vmm,
+        vm_info: VmInfo::default(),
+        buffers: None,
+        order: EpochOrder::default(),
+        replies: ReplyCache::default(),
+        pending: None,
+        tracker: None,
+        standing: None,
+    };
+    let previous_state = BackendState::load();
+    let flat = memfd(c"flat", 0);
+    let rearm = |service: &mut CaptureService, id| {
+        protocol::send_frame(&peer, MsgType::Rearm, id, &[], &[flat.as_raw_fd()]).unwrap();
+        service.serve_one().unwrap();
+        let reply = protocol::recv_frame(&peer).unwrap();
+        assert_eq!(reply.header.msg(), MsgType::Error);
+        assert!(reply.fds.is_empty());
+        assert_eq!(
+            reply.body[..4],
+            (ErrorCode::RearmFailed as u32).to_le_bytes()
+        );
+    };
+
+    // Nothing is tracked, so there is no tracker to move.
+    BackendState::Ready.store();
+    rearm(&mut service, 1);
+    assert!(service.standing.is_none());
+
+    // A guest quiesced for a capture is never rearmed: CREATE may be about to move the standing
+    // version, and memory plane sends Rearm only after the resume.
+    let standing = Arc::new(memfd(c"standing", 0));
+    service.tracker = Some(memfd(c"device", 0));
+    service.standing = Some(standing.clone());
+    BackendState::Quiesced.store();
+    rearm(&mut service, 2);
+    assert!(Arc::ptr_eq(service.standing.as_ref().unwrap(), &standing));
+
+    // The kernel refusing the swap (here: a descriptor that is not the device) leaves the
+    // tracker and the standing version where they were, so memory plane's Untrack still releases
+    // the version the tracker stands on.
+    BackendState::Ready.store();
+    rearm(&mut service, 3);
+    assert!(service.tracker.is_some());
+    assert!(Arc::ptr_eq(service.standing.as_ref().unwrap(), &standing));
+    previous_state.store();
+}
