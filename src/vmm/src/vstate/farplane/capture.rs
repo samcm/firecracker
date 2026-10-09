@@ -266,6 +266,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Track => (&[0, 8], &[1, 2]),
         MsgType::Refresh => (&[0], &[0]),
         MsgType::Untrack => (&[0], &[0]),
+        MsgType::Rearm => (&[0], &[1]),
         _ => return Err(ChannelError::Malformed),
     };
     if !lens.contains(&body_len) || !counts.contains(&fd_count) {
@@ -462,6 +463,7 @@ impl CaptureService {
             MsgType::Track => self.track(incoming),
             MsgType::Refresh => self.refresh(request_id),
             MsgType::Untrack => self.untrack(request_id),
+            MsgType::Rearm => self.rearm(incoming),
             _ => Err(ChannelError::Malformed),
         }
     }
@@ -696,6 +698,31 @@ impl CaptureService {
             MsgType::Tracked,
             &encode_tracked(&memversion::TrackInfo::default(), 0),
         )
+    }
+
+    /// Moves the tracker onto `flat`, the flat version pagemaster made of the standing version
+    /// after a transient capture published, so the next capture folds onto a version its source
+    /// keeps instead of one that leaves the node. Runs while the guest runs: the kernel swaps one
+    /// reference under the tracker's lock and touches no dirty bit, which stay valid because
+    /// `flat` holds the same content. The kernel refuses a version whose content is not the
+    /// standing version's, so a standing version moved by another CREATE is never replaced. Any
+    /// refusal changes nothing and pagemaster untracks instead.
+    fn rearm(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
+        let request_id = incoming.header.request_id;
+        let [flat] = <[_; 1]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+        let Some(tracker) = self.tracker.as_ref() else {
+            return self.reject(request_id, ErrorCode::RearmFailed, MsgType::Rearm);
+        };
+        if BackendState::load() != BackendState::Ready {
+            return self.reject(request_id, ErrorCode::RearmFailed, MsgType::Rearm);
+        }
+        if let Err(err) = memversion::rebase(tracker.as_fd(), flat.as_fd()) {
+            error!("Farplane could not rearm the memory tracker: {err}");
+            return self.reject(request_id, ErrorCode::RearmFailed, MsgType::Rearm);
+        }
+        info!("Farplane rearmed the memory tracker on a flat version");
+        self.standing = Some(Arc::new(flat));
+        self.reply(request_id, MsgType::Rearmed, &[])
     }
 
     fn arm_buffers(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
