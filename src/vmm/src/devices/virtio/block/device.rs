@@ -66,6 +66,13 @@ impl Block {
         }
     }
 
+    /// The device's write log, which a capture records the scratch disk's writes into.
+    pub fn write_log(&self) -> Arc<super::virtio::write_log::WriteLog> {
+        match self {
+            Self::Virtio(b) => b.disk.write_log.clone(),
+        }
+    }
+
     pub fn root_device(&self) -> bool {
         match self {
             Self::Virtio(b) => b.root_device,
