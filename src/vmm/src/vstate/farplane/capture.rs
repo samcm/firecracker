@@ -266,6 +266,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Track => (&[0, 8], &[1, 2]),
         MsgType::Refresh => (&[0], &[0]),
         MsgType::Untrack => (&[0], &[0]),
+        MsgType::TrackSample => (&[0], &[0]),
         _ => return Err(ChannelError::Malformed),
     };
     if !lens.contains(&body_len) || !counts.contains(&fd_count) {
@@ -409,6 +410,7 @@ impl CaptureService {
             MsgType::Track => self.track(incoming),
             MsgType::Refresh => self.refresh(request_id),
             MsgType::Untrack => self.untrack(request_id),
+            MsgType::TrackSample => self.track_sample(request_id),
             _ => Err(ChannelError::Malformed),
         }
     }
@@ -509,6 +511,63 @@ impl CaptureService {
         } else {
             (info, info.dirty_pages)
         };
+        self.reply(
+            request_id,
+            MsgType::Tracked,
+            &encode_tracked(&info, included),
+        )
+    }
+
+    /// Samples, while the guest runs, what the next quiesced CREATE would fold against the
+    /// exclusions it would get now: the estimate pagemaster sizes a tracked capture's charge by.
+    /// Never waits: a busy VMM lock or any state but Ready is a refusal for this sample only.
+    /// The log reads keep every bit for the next harvest, so a later quiesce is unaffected.
+    /// Untracked, or a kernel without TRACK_INFO2, answers untracked: no sample.
+    fn track_sample(&mut self, request_id: u64) -> Result<(), ChannelError> {
+        if BackendState::load() != BackendState::Ready {
+            return self.reject(request_id, ErrorCode::TrackFailed, MsgType::TrackSample);
+        }
+        let Some(tracker) = self.tracker.as_ref() else {
+            return self.reply(
+                request_id,
+                MsgType::Tracked,
+                &encode_tracked(&memversion::TrackInfo::default(), 0),
+            );
+        };
+        let started = Instant::now();
+        let exclusions = memversion::geometry(&self.channel.regions).and_then(|regions| {
+            let vmm = self
+                .vmm
+                .try_lock()
+                .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
+            let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
+            let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
+            let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
+            Ok((memversion::exclusions(&regions, &free, &dirty)?, regions))
+        });
+        let (exclusions, regions) = match exclusions {
+            Ok(built) => built,
+            Err(err) => {
+                info!("Farplane could not sample the tracked capture size: {err}");
+                return self.reject(request_id, ErrorCode::TrackFailed, MsgType::TrackSample);
+            }
+        };
+        let sampled = memversion::track_sample(tracker.as_fd(), &regions, &exclusions.runs);
+        let (info, included) = match sampled {
+            Ok(Some((info, included))) => (info, included),
+            Ok(None) => (memversion::TrackInfo::default(), 0),
+            Err(err) => {
+                info!("Farplane could not sample the tracked capture size: {err}");
+                (memversion::TrackInfo::default(), 0)
+            }
+        };
+        if info.tracked != 0 {
+            info!(
+                "Farplane sampled {included} of {} dirty pages for the next CREATE in {} us",
+                info.dirty_pages,
+                started.elapsed().as_micros()
+            );
+        }
         self.reply(
             request_id,
             MsgType::Tracked,

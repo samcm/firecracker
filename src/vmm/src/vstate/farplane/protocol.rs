@@ -24,7 +24,7 @@ pub const MAX_SCM_FDS: usize = 253;
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
 /// the handshake and the capture command order a peer must speak.
-pub const FEATURE_IDENTITY: &str = "farplane/9";
+pub const FEATURE_IDENTITY: &str = "farplane/10";
 /// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
 /// it was captured under. It changes only when those do, so a channel change alone leaves every
 /// stored vmstate restorable.
@@ -111,6 +111,12 @@ pub enum MsgType {
     /// Firecracker returns the new standing version: LE u64 own pages, u64 new pages,
     /// u32 depth, u32 zero runs, u64 folded pages.
     Refreshed = 31,
+    /// Pagemaster asks, while the guest runs, how many pages the next quiesced CREATE would
+    /// fold against the exclusions it would get now. Empty body. Firecracker answers with
+    /// `tracked`: an exact included count needs a tracked guest and a kernel with
+    /// MV_IOC_TRACK_INFO2; otherwise the reply is untracked (tracked=0), meaning no sample.
+    /// Since farplane/10; tags 32 and 33 are Rearm/Rearmed on another branch.
+    TrackSample = 34,
 }
 
 impl MsgType {
@@ -137,6 +143,7 @@ impl MsgType {
             29 => Some(Self::Tracked),
             30 => Some(Self::Refresh),
             31 => Some(Self::Refreshed),
+            34 => Some(Self::TrackSample),
             // Reserved /6 tags, including 18-21, must never be interpreted as /8 commands.
             _ => None,
         }
@@ -950,6 +957,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/9");
+        assert_eq!(FEATURE_IDENTITY, "farplane/10");
     }
 }
