@@ -1312,7 +1312,7 @@ fn extent_count(file: RawFd) -> Result<u64, io::Error> {
         extent_count: u32,
         reserved: u32,
     }
-    const FS_IOC_FIEMAP: libc::c_ulong = 0xc020_660b;
+    const FS_IOC_FIEMAP: libc::Ioctl = 0xc020_660b_u32 as libc::Ioctl;
     let mut request = Fiemap {
         length: u64::MAX,
         ..Default::default()
