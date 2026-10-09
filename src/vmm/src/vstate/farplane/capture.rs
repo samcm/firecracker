@@ -37,8 +37,9 @@ struct EpochOrder {
 }
 
 impl EpochOrder {
-    fn open(&mut self) {
+    fn open(&mut self, replies: &mut ReplyCache) {
         self.result = None;
+        replies.release_versions();
     }
 }
 
@@ -107,12 +108,16 @@ struct CachedReply {
     msg: MsgType,
     body: Vec<u8>,
     version: Option<Arc<OwnedFd>>,
+    /// The answer carried a version this cache no longer holds: replaying it would drop the
+    /// descriptor, so a retry is refused instead.
+    version_released: bool,
 }
 
 #[derive(Debug)]
 enum FrameDisposition {
     Serve,
     Replay(MsgType, Vec<u8>, Option<Arc<OwnedFd>>),
+    ReplayUnavailable,
     Reused,
 }
 
@@ -131,6 +136,9 @@ impl ReplyCache {
             .find(|answer| answer.request_id == request_id)
         {
             if command.is_exactly(&answer.command) {
+                if answer.version_released {
+                    return FrameDisposition::ReplayUnavailable;
+                }
                 return FrameDisposition::Replay(
                     answer.msg,
                     answer.body.clone(),
@@ -143,6 +151,26 @@ impl ReplyCache {
             return FrameDisposition::Reused;
         }
         FrameDisposition::Serve
+    }
+    /// Pagemaster sends one command at a time and the next only once the previous resolved,
+    /// so a new request acknowledges every earlier answer: their version descriptors are
+    /// released here, and with them the last reference this process holds to a generation
+    /// pagemaster has let go. Otherwise each would live until 64 later answers evicted it.
+    fn acknowledge_before(&mut self, request_id: u64) {
+        for answer in self.answers.iter_mut() {
+            if answer.request_id < request_id && answer.version.take().is_some() {
+                answer.version_released = true;
+            }
+        }
+    }
+    /// Reset ends descriptor replay even if no newer request has acknowledged the answer.
+    /// Keep its identity so a late retry is refused, never silently recaptured.
+    fn release_versions(&mut self) {
+        for answer in &mut self.answers {
+            if answer.version.take().is_some() {
+                answer.version_released = true;
+            }
+        }
     }
     fn record(
         &mut self,
@@ -161,6 +189,7 @@ impl ReplyCache {
             msg,
             body,
             version,
+            version_released: false,
         });
         self.highest = self.highest.max(request_id);
     }
@@ -303,9 +332,18 @@ impl CaptureService {
         validate_command(msg, incoming.body.len(), incoming.fds.len())?;
         let command = CommandKey::of(msg, &incoming.body, &incoming.fds);
         match self.replies.disposition(request_id, &command) {
-            FrameDisposition::Serve => {}
+            FrameDisposition::Serve => self.replies.acknowledge_before(request_id),
             FrameDisposition::Replay(msg, body, version) => {
                 return send_reply(&self.channel.sock, msg, request_id, &body, version.as_ref());
+            }
+            FrameDisposition::ReplayUnavailable => {
+                return protocol::send_frame(
+                    &self.channel.sock,
+                    MsgType::Error,
+                    request_id,
+                    &protocol::encode_error(ErrorCode::ReplayUnavailable, msg, ""),
+                    &[],
+                );
             }
             FrameDisposition::Reused => {
                 return protocol::send_frame(
@@ -459,6 +497,7 @@ impl CaptureService {
             self.standing = None;
             info!("Farplane untracked guest memory");
         }
+        self.order.open(&mut self.replies);
         self.reply(
             request_id,
             MsgType::Tracked,
@@ -551,7 +590,7 @@ impl CaptureService {
         }
         let drain_clone_us = at();
         drop(vmm);
-        self.order.open();
+        self.order.open(&mut self.replies);
         BackendState::Quiesced.store();
         info!(
             "Farplane quiesce timing gate_close_us={gate_us} vmm_lock_us={lock_us} \
@@ -666,7 +705,7 @@ impl CaptureService {
         let running = vmm.instance_info.state == VmState::Running;
         drop(vmm);
         self.buffers = None;
-        self.order.open();
+        self.order.open(&mut self.replies);
         set_capture_buffers_armed(false);
         BackendState::Ready.store();
         dispatch::gate().open();

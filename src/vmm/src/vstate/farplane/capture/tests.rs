@@ -51,14 +51,14 @@ fn serialization_and_create_run_once_per_epoch() {
     assert_eq!(second.0, 9001);
     assert!(Arc::ptr_eq(&first.1, &second.1));
     assert_eq!(runs.get(), 1);
-    order.open();
+    order.open(&mut ReplyCache::default());
     let third = serve_write_vmstate(&mut order, capture).unwrap();
     assert!(!Arc::ptr_eq(&first.1, &third.1));
     assert_eq!(runs.get(), 2);
 }
 
 #[test]
-fn exact_id_retains_version_across_epoch_reset() {
+fn exact_id_retains_version_until_acknowledged_or_reset() {
     let device = memfd(c"device", 0);
     let key = CommandKey::of(MsgType::WriteVmstate, &[], std::slice::from_ref(&device));
     let mut order = EpochOrder::default();
@@ -72,8 +72,6 @@ fn exact_id_retains_version_across_epoch_reset() {
         bytes.to_le_bytes().to_vec(),
         Some(version.clone()),
     );
-    order.open();
-    serve_write_vmstate(&mut order, || Ok((456, memfd(c"next-version", 0)))).unwrap();
     let FrameDisposition::Replay(msg, body, Some(retained)) = replies.disposition(1, &key) else {
         panic!("not replayed")
     };
@@ -88,6 +86,188 @@ fn exact_id_retains_version_across_epoch_reset() {
         descriptor_identity(received.fds[0].as_raw_fd()),
         descriptor_identity(version.as_raw_fd())
     );
+}
+
+#[test]
+fn reset_releases_a_refused_or_retracted_create_without_waiting_for_cache_eviction() {
+    let mut order = EpochOrder::default();
+    let mut replies = ReplyCache::default();
+    let key = command(MsgType::WriteVmstate);
+    let (_, version) =
+        serve_write_vmstate(&mut order, || Ok((123, memfd(c"unpublished-version", 0)))).unwrap();
+    let lifetime = Arc::downgrade(&version);
+    replies.record(
+        1,
+        key.clone(),
+        MsgType::VmstateWritten,
+        vec![],
+        Some(version),
+    );
+    // Pagemaster has refused/retracted the result and closed its descriptor.
+    // The epoch and cached answer are now the only local holders.
+    assert!(lifetime.upgrade().is_some());
+    order.open(&mut replies);
+    assert!(lifetime.upgrade().is_none());
+    assert!(matches!(
+        replies.disposition(1, &key),
+        FrameDisposition::ReplayUnavailable
+    ));
+    // Reset must retire every descriptor, not only the epoch's current one,
+    // and must not discard ordinary idempotent replies or their identities.
+    let other = Arc::new(memfd(c"other-version", 0));
+    let other_lifetime = Arc::downgrade(&other);
+    replies.record(2, key.clone(), MsgType::VmstateWritten, vec![], Some(other));
+    let resume = command(MsgType::Resume);
+    replies.record(3, resume.clone(), MsgType::Resumed, vec![], None);
+    order.open(&mut replies);
+    assert!(other_lifetime.upgrade().is_none());
+    assert!(matches!(
+        replies.disposition(2, &key),
+        FrameDisposition::ReplayUnavailable
+    ));
+    assert!(matches!(
+        replies.disposition(3, &resume),
+        FrameDisposition::Replay(MsgType::Resumed, _, None)
+    ));
+}
+
+#[test]
+fn next_request_releases_answered_versions_and_a_late_retry_is_refused() {
+    let device = memfd(c"device", 0);
+    let key = CommandKey::of(MsgType::WriteVmstate, &[], std::slice::from_ref(&device));
+    let plain = CommandKey::of(MsgType::Resume, &1u32.to_le_bytes(), &[]);
+    let version = Arc::new(memfd(c"version", 0));
+    let mut replies = ReplyCache::default();
+    replies.record(
+        1,
+        key.clone(),
+        MsgType::VmstateWritten,
+        vec![7],
+        Some(version.clone()),
+    );
+    replies.record(2, plain.clone(), MsgType::Resumed, vec![], None);
+    // Until a newer request arrives, the answer and its version replay exactly.
+    assert_eq!(Arc::strong_count(&version), 2);
+    assert!(matches!(
+        replies.disposition(1, &key),
+        FrameDisposition::Replay(MsgType::VmstateWritten, _, Some(_))
+    ));
+    // A new request acknowledges every earlier answer: the cache lets the version go...
+    assert!(matches!(
+        replies.disposition(3, &plain),
+        FrameDisposition::Serve
+    ));
+    replies.acknowledge_before(3);
+    assert_eq!(Arc::strong_count(&version), 1);
+    // ...so a retry of it is refused with a typed error, never replayed without its fd.
+    assert!(matches!(
+        replies.disposition(1, &key),
+        FrameDisposition::ReplayUnavailable
+    ));
+    // An answer that carried no version still replays, and a reused id is still refused.
+    assert!(matches!(
+        replies.disposition(2, &plain),
+        FrameDisposition::Replay(MsgType::Resumed, _, None)
+    ));
+    assert!(matches!(
+        replies.disposition(1, &plain),
+        FrameDisposition::Reused
+    ));
+    // Only answers older than the new request are released.
+    let later = Arc::new(memfd(c"later", 0));
+    replies.record(
+        4,
+        key.clone(),
+        MsgType::VmstateWritten,
+        vec![8],
+        Some(later.clone()),
+    );
+    replies.acknowledge_before(4);
+    assert_eq!(Arc::strong_count(&later), 2);
+}
+
+#[test]
+#[ignore = "requires the fpmv3 memversion device; run alone with --test-threads=1"]
+fn reset_returns_unpublished_kernel_pages_to_the_next_create() {
+    let device = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/memversion_v1")
+        .unwrap();
+    for tracked in [false, true] {
+        let len = 3 * 4096;
+        // SAFETY: create and own a private anonymous mapping, advised before its first touch.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        let mapping = memversion::Mapping {
+            addr: addr as usize,
+            len,
+        };
+        // SAFETY: the whole range is owned and writable until mapping drops.
+        unsafe {
+            assert_eq!(libc::madvise(addr, len, libc::MADV_NOHUGEPAGE), 0);
+            std::ptr::write_bytes(addr.cast::<u8>(), 0x5a, len);
+        }
+        let regions = [memversion::Region {
+            addr: mapping.addr as u64,
+            len: len as u64,
+        }];
+        if tracked {
+            memversion::track(device.as_fd(), &regions, None).unwrap();
+        }
+        let mut order = EpochOrder::default();
+        let mut replies = ReplyCache::default();
+        let (_, version) = serve_write_vmstate(&mut order, || {
+            let result = if tracked {
+                memversion::create_tracked(
+                    device.as_fd(),
+                    &regions,
+                    &[],
+                    memversion::Fold::Quiesced,
+                )
+            } else {
+                memversion::create(device.as_fd(), &regions, &[])
+            };
+            result
+                .map(|fd| (123, fd))
+                .map_err(|_| ErrorCode::VmstateWriteFailed)
+        })
+        .unwrap();
+        assert_eq!(memversion::info2(version.as_fd()).unwrap().new_pages, 3);
+        let mut standing = tracked.then(|| version.clone());
+        replies.record(
+            1,
+            command(MsgType::WriteVmstate),
+            MsgType::VmstateWritten,
+            vec![],
+            Some(version),
+        );
+        // Refusal/retraction has closed pagemaster's result. Complete the same reset
+        // as Untrack: kernel tracker, local standing, epoch, and every reply holder.
+        if tracked {
+            memversion::untrack(device.as_fd()).unwrap();
+        }
+        standing.take();
+        order.open(&mut replies);
+        let next = memversion::create(device.as_fd(), &regions, &[]).unwrap();
+        // A cached old version would keep mapcount > 1 and wrongly report zero.
+        assert_eq!(memversion::info2(next.as_fd()).unwrap().new_pages, 3);
+        // SAFETY: mapping still owns the readable range.
+        assert!(
+            unsafe { std::slice::from_raw_parts(addr.cast::<u8>(), len) }
+                .iter()
+                .all(|b| *b == 0x5a)
+        );
+    }
 }
 
 #[test]
