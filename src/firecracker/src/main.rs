@@ -65,6 +65,8 @@ const BUILD_COMMIT: &str = env!("FIRECRACKER_BUILD_COMMIT");
 enum MainError {
     /// Failed to set the logger: {0}
     SetLogger(vmm::logger::LoggerInitError),
+    /// Failed to stop being dumpable: {0}
+    SealProcess(std::io::Error),
     /// Failed to register signal handlers: {0}
     RegisterSignalHandlers(#[source] vmm_sys_util::errno::Error),
     /// Arguments parsing error: {0} \n\nFor more information try --help.
@@ -138,6 +140,9 @@ fn main_exec() -> Result<(), MainError> {
     // Published before anything can observe the instance description, so that the runtime state
     // API reports the same provenance as `--version` for the whole life of the process.
     vmm::vstate::ramet::set_source_commit(BUILD_COMMIT);
+
+    // Before anything else of the process exists: not dumpable.
+    vmm::vstate::ramet::seal_process().map_err(MainError::SealProcess)?;
 
     // First call to this function updates the value to current
     // host page size.

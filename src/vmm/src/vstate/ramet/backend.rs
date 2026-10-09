@@ -302,6 +302,18 @@ pub fn set_source_commit(commit: &'static str) {
     );
 }
 
+/// Makes the process non-dumpable: no other process of its identity, its own memory plane
+/// included, can read its memory, maps or pagemap through /proc, trace it, or open its root. Only
+/// root may, which is how the supervisor hands the memory plane this process's pagemap. Runs once,
+/// before the seccomp filters.
+pub fn seal_process() -> std::io::Result<()> {
+    // SAFETY: PR_SET_DUMPABLE takes one integer argument; the return code is checked.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The published source commit, or `unknown` when nothing published one.
 pub fn source_commit() -> &'static str {
     SOURCE_COMMIT
