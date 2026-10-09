@@ -39,6 +39,41 @@ fn the_vmstate_writer_stops_at_the_advertised_capacity() {
 }
 
 #[test]
+fn a_vmstate_over_the_capacity_names_efbig_in_the_reply() {
+    let mut file = TempFile::new().unwrap().into_file();
+    let refusal = serialize_vmstate_within(&mut file, MicrovmState::default(), 8).unwrap_err();
+    assert_eq!(refusal.code, ErrorCode::VmstateWriteFailed);
+    let efbig = io::Error::from_raw_os_error(libc::EFBIG).to_string();
+    assert!(
+        refusal.detail.starts_with("vmstate save: "),
+        "{}",
+        refusal.detail
+    );
+    assert!(refusal.detail.contains(&efbig), "{}", refusal.detail);
+    // The detail travels in the error reply's fixed field, as the client decodes it.
+    let mut order = EpochOrder::default();
+    let refused = serve_write_vmstate(&mut order, || {
+        serialize_vmstate_within(&mut file, MicrovmState::default(), 8)?;
+        unreachable!("serialization failed")
+    })
+    .unwrap_err();
+    let body = protocol::encode_error(refused.code, MsgType::WriteVmstate, &refused.detail);
+    let detail = &body[8..8 + protocol::ERROR_DETAIL_LEN];
+    let text = std::str::from_utf8(detail).unwrap().trim_end_matches('\0');
+    assert_eq!(text, refusal.detail);
+    // The default state fits the real capacity.
+    assert!(serialize_vmstate(&mut file, MicrovmState::default()).unwrap() > 8);
+}
+
+#[test]
+fn a_long_refusal_is_cut_to_the_detail_field_on_a_character_boundary() {
+    let refusal = VmstateRefusal::failed("memory version", "é".repeat(100));
+    assert!(refusal.detail.len() <= protocol::ERROR_DETAIL_LEN);
+    assert!(refusal.detail.len() > protocol::ERROR_DETAIL_LEN - 2);
+    assert!(refusal.detail.starts_with("memory version: é"));
+}
+
+#[test]
 fn serialization_and_create_run_once_per_epoch() {
     let mut order = EpochOrder::default();
     let runs = std::cell::Cell::new(0);
@@ -156,10 +191,13 @@ fn failed_create_publishes_nothing_exact_failure_replays_new_id_retries() {
     assert!(matches!(
         serve_write_vmstate(&mut order, || {
             let version = memversion::create(device.as_fd(), &regions, &[])
-                .map_err(|_| ErrorCode::VmstateWriteFailed)?;
+                .map_err(|err| VmstateRefusal::failed("memory version", err))?;
             Ok((64, version))
         }),
-        Err(ErrorCode::VmstateWriteFailed)
+        Err(VmstateRefusal {
+            code: ErrorCode::VmstateWriteFailed,
+            ..
+        })
     ));
     assert!(order.result.is_none());
     let mut replies = ReplyCache::default();
