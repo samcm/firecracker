@@ -1926,6 +1926,97 @@ mod tests {
         drop(imported);
     }
 
+    /// On a memversion host with TRACK (fpmv3 or later): the residency count an older kernel
+    /// takes (TRACK_INFO2 answers ENOTTY, so MV_IOC_RESIDENT then `newly_retained`) over a
+    /// reduced exclusion list equals the new pages the tracked CREATE given that list retains,
+    /// both for a first fold whose dropped runs are present source-only pages and for a later
+    /// fold over pages the first version already backs. Only TRACK_INFO2 is forced to ENOTTY:
+    /// RESIDENT, TRACK and CREATE are the device's. Skips where the device or TRACK is absent.
+    #[test]
+    fn the_residency_count_over_a_reduced_list_equals_what_a_tracked_create_retains() {
+        let Ok(device) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/memversion_v1")
+        else {
+            eprintln!("skipped: requires the pinned memversion host");
+            return;
+        };
+        let page = crate::arch::host_page_size() as u64;
+        let pages = 64 * 64;
+        let regions = [Region {
+            addr: GUEST_RAM_BASE,
+            len: pages * page,
+        }];
+        let source = map_regions(&regions, None).unwrap();
+        let at = |p: u64| (GUEST_RAM_BASE + p * page) as *mut u64;
+        let fill = |range: std::ops::Range<u64>, tag: u64| {
+            for p in range {
+                // SAFETY: every page lies in the live, writable source mapping.
+                unsafe { at(p).write((tag << 32) | p) };
+            }
+        };
+        fill(0..pages, 1);
+        if let Err(err) = track(device.as_fd(), &regions, None) {
+            eprintln!("skipped: this device does not track: {err}");
+            return;
+        }
+        let words = usize::try_from(pages / 64).unwrap();
+        let residency = |runs: &[Exclusion]| {
+            let counted = included_pages_with(
+                runs,
+                |_| Err(io::Error::from_raw_os_error(libc::ENOTTY)),
+                || newly_retained(&regions, written_pages(device.as_fd(), &regions)?, runs),
+            )
+            .unwrap();
+            let Included::Resident(pages) = counted else {
+                panic!("an ENOTTY count came from {counted:?}");
+            };
+            pages
+        };
+        let fold = |runs: &[Exclusion]| {
+            let version = create_tracked(device.as_fd(), &regions, runs, Fold::Quiesced).unwrap();
+            info2(version.as_fd()).unwrap()
+        };
+
+        // First fold: free runs of 1..=8 pages in every word, cut to the 8 longest. Every page is
+        // present and only the source maps it, so each dropped run is copied and retained.
+        let free: Vec<u64> = (0..words)
+            .map(|w| {
+                let len = u32::try_from(w % 8).unwrap() + 1;
+                ((1u64 << len) - 1) << 3
+            })
+            .collect();
+        let first =
+            exclusions_within(&regions, std::slice::from_ref(&free), &[vec![0; words]], 8).unwrap();
+        assert!(
+            first.found > first.runs.len() && first.dropped_pages > 0,
+            "{first:?}"
+        );
+        let counted = residency(&first.runs);
+        let info = fold(&first.runs);
+        let kept: u64 = first.runs.iter().map(|x| x.len / page).sum();
+        assert_eq!(counted, pages - kept, "residency count, first fold");
+        assert_eq!(info.new_pages, counted, "first fold {info:?}");
+
+        // Second fold: the guest rewrites a quarter of the pages, some of them in runs the first
+        // fold excluded or dropped; the rest the first version already backs. A new reduction,
+        // now to the 4 longest, with the rewritten pages dirty.
+        let mut dirty = vec![0u64; words];
+        for p in (0..pages).filter(|p| p % 4 == 1) {
+            dirty[usize::try_from(p / 64).unwrap()] |= 1 << (p % 64);
+        }
+        for p in (0..pages).filter(|p| p % 4 == 1) {
+            fill(p..p + 1, 2);
+        }
+        let second = exclusions_within(&regions, &[free], &[dirty], 4).unwrap();
+        let counted = residency(&second.runs);
+        let info = fold(&second.runs);
+        assert_eq!(info.new_pages, counted, "second fold {info:?}");
+        drop(source);
+        untrack(device.as_fd()).unwrap();
+    }
+
     #[test]
     fn an_exclusion_cap_can_only_lower_the_limit_and_a_bad_one_is_an_error() {
         assert_eq!(parse_exclusion_cap("1").unwrap(), 1);
