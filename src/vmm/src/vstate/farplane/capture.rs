@@ -314,6 +314,59 @@ fn counts_retained(state: BackendState, info: &memversion::TrackInfo, bound: u64
     state == BackendState::Quiesced && info.tracked != 0 && info.dirty_pages > bound
 }
 
+/// The tracked sample of a successful free summary: the included pages and standing version the
+/// kernel counts against the summary's own words, or no count. `count` is TRACK_INFO2; the
+/// deadline is checked before the reducer, before the ioctl and after it, so a late count is
+/// never reported.
+fn sample_tracked(
+    tracker: Option<BorrowedFd<'_>>,
+    regions: &[protocol::RegionRecord],
+    summary: &[Vec<u64>],
+    deadline: Instant,
+    count: impl FnOnce(
+        BorrowedFd<'_>,
+        &[memversion::Exclusion],
+    ) -> io::Result<Option<(memversion::TrackInfo, u64)>>,
+) -> (u64, u64) {
+    let in_time = || Instant::now() < deadline;
+    let Some(tracker) = tracker else {
+        return NO_TRACKED_SAMPLE;
+    };
+    if !in_time() {
+        return NO_TRACKED_SAMPLE;
+    }
+    let Ok(exclusions) = memversion::geometry(regions)
+        .and_then(|regions| memversion::exclusions_from_free(&regions, summary))
+    else {
+        return NO_TRACKED_SAMPLE;
+    };
+    if !in_time() {
+        return NO_TRACKED_SAMPLE;
+    }
+    let counted = count(tracker, &exclusions.runs);
+    if !in_time() {
+        return NO_TRACKED_SAMPLE;
+    }
+    match counted {
+        Ok(Some((info, included))) if info.tracked != 0 && info.standing_id != 0 => {
+            (included, info.standing_id)
+        }
+        _ => NO_TRACKED_SAMPLE,
+    }
+}
+
+/// A free summary's tracked sample when there is no count: included pages u64::MAX, id 0.
+const NO_TRACKED_SAMPLE: (u64, u64) = (u64::MAX, 0);
+
+/// The 24-byte `free_summary_done` body: popcount, included pages, standing version id.
+fn encode_free_summary_done(pages: u64, included: u64, standing_id: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&pages.to_le_bytes());
+    body.extend_from_slice(&included.to_le_bytes());
+    body.extend_from_slice(&standing_id.to_le_bytes());
+    body
+}
+
 /// The `refreshed` reply body.
 fn encode_refreshed(info: &memversion::Info2) -> Vec<u8> {
     let mut body = Vec::with_capacity(32);
@@ -418,6 +471,7 @@ impl CaptureService {
         let deadline = Instant::now() + Duration::from_micros(budget);
         let request_id = incoming.header.request_id;
         let [fd] = <[_; 1]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+        let mut summary_words = None;
         let result = serve_free_summary(
             BackendState::load(),
             &File::from(fd),
@@ -432,14 +486,57 @@ impl CaptureService {
                     .ok()
                     .and_then(|vmm| vmm.kvm_vm().cloned())
                     .ok_or(ErrorCode::FreeSummaryUnavailable)?;
-                vm.free_summary_until(deadline)
-                    .map_err(|_| ErrorCode::FreeSummaryUnavailable)
+                let summary = vm
+                    .free_summary_until(deadline)
+                    .map_err(|_| ErrorCode::FreeSummaryUnavailable)?;
+                summary_words = Some(summary.clone());
+                Ok(summary)
             },
         );
         match result {
-            Ok(pages) => self.reply(request_id, MsgType::FreeSummaryDone, &pages.to_le_bytes()),
+            Ok(pages) => {
+                let (included, standing_id) = summary_words.map_or(NO_TRACKED_SAMPLE, |words| {
+                    self.tracked_sample(&words, deadline)
+                });
+                self.reply(
+                    request_id,
+                    MsgType::FreeSummaryDone,
+                    &encode_free_summary_done(pages, included, standing_id),
+                )
+            }
             Err(code) => self.reject(request_id, code, MsgType::FreeSummary),
         }
+    }
+
+    /// What the next quiesced CREATE would fold against the exclusions it would get now, and the
+    /// standing version that count is against: the estimate pagemaster sizes a tracked capture's
+    /// charge by.
+    ///
+    /// The free summary is already the capture's exclusion input: per page, reported free and not
+    /// written since (no KVM, pending or host-write evidence), read under the summary's own
+    /// try_locks. So the sample reads no log and takes no lock of its own, and retires no
+    /// evidence: a later capture sees exactly what it would have. It reduces those words with the
+    /// capture's builder and asks MV_IOC_TRACK_INFO2 for the count. The budget is cooperative:
+    /// the deadline is checked before and after each step, and a count that arrives after it is
+    /// not reported. TRACK_INFO2 itself cannot be preempted. Anything short of the kernel's count
+    /// in time is no count, and it never falls back to the residency walk.
+    fn tracked_sample(&self, summary: &[Vec<u64>], deadline: Instant) -> (u64, u64) {
+        let started = Instant::now();
+        let sample = sample_tracked(
+            self.tracker.as_ref().map(AsFd::as_fd),
+            &self.channel.regions,
+            summary,
+            deadline,
+            memversion::track_sample,
+        );
+        if sample != NO_TRACKED_SAMPLE {
+            info!(
+                "Farplane sampled {} pages for the next CREATE in {} us",
+                sample.0,
+                started.elapsed().as_micros()
+            );
+        }
+        sample
     }
 
     /// Tracks the guest's memory from now on. Runs while the guest runs: the kernel walks the

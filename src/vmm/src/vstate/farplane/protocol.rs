@@ -24,7 +24,7 @@ pub const MAX_SCM_FDS: usize = 253;
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
 /// the handshake and the capture command order a peer must speak.
-pub const FEATURE_IDENTITY: &str = "farplane/9";
+pub const FEATURE_IDENTITY: &str = "farplane/10";
 /// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
 /// it was captured under. It changes only when those do, so a channel change alone leaves every
 /// stored vmstate restorable.
@@ -88,7 +88,11 @@ pub enum MsgType {
     Rebased = 21,
     /// Pagemaster requests an advisory free summary with a bounded work budget.
     FreeSummary = 22,
-    /// Every bitmap word was written; the body is its LE u64 popcount, with no descriptors.
+    /// Every bitmap word was written; with no descriptors. The body is LE u64 popcount, u64
+    /// included pages and u64 standing version id: what the next quiesced CREATE would fold
+    /// against the exclusions sampled with the summary, and the version that count is against.
+    /// Included pages is u64::MAX (and the id 0) when there is no count. Since farplane/10; a
+    /// farplane/9 reply is the popcount alone.
     FreeSummaryDone = 23,
     /// Pagemaster hands over the drive images: the read-only root image and, for a sandbox with
     /// a disk, its read-write scratch disk. The body is the LE u32 descriptor count.
@@ -950,6 +954,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/9");
+        assert_eq!(FEATURE_IDENTITY, "farplane/10");
     }
 }

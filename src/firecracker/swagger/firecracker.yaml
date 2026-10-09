@@ -846,7 +846,7 @@ definitions:
           channel alone.
         type: string
         enum:
-          - "farplane/9"
+          - "farplane/10"
       vmstate_identity:
         description:
           Identity of the vmstate this binary writes and restores, which moves only
