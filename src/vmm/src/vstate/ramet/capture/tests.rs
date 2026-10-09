@@ -943,7 +943,9 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         &[file.as_raw_fd()],
     );
     assert_eq!(reply.header.msg(), MsgType::FreeSummaryDone);
-    assert_eq!(reply.body, 64u64.to_le_bytes());
+    // ramet/10: the popcount, then no tracked sample (an untracked guest): MAX and id 0.
+    let untracked = encode_free_summary_done(64, u64::MAX, 0);
+    assert_eq!(reply.body, untracked);
     assert!(reply.fds.is_empty());
     file.write_all_at(&[0xa5; 4096], 0).unwrap();
     let replay = request(
@@ -993,7 +995,7 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         &[file.as_raw_fd()],
     );
     assert_eq!(after.header.msg(), MsgType::FreeSummaryDone);
-    assert_eq!(after.body, 64u64.to_le_bytes());
+    assert_eq!(after.body, untracked);
     assert_eq!(BackendState::load(), BackendState::Ready);
     assert!(!dispatch::gate().is_closed());
     for (id, body, fds) in [
