@@ -87,6 +87,8 @@ enum MainError {
     LockWorkingSet(io::Error),
     /// Missing required --farplane-mem-socket
     MissingFarplaneSocket,
+    /// Invalid --farplane-exclusion-cap: {0}
+    InvalidExclusionCap(io::Error),
     /// Could not connect the pagemaster memory channel: {0}
     FarplaneConnect(vmm::vstate::farplane::BackendError),
     /// RunWithApiError error: {0}
@@ -110,6 +112,7 @@ impl From<MainError> for FcExitCode {
         match value {
             MainError::ParseArguments(_) => FcExitCode::ArgParsing,
             MainError::InvalidLogLevel(_) => FcExitCode::BadConfiguration,
+            MainError::InvalidExclusionCap(_) => FcExitCode::BadConfiguration,
             MainError::RunWithApi(ApiServerError::MicroVMStoppedWithError(code)) => code,
             MainError::RunWithoutApiError(RunWithoutApiError::Shutdown(code)) => code,
             _ => FcExitCode::GenericError,
@@ -290,6 +293,14 @@ fn main_exec() -> Result<(), MainError> {
                 Argument::new("farplane-mem-socket")
                     .takes_value(true)
                     .help("Path to the pagemaster SEQPACKET memory channel."),
+            )
+            .arg(
+                Argument::new("farplane-exclusion-cap")
+                    .takes_value(true)
+                    .help(
+                        "Lowers the free-run limit of a capture below the kernel's 65536 \
+                         (1..=65536); a test cell's knob.",
+                    ),
             );
 
     arg_parser.parse_from_cmdline()?;
@@ -323,6 +334,12 @@ fn main_exec() -> Result<(), MainError> {
         .single_value("farplane-mem-socket")
         .ok_or(MainError::MissingFarplaneSocket)?;
     vmm::vstate::farplane::FarplaneBackend::set_socket_path(PathBuf::from(farplane_socket));
+    if let Some(cap) = arguments.single_value("farplane-exclusion-cap") {
+        let cap = vmm::vstate::farplane::set_exclusion_cap(cap)
+            .map_err(MainError::InvalidExclusionCap)?;
+        // Before the logger is configured, so this reaches stderr whatever the log path.
+        eprintln!("Farplane capture exclusion cap is {cap} runs");
+    }
     // Firecracker is started before its sandbox is known. The memory channel is connected now so
     // that a claim finds it waiting; pagemaster sends nothing on it until the claim arrives.
     vmm::vstate::farplane::FarplaneBackend::connect().map_err(MainError::FarplaneConnect)?;
