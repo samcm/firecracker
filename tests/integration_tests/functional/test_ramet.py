@@ -1,7 +1,7 @@
 # Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for guest memory served over the farplane pagemaster channel."""
+"""Tests for guest memory served over the ramet pagemaster channel."""
 
 # pylint: disable=too-many-lines
 
@@ -21,14 +21,14 @@ import pytest
 from framework import utils
 from framework.defs import SECCOMP_JSON_DIR
 from framework.properties import global_props
-from host_tools import farplane as fp
+from host_tools import ramet as fp
 
 pytestmark = pytest.mark.skipif(
     not Path("/dev/kvm").exists()
     or not fp.DEV_USERFAULTFD.exists()
     or global_props.host_linux_version_tpl < (6, 1),
     reason=(
-        "farplane needs KVM, /dev/userfaultfd and a host kernel with shmem"
+        "ramet needs KVM, /dev/userfaultfd and a host kernel with shmem"
         " minor/write-protect userfaultfd"
     ),
 )
@@ -38,12 +38,12 @@ MEM_SIZE_MIB = 128
 
 
 @pytest.fixture
-def farplane_factory(
+def ramet_factory(
     microvm_factory, test_fc_session_root_path, guest_kernel_default, rootfs
 ):
-    """Build farplane microVMs from the session's binaries and artifacts."""
+    """Build ramet microVMs from the session's binaries and artifacts."""
     built = []
-    chroot_base = Path(test_fc_session_root_path) / "farplane"
+    chroot_base = Path(test_fc_session_root_path) / "ramet"
 
     def build(microvm_id=None):
         """Create one jailed Firecracker; the fixture tears it down."""
@@ -52,7 +52,7 @@ def farplane_factory(
         # the same way as the general microvm factory.
         label = (microvm_id or f"fp{len(built)}").replace("_", "-")
         microvm_id = f"{label}-{uuid.uuid4().hex[:8]}"
-        vm = fp.FarplaneMicrovm(
+        vm = fp.RametMicrovm(
             binary_dir=microvm_factory.binary_path,
             chroot_base=chroot_base,
             microvm_id=microvm_id,
@@ -101,7 +101,7 @@ def scratch_disk(vm, *, directory=None, **kwargs):
         if directory is None:
             pytest.skip(str(err))
         pytest.fail(
-            f"FARPLANE_TEST_XFS_DIR names {directory}, which refuses the O_DIRECT open"
+            f"RAMET_TEST_XFS_DIR names {directory}, which refuses the O_DIRECT open"
             f" every scratch descriptor carries: {err}"
         )
 
@@ -254,28 +254,28 @@ def fdinfo_flags(pid, fileno):
 
 
 def reflink_dir():
-    """The directory `FARPLANE_TEST_XFS_DIR` names, proven able to reflink a file in it.
+    """The directory `RAMET_TEST_XFS_DIR` names, proven able to reflink a file in it.
     Only an unset variable and an `EOPNOTSUPP` probe skip; anything else about it fails.
     """
-    configured = os.environ.get("FARPLANE_TEST_XFS_DIR")
+    configured = os.environ.get("RAMET_TEST_XFS_DIR")
     if not configured:
         pytest.skip(
-            "FARPLANE_TEST_XFS_DIR must name a writable directory on an XFS filesystem"
+            "RAMET_TEST_XFS_DIR must name a writable directory on an XFS filesystem"
             " formatted with reflink=1, the only place a clone of the scratch disk can land"
         )
     directory = Path(configured)
     if not directory.is_dir():
         pytest.fail(
-            f"FARPLANE_TEST_XFS_DIR names {directory}, which is not an existing directory"
+            f"RAMET_TEST_XFS_DIR names {directory}, which is not an existing directory"
         )
     magic = utils.check_output(f"stat -f -c %T {directory}").stdout.strip()
     if magic != "xfs":
         pytest.fail(
-            f"FARPLANE_TEST_XFS_DIR names {directory}, whose filesystem is {magic} and"
+            f"RAMET_TEST_XFS_DIR names {directory}, whose filesystem is {magic} and"
             " not xfs, so nothing measured about the clone holds there"
         )
-    source = directory / "farplane-reflink-probe-source"
-    destination = directory / "farplane-reflink-probe-destination"
+    source = directory / "ramet-reflink-probe-source"
+    destination = directory / "ramet-reflink-probe-destination"
     try:
         source.write_bytes(bytes(PAGE))
         destination.write_bytes(b"")
@@ -284,11 +284,11 @@ def reflink_dir():
     except OSError as err:
         if err.errno == errno.EOPNOTSUPP:
             pytest.skip(
-                f"FARPLANE_TEST_XFS_DIR names {directory}, which is on a filesystem that"
+                f"RAMET_TEST_XFS_DIR names {directory}, which is on a filesystem that"
                 " has no reflinks"
             )
         pytest.fail(
-            f"FARPLANE_TEST_XFS_DIR names {directory}, which cannot take the reflink the"
+            f"RAMET_TEST_XFS_DIR names {directory}, which cannot take the reflink the"
             f" clone proofs need: {err}"
         )
     finally:
@@ -310,9 +310,9 @@ def clone_failure(vm):
     )
 
 
-def test_multi_extent_regions_boot_and_read_across_every_boundary(farplane_factory):
+def test_multi_extent_regions_boot_and_read_across_every_boundary(ramet_factory):
     """A region tiled by several memfds boots and serves the right bytes at every VMA boundary."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm, splits=4)
 
     assert len(pagemaster.extents) == 4 * len(pagemaster.regions)
@@ -333,9 +333,9 @@ def test_multi_extent_regions_boot_and_read_across_every_boundary(farplane_facto
         ), f"the extent boundary at {guest_addr:#x} served the wrong memfd bytes"
 
 
-def test_missing_minor_and_wp_events_reach_the_pagemaster(farplane_factory):
+def test_missing_minor_and_wp_events_reach_the_pagemaster(ramet_factory):
     """The userfaultfd Firecracker creates off the device delivers missing, minor and wp faults."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm, splits=2)
 
     marker = sorted(pagemaster.marker_bytes)[0]
@@ -361,10 +361,10 @@ def test_missing_minor_and_wp_events_reach_the_pagemaster(farplane_factory):
     assert observed == {"minor": True, "wp": True, "missing": True}
 
 
-def test_siblings_share_clean_pages_and_private_writes_stay_private(farplane_factory):
+def test_siblings_share_clean_pages_and_private_writes_stay_private(ramet_factory):
     """Two guests over the same memfds share clean pages; a write in one is visible nowhere else."""
-    first = farplane_factory("share-a")
-    second = farplane_factory("share-b")
+    first = ramet_factory("share-a")
+    second = ramet_factory("share-b")
 
     left = boot(first, splits=2)
     right = boot(second, splits=2, shared_memfds=left.backing_fds)
@@ -387,9 +387,9 @@ def test_siblings_share_clean_pages_and_private_writes_stay_private(farplane_fac
     ), "a private write reached the sealed memfd"
 
 
-def test_fault_stays_blocked_after_the_handler_closes_its_duplicate(farplane_factory):
+def test_fault_stays_blocked_after_the_handler_closes_its_duplicate(ramet_factory):
     """With no handler left, a first touch of guest memory never completes."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     region = pagemaster.ready_regions[-1]
@@ -426,9 +426,9 @@ def test_fault_stays_blocked_after_the_handler_closes_its_duplicate(farplane_fac
     os.waitpid(child, 0)
 
 
-def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory):
+def test_dirty_harvest_covers_loader_vcpu_and_device_writes(ramet_factory):
     """The first harvest holds the loader image, every faulted guest write and device writes."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm, fc_args=("--metrics-path", "fc.ndjson"))
 
     wait_for_block_read(vm, "rootfs")
@@ -459,9 +459,9 @@ def test_dirty_harvest_covers_loader_vcpu_and_device_writes(farplane_factory):
     assert written <= harvested_pages
 
 
-def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
+def test_dirty_snapshot_returns_each_epoch_exactly_once(ramet_factory):
     """Harvesting clears the log, so the next epoch reports nothing until the guest writes."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm, serial_input=True)
     wait_for_shell_prompt(vm)
 
@@ -501,7 +501,7 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
         pagemaster.protect_guest(page)
     assert pagemaster.resume(run_vcpus=1).error is None
     assert pagemaster.capture_buffers().error is None
-    command_marker = f"farplane-epoch-{uuid.uuid4().hex}"
+    command_marker = f"ramet-epoch-{uuid.uuid4().hex}"
     vm.serial_input(f"echo {command_marker}\n")
     wait_for(
         lambda: command_marker in vm.stdio_text(),
@@ -537,14 +537,14 @@ def test_dirty_snapshot_returns_each_epoch_exactly_once(farplane_factory):
     )
 
 
-def test_freed_guest_memory_leaves_the_dirty_harvest_and_is_named_free(farplane_factory):
+def test_freed_guest_memory_leaves_the_dirty_harvest_and_is_named_free(ramet_factory):
     """Memory a guest writes and frees is reported, loses its dirty marks and is named free.
 
     Nothing is discarded: the harvest names the reported pages beside the dirty ones, the dirty
     half no longer marks them, and a free summary names them between epochs but is refused inside
     one.
     """
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm, mem_size_mib=512, serial_input=True)
     wait_for_shell_prompt(vm)
     freed_pages = 192 * 1024 * 1024 // PAGE
@@ -556,7 +556,7 @@ def test_freed_guest_memory_leaves_the_dirty_harvest_and_is_named_free(farplane_
     assert pagemaster.dirty_snapshot().error is None
     assert pagemaster.resume(run_vcpus=1).error is None
 
-    marker = f"farplane-freed-{uuid.uuid4().hex}"
+    marker = f"ramet-freed-{uuid.uuid4().hex}"
     vm.serial_input(
         "dd if=/dev/urandom of=/dev/shm/freed bs=1M count=192 status=none"
         f" && rm /dev/shm/freed && echo {marker}\n"
@@ -609,9 +609,9 @@ def present_pages(vm, pagemaster, pages):
     return present
 
 
-def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
+def test_a_restored_parent_harvests_only_post_restore_writes(ramet_factory):
     """A restored VM's first epoch holds the restore's writes, not the whole geometry."""
-    parent_vm = farplane_factory("restore-parent")
+    parent_vm = ramet_factory("restore-parent")
     parent = boot(
         parent_vm,
         fc_args=("--metrics-path", "fc.ndjson"),
@@ -619,7 +619,7 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     )
     wait_for_block_read(parent_vm, "rootfs")
     wait_for_shell_prompt(parent_vm)
-    loop_marker = f"farplane-loop-{uuid.uuid4().hex}"
+    loop_marker = f"ramet-loop-{uuid.uuid4().hex}"
     parent_vm.serial_input(
         f"(i=0; while :; do i=$((i + 1)); done) & echo {loop_marker}\n"
     )
@@ -638,7 +638,7 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     assert written.error is None
     (vmstate_length,) = struct.unpack("<Q", written.body)
     vmstate_image = fp.sealed_memfd(
-        "farplane-vmstate-image",
+        "ramet-vmstate-image",
         vmstate_length,
         content=parent.vmstate(vmstate_length),
         seals=fp.ROOT_SEALS,
@@ -656,7 +656,7 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
         assert fp.seals_of(checkpoint_fd) == fp.ROOT_SEALS | fp.F_SEAL_FUTURE_WRITE
         assert fcntl.fcntl(checkpoint_fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
 
-    child_vm = farplane_factory("restore-child")
+    child_vm = ramet_factory("restore-child")
     try:
         child = restore(child_vm, parent, vmstate_image, checkpoint_fds)
     finally:
@@ -748,14 +748,14 @@ def test_a_restored_parent_harvests_only_post_restore_writes(farplane_factory):
     assert len(second_pages) < len(all_pages)
 
 
-def test_a_repeated_capture_command_replays_its_answer(farplane_factory):
+def test_a_repeated_capture_command_replays_its_answer(ramet_factory):
     """A retry after a lost reply must answer, not redo the work it already did.
 
     A second harvest would overwrite the armed bitmap with the accumulator the first one
     cleared, which loses the only copy of the epoch's dirty set. A second serialization
     would run device `prepare_save()` again and leave a different vmstate in the buffer.
     """
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     pagemaster.capture_buffers()
@@ -791,14 +791,14 @@ def test_a_repeated_capture_command_replays_its_answer(farplane_factory):
     assert bytes(pagemaster.harvest().data) == bytes(harvested.data)
 
 
-def test_an_exact_retry_of_a_frame_is_answered_not_served(farplane_factory):
+def test_an_exact_retry_of_a_frame_is_answered_not_served(ramet_factory):
     """The same datagram, resent, draws the same answer whatever happened in between.
 
     Pagemaster resends a command whose reply it never saw. The answer is keyed by the
     request identifier and the contents of the frame, so a retry cannot harvest again even
     after a `dirty_union` has put the bits back and reopened the epoch's dirty set.
     """
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     pagemaster.capture_buffers()
@@ -837,26 +837,26 @@ def test_an_exact_retry_of_a_frame_is_answered_not_served(farplane_factory):
     ), "replaying an old answer served its old harvest into the next epoch's buffer"
 
 
-def test_a_retry_of_a_descriptor_command_must_name_the_same_memfds(farplane_factory):
+def test_a_retry_of_a_descriptor_command_must_name_the_same_memfds(ramet_factory):
     """`capture_buffers` carries its input in descriptors, so identity is the files, not the count.
 
     A retry duplicates the descriptors of the same memfds and is answered from the record.
     The same identifier naming other memfds of the same sizes is a different command: the
     answer on record acknowledged buffers that are not these, so it is refused.
     """
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     def buffers():
         return (
             fp.sealed_memfd(
-                "farplane-dirty",
+                "ramet-dirty",
                 pagemaster.dirty_bitmap_bytes,
                 seals=fp.BUFFER_SEALS,
                 read_only=False,
             ),
             fp.sealed_memfd(
-                "farplane-vmstate",
+                "ramet-vmstate",
                 pagemaster.vmstate_capacity_bytes,
                 seals=fp.BUFFER_SEALS,
                 read_only=False,
@@ -883,14 +883,14 @@ def test_a_retry_of_a_descriptor_command_must_name_the_same_memfds(farplane_fact
         os.close(descriptor)
 
 
-def test_a_harvest_before_the_vmstate_is_refused(farplane_factory):
+def test_a_harvest_before_the_vmstate_is_refused(ramet_factory):
     """The vmstate is serialized before the dirty log is harvested, or not at all.
 
     Serializing the vmstate runs `prepare_save()` on every device, and a device may write
     guest memory there, so a harvest that ran first would report a bitmap that predates
     those writes.
     """
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     pagemaster.capture_buffers()
@@ -918,10 +918,10 @@ def test_a_harvest_before_the_vmstate_is_refused(farplane_factory):
 
 
 def test_dirty_union_restores_the_snapshot_and_is_refused_outside_quiesce(
-    farplane_factory,
+    ramet_factory,
 ):
     """Folding a harvest back in reproduces it bit for bit, and only while quiesced."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     pagemaster.capture_buffers()
@@ -943,19 +943,19 @@ def test_dirty_union_restores_the_snapshot_and_is_refused_outside_quiesce(
     assert reply.error == (fp.Err.NOT_QUIESCED, fp.Msg.DIRTY_UNION)
 
 
-def test_a_failed_harvest_preserves_every_bit(farplane_factory):
+def test_a_failed_harvest_preserves_every_bit(ramet_factory):
     """A harvest that cannot be written keeps the dirty log intact for the retry."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     write_sealed = fp.sealed_memfd(
-        "farplane-dirty-ro",
+        "ramet-dirty-ro",
         pagemaster.dirty_bitmap_bytes,
         seals=fp.BUFFER_SEALS,
         read_only=False,
     )
     vmstate = fp.sealed_memfd(
-        "farplane-vmstate",
+        "ramet-vmstate",
         pagemaster.vmstate_capacity_bytes,
         seals=fp.BUFFER_SEALS,
         read_only=False,
@@ -989,9 +989,9 @@ def test_a_failed_harvest_preserves_every_bit(farplane_factory):
     os.close(vmstate)
 
 
-def test_guest_memory_is_frozen_between_quiesce_and_resume(farplane_factory):
+def test_guest_memory_is_frozen_between_quiesce_and_resume(ramet_factory):
     """Not one guest byte moves while the capture is in progress."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     pagemaster.capture_buffers()
@@ -1007,12 +1007,12 @@ def test_guest_memory_is_frozen_between_quiesce_and_resume(farplane_factory):
     assert before == after, "guest memory changed while quiesced"
 
     pagemaster.resume(run_vcpus=1)
-    assert vm.farplane_state()["backend_state"] == "ready"
+    assert vm.ramet_state()["backend_state"] == "ready"
 
 
-def test_vmstate_lands_in_the_supplied_memfd_and_no_file_appears(farplane_factory):
+def test_vmstate_lands_in_the_supplied_memfd_and_no_file_appears(ramet_factory):
     """write_vmstate fills the capture buffer and never touches the jail filesystem."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     before = sorted(str(path) for path in vm.chroot.rglob("*"))
@@ -1033,9 +1033,9 @@ def test_vmstate_lands_in_the_supplied_memfd_and_no_file_appears(farplane_factor
     ), f"the capture created files in the jail: {set(after) - set(before)}"
 
 
-def test_ptracer_permits_the_pagemaster_and_denies_a_stranger(farplane_factory):
+def test_ptracer_permits_the_pagemaster_and_denies_a_stranger(ramet_factory):
     """Guest memory is readable by the declared pagemaster only."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     marker_addr = sorted(pagemaster.marker_bytes)[0]
@@ -1065,9 +1065,9 @@ def test_ptracer_permits_the_pagemaster_and_denies_a_stranger(farplane_factory):
     assert outcome != b"allowed", "an unrelated process could read guest memory"
 
 
-def test_every_guest_vma_is_locked_on_fault_and_huge_page_free(farplane_factory):
+def test_every_guest_vma_is_locked_on_fault_and_huge_page_free(ramet_factory):
     """Guest mappings are locked on fault and never backed by huge pages."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm, splits=2)
 
     for region in pagemaster.ready_regions:
@@ -1091,9 +1091,9 @@ def test_every_guest_vma_is_locked_on_fault_and_huge_page_free(farplane_factory)
                 ), f"{entry['header']} is fully resident, so it was not locked on fault"
 
 
-def test_hole_punching_syscalls_are_denied_by_the_installed_filter(farplane_factory):
+def test_hole_punching_syscalls_are_denied_by_the_installed_filter(ramet_factory):
     """Firecracker runs a filter that cannot discard guest pages."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     boot(vm)
 
     utils.assert_seccomp_level(vm.pid, "2")
@@ -1120,9 +1120,9 @@ def test_hole_punching_syscalls_are_denied_by_the_installed_filter(farplane_fact
                 assert arg["val"] not in (4, 9), f"{thread} allows advice {arg['val']}"
 
 
-def test_parent_death_kills_firecracker(farplane_factory):
+def test_parent_death_kills_firecracker(ramet_factory):
     """Firecracker dies with its parent, so an orphaned jail cannot outlive the pagemaster."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     vm.spawn(via_wrapper=True)
     pid = vm.pid
     assert Path(f"/proc/{pid}").exists()
@@ -1147,10 +1147,10 @@ def test_parent_death_kills_firecracker(farplane_factory):
     )
 
 
-def test_root_drive_is_served_from_a_shared_read_only_regular_file(farplane_factory):
+def test_root_drive_is_served_from_a_shared_read_only_regular_file(ramet_factory):
     """One published image file backs several microVMs, with no per-jail copy of it."""
-    first = farplane_factory("shared-image-a")
-    second = farplane_factory("shared-image-b")
+    first = ramet_factory("shared-image-a")
+    second = ramet_factory("shared-image-b")
 
     first.open_root_image_file()
     second.open_root_image_file()
@@ -1201,9 +1201,9 @@ def test_root_drive_is_served_from_a_shared_read_only_regular_file(farplane_fact
         assert not staged, f"an image was staged in {vm.chroot}: {staged}"
 
 
-def test_root_drive_is_served_from_the_sealed_memfd(farplane_factory):
+def test_root_drive_is_served_from_the_sealed_memfd(ramet_factory):
     """The root device comes from fd 4, which no one can write."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     boot(vm, fc_args=("--metrics-path", "fc.ndjson"))
     wait_for_block_read(vm, "rootfs")
 
@@ -1219,9 +1219,9 @@ def test_root_drive_is_served_from_the_sealed_memfd(farplane_factory):
     ), "Firecracker fd 4 is not the supplied root memfd"
 
 
-def test_scratch_drive_is_served_from_the_supplied_writable_file(farplane_factory):
+def test_scratch_drive_is_served_from_the_supplied_writable_file(ramet_factory):
     """The scratch device comes from fd 5, which Firecracker holds open for writing."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     boot_with_scratch(vm, fc_args=("--metrics-path", "fc.ndjson"))
     wait_for_block_read(vm, "scratch")
 
@@ -1238,9 +1238,9 @@ def test_scratch_drive_is_served_from_the_supplied_writable_file(farplane_factor
     assert flags & os.O_DIRECT, f"fd 5 is open {flags:#o}"
 
 
-def test_scratch_fd_is_closed_when_not_handed_to_the_jailer(farplane_factory):
+def test_scratch_fd_is_closed_when_not_handed_to_the_jailer(ramet_factory):
     """An unsupplied scratch disk cannot be selected through a reused fd number."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     supplied_identity = os.fstat(scratch_disk(vm))
     boot(vm, scratch_fd=None)
 
@@ -1268,9 +1268,9 @@ def test_scratch_fd_is_closed_when_not_handed_to_the_jailer(farplane_factory):
     assert response.status_code == 400, response.text
 
 
-def test_api_refuses_scratch_fd_without_the_scratch_disk(farplane_factory):
+def test_api_refuses_scratch_fd_without_the_scratch_disk(ramet_factory):
     """fd 5 cannot configure a drive when the jailer did not receive it."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     boot(vm)
 
     response = raw(
@@ -1287,11 +1287,11 @@ def test_api_refuses_scratch_fd_without_the_scratch_disk(farplane_factory):
     assert response.status_code == 400, response.text
 
 
-def test_a_capture_with_a_destination_clones_the_scratch_disk(farplane_factory):
+def test_a_capture_with_a_destination_clones_the_scratch_disk(ramet_factory):
     """A three-descriptor capture reflinks the disk into the destination inside the quiesce."""
     directory = reflink_dir()
-    vm = farplane_factory("scratch-clone")
-    marker = f"farplane-scratch-{uuid.uuid4().hex}".encode()
+    vm = ramet_factory("scratch-clone")
+    marker = f"ramet-scratch-{uuid.uuid4().hex}".encode()
     pagemaster = boot_with_scratch(vm, directory=directory, seed=marker)
     destination = vm.open_clone_destination(directory=directory)
 
@@ -1309,24 +1309,24 @@ def test_a_capture_with_a_destination_clones_the_scratch_disk(farplane_factory):
     assert cloned == vm.scratch_file.read_bytes(), "the clone is not the whole disk"
 
 
-def test_a_clone_destination_without_a_scratch_drive_is_refused(farplane_factory):
+def test_a_clone_destination_without_a_scratch_drive_is_refused(ramet_factory):
     """A capture cannot name a clone destination for a guest that has no disk to clone."""
-    vm = farplane_factory("clone-no-scratch")
+    vm = ramet_factory("clone-no-scratch")
     pagemaster = boot(vm)
     destination = vm.open_clone_destination()
 
     reply = pagemaster.capture_buffers(clone_fd=destination)
     assert reply.error == (fp.Err.NO_SCRATCH_DRIVE, fp.Msg.CAPTURE_BUFFERS)
-    assert vm.farplane_state()["capture_buffers_armed"] is False
+    assert vm.ramet_state()["capture_buffers_armed"] is False
 
 
-def test_a_failed_clone_refuses_the_quiesce_and_hands_the_vcpus_back(farplane_factory):
+def test_a_failed_clone_refuses_the_quiesce_and_hands_the_vcpus_back(ramet_factory):
     """A destination on another filesystem can hold no reflink, so the clone cannot succeed.
 
     The clone is taken before the epoch opens, so its failure leaves the backend ready with the
     vCPUs running and pagemaster free to arm the epoch again.
     """
-    vm = farplane_factory("clone-failed")
+    vm = ramet_factory("clone-failed")
     pagemaster = boot_with_scratch(vm)
     destination = vm.open_clone_destination(directory=vm.chroot_base)
     # The session root is a tmpfs and the disk is on the node's own filesystem, so the two inodes
@@ -1341,7 +1341,7 @@ def test_a_failed_clone_refuses_the_quiesce_and_hands_the_vcpus_back(farplane_fa
     assert pagemaster.quiesce().error == (fp.Err.DISK_CLONE_FAILED, fp.Msg.QUIESCE)
     assert "clone the scratch disk" in clone_failure(vm)
 
-    state = vm.farplane_state()
+    state = vm.ramet_state()
     assert state["backend_state"] == "ready"
     assert state["vcpus"] == "running"
 
@@ -1351,9 +1351,9 @@ def test_a_failed_clone_refuses_the_quiesce_and_hands_the_vcpus_back(farplane_fa
     assert pagemaster.write_vmstate().error is None
 
 
-def test_a_capture_of_a_guest_with_a_disk_needs_no_destination(farplane_factory):
+def test_a_capture_of_a_guest_with_a_disk_needs_no_destination(ramet_factory):
     """The disk is optional in a capture: two buffers capture a guest that has a scratch drive."""
-    vm = farplane_factory("scratch-no-clone")
+    vm = ramet_factory("scratch-no-clone")
     pagemaster = boot_with_scratch(vm)
 
     assert pagemaster.capture_buffers().error is None
@@ -1362,7 +1362,7 @@ def test_a_capture_of_a_guest_with_a_disk_needs_no_destination(farplane_factory)
     assert pagemaster.dirty_snapshot().error is None
     assert pagemaster.harvest().count() > 0
     assert pagemaster.resume(run_vcpus=1).error is None
-    assert vm.farplane_state()["backend_state"] == "ready"
+    assert vm.ramet_state()["backend_state"] == "ready"
 
 
 def bad_root_fd(vm, flaw):
@@ -1456,9 +1456,9 @@ def bad_scratch_fd(vm, flaw):
         ),
     ],
 )
-def test_jailer_refuses_a_bad_block_fd(farplane_factory, descriptor, flaw, expected):
+def test_jailer_refuses_a_bad_block_fd(ramet_factory, descriptor, flaw, expected):
     """Every root and scratch descriptor precondition is enforced before the jail is built."""
-    vm = farplane_factory(f"{descriptor}fd-{flaw}")
+    vm = ramet_factory(f"{descriptor}fd-{flaw}")
     if descriptor == "root":
         block_fd = bad_root_fd(vm, flaw)
     else:
@@ -1470,9 +1470,9 @@ def test_jailer_refuses_a_bad_block_fd(farplane_factory, descriptor, flaw, expec
     assert not vm.api_socket.exists()
 
 
-def test_jailer_refuses_a_scratch_descriptor_naming_the_root_inode(farplane_factory):
+def test_jailer_refuses_a_scratch_descriptor_naming_the_root_inode(ramet_factory):
     """One inode cannot be both the immutable root image and the disk the guest writes to."""
-    vm = farplane_factory("scratchfd-root-alias")
+    vm = ramet_factory("scratchfd-root-alias")
     root_fd = vm.open_root_image_file()
     try:
         vm.scratch_fd = fp.open_disk_file(vm.root_image_path, size=None)
@@ -1487,10 +1487,10 @@ def test_jailer_refuses_a_scratch_descriptor_naming_the_root_inode(farplane_fact
 
 @pytest.mark.parametrize("violation", ["eof", "oversized"])
 def test_channel_violation_after_ready_only_fails_the_channel(
-    farplane_factory, violation
+    ramet_factory, violation
 ):
     """Breaking the channel after Ready leaves the guest untouched and is reported."""
-    vm = farplane_factory(f"violation-{violation}")
+    vm = ramet_factory(f"violation-{violation}")
     pagemaster = boot(vm)
 
     sample = sorted(pagemaster.marker_bytes)
@@ -1505,7 +1505,7 @@ def test_channel_violation_after_ready_only_fails_the_channel(
         pagemaster.send_raw(header + bytes(fp.MAX_DATAGRAM))
 
     wait_for(
-        lambda: vm.farplane_state()["backend_state"] == "channel_failed",
+        lambda: vm.ramet_state()["backend_state"] == "channel_failed",
         message="the backend reporting channel_failed",
     )
     assert vm.instance()["state"] == "Running"
@@ -1514,9 +1514,9 @@ def test_channel_violation_after_ready_only_fails_the_channel(
     ), "guest memory changed after the violation"
 
 
-def test_removed_api_surfaces_are_absent(farplane_factory):
+def test_removed_api_surfaces_are_absent(ramet_factory):
     """Every deleted route and field is refused instead of silently accepted."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     boot(vm)
 
     for path, body in [
@@ -1556,9 +1556,9 @@ def test_removed_api_surfaces_are_absent(farplane_factory):
     assert load.status_code == 400, "snapshot/load still accepts file paths"
 
 
-def test_patch_vm_during_a_capture_conflicts(farplane_factory):
+def test_patch_vm_during_a_capture_conflicts(ramet_factory):
     """Pausing or resuming over the API is refused while a capture holds the vCPUs."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm)
 
     assert raw(vm.api, "PATCH", "/vm", {"state": "Paused"}).status_code == 204
@@ -1574,9 +1574,9 @@ def test_patch_vm_during_a_capture_conflicts(farplane_factory):
     assert raw(vm.api, "PATCH", "/vm", {"state": "Paused"}).status_code == 204
 
 
-def test_jail_hands_over_renumbered_fds_and_a_stripped_process(farplane_factory):
+def test_jail_hands_over_renumbered_fds_and_a_stripped_process(ramet_factory):
     """The jailer renumbers the inherited descriptors and strips the process it execs."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     root_base = vm.open_root_memfd()
     scratch_base = scratch_disk(vm)
     root_spares = [os.dup(root_base) for _ in range(8)]
@@ -1628,10 +1628,10 @@ def test_jail_hands_over_renumbered_fds_and_a_stripped_process(farplane_factory)
     assert soft == "unlimited" or int(soft) >= MEM_SIZE_MIB << 20, memlock
 
 
-def test_jailer_joins_a_precreated_cgroup(farplane_factory):
+def test_jailer_joins_a_precreated_cgroup(ramet_factory):
     """--cgroup-join moves Firecracker into the leaf the caller prepared."""
-    vm = farplane_factory()
-    leaf = Path("/sys/fs/cgroup") / f"farplane-join-{vm.microvm_id}"
+    vm = ramet_factory()
+    leaf = Path("/sys/fs/cgroup") / f"ramet-join-{vm.microvm_id}"
     leaf.mkdir(exist_ok=True)
 
     vm.spawn(cgroup_join=leaf)
@@ -1639,9 +1639,9 @@ def test_jailer_joins_a_precreated_cgroup(farplane_factory):
     assert leaf.name in membership, membership
 
 
-def test_cold_boot_over_one_all_hole_sparse_memfd(farplane_factory):
+def test_cold_boot_over_one_all_hole_sparse_memfd(ramet_factory):
     """A guest boots when every page starts as a hole in a single sparse memfd."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     pagemaster = boot(vm, single_memfd=True, markers=False)
 
     assert len(pagemaster.backing_fds) == 1
@@ -1658,13 +1658,13 @@ def test_cold_boot_over_one_all_hole_sparse_memfd(farplane_factory):
     )
 
 
-def test_instance_info_reports_the_farplane_state_sequence(farplane_factory):
+def test_instance_info_reports_the_ramet_state_sequence(ramet_factory):
     """GET / follows the backend through the whole capture cycle."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     vm.spawn()
     pagemaster = vm.start_pagemaster()
 
-    cold = vm.farplane_state()
+    cold = vm.ramet_state()
     assert cold["backend_state"] == "awaiting_plan"
     assert cold["vcpus"] == "not_started"
     assert cold["capture_buffers_armed"] is False
@@ -1676,22 +1676,22 @@ def test_instance_info_reports_the_farplane_state_sequence(farplane_factory):
     pagemaster.wait_ready()
     vm.api.vm.patch(state="Resumed")
 
-    running = vm.farplane_state()
+    running = vm.ramet_state()
     assert running["backend_state"] == "ready"
     assert running["vcpus"] == "running"
     assert running["capture_buffers_armed"] is False
     assert running["source_commit"] == cold["source_commit"]
 
     pagemaster.capture_buffers()
-    assert vm.farplane_state()["capture_buffers_armed"] is True
+    assert vm.ramet_state()["capture_buffers_armed"] is True
 
     pagemaster.quiesce()
-    quiesced = vm.farplane_state()
+    quiesced = vm.ramet_state()
     assert quiesced["backend_state"] == "quiesced"
     assert quiesced["capture_buffers_armed"] is True
 
     pagemaster.resume(run_vcpus=1)
-    resumed = vm.farplane_state()
+    resumed = vm.ramet_state()
     assert resumed["backend_state"] == "ready"
     assert resumed["capture_buffers_armed"] is False
     # Every observation resamples the backend, and the provenance of the running binary is not
@@ -1699,9 +1699,9 @@ def test_instance_info_reports_the_farplane_state_sequence(farplane_factory):
     assert resumed["source_commit"] == cold["source_commit"]
 
 
-def test_the_state_api_reports_the_binarys_own_source_commit(farplane_factory):
+def test_the_state_api_reports_the_binarys_own_source_commit(ramet_factory):
     """`GET /` names the commit this binary was built from, exactly as `--version` reports it."""
-    vm = farplane_factory()
+    vm = ramet_factory()
     version = utils.check_output(f"{vm.fc_binary} --version").stdout
     reported = [
         line.removeprefix("commit ").strip()
@@ -1716,7 +1716,7 @@ def test_the_state_api_reports_the_binarys_own_source_commit(farplane_factory):
     # without one.
     vm.spawn()
 
-    source_commit = vm.farplane_state()["source_commit"]
+    source_commit = vm.ramet_state()["source_commit"]
     assert source_commit, "GET / reported an empty source commit"
     assert source_commit == reported[0], "the state API and --version disagree"
     # An authoritative build compiles an extraction of a clean commit and the release gate requires

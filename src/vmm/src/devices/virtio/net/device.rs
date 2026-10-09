@@ -488,7 +488,7 @@ impl Net {
         let mem = &self.device_state.active_state().unwrap().mem;
         let queue = &mut self.queues[RX_INDEX];
         loop {
-            if crate::vstate::farplane::dispatch::gate().is_closed() {
+            if crate::vstate::ramet::dispatch::gate().is_closed() {
                 defer_queue_event(&self.queue_evts[RX_INDEX], &self.metrics);
                 break;
             }
@@ -583,7 +583,7 @@ impl Net {
         }
 
         // Parsing may itself have yielded to close. Do not admit a frame afterwards.
-        if crate::vstate::farplane::dispatch::gate().is_closed() {
+        if crate::vstate::ramet::dispatch::gate().is_closed() {
             defer_queue_event(&self.queue_evts[RX_INDEX], &self.metrics);
             return Ok(None);
         }
@@ -607,7 +607,7 @@ impl Net {
     /// Read as many frames as possible.
     fn process_rx(&mut self) -> Result<(), DeviceError> {
         loop {
-            if crate::vstate::farplane::dispatch::gate().is_closed() {
+            if crate::vstate::ramet::dispatch::gate().is_closed() {
                 defer_queue_event(&self.queue_evts[RX_INDEX], &self.metrics);
                 break;
             }
@@ -663,7 +663,7 @@ impl Net {
         let tx_queue = &mut self.queues[TX_INDEX];
 
         loop {
-            if crate::vstate::farplane::dispatch::gate().is_closed() {
+            if crate::vstate::ramet::dispatch::gate().is_closed() {
                 defer_queue_event(&self.queue_evts[TX_INDEX], &self.metrics);
                 break;
             }
@@ -1096,7 +1096,7 @@ pub mod tests {
     #[ignore = "process-global dispatch gate; run this exact test in isolation"]
     fn close_yields_net_handlers_and_reopen_wakes() {
         use crate::devices::virtio::test_utils::default_interrupt;
-        use crate::vstate::farplane::dispatch;
+        use crate::vstate::ramet::dispatch;
         use crate::vstate::memory::Bytes;
         use event_manager::SubscriberOps;
         use std::sync::{Mutex, mpsc};

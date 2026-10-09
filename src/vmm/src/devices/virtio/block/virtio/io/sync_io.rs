@@ -115,12 +115,12 @@ mod tests {
     /// Filesystem magic of XFS, the only filesystem the measured alignment facts hold on.
     const XFS_SUPER_MAGIC: i128 = 0x5846_5342;
 
-    /// The directory `FARPLANE_TEST_XFS_DIR` names, or `None` for the two skips it allows: no
+    /// The directory `RAMET_TEST_XFS_DIR` names, or `None` for the two skips it allows: no
     /// directory was named, or the XFS one named has no reflinks.
     fn reflink_dir() -> Option<PathBuf> {
-        let Some(dir) = std::env::var_os("FARPLANE_TEST_XFS_DIR") else {
+        let Some(dir) = std::env::var_os("RAMET_TEST_XFS_DIR") else {
             eprintln!(
-                "skipping: FARPLANE_TEST_XFS_DIR must name a directory on an XFS filesystem \
+                "skipping: RAMET_TEST_XFS_DIR must name a directory on an XFS filesystem \
                  formatted with reflink=1"
             );
             return None;
@@ -128,14 +128,14 @@ mod tests {
         let dir = PathBuf::from(dir);
         assert!(
             dir.is_dir(),
-            "FARPLANE_TEST_XFS_DIR names {}, which is not an existing directory",
+            "RAMET_TEST_XFS_DIR names {}, which is not an existing directory",
             dir.display()
         );
         let magic = filesystem_magic(&dir);
         assert_eq!(
             magic,
             XFS_SUPER_MAGIC,
-            "FARPLANE_TEST_XFS_DIR names {}, whose filesystem magic is {magic:#x} and not XFS",
+            "RAMET_TEST_XFS_DIR names {}, whose filesystem magic is {magic:#x} and not XFS",
             dir.display()
         );
 

@@ -38,7 +38,7 @@ pub use crate::snapshot::persist::Persist;
 
 /// Version of the snapshot format produced and accepted by this crate.
 ///
-/// The major version was raised for the farplane fork: `VsockFrontendState` carries the
+/// The major version was raised for the ramet fork: `VsockFrontendState` carries the
 /// transport-reset gate and its acknowledgement watermark. The version is what a build of this
 /// same layout compares before it uses the state; a snapshot of a *different* layout never
 /// reaches that check, because the version is encoded inside the structure and bitcode requires
@@ -54,7 +54,7 @@ const SNAPSHOT_MAGIC_ID: u64 = 0x0710_1984_AAAA_0000u64;
 
 /// Maximum size in bytes for snapshot serialization and deserialization.
 ///
-/// Farplane advertises this same bound as its capture-buffer capacity. Keeping one limit means
+/// Ramet advertises this same bound as its capture-buffer capacity. Keeping one limit means
 /// every vmstate Firecracker can produce is also one it can restore.
 pub const SNAPSHOT_DESERIALIZATION_BYTES_LIMIT: usize = 16 << 20;
 
@@ -163,7 +163,7 @@ impl<Data> Snapshot<Data> {
             header: SnapshotHdr {
                 magic: SNAPSHOT_MAGIC_ID,
                 version: SNAPSHOT_VERSION.clone(),
-                feature_identity: crate::vstate::farplane::protocol::VMSTATE_IDENTITY.to_string(),
+                feature_identity: crate::vstate::ramet::protocol::VMSTATE_IDENTITY.to_string(),
             },
             data,
         }
@@ -201,9 +201,9 @@ impl<Data: DeserializeOwned> Snapshot<Data> {
 
         // Checked with the rest of the header, which is before the state is handed to a caller:
         // guest memory is mapped from a plan the caller only builds once this returns.
-        if snapshot.header.feature_identity != crate::vstate::farplane::protocol::VMSTATE_IDENTITY {
+        if snapshot.header.feature_identity != crate::vstate::ramet::protocol::VMSTATE_IDENTITY {
             return Err(SnapshotError::IncompatibleFeatureIdentity {
-                expected: crate::vstate::farplane::protocol::VMSTATE_IDENTITY.to_string(),
+                expected: crate::vstate::ramet::protocol::VMSTATE_IDENTITY.to_string(),
                 found: snapshot.header.feature_identity.clone(),
             });
         }
@@ -283,14 +283,14 @@ mod tests {
         let snapshot = Snapshot::new(MicrovmState::default());
         assert_eq!(
             snapshot.header.feature_identity,
-            crate::vstate::farplane::protocol::VMSTATE_IDENTITY
+            crate::vstate::ramet::protocol::VMSTATE_IDENTITY
         );
-        assert_eq!(snapshot.header.feature_identity, "farplane/8");
+        assert_eq!(snapshot.header.feature_identity, "ramet-vmstate/1");
 
         snapshot.save(&mut buf).unwrap();
 
         let loaded = Snapshot::<MicrovmState>::load(&mut buf.as_slice()).unwrap();
-        assert_eq!(loaded.header.feature_identity, "farplane/8");
+        assert_eq!(loaded.header.feature_identity, "ramet-vmstate/1");
     }
 
     /// A warm image baked by an older identity is refused before its state is used: the capture
@@ -298,15 +298,15 @@ mod tests {
     #[test]
     fn a_snapshot_of_an_older_identity_is_refused() {
         let mut snapshot = Snapshot::new(MicrovmState::default());
-        snapshot.header.feature_identity = "farplane/7".to_string();
+        snapshot.header.feature_identity = "ramet-vmstate/0".to_string();
         let mut buf = Vec::new();
         snapshot.save(&mut buf).unwrap();
 
         let err = Snapshot::<MicrovmState>::load(&mut buf.as_slice()).unwrap_err();
         match err {
             SnapshotError::IncompatibleFeatureIdentity { expected, found } => {
-                assert_eq!(found, "farplane/7");
-                assert_eq!(expected, "farplane/8");
+                assert_eq!(found, "ramet-vmstate/0");
+                assert_eq!(expected, "ramet-vmstate/1");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -353,7 +353,7 @@ mod tests {
             header: SnapshotHdr {
                 magic: SNAPSHOT_MAGIC_ID,
                 version: Version::new(11, 0, 0),
-                feature_identity: "farplane/2".to_string(),
+                feature_identity: "ramet/2".to_string(),
             },
             data: (7, "state this build cannot decode".to_string()),
         })

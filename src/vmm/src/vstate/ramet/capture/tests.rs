@@ -373,8 +373,8 @@ fn a_retry_is_replayed_after_the_clone_destination_grew() {
 
 #[test]
 fn the_scratch_clone_reproduces_the_disk_and_reports_its_duration() {
-    let Some(dir) = std::env::var_os("FARPLANE_TEST_XFS_DIR") else {
-        eprintln!("skipping: FARPLANE_TEST_XFS_DIR must name XFS with reflink=1");
+    let Some(dir) = std::env::var_os("RAMET_TEST_XFS_DIR") else {
+        eprintln!("skipping: RAMET_TEST_XFS_DIR must name XFS with reflink=1");
         return;
     };
     let dir = std::path::PathBuf::from(dir);

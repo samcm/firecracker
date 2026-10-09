@@ -357,7 +357,7 @@ impl<'a> PrebootApiController<'a> {
         self.boot_path = true;
         // A drive is backed by an image pagemaster hands over at claim, so it is received before
         // the drive's descriptor is checked.
-        crate::vstate::farplane::FarplaneBackend::ensure_drives()
+        crate::vstate::ramet::RametBackend::ensure_drives()
             .map_err(|err| VmmActionError::DriveImages(err.to_string()))?;
         self.vm_resources
             .set_block_device(cfg)
@@ -465,10 +465,10 @@ impl<'a> PrebootApiController<'a> {
             self.fatal_error = Some(BuildMicrovmFromRequestsError::Restore);
         })?;
         // Resume VM. The restored microVM's capture service is already serving, so the resume
-        // takes the farplane dispatch hold: an epoch that opened between the restore and here
+        // takes the ramet dispatch hold: an epoch that opened between the restore and here
         // runs to its end before the vCPUs start.
         if load_params.resume_vm {
-            crate::vstate::farplane::outside_capture_epoch(|| {
+            crate::vstate::ramet::outside_capture_epoch(|| {
                 vmm.lock().expect("Poisoned lock").resume_vm()
             })
             .inspect_err(|_| {

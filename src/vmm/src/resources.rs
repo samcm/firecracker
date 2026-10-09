@@ -19,7 +19,7 @@ use crate::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics
 use crate::vmm_config::net::*;
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::vsock::*;
-use crate::vstate::farplane::FarplaneBackend;
+use crate::vstate::ramet::RametBackend;
 use crate::vstate::memory::{GuestRegionMmap, MemoryError};
 
 /// Errors encountered when configuring microVM resources.
@@ -237,8 +237,8 @@ impl VmResources {
     pub fn allocate_guest_memory(&self) -> Result<Vec<GuestRegionMmap>, MemoryError> {
         let regions =
             crate::arch::arch_memory_regions(mib_to_bytes(self.machine_config.mem_size_mib));
-        FarplaneBackend::construct_boot(&regions)
-            .map_err(|err| MemoryError::Farplane(err.to_string()))
+        RametBackend::construct_boot(&regions)
+            .map_err(|err| MemoryError::Ramet(err.to_string()))
     }
 }
 

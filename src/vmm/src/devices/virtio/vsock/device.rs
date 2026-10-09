@@ -314,7 +314,7 @@ where
     }
 
     pub(crate) fn defer_closed_queue(event: &EventFd) -> bool {
-        if !crate::vstate::farplane::dispatch::gate().is_closed() {
+        if !crate::vstate::ramet::dispatch::gate().is_closed() {
             return false;
         }
         if let Err(err) = event.write(1)
@@ -760,7 +760,7 @@ where
     /// Collects an acknowledgement the guest has already given, so the serialized state does not
     /// wait for it twice.
     ///
-    /// The guest can answer a published reset when no handler will run: Farplane's capture closes
+    /// The guest can answer a published reset when no handler will run: Ramet's capture closes
     /// event dispatch before it pauses the vCPUs, so a guest that refills the event queue in
     /// between leaves only the ring behind. Serializing that reset as still published would make
     /// the restored VM signal a used ring its guest has already consumed: it would never be asked
@@ -820,7 +820,7 @@ mod tests {
     #[test]
     #[ignore = "process-global dispatch gate; run this exact test in isolation"]
     fn close_yields_vsock_loops_and_reopen_wakes_refill() {
-        use crate::vstate::farplane::dispatch;
+        use crate::vstate::ramet::dispatch;
 
         for queue in [RXQ_INDEX, TXQ_INDEX] {
             let ctx = TestContext::new();
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     #[ignore = "process-global dispatch gate; run this exact test in isolation"]
     fn closed_reset_retains_event_wake_and_reopens() {
-        use crate::vstate::farplane::dispatch;
+        use crate::vstate::ramet::dispatch;
 
         let ctx = TestContext::new();
         let mut handler = ctx.create_event_handler_context();

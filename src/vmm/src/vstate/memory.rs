@@ -24,7 +24,7 @@ use crate::utils::u64_to_usize;
 #[derive(Debug)]
 pub struct GuestRegionMmap {
     region: vm_memory::GuestRegionMmap<Option<AtomicBitmap>>,
-    _mapping: Option<super::farplane::memversion::Mapping>,
+    _mapping: Option<super::ramet::memversion::Mapping>,
 }
 
 impl GuestRegionMmap {
@@ -38,7 +38,7 @@ impl GuestRegionMmap {
 
     /// Wraps an externally allocated mapping and transfers lifetime ownership to the region.
     pub(crate) fn from_external(
-        mapping: super::farplane::memversion::Mapping,
+        mapping: super::ramet::memversion::Mapping,
         address: GuestAddress,
     ) -> Result<Self, std::io::Error> {
         use vm_memory::bitmap::NewBitmap;
@@ -91,8 +91,8 @@ pub enum MemoryError {
         /// Size in bytes recorded in the snapshot.
         want_size: usize,
     },
-    /// Farplane memory channel failed: {0}
-    Farplane(String),
+    /// Ramet memory channel failed: {0}
+    Ramet(String),
 }
 
 /// An extension to GuestMemoryRegion which records the KVM memory slot the region is

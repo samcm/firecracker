@@ -152,7 +152,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         file_engine_type: None,
     };
 
-    // A drive's image arrives over the farplane memory channel, which this test does not
+    // A drive's image arrives over the ramet memory channel, which this test does not
     // connect: the insert is refused for that alone, after it has committed to booting.
     let req = VmmAction::InsertBlockDevice(config);
     verify_load_snap_disallowed_after(req, "InsertBlockDevice", |result| {

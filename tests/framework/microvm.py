@@ -40,7 +40,7 @@ from framework.jailer import JailerContext
 from framework.microvm_helpers import MicrovmHelpers
 from framework.properties import global_props
 from framework.utils_cpu_templates import get_cpu_template_name
-from host_tools.farplane import (
+from host_tools.ramet import (
     ROOT_FILENO,
     Pagemaster,
     memfd_from_file,
@@ -63,7 +63,7 @@ class Microvm:
     process.
     """
 
-    MEM_SOCKET_NAME = "farplane.sock"
+    MEM_SOCKET_NAME = "ramet.sock"
 
     def __init__(
         self,
@@ -621,7 +621,7 @@ class Microvm:
         else:
             self.jailer.scratch_fd = None
         self.pagemaster = self.start_pagemaster()
-        self.jailer.extra_args["farplane-mem-socket"] = f"/{self.MEM_SOCKET_NAME}"
+        self.jailer.extra_args["ramet-mem-socket"] = f"/{self.MEM_SOCKET_NAME}"
 
         cmd = [
             *self._pre_cmd,

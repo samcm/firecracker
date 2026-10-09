@@ -253,7 +253,7 @@
             },
             {
                 "syscall": "madvise",
-                "comment": "Used by a farplane rebase to install a remapped guest range read-only from its generation before registering it",
+                "comment": "Used by a ramet rebase to install a remapped guest range read-only from its generation before registering it",
                 "args": [
                     {
                         "index": 2,

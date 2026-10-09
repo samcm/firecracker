@@ -375,7 +375,7 @@ impl VirtioBlock {
         loop {
             // A close racing after this check may finish this iteration, but cannot keep
             // dispatch alive by refilling the queue. Still run the submission/used epilogue.
-            if crate::vstate::farplane::dispatch::gate().is_closed() {
+            if crate::vstate::ramet::dispatch::gate().is_closed() {
                 // The handler consumed its eventfd before entering this loop. Preserve a host
                 // wakeup for reopen, even when EVENT_IDX suppressed the guest's refill kick.
                 // EAGAIN means the nonblocking counter is full: a wake is already pending.
@@ -815,7 +815,7 @@ mod tests {
 
         use event_manager::SubscriberOps;
 
-        use crate::vstate::farplane::dispatch;
+        use crate::vstate::ramet::dispatch;
 
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
             for event_idx in [false, true] {

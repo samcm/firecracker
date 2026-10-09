@@ -25,7 +25,7 @@ use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::LoadSnapshotParams;
-use crate::vstate::farplane::FarplaneBackend;
+use crate::vstate::ramet::RametBackend;
 use crate::vstate::kvm::KvmState;
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::VmState;
@@ -200,7 +200,7 @@ pub fn snapshot_state_sanity_check(
 pub enum RestoreFromSnapshotError {
     /// Invalid snapshot state: {0}
     Invalid(#[from] SnapShotStateSanityCheckError),
-    /// Failed to load guest memory: Farplane restore failed: {0}
+    /// Failed to load guest memory: Ramet restore failed: {0}
     GuestMemory(String),
     /// Failed to build microVM from snapshot: {0}
     Build(#[from] BuildMicrovmFromSnapshotError),
@@ -214,7 +214,7 @@ pub fn restore_from_snapshot(
     params: &LoadSnapshotParams,
     vm_resources: &mut VmResources,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
-    let (guest_memory, microvm_state) = FarplaneBackend::construct_restore()
+    let (guest_memory, microvm_state) = RametBackend::construct_restore()
         .map_err(|err| RestoreFromSnapshotError::GuestMemory(err.to_string()))?;
 
     let vcpu_count = microvm_state

@@ -25,7 +25,7 @@ pub(crate) fn parse_put_snapshot(
 }
 
 pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, RequestError> {
-    if vmm::vstate::farplane::FarplaneBackend::capture_in_progress() {
+    if vmm::vstate::ramet::RametBackend::capture_in_progress() {
         return Err(RequestError::Generic(
             StatusCode::Conflict,
             "capture_in_progress".to_string(),

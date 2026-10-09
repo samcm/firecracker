@@ -85,10 +85,10 @@ enum MainError {
     ParentDeath(io::Error),
     /// Failed to lock the working set: {0}
     LockWorkingSet(io::Error),
-    /// Missing required --farplane-mem-socket
-    MissingFarplaneSocket,
+    /// Missing required --ramet-mem-socket
+    MissingRametSocket,
     /// Could not connect the pagemaster memory channel: {0}
-    FarplaneConnect(vmm::vstate::farplane::BackendError),
+    RametConnect(vmm::vstate::ramet::BackendError),
     /// RunWithApiError error: {0}
     RunWithApi(ApiServerError),
     /// RunWithoutApiError error: {0}
@@ -137,7 +137,7 @@ fn main_exec() -> Result<(), MainError> {
 
     // Published before anything can observe the instance description, so that the runtime state
     // API reports the same provenance as `--version` for the whole life of the process.
-    vmm::vstate::farplane::set_source_commit(BUILD_COMMIT);
+    vmm::vstate::ramet::set_source_commit(BUILD_COMMIT);
 
     // First call to this function updates the value to current
     // host page size.
@@ -287,7 +287,7 @@ fn main_exec() -> Result<(), MainError> {
                     .help("Enables PCIe support."),
             )
             .arg(
-                Argument::new("farplane-mem-socket")
+                Argument::new("ramet-mem-socket")
                     .takes_value(true)
                     .help("Path to the pagemaster SEQPACKET memory channel."),
             );
@@ -303,7 +303,7 @@ fn main_exec() -> Result<(), MainError> {
 
     if arguments.flag_present("version") {
         println!("Firecracker v{FIRECRACKER_VERSION}\n");
-        println!("{}", vmm::vstate::farplane::FEATURE_IDENTITY);
+        println!("{}", vmm::vstate::ramet::FEATURE_IDENTITY);
         // A line of its own, because the version line is parsed for the version alone.
         println!("commit {BUILD_COMMIT}");
         return Ok(());
@@ -319,13 +319,13 @@ fn main_exec() -> Result<(), MainError> {
         return Ok(());
     }
 
-    let farplane_socket = arguments
-        .single_value("farplane-mem-socket")
-        .ok_or(MainError::MissingFarplaneSocket)?;
-    vmm::vstate::farplane::FarplaneBackend::set_socket_path(PathBuf::from(farplane_socket));
+    let ramet_socket = arguments
+        .single_value("ramet-mem-socket")
+        .ok_or(MainError::MissingRametSocket)?;
+    vmm::vstate::ramet::RametBackend::set_socket_path(PathBuf::from(ramet_socket));
     // Firecracker is started before its sandbox is known. The memory channel is connected now so
     // that a claim finds it waiting; pagemaster sends nothing on it until the claim arrives.
-    vmm::vstate::farplane::FarplaneBackend::connect().map_err(MainError::FarplaneConnect)?;
+    vmm::vstate::ramet::RametBackend::connect().map_err(MainError::RametConnect)?;
 
     // It's safe to unwrap here because the field's been provided with a default value.
     let instance_id = arguments.single_value("id").unwrap();
@@ -391,7 +391,7 @@ fn main_exec() -> Result<(), MainError> {
         state: VmState::NotStarted,
         vmm_version: FIRECRACKER_VERSION.to_string(),
         app_name: "Firecracker".to_string(),
-        farplane: vmm::vstate::farplane::FarplaneState::default(),
+        ramet: vmm::vstate::ramet::RametState::default(),
     };
     instance_info.publish();
 
@@ -635,10 +635,10 @@ fn build_microvm_from_json(
     .map_err(BuildFromJsonError::StartMicroVM)?;
 
     // No API client exists to resume a boot that stays paused, so this path resumes the instance
-    // itself. The capture service is already serving by now, so the resume takes the farplane
+    // itself. The capture service is already serving by now, so the resume takes the ramet
     // dispatch hold: a capture epoch that opened during startup runs to its end before the guest
     // is allowed to execute.
-    vmm::vstate::farplane::outside_capture_epoch(|| vmm.lock().unwrap().resume_vm())
+    vmm::vstate::ramet::outside_capture_epoch(|| vmm.lock().unwrap().resume_vm())
         .map_err(vmm::builder::StartMicrovmError::Internal)
         .map_err(BuildFromJsonError::StartMicroVM)?;
 
@@ -688,9 +688,9 @@ fn run_without_api(
 
     // Run the EventManager that drives everything in the microVM.
     loop {
-        // One dispatch slice, holding the farplane gate: a capture epoch closes it and this
+        // One dispatch slice, holding the ramet gate: a capture epoch closes it and this
         // loop parks in the slice call until the epoch ends, so no device handler runs inside it.
-        vmm::vstate::farplane::dispatch_slice(&mut event_manager)
+        vmm::vstate::ramet::dispatch_slice(&mut event_manager)
             .expect("Failed to start the event manager");
 
         match vmm.lock().unwrap().shutdown_exit_code() {

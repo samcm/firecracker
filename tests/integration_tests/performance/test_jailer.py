@@ -12,7 +12,7 @@ import pytest
 from framework import utils
 from framework.jailer import DEFAULT_CHROOT_PATH, JailerContext
 from framework.properties import global_props
-from host_tools.farplane import PAGE_SIZE, ROOT_SEALS, sealed_memfd
+from host_tools.ramet import PAGE_SIZE, ROOT_SEALS, sealed_memfd
 
 
 def setup_bind_mounts(tmp_path, n):

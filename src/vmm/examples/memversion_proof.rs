@@ -16,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use vmm::vstate::farplane::protocol::{self, Incoming, MsgType};
+use vmm::vstate::ramet::protocol::{self, Incoming, MsgType};
 use vmm_sys_util::ioctl::ioctl_with_mut_ref;
 
 const BASE: u64 = 0x3000_0000_0000;
@@ -467,7 +467,7 @@ impl Vm {
                 "--",
                 "--api-sock",
                 "/api.sock",
-                "--farplane-mem-socket",
+                "--ramet-mem-socket",
                 "/memory.sock",
                 "--log-path",
                 "/fc.log",

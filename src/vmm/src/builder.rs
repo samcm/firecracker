@@ -47,7 +47,7 @@ use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
-use crate::vstate::farplane::{CaptureService, FarplaneBackend};
+use crate::vstate::ramet::{CaptureService, RametBackend};
 use crate::vstate::kvm::{Kvm, KvmError};
 use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
@@ -345,7 +345,7 @@ pub fn build_microvm_for_boot(
     // The channel's thread is started before this thread is confined, because it
     // confines itself with the same filter and a filtered thread may not be
     // allowed to create another.
-    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
+    let channel = RametBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
     CaptureService::spawn(
         channel,
         vmm.clone(),
@@ -538,7 +538,7 @@ pub fn build_microvm_from_snapshot(
     // Started before this thread is confined: the channel's thread confines
     // itself with the same filter, and a filtered thread may not be allowed to
     // create another.
-    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
+    let channel = RametBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
     CaptureService::spawn(
         channel,
         vmm.clone(),

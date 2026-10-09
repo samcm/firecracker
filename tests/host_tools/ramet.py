@@ -1,11 +1,11 @@
 # Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A pagemaster stand-in for the farplane memory channel.
+"""A pagemaster stand-in for the ramet memory channel.
 
 `Pagemaster` owns the SEQPACKET socket Firecracker connects to, hands over the sealed backing
 memfds and the canonical extent table, serves userfaultfd events for the guest mappings and drives
-the capture cycle. `FarplaneMicrovm` launches the jailer with an inherited root image descriptor so
+the capture cycle. `RametMicrovm` launches the jailer with an inherited root image descriptor so
 tests can talk to a real Firecracker over that channel.
 """
 
@@ -38,7 +38,7 @@ MAGIC = 0x314D5046
 VERSION = 1
 MAX_DATAGRAM = 65536
 MAX_EXTENTS = 65536
-FEATURE_IDENTITY = "farplane/8"
+FEATURE_IDENTITY = "ramet-vmstate/1"
 
 HEADER = struct.Struct("<IHHQIIQ")
 HELLO = struct.Struct("<IIHHI32s")
@@ -299,7 +299,7 @@ def seals_files(directory):
         probe.unlink()
 
 
-_REGULAR_IMAGE_SUBDIR = "farplane-images"
+_REGULAR_IMAGE_SUBDIR = "ramet-images"
 
 
 @cache
@@ -684,7 +684,7 @@ class Pagemaster:
             total = sum(size for _, size in self.regions)
             if not self.backing_fds:
                 # One all-hole sparse memfd tiling every region back to back.
-                self.backing_fds = [sealed_memfd("farplane-sparse", total)]
+                self.backing_fds = [sealed_memfd("ramet-sparse", total)]
             offset = 0
             for addr, size in self.regions:
                 self.extents.append(Extent(addr, size, 0, offset))
@@ -706,7 +706,7 @@ class Pagemaster:
                 if build:
                     self.backing_fds.append(
                         sealed_memfd(
-                            f"farplane-backing-{guest_addr:#x}",
+                            f"ramet-backing-{guest_addr:#x}",
                             length,
                             content=marker,
                             offset=length - PAGE_SIZE if marker else 0,
@@ -719,13 +719,13 @@ class Pagemaster:
         """Record, and return, the marker planted on the last page of an extent."""
         if not self.markers:
             return None
-        marker = f"farplane-{guest_addr:#x}".encode()
+        marker = f"ramet-{guest_addr:#x}".encode()
         self.marker_bytes[guest_addr + length - PAGE_SIZE] = marker
         return marker
 
     def _extent_table_fd(self):
         table = b"".join(extent.pack() for extent in self.extents)
-        return sealed_memfd("farplane-extents", len(table), content=table)
+        return sealed_memfd("ramet-extents", len(table), content=table)
 
     def _parse_backend_ready(self, body, fds):
         (count,) = struct.unpack_from("<I", body, 0)
@@ -936,7 +936,7 @@ class Pagemaster:
 
     def _materialize_checkpoint_extent(self, extent):
         """Copy one guest extent into a sparse, finally sealed memfd."""
-        fd = _memfd_create(f"farplane-checkpoint-{extent.guest_addr:#x}")
+        fd = _memfd_create(f"ramet-checkpoint-{extent.guest_addr:#x}")
         try:
             os.ftruncate(fd, extent.len)
             zero = bytes(PAGE_SIZE)
@@ -965,7 +965,7 @@ class Pagemaster:
             if self.dirty_fd is not None:
                 os.close(self.dirty_fd)
             dirty_fd = sealed_memfd(
-                "farplane-dirty",
+                "ramet-dirty",
                 self.dirty_bitmap_bytes,
                 seals=BUFFER_SEALS,
                 read_only=False,
@@ -975,7 +975,7 @@ class Pagemaster:
             if self.vmstate_fd is not None:
                 os.close(self.vmstate_fd)
             vmstate_fd = sealed_memfd(
-                "farplane-vmstate",
+                "ramet-vmstate",
                 self.vmstate_capacity_bytes,
                 seals=BUFFER_SEALS,
                 read_only=False,
@@ -1015,7 +1015,7 @@ class Pagemaster:
         """The reply and all unchanged reported-free pages; failed buffers are discarded."""
         size = sum(((r["size"] // 4096 + 63) // 64) * 8 for r in self.ready_regions)
         fd = sealed_memfd(
-            "farplane-free-summary", size, seals=BUFFER_SEALS, read_only=False
+            "ramet-free-summary", size, seals=BUFFER_SEALS, read_only=False
         )
         try:
             reply = self.request(
@@ -1043,7 +1043,7 @@ class Pagemaster:
         """Fold `bitmap` back into the dirty log."""
         data = bytes(bitmap.data if isinstance(bitmap, DirtyBitmap) else bitmap)
         fd = sealed_memfd(
-            "farplane-union",
+            "ramet-union",
             len(data),
             content=data,
             seals=BUFFER_SEALS,
@@ -1158,12 +1158,12 @@ class Pagemaster:
         return header, payload[HEADER.size :], list(fds)
 
 
-class FarplaneMicrovm:
+class RametMicrovm:
     """A jailed Firecracker whose guest memory comes from a `Pagemaster`."""
 
     # pylint: disable=too-many-public-methods
 
-    SOCKET_NAME = "farplane.sock"
+    SOCKET_NAME = "ramet.sock"
 
     def __init__(
         self,
@@ -1359,7 +1359,7 @@ class FarplaneMicrovm:
             argv += ["--resource-limit", limit]
         argv += ["--"]
         argv += [
-            "--farplane-mem-socket",
+            "--ramet-mem-socket",
             f"/{self.SOCKET_NAME}",
             "--log-path",
             "fc.log",
@@ -1511,9 +1511,9 @@ class FarplaneMicrovm:
         """The `GET /` document."""
         return self.api.describe.get().json()
 
-    def farplane_state(self):
-        """The `farplane` object of `GET /`."""
-        return self.instance()["farplane"]
+    def ramet_state(self):
+        """The `ramet` object of `GET /`."""
+        return self.instance()["ramet"]
 
     # ------------------------------------------------------------------- teardown
 

@@ -17,12 +17,12 @@ use std::thread;
 use std::time::Duration;
 
 use vm_memory::GuestAddress;
-use vmm::vstate::farplane::backend::VMSTATE_CAPACITY_BYTES;
-use vmm::vstate::farplane::protocol::{
+use vmm::vstate::ramet::backend::VMSTATE_CAPACITY_BYTES;
+use vmm::vstate::ramet::protocol::{
     self, ChannelError, ERROR_DETAIL_LEN, HEADER_LEN, Header, MAGIC, MAX_DATAGRAM, Mode, MsgType,
     READY_REGION_RECORD_LEN, RegionRecord, VERSION,
 };
-use vmm::vstate::farplane::{BackendError, ErrorCode, FarplaneBackend};
+use vmm::vstate::ramet::{BackendError, ErrorCode, RametBackend};
 use vmm_sys_util::tempdir::TempDir;
 
 // Socket/channel state and fixed guest addresses are process-global.
@@ -64,10 +64,10 @@ fn connect_backend(path: &Path) {
             let null = std::fs::File::open("/dev/null").unwrap();
             assert_eq!(unsafe { libc::dup2(null.as_raw_fd(), slot) }, slot);
         }
-        vmm::vstate::farplane::drives::install(sealed_root_image(), None).unwrap();
+        vmm::vstate::ramet::drives::install(sealed_root_image(), None).unwrap();
     });
-    FarplaneBackend::set_socket_path(path.to_path_buf());
-    FarplaneBackend::connect().expect("connect the memory channel");
+    RametBackend::set_socket_path(path.to_path_buf());
+    RametBackend::connect().expect("connect the memory channel");
 }
 
 fn page_size() -> u64 {
@@ -245,7 +245,7 @@ fn cold_boot_multiregion_ready_ack_and_mapping_lifetime() {
         .iter()
         .map(|r| (GuestAddress(r.guest_addr), r.size as usize))
         .collect();
-    let memory = FarplaneBackend::construct_boot(&requested).expect("portable anonymous cold boot");
+    let memory = RametBackend::construct_boot(&requested).expect("portable anonymous cold boot");
     pm.join().unwrap();
     let memory: Vec<_> = memory.into_iter().map(Arc::new).collect();
     for (guest, record) in memory.iter().zip(regions()) {
@@ -256,7 +256,7 @@ fn cold_boot_multiregion_ready_ack_and_mapping_lifetime() {
         bytes.fill(0xa5);
         assert!(bytes.iter().all(|byte| *byte == 0xa5));
     }
-    drop(FarplaneBackend::take_channel().expect("published channel"));
+    drop(RametBackend::take_channel().expect("published channel"));
     for record in regions() {
         assert_mapped(&record);
     }
@@ -347,13 +347,13 @@ fn reject_plan(mode: Mode, body: Vec<u8>, fds: Vec<OwnedFd>) -> (BackendError, O
             .iter()
             .map(|r| (GuestAddress(r.guest_addr), r.size as usize))
             .collect();
-        FarplaneBackend::construct_boot(&requested).map(|_| ())
+        RametBackend::construct_boot(&requested).map(|_| ())
     } else {
-        FarplaneBackend::construct_restore().map(|_| ())
+        RametBackend::construct_restore().map(|_| ())
     };
     let error = result.expect_err("invalid plan must fail");
     let wire = pm.join().unwrap();
-    assert!(FarplaneBackend::take_channel().is_none());
+    assert!(RametBackend::take_channel().is_none());
     (error, wire)
 }
 
@@ -658,7 +658,7 @@ fn free_summary_v8_wire_budget_and_descriptor_roundtrip() {
 /// per process and takes over the process's own drive slots.
 #[test]
 fn drives_frame_installs_images_before_the_handshake() {
-    const CHILD: &str = "FARPLANE_DRIVES_FRAME_CASE";
+    const CHILD: &str = "RAMET_DRIVES_FRAME_CASE";
     let Some(case) = std::env::var_os(CHILD) else {
         for case in ["sealed", "writable", "count"] {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -680,8 +680,8 @@ fn drives_frame_installs_images_before_the_handshake() {
     let dir = TempDir::new().unwrap();
     let path = dir.as_path().join("pagemaster.sock");
     let listener = listen_seqpacket(&path);
-    FarplaneBackend::set_socket_path(path);
-    FarplaneBackend::connect().unwrap();
+    RametBackend::set_socket_path(path);
+    RametBackend::connect().unwrap();
     let case = case.into_string().unwrap();
     let (root, count) = match case.as_str() {
         "sealed" => (sealed_root_image(), 1u32),
@@ -716,7 +716,7 @@ fn drives_frame_installs_images_before_the_handshake() {
             .unwrap();
         protocol::recv_frame(&sock).ok()
     });
-    let result = FarplaneBackend::ensure_drives();
+    let result = RametBackend::ensure_drives();
     let reply = pm.join().unwrap();
     match case.as_str() {
         "sealed" => {
@@ -729,7 +729,7 @@ fn drives_frame_installs_images_before_the_handshake() {
             let flags = unsafe { libc::fcntl(5, libc::F_GETFL) };
             assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
             // Installation happens once.
-            FarplaneBackend::ensure_drives().unwrap();
+            RametBackend::ensure_drives().unwrap();
         }
         "writable" => {
             assert!(matches!(result, Err(BackendError::Drives(_))), "{result:?}");
@@ -739,14 +739,14 @@ fn drives_frame_installs_images_before_the_handshake() {
                 u32::from_le_bytes(reply.body[..4].try_into().unwrap()),
                 ErrorCode::BadDrive as u32
             );
-            assert!(!vmm::vstate::farplane::drives::installed());
+            assert!(!vmm::vstate::ramet::drives::installed());
         }
         "count" => {
             assert!(
                 result.is_err(),
                 "a count that disagrees with the rights was accepted"
             );
-            assert!(!vmm::vstate::farplane::drives::installed());
+            assert!(!vmm::vstate::ramet::drives::installed());
         }
         _ => unreachable!(),
     }

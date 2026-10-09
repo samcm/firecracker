@@ -322,7 +322,7 @@ impl Vmm {
                         entropy = Some(EntropyDeviceConfig::from(e));
                     }
                 }
-                // Free page reporting is part of every farplane machine, not configuration.
+                // Free page reporting is part of every ramet machine, not configuration.
                 VirtioDeviceType::Balloon => {}
             });
 

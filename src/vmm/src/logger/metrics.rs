@@ -765,9 +765,9 @@ impl VmmMetrics {
     }
 }
 
-/// Metrics of the farplane capture channel.
+/// Metrics of the ramet capture channel.
 #[derive(Debug, Default, Serialize)]
-pub struct FarplaneMetrics {
+pub struct RametMetrics {
     /// Number of scratch disk reflinks taken inside a capture quiesce.
     pub disk_clones: SharedIncMetric,
     /// Provides Min/max/sum for the reflink of the scratch disk, which is part of the freeze.
@@ -775,7 +775,7 @@ pub struct FarplaneMetrics {
     /// Number of scratch disk reflinks that failed and refused the quiesce.
     pub disk_clone_failures: SharedIncMetric,
 }
-impl FarplaneMetrics {
+impl RametMetrics {
     /// Const default construction.
     pub const fn new() -> Self {
         Self {
@@ -839,8 +839,8 @@ pub struct FirecrackerMetrics {
     pub block_ser: BlockMetricsSerializeProxy,
     /// Metrics related to deprecated API calls.
     pub deprecated_api: DeprecatedApiMetrics,
-    /// Metrics related to the farplane capture channel.
-    pub farplane: FarplaneMetrics,
+    /// Metrics related to the ramet capture channel.
+    pub ramet: RametMetrics,
     /// Metrics related to API GET requests.
     pub get_api_requests: GetRequestsMetrics,
     #[serde(flatten)]
@@ -882,7 +882,7 @@ impl FirecrackerMetrics {
             api_server: ApiServerMetrics::new(),
             block_ser: BlockMetricsSerializeProxy {},
             deprecated_api: DeprecatedApiMetrics::new(),
-            farplane: FarplaneMetrics::new(),
+            ramet: RametMetrics::new(),
             get_api_requests: GetRequestsMetrics::new(),
             legacy_dev_ser: LegacyDevMetricsSerializeProxy {},
             latencies_us: PerformanceMetrics::new(),

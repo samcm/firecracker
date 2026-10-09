@@ -1,6 +1,6 @@
 # The post-close device guard covers 2804 distinct guest pages
 
-The farplane/7 hard cutover has one device profile. The host-device term is
+The ramet-vmstate/0 hard cutover has one device profile. The host-device term is
 **2804 × 4096 = 11,485,184 bytes**. Its Rust contract is
 `devices::virtio::MAX_POST_CLOSE_GUEST_PAGES`; the arithmetic test derives it from
 the actual payload, queue and in-flight constants. Pagemaster adds this term to
@@ -82,7 +82,7 @@ compiled native policy and verifies SIGSYS for vmm, vcpu and api, including advi
 with nonzero high register bits, plus an allowed NOHUGEPAGE control. Guest RAM is
 NOHUGEPAGE before first touch and pinned on fault; running guests never discard it.
 
-## Farplane/8 free summaries do not alter capture or the guard
+## Ramet/8 free summaries do not alter capture or the guard
 
 FreeSummary (22) carries one LE u64 budget of 1–250000 microseconds and one
 read-write, grow/shrink-sealed memfd. FreeSummaryDone (23) has one LE u64 popcount

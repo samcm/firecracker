@@ -24,11 +24,11 @@ pub const MAX_SCM_FDS: usize = 253;
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
 /// the handshake and the capture command order a peer must speak.
-pub const FEATURE_IDENTITY: &str = "farplane/9";
+pub const FEATURE_IDENTITY: &str = "ramet/1";
 /// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
 /// it was captured under. It changes only when those do, so a channel change alone leaves every
 /// stored vmstate restorable.
-pub const VMSTATE_IDENTITY: &str = "farplane/8";
+pub const VMSTATE_IDENTITY: &str = "ramet-vmstate/1";
 /// Maximum output of an advisory free summary, including per-region word padding.
 pub const MAX_FREE_SUMMARY_BYTES: u64 = 4 * 1024 * 1024;
 /// Maximum cooperative work budget for one advisory free summary.
@@ -743,7 +743,7 @@ mod tests {
         let (tx, rx) = seqpacket_pair();
         set_buffers(&tx);
         set_buffers(&rx);
-        let mut memfd = memfd(b"farplane-test\0");
+        let mut memfd = memfd(b"ramet-test\0");
         memfd.write_all(b"payload").unwrap();
 
         let body = 3u32.to_le_bytes().to_vec();
@@ -761,7 +761,7 @@ mod tests {
         let (tx, rx) = seqpacket_pair();
         set_buffers(&tx);
         set_buffers(&rx);
-        let memfd = memfd(b"farplane-fd-limit\0");
+        let memfd = memfd(b"ramet-fd-limit\0");
         let fds = vec![memfd.as_raw_fd(); MAX_SCM_FDS];
 
         let count = u32::try_from(MAX_SCM_FDS).unwrap();
@@ -933,6 +933,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/9");
+        assert_eq!(FEATURE_IDENTITY, "ramet/1");
     }
 }

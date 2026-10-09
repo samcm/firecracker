@@ -24,7 +24,7 @@ use crate::devices::virtio::queue::VIRTQ_DESC_F_NEXT;
 use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt};
 use crate::snapshot::Persist;
 use crate::test_utils::single_region_mem;
-use crate::vstate::farplane::dispatch;
+use crate::vstate::ramet::dispatch;
 use crate::vstate::memory::{Bytes, GuestAddress, GuestMemory};
 
 #[cfg(test)]

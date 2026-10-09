@@ -452,7 +452,7 @@ pub(crate) mod tests {
 
     /// The acknowledgement a guest gives after event dispatch has stopped is not lost.
     ///
-    /// Farplane's capture closes dispatch before it pauses the vCPUs, so the guest can answer a
+    /// Ramet's capture closes dispatch before it pauses the vCPUs, so the guest can answer a
     /// published reset when no handler will ever run and no kick can be relied on. The restored VM
     /// gets a used ring its guest has already consumed, so a snapshot that recorded `Published`
     /// would ask for an answer that can no longer be given and gate that guest for the rest of its

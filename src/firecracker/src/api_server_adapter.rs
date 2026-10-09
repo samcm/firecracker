@@ -63,7 +63,7 @@ impl ApiServerAdapter {
         }));
         event_manager.add_subscriber(api_adapter.clone());
         loop {
-            vmm::vstate::farplane::dispatch_slice(event_manager)
+            vmm::vstate::ramet::dispatch_slice(event_manager)
                 .expect("EventManager events driver fatal error");
             api_adapter.lock().expect("Poisoned lock").handle_request();
 
@@ -110,7 +110,7 @@ fn serve_actions(
     };
 
     let staged_is_pause = *staged == VmmAction::Pause;
-    respond(vmm::vstate::farplane::outside_capture_epoch(|| {
+    respond(vmm::vstate::ramet::outside_capture_epoch(|| {
         execute(*staged)
     }));
     if !staged_is_pause {
@@ -123,7 +123,7 @@ fn serve_actions(
     loop {
         let request = from_api.recv().expect("Error receiving API request.");
         let request_is_resume = *request == VmmAction::Resume;
-        respond(vmm::vstate::farplane::outside_capture_epoch(|| {
+        respond(vmm::vstate::ramet::outside_capture_epoch(|| {
             execute(*request)
         }));
         if request_is_resume {
@@ -293,7 +293,7 @@ mod tests {
 
         // The epoch closes with the Resume already staged, exactly as a capture that starts while
         // the API thread has handed an action over leaves it.
-        vmm::vstate::farplane::gate().close();
+        vmm::vstate::ramet::gate().close();
 
         let served = thread::spawn(move || {
             serve_actions(
@@ -309,7 +309,7 @@ mod tests {
         });
 
         // The action is provably parked on the gate, not merely late, and stays there.
-        vmm::vstate::farplane::gate().wait_for_parked(1);
+        vmm::vstate::ramet::gate().wait_for_parked(1);
         assert!(
             !EXECUTED.load(Ordering::SeqCst),
             "the action ran inside the capture epoch"
@@ -319,7 +319,7 @@ mod tests {
             "a response was sent for an action that must not have run"
         );
 
-        vmm::vstate::farplane::gate().open();
+        vmm::vstate::ramet::gate().open();
 
         served.join().expect("action thread panicked");
         assert!(

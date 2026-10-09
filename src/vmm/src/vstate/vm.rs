@@ -651,7 +651,7 @@ impl KvmVm {
     pub fn free_summary(&self) -> Result<Vec<Vec<u64>>, VmError> {
         self.free_summary_until(
             Instant::now()
-                + Duration::from_micros(crate::vstate::farplane::protocol::MAX_FREE_SUMMARY_MICROS),
+                + Duration::from_micros(crate::vstate::ramet::protocol::MAX_FREE_SUMMARY_MICROS),
         )
     }
 
@@ -671,7 +671,7 @@ impl KvmVm {
             check()?;
             bytes = bytes
                 .checked_add((region.len() / 4096).div_ceil(64) * 8)
-                .filter(|&n| n <= crate::vstate::farplane::protocol::MAX_FREE_SUMMARY_BYTES)
+                .filter(|&n| n <= crate::vstate::ramet::protocol::MAX_FREE_SUMMARY_BYTES)
                 .ok_or(VmError::FreeSummaryUnavailable)?;
         }
         let mut summary = Vec::with_capacity(self.guest_memory().num_regions());
@@ -777,7 +777,7 @@ impl KvmVm {
         state: &GuestMemoryState,
     ) -> Result<(), VmError> {
         if regions.len() != state.regions.len() {
-            return Err(VmError::MemoryError(MemoryError::Farplane(
+            return Err(VmError::MemoryError(MemoryError::Ramet(
                 "restored geometry does not match the vmstate".to_string(),
             )));
         }
@@ -1799,7 +1799,7 @@ pub(crate) mod tests {
     /// A restored VM's slots start with a clear KVM log: the state a baseline reaches, with no
     /// clear over the geometry, and still reporting what the host accumulator holds.
     #[test]
-    fn test_farplane_restored_slots_start_with_a_clear_log() {
+    fn test_ramet_restored_slots_start_with_a_clear_log() {
         let page_size = host_page_size();
         let mut vm = setup_vm();
         vm.start_dirty_log_clear().unwrap();

@@ -781,7 +781,7 @@ definitions:
       - id
       - state
       - vmm_version
-      - farplane
+      - ramet
     properties:
       app_name:
         description: Application name.
@@ -801,13 +801,13 @@ definitions:
       vmm_version:
         description: MicroVM hypervisor build version.
         type: string
-      farplane:
-        $ref: "#/definitions/FarplaneState"
-        description: Farplane memory-channel observation.
+      ramet:
+        $ref: "#/definitions/RametState"
+        description: Ramet memory-channel observation.
 
-  FarplaneState:
+  RametState:
     type: object
-    description: Farplane memory-channel observation.
+    description: Ramet memory-channel observation.
     required:
       - backend_state
       - vcpus
@@ -846,7 +846,7 @@ definitions:
           channel alone.
         type: string
         enum:
-          - "farplane/9"
+          - "ramet/1"
       vmstate_identity:
         description:
           Identity of the vmstate this binary writes and restores, which moves only
@@ -854,7 +854,7 @@ definitions:
           channel. A capture records this value.
         type: string
         enum:
-          - "farplane/8"
+          - "ramet-vmstate/1"
       source_commit:
         description:
           Commit of the source tree this binary was built from, the same value

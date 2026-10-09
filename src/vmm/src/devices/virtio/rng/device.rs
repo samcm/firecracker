@@ -140,7 +140,7 @@ impl Entropy {
         let mut used_any = false;
         loop {
             // Finish an admitted request, but never admit another after dispatch closes.
-            if crate::vstate::farplane::dispatch::gate().is_closed() {
+            if crate::vstate::ramet::dispatch::gate().is_closed() {
                 if let Err(err) = self.queue_events[RNG_QUEUE].write(1)
                     && err.raw_os_error() != Some(libc::EAGAIN)
                 {
@@ -366,7 +366,7 @@ mod tests {
     #[ignore = "process-global dispatch gate; run this exact test in isolation"]
     fn close_yields_entropy_loop_and_reopen_wakes_refill() {
         use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt};
-        use crate::vstate::farplane::dispatch;
+        use crate::vstate::ramet::dispatch;
         use crate::vstate::memory::{Bytes, GuestAddress};
 
         let mem = create_virtio_mem();

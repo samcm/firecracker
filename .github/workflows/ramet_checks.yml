@@ -1,10 +1,10 @@
-name: Farplane checks
+name: Ramet checks
 
 on:
   pull_request:
   push:
     branches:
-      - farplane
+      - ramet
   # The functional lane needs a host that exposes /dev/kvm and /dev/userfaultfd, so it runs
   # only when it is dispatched with a runner label that names such a host.
   workflow_dispatch:
@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: farplane-checks-${{ github.ref }}
+  group: ramet-checks-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -185,32 +185,32 @@ jobs:
             echo "guard: cargo test $* executed $passed tests, the floor is $min"
           }
 
-          guarded_cargo_test 3 -p vmm --lib vstate::farplane::dispatch
-          guarded_cargo_test 20 -p vmm --lib vstate::farplane::capture
-          guarded_cargo_test 13 -p vmm --lib vstate::farplane::backend
-          guarded_cargo_test 13 -p vmm --lib vstate::farplane::protocol
+          guarded_cargo_test 3 -p vmm --lib vstate::ramet::dispatch
+          guarded_cargo_test 20 -p vmm --lib vstate::ramet::capture
+          guarded_cargo_test 13 -p vmm --lib vstate::ramet::backend
+          guarded_cargo_test 13 -p vmm --lib vstate::ramet::protocol
           guarded_cargo_test 23 -p vmm --lib devices::virtio::vsock::device
           guarded_cargo_test 15 -p vmm --lib devices::virtio::vsock::event_handler
           guarded_cargo_test 12 -p vmm --lib devices::virtio::vsock::persist
           guarded_cargo_test 12 -p vmm --lib snapshot::
-          guarded_cargo_test 25 -p vmm --test farplane_channel
+          guarded_cargo_test 25 -p vmm --test ramet_channel
           guarded_cargo_test 1 -p firecracker --bin firecracker api_server_adapter
           # One image-alias test briefly redirects stderr, so the jailer crate runs
           # single-threaded rather than exposing process-global fd 2 to another test.
           guarded_cargo_test 28 -p jailer -- --test-threads=1
 
-          # Pin the whole family as well as its three Farplane-specific modules, so
+          # Pin the whole family as well as its three Ramet-specific modules, so
           # deleting a muxer, packet, or connection-state test cannot hide in the
           # still-large aggregate.
           guarded_cargo_test 87 -p vmm --lib devices::virtio::vsock -- --test-threads=1
 
-          if guarded_cargo_test 1 -p vmm --lib vstate::farplane::this_filter_matches_nothing; then
+          if guarded_cargo_test 1 -p vmm --lib vstate::ramet::this_filter_matches_nothing; then
             echo "::error::the guard accepted a filter that selects no tests"
             exit 1
           fi
           echo "the guard rejected a filter that selects nothing, as it must"
 
-          if guarded_cargo_test 100000 -p vmm --lib vstate::farplane::dispatch; then
+          if guarded_cargo_test 100000 -p vmm --lib vstate::ramet::dispatch; then
             echo "::error::the guard accepted a suite that executed fewer tests than its floor"
             exit 1
           fi
@@ -271,7 +271,7 @@ jobs:
       # Distributions and versions come from tools/devctr/poetry.lock, the set the suite
       # resolves to in the dev container: pytest and pytest-json-report for the
       # `--json-report` that tests/pytest.ini pins in `addopts`, pytest-timeout for its
-      # `timeout = 300`, and what the test module imports through `host_tools.farplane`,
+      # `timeout = 300`, and what the test module imports through `host_tools.ramet`,
       # which reaches `framework/http_api.py` (requests, and requests-unixsocket2, whose
       # module name is `requests_unixsocket`) and through it
       # `framework/swagger_validator.py` (PyYAML, jsonschema).
@@ -285,7 +285,7 @@ jobs:
       # `--confcutdir` keeps the session conftest out: it wants a built binary and the test
       # artifacts, and these tests read only checked-in sources. `python3 -m pytest`, unlike
       # `pytest`, puts the working directory on `sys.path`, which is what resolves
-      # `import host_tools.farplane` without that conftest.
+      # `import host_tools.ramet` without that conftest.
       #
       # tests/pytest.ini points `--json-report` at the suite-wide `../test_results` path;
       # this run redirects the report to a path of its own and reads the executed-test count
@@ -301,9 +301,9 @@ jobs:
           python3 -m pytest -q \
             --confcutdir=integration_tests/build \
             --json-report --json-report-file="$report" \
-            integration_tests/build/test_farplane_wire.py || status=$?
+            integration_tests/build/test_ramet_wire.py || status=$?
           if [ "$status" -ne 0 ]; then
-            echo "::error::the farplane wire tests exited $status"
+            echo "::error::the ramet wire tests exited $status"
             exit "$status"
           fi
           if [ ! -f "$report" ]; then
@@ -673,7 +673,7 @@ jobs:
     # `inputs.runner` is required on dispatch, so the fallback is reached only on the events
     # where this job is skipped, where it just keeps the expression valid. It names no real
     # runner on purpose: no default can place this job on a host that lacks the devices.
-    runs-on: ${{ inputs.runner || 'farplane-functional-runner-unset' }}
+    runs-on: ${{ inputs.runner || 'ramet-functional-runner-unset' }}
     # An unmatched label leaves the job queued until GitHub expires it; this bounds the job
     # once a runner does pick it up, so a capable-looking but wrong host ends the run.
     timeout-minutes: 120
@@ -695,7 +695,7 @@ jobs:
           [ "$major" -gt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -ge 1 ]; } \
             || missing="$missing kernel>=6.1(have $kernel)"
           if [ -n "$missing" ]; then
-            echo "::error::this host cannot run the functional farplane tests; missing:$missing"
+            echo "::error::this host cannot run the functional ramet tests; missing:$missing"
             exit 1
           fi
 
@@ -722,5 +722,5 @@ jobs:
       - name: "Build the binaries the functional tests drive"
         run: ./tools/devtool -y build --release
 
-      - name: "Functional farplane tests"
-        run: ./tools/devtool -y test --no-build -- integration_tests/functional/test_farplane.py
+      - name: "Functional ramet tests"
+        run: ./tools/devtool -y test --no-build -- integration_tests/functional/test_ramet.py

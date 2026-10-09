@@ -173,7 +173,7 @@ impl FreePageReporting {
     }
 
     fn defer_closed_queue(&self, queue: usize) -> bool {
-        if !crate::vstate::farplane::dispatch::gate().is_closed() {
+        if !crate::vstate::ramet::dispatch::gate().is_closed() {
             return false;
         }
         // A saturated counter already holds a wake for reopen.
@@ -335,7 +335,7 @@ mod tests {
     #[ignore = "requires KVM and process-global dispatch gate; run exact test in isolation"]
     fn close_yields_reporting_loops_and_reopen_wakes_refill() {
         use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
-        use crate::vstate::farplane::dispatch;
+        use crate::vstate::ramet::dispatch;
         use crate::vstate::memory::Bytes;
 
         for queue in [INFLATE_QUEUE, DEFLATE_QUEUE, REPORTING_QUEUE] {
