@@ -1170,13 +1170,15 @@ fn track_and_refresh_frames_numbers_and_bodies() {
         nr_zero_runs: 4,
         folded_pages: 7,
         ..Default::default()
-    }, 8);
-    assert_eq!(body.len(), 40);
+    }, 8, 9, 10);
+    assert_eq!(body.len(), 56);
     assert_eq!(body[..8], 5u64.to_le_bytes());
     assert_eq!(body[8..16], 6u64.to_le_bytes());
     assert_eq!(body[16..24], [3, 0, 0, 0, 4, 0, 0, 0]);
     assert_eq!(body[24..32], 7u64.to_le_bytes());
-    assert_eq!(body[32..], 8u64.to_le_bytes());
+    assert_eq!(body[32..40], 8u64.to_le_bytes());
+    assert_eq!(body[40..48], 9u64.to_le_bytes());
+    assert_eq!(body[48..], 10u64.to_le_bytes());
 }
 
 #[test]

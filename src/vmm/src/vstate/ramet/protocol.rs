@@ -117,7 +117,9 @@ pub enum MsgType {
     Refresh = 30,
     /// Firecracker returns the new standing version, a flat copy of the fold, as the one
     /// descriptor, and the fold's counts: LE u64 own pages, u64 new pages, u32 depth,
-    /// u32 zero runs, u64 folded pages, u64 microseconds the guest was paused for it.
+    /// u32 zero runs, u64 folded pages, u64 microseconds the guest was paused for it, u64 dirty
+    /// pages before the fold and u64 dirty pages after the rebase (u64::MAX when unread): their
+    /// sum bounds what the old chain held beyond the guest's own pages.
     Refreshed = 31,
     /// Pagemaster hands over a flat version it made with FLATTEN of the standing version, after a
     /// transient capture published, and asks for the tracker to stand on it instead. No body, one

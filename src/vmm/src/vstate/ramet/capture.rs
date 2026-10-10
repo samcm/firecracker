@@ -378,14 +378,16 @@ fn encode_free_summary_done(pages: u64, included: u64, standing_id: u64) -> Vec<
 }
 
 /// The `refreshed` reply body.
-fn encode_refreshed(info: &memversion::Info2, paused_us: u64) -> Vec<u8> {
-    let mut body = Vec::with_capacity(40);
+fn encode_refreshed(info: &memversion::Info2, paused_us: u64, before: u64, after: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(56);
     body.extend_from_slice(&info.own_pages.to_le_bytes());
     body.extend_from_slice(&info.new_pages.to_le_bytes());
     body.extend_from_slice(&info.depth.to_le_bytes());
     body.extend_from_slice(&info.nr_zero_runs.to_le_bytes());
     body.extend_from_slice(&info.folded_pages.to_le_bytes());
     body.extend_from_slice(&paused_us.to_le_bytes());
+    body.extend_from_slice(&before.to_le_bytes());
+    body.extend_from_slice(&after.to_le_bytes());
     body
 }
 
@@ -676,6 +678,9 @@ impl CaptureService {
             return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
         }
         let started = Instant::now();
+        // The pages the old chain may hold beyond the guest's own: what is dirty before the
+        // fold, and what is dirty once the rebase lets the old chain go.
+        let before = memversion::track_info(tracker.as_fd()).map_or(u64::MAX, |t| t.dirty_pages);
         let refreshed = memversion::geometry(&self.channel.regions)
             .and_then(|regions| {
                 memversion::refresh(
@@ -694,13 +699,14 @@ impl CaptureService {
                 // fails leaves the tracker on the fold, which is still exact. While it flattens,
                 // the guest's writes copy pages the old chain keeps: past the budget, the watch
                 // pauses the vCPUs until the rebase lets the old chain go.
-                let watching = budget > 0
-                    && memversion::track_info(tracker.as_fd())
-                        .map(|t| {
-                            self.background
-                                .start_watch(tracker.as_raw_fd(), t.dirty_pages, budget)
-                        })
-                        .is_ok();
+                let base = memversion::track_info(tracker.as_fd())
+                    .map(|t| t.dirty_pages)
+                    .ok();
+                let watching = budget > 0 && base.is_some();
+                if let (true, Some(base)) = (watching, base) {
+                    self.background
+                        .start_watch(tracker.as_raw_fd(), base, budget);
+                }
                 let flattened = memversion::flatten(folded.as_fd()).and_then(|flat| {
                     memversion::rebase(tracker.as_fd(), flat.as_fd())?;
                     Ok(flat)
@@ -710,6 +716,7 @@ impl CaptureService {
                 } else {
                     Duration::ZERO
                 };
+                let after = memversion::track_info(tracker.as_fd()).map_or(u64::MAX, |t| t.dirty_pages);
                 let version = match flattened {
                     Ok(flat) => flat,
                     Err(err) => {
@@ -732,7 +739,7 @@ impl CaptureService {
                 let answered = self.answer_with_version(
                     request_id,
                     MsgType::Refreshed,
-                    encode_refreshed(&info, paused_us),
+                    encode_refreshed(&info, paused_us, before, after),
                     Some(version),
                 );
                 // What the source still maps alone is what the fold refused and what the
