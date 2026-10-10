@@ -296,6 +296,9 @@ pub struct CaptureService {
     /// The last version a tracked capture or refresh produced, which the kernel's tracker
     /// also holds; kept to flatten it at the depth bound.
     standing: Option<Arc<OwnedFd>>,
+    /// Where the last refresh armed the standing guard, beyond the dirty count its fold left;
+    /// a capture's resume arms it again there, beyond what the capture's CREATE left marked.
+    guard_pages: u64,
     /// Re-shares the pages a live fold refused and guards the standing bound; a capture
     /// fences it as a guest-memory writer.
     background: Background,
@@ -434,6 +437,7 @@ impl CaptureService {
                     pending: None,
                     tracker: None,
                     standing: None,
+                    guard_pages: 0,
                     background,
                 };
                 loop {
@@ -689,6 +693,7 @@ impl CaptureService {
         if let Some(wake) = wake {
             self.background.wake_with(wake);
         }
+        self.guard_pages = bound.pages;
         let Some(tracker) = self.tracker.as_ref() else {
             return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
         };
@@ -850,8 +855,14 @@ impl CaptureService {
         // refreshes nothing until it flips, while the capture needs the guest running for its
         // barrier and the event loop for its pause: a guard pause from here on would wait for
         // a refresh that waits for the capture. The next refresh arms it anew and reports the
-        // pause.
+        // pause. What the guest writes until the fold is the capture's: its CREATE folds it, and
+        // the generation charges the standing level that keeps the old copies.
         self.background.disarm();
+        if let Some(tracker) = self.tracker.as_ref()
+            && let Ok(track) = memversion::track_info(tracker.as_fd())
+        {
+            info!("Ramet armed a capture at {} dirty pages", track.dirty_pages);
+        }
         let mut fds = incoming.fds;
         let destination = (fds.len() == 2).then(|| fds.remove(1));
         let [vmstate] = <[_; 1]>::try_from(fds).map_err(|_| ChannelError::FdCountMismatch)?;
@@ -904,6 +915,11 @@ impl CaptureService {
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
         let pause_us = at();
+        if let Some(tracker) = self.tracker.as_ref()
+            && let Ok(track) = memversion::track_info(tracker.as_fd())
+        {
+            info!("Ramet quiesced a capture at {} dirty pages", track.dirty_pages);
+        }
         // The background worker writes guest memory too: no touch runs past here.
         self.background.fence();
         if let Err(err) = vmm.drain_guest_memory_writers() {
@@ -1074,6 +1090,15 @@ impl CaptureService {
         self.order.open();
         set_capture_buffers_armed(false);
         BackendState::Ready.store();
+        // The capture's fold has landed: the guard is armed again at once, beyond the pages the
+        // CREATE left marked (its exclusions), so it counts only what the guest writes next.
+        if self.guard_pages > 0
+            && let Some(tracker) = self.tracker.as_ref()
+            && let Ok(track) = memversion::track_info(tracker.as_fd())
+        {
+            self.background
+                .guard(tracker, track.dirty_pages.saturating_add(self.guard_pages));
+        }
         self.background.unfence();
         dispatch::gate().open();
         self.reply(

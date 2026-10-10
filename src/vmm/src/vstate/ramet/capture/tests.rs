@@ -926,6 +926,7 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         pending: None,
         tracker: None,
         standing: None,
+        guard_pages: 0,
         background: Background::detached(),
     };
     let file = summary_buffer(4096);
@@ -1234,6 +1235,7 @@ fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
         pending: None,
         tracker: None,
         standing: None,
+        guard_pages: 0,
         background: Background::detached(),
     };
     let previous_state = BackendState::load();
