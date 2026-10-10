@@ -17,6 +17,36 @@ pub(crate) const GUEST_RAM_BASE: u64 = 0x3000_0000_0000;
 pub(crate) const MAX_REGIONS: usize = 16;
 const MAX_EXCLUSIONS: usize = 65_536;
 
+/// A lower run limit set once at startup by `--ramet-exclusion-cap`, so a test cell can
+/// drive a capture over it with an ordinary guest. Unset, the limit is [`MAX_EXCLUSIONS`].
+static EXCLUSION_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Parses an exclusion cap: a decimal run count in `1..=MAX_EXCLUSIONS`. It can only lower the
+/// kernel's limit; anything else is an error, never the default.
+pub(crate) fn parse_exclusion_cap(value: &str) -> io::Result<usize> {
+    match value.parse::<usize>() {
+        Ok(cap) if (1..=MAX_EXCLUSIONS).contains(&cap) => Ok(cap),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("exclusion cap {value:?} is not a run count in 1..={MAX_EXCLUSIONS}"),
+        )),
+    }
+}
+
+/// Sets the run limit every capture and Track count uses from now on. Once only.
+pub fn set_exclusion_cap(value: &str) -> io::Result<usize> {
+    let cap = parse_exclusion_cap(value)?;
+    EXCLUSION_CAP
+        .set(cap)
+        .map_err(|_| io::Error::other("the exclusion cap is already set"))?;
+    Ok(cap)
+}
+
+/// The run limit in force: the startup cap, or [`MAX_EXCLUSIONS`].
+pub(crate) fn exclusion_cap() -> usize {
+    EXCLUSION_CAP.get().copied().unwrap_or(MAX_EXCLUSIONS)
+}
+
 /// Mapping failure retaining the exact guest range and failed operation.
 #[derive(Debug, thiserror::Error)]
 #[error("{operation}(addr={addr:#x}, len={len:#x}) failed: {source}")]
@@ -293,7 +323,7 @@ pub(crate) fn geometry(regions: &[RegionRecord]) -> io::Result<Vec<Region>> {
 /// The runs a capture excludes, and what the run limit left out.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Exclusions {
-    /// Sorted by region then offset, disjoint, at most [`MAX_EXCLUSIONS`]: what CREATE and
+    /// Sorted by region then offset, disjoint, at most [`exclusion_cap`]: what CREATE and
     /// TRACK_INFO2 are both given.
     pub runs: Vec<Exclusion>,
     /// The runs the bitmaps hold, `runs.len()` unless the limit dropped some.
@@ -304,7 +334,7 @@ pub(crate) struct Exclusions {
 
 /// Exclude only reported-free pages with no subsequent KVM, ring or host write evidence.
 ///
-/// More runs than CREATE takes keep the [`MAX_EXCLUSIONS`] longest (ties to the lower address)
+/// More runs than CREATE takes keep the [`exclusion_cap`] longest (ties to the lower address)
 /// and drop the rest: a dropped free page is copied, which is always correct, only more bytes.
 /// The choice is a function of the bitmaps alone, so Track's count and CREATE agree.
 ///
@@ -315,7 +345,7 @@ pub(crate) fn exclusions(
     free: &[Vec<u64>],
     dirty: &[Vec<u64>],
 ) -> io::Result<Exclusions> {
-    exclusions_within(regions, free, dirty, MAX_EXCLUSIONS)
+    exclusions_within(regions, free, dirty, exclusion_cap())
 }
 
 /// Keeps the `limit` longest of `runs`, ties to the lower address; returns the bytes dropped.
@@ -462,7 +492,7 @@ fn create_flags_with(
     flags: u32,
     ioctl: impl FnOnce(&mut Create) -> io::Result<()>,
 ) -> io::Result<OwnedFd> {
-    if regions.is_empty() || regions.len() > MAX_REGIONS || exclusions.len() > MAX_EXCLUSIONS {
+    if regions.is_empty() || regions.len() > MAX_REGIONS || exclusions.len() > exclusion_cap() {
         return Err(invalid());
     }
     let mut request = Create {
@@ -832,7 +862,7 @@ fn included_pages_with(
     track_info2: impl FnOnce(&mut TrackInfo2) -> io::Result<()>,
     resident: impl FnOnce() -> io::Result<u64>,
 ) -> io::Result<Included> {
-    if exclusions.len() > MAX_EXCLUSIONS {
+    if exclusions.len() > exclusion_cap() {
         return Err(invalid());
     }
     let mut request = TrackInfo2 {
@@ -1894,6 +1924,28 @@ mod tests {
             assert_eq!(read(p), p + 1, "page {p} was captured");
         }
         drop(imported);
+    }
+
+    #[test]
+    fn an_exclusion_cap_can_only_lower_the_limit_and_a_bad_one_is_an_error() {
+        assert_eq!(parse_exclusion_cap("1").unwrap(), 1);
+        assert_eq!(parse_exclusion_cap("1024").unwrap(), 1024);
+        assert_eq!(parse_exclusion_cap("65536").unwrap(), MAX_EXCLUSIONS);
+        for bad in [
+            "0",
+            "65537",
+            "4294967296",
+            "-1",
+            "",
+            " 8",
+            "8 ",
+            "0x10",
+            "1e3",
+        ] {
+            parse_exclusion_cap(bad).unwrap_err();
+        }
+        // Unset, every capture uses the kernel's limit.
+        assert_eq!(exclusion_cap(), MAX_EXCLUSIONS);
     }
 
     #[test]

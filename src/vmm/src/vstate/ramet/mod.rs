@@ -16,6 +16,7 @@ pub mod protocol;
 pub use backend::{BackendError, BackendState, RametBackend, RametState, seal_process, set_source_commit};
 pub use capture::CaptureService;
 pub use dispatch::{dispatch_slice, gate, outside_capture_epoch};
+pub use memversion::set_exclusion_cap;
 pub use protocol::{
     Arch, BackendReadyRegion, ChannelError, ErrorCode, FEATURE_IDENTITY, Header, MAGIC,
     MAX_DATAGRAM, Mode, MsgType, RegionRecord, VERSION,

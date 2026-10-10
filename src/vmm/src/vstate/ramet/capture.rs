@@ -748,9 +748,10 @@ impl CaptureService {
                 } = memversion::exclusions(&regions, &free, &dirty)?;
                 // One line per capture, so how close guests come to the run limit is visible.
                 info!(
-                    "Ramet capture excludes {} of {found} free runs; {dropped_pages} free \
-                     pages in dropped runs are copied",
-                    exclusions.len()
+                    "Ramet capture excludes {} of {found} free runs (cap {}); {dropped_pages} \
+                     free pages in dropped runs are copied",
+                    exclusions.len(),
+                    memversion::exclusion_cap()
                 );
                 if tracker.is_none() {
                     return memversion::create(device.as_fd(), &regions, &exclusions);
