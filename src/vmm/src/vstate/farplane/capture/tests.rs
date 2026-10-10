@@ -305,7 +305,9 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
 /// On a reflink filesystem (FARPLANE_REFLINK_DIR): a standing clone driven step by step while a
 /// writer runs between every step (through the clone, the background catch-ups and, with a log
 /// too small for the writes, an overflow that restarts the clone), then adopted and caught up at
-/// the freeze, equals the disk byte for byte and a whole clone taken at that instant.
+/// the freeze, equals the disk byte for byte and a whole clone taken at that instant. Its flip
+/// is then refused: the destination returns to standing, ready, and a readmitted capture adopts
+/// it without waiting, catches up only what was written since, and equals the disk again.
 #[test]
 fn a_standing_clone_caught_up_at_the_freeze_equals_the_disk() {
     use std::io::Read;
@@ -402,7 +404,7 @@ fn a_standing_clone_caught_up_at_the_freeze_equals_the_disk() {
         // A catch-up is left half applied at the arm on purpose: its ranges return to the log.
         advance_standing(&mut stood, live.as_raw_fd()).unwrap();
         write(&log);
-        let (dest, pre, _, _) = adopt_standing(stood, live.as_raw_fd()).unwrap();
+        let (dest, pre, adopted, _) = adopt_standing(stood, live.as_raw_fd()).unwrap();
         write(&log);
         live.sync_all().unwrap();
         let (_, how) = finish_scratch_clone(dest.as_raw_fd(), live.as_raw_fd(), Some(pre)).unwrap();
@@ -410,24 +412,78 @@ fn a_standing_clone_caught_up_at_the_freeze_equals_the_disk() {
             matches!(how, ScratchCloneHow::CaughtUp { .. }),
             "{variant}: {how}"
         );
-        let reference = open("reference");
-        clone_scratch(reference.as_raw_fd(), live.as_raw_fd()).unwrap();
+        assert!(!log.recording(), "{variant}: the freeze left the log on");
         let read = |mut file: &File| {
             let mut bytes = Vec::new();
             file.seek(SeekFrom::Start(0)).unwrap();
             file.read_to_end(&mut bytes).unwrap();
             bytes
         };
-        let (live_bytes, dest_bytes, ref_bytes) = (read(&live), read(&dest), read(&reference));
-        let first_difference = live_bytes.iter().zip(&dest_bytes).position(|(a, b)| a != b);
-        assert_eq!(
-            (dest_bytes.len(), first_difference),
-            (live_bytes.len(), None),
-            "{variant}: the adopted standing clone differs from the disk"
+        let equal_to_disk = |dest: &File, when: &str| {
+            let reference = open("reference");
+            clone_scratch(reference.as_raw_fd(), live.as_raw_fd()).unwrap();
+            let (live_bytes, dest_bytes, ref_bytes) = (read(&live), read(dest), read(&reference));
+            let first_difference = live_bytes.iter().zip(&dest_bytes).position(|(a, b)| a != b);
+            assert_eq!(
+                (dest_bytes.len(), first_difference),
+                (live_bytes.len(), None),
+                "{variant}, {when}: the adopted standing clone differs from the disk"
+            );
+            assert!(
+                dest_bytes == ref_bytes,
+                "{variant}, {when}: it differs from a whole clone"
+            );
+        };
+        equal_to_disk(&dest, "first freeze");
+        // The flip is refused: the resume restarts the log before anything writes, and the
+        // destination returns to standing, ready, with nothing to clone.
+        log.start(WRITE_LOG_MAX_RANGES, WRITE_LOG_MAX_BYTES);
+        let inode = adopted.inode;
+        let kept = keep_standing(
+            CaptureBuffers {
+                vmstate: File::from(memfd(c"vmstate", 0)),
+                disk_clone: Some(dest),
+                pre_cloned: None,
+                adopted: Some(adopted),
+            },
+            log.clone(),
+        )
+        .unwrap();
+        assert_eq!(kept.inode, inode);
+        assert!(
+            matches!(&kept.phase, StandingPhase::Ready { pending, .. } if pending.is_empty()),
+            "{variant}: the kept clone is not ready"
+        );
+        // The readmitted capture adopts it at once and catches up only what was written since.
+        for _ in 0..20 {
+            write(&log);
+        }
+        let (dest, pre, _, wait_us) = adopt_standing(kept, live.as_raw_fd()).unwrap();
+        write(&log);
+        live.sync_all().unwrap();
+        let (_, how) = finish_scratch_clone(dest.as_raw_fd(), live.as_raw_fd(), Some(pre)).unwrap();
+        assert!(
+            matches!(how, ScratchCloneHow::CaughtUp { ranges, .. } if (1..=21).contains(&ranges)),
+            "{variant}: {how}"
         );
         assert!(
-            dest_bytes == ref_bytes,
-            "{variant}: it differs from a whole clone"
+            wait_us < 1_000,
+            "{variant}: the readmitted arm waited {wait_us} us"
+        );
+        equal_to_disk(&dest, "readmitted freeze");
+        // A destination the capture did not adopt is never made standing.
+        let unkept = keep_standing(
+            CaptureBuffers {
+                vmstate: File::from(memfd(c"vmstate", 0)),
+                disk_clone: Some(dest),
+                pre_cloned: None,
+                adopted: None,
+            },
+            log.clone(),
+        );
+        assert!(
+            unkept.is_none(),
+            "{variant}: a destination not adopted was kept"
         );
         for name in ["live", "shadow", "dest", "reference"] {
             std::fs::remove_file(path(name)).unwrap();
@@ -679,7 +735,7 @@ fn exact_id_retains_version_across_epoch_reset() {
 fn next_request_releases_answered_versions_and_a_late_retry_is_refused() {
     let device = memfd(c"device", 0);
     let key = CommandKey::of(MsgType::WriteVmstate, &[], std::slice::from_ref(&device));
-    let plain = CommandKey::of(MsgType::Resume, &1u32.to_le_bytes(), &[]);
+    let plain = CommandKey::of(MsgType::Resume, &[1, 0, 0, 0, 0, 0, 0, 0], &[]);
     let version = Arc::new(memfd(c"version", 0));
     let mut replies = ReplyCache::default();
     replies.record(
@@ -902,7 +958,7 @@ fn descriptor_counts_and_bodies_match_v8() {
         (MsgType::CaptureBuffers, 0, vec![1, 2]),
         (MsgType::WriteVmstate, 0, vec![1]),
         (MsgType::Quiesce, 0, vec![0]),
-        (MsgType::Resume, 4, vec![0]),
+        (MsgType::Resume, 8, vec![0]),
         (MsgType::FreeSummary, 8, vec![1]),
     ] {
         for count in 0..=4 {
@@ -1397,7 +1453,7 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         refused.body[..4],
         (ErrorCode::AlreadyQuiesced as u32).to_le_bytes()
     );
-    let resumed = request(&mut service, MsgType::Resume, 5, &0u32.to_le_bytes(), &[]);
+    let resumed = request(&mut service, MsgType::Resume, 5, &[0; 8], &[]);
     assert_eq!(resumed.header.msg(), MsgType::Resumed);
     let after = request(
         &mut service,
@@ -1621,6 +1677,17 @@ fn disarm_frames_numbers_and_bodies() {
     validate_command(MsgType::Stand, 0, 0).unwrap_err();
     validate_command(MsgType::Stand, 1, 1).unwrap_err();
     validate_command(MsgType::Standing, 0, 0).unwrap_err();
+    // Resume carries {run_vcpus, keep_standing}; keep_standing is 0 or 1.
+    assert_eq!(
+        protocol::parse_resume(&[1, 0, 0, 0, 1, 0, 0, 0]).unwrap(),
+        protocol::ResumeBody {
+            run_vcpus: 1,
+            keep_standing: true
+        }
+    );
+    assert!(!protocol::parse_resume(&[0; 8]).unwrap().keep_standing);
+    protocol::parse_resume(&[0, 0, 0, 0, 2, 0, 0, 0]).unwrap_err();
+    protocol::parse_resume(&[0; 4]).unwrap_err();
     // The armed reply names the pre-clone, or u64::MAX extents for none.
     let body = encode_capture_buffers_armed(Some((3224, 147_939, 11_402)), 2_345);
     assert_eq!(body[..8], 3224u64.to_le_bytes());
@@ -1770,5 +1837,117 @@ fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
     rearm(&mut service, 3);
     assert!(service.tracker.is_some());
     assert!(Arc::ptr_eq(service.standing.as_ref().unwrap(), &standing));
+    previous_state.store();
+}
+
+/// A resume with keep_standing returns only an adopted destination to standing, with the scratch
+/// write log already recording when the resume answers; without the flag, or for a destination
+/// the capture did not adopt, the destination is closed and the log stays off. Uses KVM and a
+/// scratch drive; run with --test-threads=1 like the other dispatcher tests.
+#[test]
+fn a_refused_flip_keeps_only_an_adopted_destination_standing() {
+    use crate::builder::tests::{
+        CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_block_devices,
+    };
+    use crate::devices::virtio::block::CacheType;
+
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("SKIP: real capture dispatcher requires /dev/kvm");
+        return;
+    }
+    let mut event_manager = event_manager::EventManager::new().unwrap();
+    let mut vmm = default_vmm();
+    let _images = insert_block_devices(
+        &mut vmm,
+        &mut default_kernel_cmdline(),
+        &mut event_manager,
+        vec![
+            CustomBlockConfig::new("root".into(), true, None, true, CacheType::Unsafe),
+            CustomBlockConfig::new("scratch".into(), false, None, false, CacheType::Unsafe),
+        ],
+    );
+    let log = vmm.scratch_write_log().expect("a scratch drive");
+    let vmm = Arc::new(Mutex::new(vmm));
+    let (sock, peer) = UnixStream::pair().unwrap();
+    let mut service = CaptureService {
+        channel: MemoryChannel {
+            sock,
+            regions: vec![protocol::RegionRecord {
+                guest_addr: 0,
+                size: 128 * 1024 * 1024,
+            }],
+        },
+        vmm,
+        vm_info: VmInfo::default(),
+        buffers: None,
+        order: EpochOrder::default(),
+        replies: ReplyCache::default(),
+        pending: None,
+        tracker: None,
+        standing: None,
+        stood: None,
+    };
+    let previous_state = BackendState::load();
+    let dest = || File::from(memfd(c"destination", 0));
+    // A quiesced capture: the freeze took the pre-clone's log, which is off.
+    let quiesced = |service: &mut CaptureService, adopted: bool| {
+        let disk_clone = dest();
+        let inode = inode_of(disk_clone.as_raw_fd()).unwrap();
+        service.buffers = Some(CaptureBuffers {
+            vmstate: File::from(memfd(c"vmstate", 0)),
+            disk_clone: Some(disk_clone),
+            pre_cloned: None,
+            adopted: adopted.then(|| Adopted {
+                inode,
+                clone: ChunkedClone::default(),
+            }),
+        });
+        BackendState::Quiesced.store();
+        inode
+    };
+    let resume = |service: &mut CaptureService, id, keep: u32| {
+        let mut body = 0u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&keep.to_le_bytes());
+        protocol::send_frame(&peer, MsgType::Resume, id, &body, &[]).unwrap();
+        service.serve_one().unwrap();
+        let reply = protocol::recv_frame(&peer).unwrap();
+        assert_eq!(reply.header.msg(), MsgType::Resumed);
+        assert!(reply.fds.is_empty());
+        assert!(service.buffers.is_none());
+        assert_eq!(BackendState::load(), BackendState::Ready);
+    };
+
+    let inode = quiesced(&mut service, true);
+    resume(&mut service, 1, 1);
+    let stood = service
+        .stood
+        .as_ref()
+        .expect("the adopted destination was not kept");
+    assert_eq!(stood.inode, inode);
+    assert!(matches!(&stood.phase, StandingPhase::Ready { pending, .. } if pending.is_empty()));
+    assert!(log.recording(), "the kept clone's log is not recording");
+    assert!(Arc::ptr_eq(&stood.log, &log));
+    service.stood = None;
+    log.stop();
+
+    // A published or ambiguous flip: the destination is closed, nothing records.
+    quiesced(&mut service, true);
+    resume(&mut service, 2, 0);
+    assert!(service.stood.is_none());
+    assert!(!log.recording());
+
+    // A destination the capture did not adopt is never made standing.
+    quiesced(&mut service, false);
+    resume(&mut service, 3, 1);
+    assert!(service.stood.is_none());
+    assert!(!log.recording());
+
+    // keep_standing is 0 or 1.
+    quiesced(&mut service, true);
+    let mut body = 0u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&2u32.to_le_bytes());
+    protocol::send_frame(&peer, MsgType::Resume, 4, &body, &[]).unwrap();
+    assert!(service.serve_one().is_err());
+    service.buffers = None;
     previous_state.store();
 }

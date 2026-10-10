@@ -534,7 +534,11 @@ fn commit_plan(
     if ack.header.msg() != MsgType::Resume
         || ack.header.request_id == 0
         || !ack.fds.is_empty()
-        || protocol::parse_u32(&ack.body)? != 0
+        || protocol::parse_resume(&ack.body)?
+            != (protocol::ResumeBody {
+                run_vcpus: 0,
+                keep_standing: false,
+            })
     {
         return Err(BackendError::Channel(ChannelError::Malformed));
     }

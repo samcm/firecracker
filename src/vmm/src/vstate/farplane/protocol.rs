@@ -630,12 +630,40 @@ pub fn encode_backend_ready(
     body
 }
 
-/// Parses a body that carries exactly one `u32`, as `plan_fds` and `resume` do.
+/// Parses a body that carries exactly one `u32`, as `plan_fds` does.
 pub fn parse_u32(body: &[u8]) -> Result<u32, ChannelError> {
     if body.len() != 4 {
         return Err(ChannelError::Malformed);
     }
     Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
+}
+
+/// A parsed `resume` body: two LE `u32`s, `run_vcpus` and `keep_standing`, each 0 or 1 for
+/// `keep_standing`. `keep_standing` is set only for a flip pagemaster refused, never for one that
+/// published or whose outcome it does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeBody {
+    /// Restart the vCPUs; pagemaster sends 0 and the supervisor runs them over the API.
+    pub run_vcpus: u32,
+    /// The flip was refused: an adopted standing destination returns to standing.
+    pub keep_standing: bool,
+}
+
+/// Parses a `resume` body.
+pub fn parse_resume(body: &[u8]) -> Result<ResumeBody, ChannelError> {
+    if body.len() != 8 {
+        return Err(ChannelError::Malformed);
+    }
+    let run_vcpus = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let keep_standing = match u32::from_le_bytes(body[4..8].try_into().unwrap()) {
+        0 => false,
+        1 => true,
+        _ => return Err(ChannelError::Malformed),
+    };
+    Ok(ResumeBody {
+        run_vcpus,
+        keep_standing,
+    })
 }
 
 /// Parses the bounded, nonzero microsecond budget of a FreeSummary request.

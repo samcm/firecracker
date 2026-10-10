@@ -1054,9 +1054,11 @@ class Pagemaster:
         finally:
             os.close(fd)
 
-    def resume(self, run_vcpus=1):
-        """Let the vCPUs run again."""
-        return self.request(Msg.RESUME, body=struct.pack("<I", run_vcpus))
+    def resume(self, run_vcpus=1, keep_standing=0):
+        """Let the vCPUs run again; keep_standing=1 returns an adopted standing clone to standing."""
+        return self.request(
+            Msg.RESUME, body=struct.pack("<II", run_vcpus, keep_standing)
+        )
 
     # ----------------------------------------------------------------- plumbing
 

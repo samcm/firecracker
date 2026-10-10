@@ -234,7 +234,7 @@ fn cold_boot_multiregion_ready_ack_and_mapping_lifetime() {
         expected.extend_from_slice(&0u64.to_le_bytes()); // harvest buffer
         expected.extend_from_slice(&VMSTATE_CAPACITY_BYTES.to_le_bytes());
         assert_eq!(ready.body, expected);
-        protocol::send_frame(&sock, MsgType::Resume, 3, &0u32.to_le_bytes(), &[]).unwrap();
+        protocol::send_frame(&sock, MsgType::Resume, 3, &[0; 8], &[]).unwrap();
         let resumed = protocol::recv_frame(&sock).unwrap();
         assert_eq!(resumed.header.msg_type, MsgType::Resumed as u16);
         assert_eq!(resumed.header.request_id, 3);

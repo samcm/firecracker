@@ -352,7 +352,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::CaptureBuffers => (&[0], &[1, 2]),
         MsgType::Quiesce => (&[0], &[0]),
         MsgType::WriteVmstate => (&[0], &[1]),
-        MsgType::Resume => (&[4], &[0]),
+        MsgType::Resume => (&[8], &[0]),
         MsgType::FreeSummary => (&[8], &[1]),
         MsgType::Track => (&[0, 8], &[1, 2]),
         MsgType::Refresh => (&[0], &[0]),
@@ -600,7 +600,7 @@ impl CaptureService {
             MsgType::CaptureBuffers => self.arm_buffers(incoming),
             MsgType::Quiesce => self.quiesce(request_id),
             MsgType::WriteVmstate => self.write_vmstate(incoming),
-            MsgType::Resume => self.resume(request_id, protocol::parse_u32(&incoming.body)?),
+            MsgType::Resume => self.resume(request_id, protocol::parse_resume(&incoming.body)?),
             MsgType::FreeSummary => self.free_summary(incoming),
             MsgType::Track => self.track(incoming),
             MsgType::Refresh => self.refresh(request_id),
@@ -1260,22 +1260,45 @@ impl CaptureService {
         }
     }
 
-    fn resume(&mut self, request_id: u64, run_vcpus: u32) -> Result<(), ChannelError> {
+    /// Ends the capture epoch. With `keep_standing`, for a flip pagemaster refused, a destination
+    /// the capture adopted from standing returns to standing: the freeze made it the disk as it
+    /// stands, nothing published it, and the write log restarts here, while the vCPUs are
+    /// stopped and device handlers are gated, so the next capture adopts it with nothing to wait
+    /// for. A destination not adopted from standing is closed either way, as is every
+    /// destination without `keep_standing`.
+    fn resume(&mut self, request_id: u64, body: protocol::ResumeBody) -> Result<(), ChannelError> {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Resume);
         }
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
-        if run_vcpus > 0
+        let keep = body.keep_standing
+            && self
+                .buffers
+                .as_ref()
+                .is_some_and(|b| b.adopted.is_some() && b.disk_clone.is_some());
+        let log = if keep { vmm.scratch_write_log() } else { None };
+        // Before any vCPU or device handler can write the disk again.
+        if let Some(log) = &log {
+            log.start(WRITE_LOG_MAX_RANGES, WRITE_LOG_MAX_BYTES);
+        }
+        if body.run_vcpus > 0
             && vmm.instance_info.state != VmState::Running
             && let Err(err) = vmm.resume_vm()
         {
             error!("Farplane capture could not restart the vCPUs: {err}");
+            if let Some(log) = &log {
+                log.stop();
+            }
             drop(vmm);
             return self.reject(request_id, ErrorCode::ResumeFailed, MsgType::Resume);
         }
         let running = vmm.instance_info.state == VmState::Running;
         drop(vmm);
-        self.buffers = None;
+        let buffers = self.buffers.take();
+        if let (Some(log), Some(buffers)) = (log, buffers) {
+            self.stood = keep_standing(buffers, log);
+            info!("Farplane kept the standing scratch clone across a refused flip");
+        }
         self.order.open();
         set_capture_buffers_armed(false);
         BackendState::Ready.store();
@@ -1669,6 +1692,23 @@ fn adopt_standing(
         clone,
     };
     Ok((stood.dest, pre, adopted, wait_us))
+}
+
+/// Returns a refused flip's adopted destination to standing. The freeze caught it up to the disk
+/// and `log`, restarted before anything could write since, holds what follows.
+fn keep_standing(buffers: CaptureBuffers, log: Arc<WriteLog>) -> Option<StandingDisk> {
+    let (Some(dest), Some(adopted)) = (buffers.disk_clone, buffers.adopted) else {
+        return None;
+    };
+    Some(StandingDisk {
+        dest,
+        inode: adopted.inode,
+        log,
+        phase: StandingPhase::Ready {
+            clone: adopted.clone,
+            pending: Vec::new(),
+        },
+    })
 }
 
 /// The chunk walk of a standing clone, whole. `extents_from(from, n)` names the logical
