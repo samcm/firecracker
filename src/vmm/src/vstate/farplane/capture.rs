@@ -312,6 +312,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Refresh => (&[0], &[0]),
         MsgType::Untrack => (&[0], &[0]),
         MsgType::Rearm => (&[0], &[1]),
+        MsgType::Disarm => (&[0], &[0]),
         _ => return Err(ChannelError::Malformed),
     };
     if !lens.contains(&body_len) || !counts.contains(&fd_count) {
@@ -399,6 +400,18 @@ fn sample_tracked(
         }
         _ => NO_TRACKED_SAMPLE,
     }
+}
+
+/// The `capture_buffers_armed` body: the pre-clone's extent count, its duration and its longest
+/// chunk in microseconds, LE u64 each, or extents u64::MAX and zeros when the arm took no
+/// pre-clone (no destination, or the pre-clone failed and the freeze clones whole).
+fn encode_capture_buffers_armed(pre_clone: Option<(u64, u64, u64)>) -> [u8; 24] {
+    let (extents, clone_us, longest_us) = pre_clone.unwrap_or((u64::MAX, 0, 0));
+    let mut body = [0; 24];
+    body[..8].copy_from_slice(&extents.to_le_bytes());
+    body[8..16].copy_from_slice(&clone_us.to_le_bytes());
+    body[16..].copy_from_slice(&longest_us.to_le_bytes());
+    body
 }
 
 /// A free summary's tracked sample when there is no count: included pages u64::MAX, id 0.
@@ -509,6 +522,7 @@ impl CaptureService {
             MsgType::Refresh => self.refresh(request_id),
             MsgType::Untrack => self.untrack(request_id),
             MsgType::Rearm => self.rearm(incoming),
+            MsgType::Disarm => self.disarm(request_id),
             _ => Err(ChannelError::Malformed),
         }
     }
@@ -788,16 +802,43 @@ impl CaptureService {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
         let disk_clone = destination.map(File::from);
+        // An earlier arm's recording must not outlive it, whatever this arm holds.
+        self.stop_write_log();
         let pre_cloned = disk_clone
             .as_ref()
             .and_then(|destination| self.pre_clone(destination.as_raw_fd()));
+        let body = encode_capture_buffers_armed(
+            pre_cloned
+                .as_ref()
+                .map(|(pre, longest)| (pre.extents, pre.clone_us, *longest)),
+        );
         self.buffers = Some(CaptureBuffers {
             vmstate: File::from(vmstate),
             disk_clone,
-            pre_cloned,
+            pre_cloned: pre_cloned.map(|(pre, _)| pre),
         });
         set_capture_buffers_armed(true);
-        self.reply(request_id, MsgType::CaptureBuffersArmed, &[])
+        self.reply(request_id, MsgType::CaptureBuffersArmed, &body)
+    }
+
+    /// Drops an armed capture that was never quiesced: its vmstate buffer, clone destination and
+    /// pre-clone, and stops the scratch write log. Refused with `not_armed` when nothing is armed
+    /// or a capture is quiesced, which a quiesced capture leaves only by `resume`.
+    fn disarm(&mut self, request_id: u64) -> Result<(), ChannelError> {
+        if BackendState::load() != BackendState::Ready || self.buffers.is_none() {
+            return self.reject(request_id, ErrorCode::NotArmed, MsgType::Disarm);
+        }
+        self.buffers = None;
+        self.stop_write_log();
+        set_capture_buffers_armed(false);
+        info!("Farplane disarmed the capture");
+        self.reply(request_id, MsgType::Disarmed, &[])
+    }
+
+    fn stop_write_log(&self) {
+        if let Some(log) = self.vmm.lock().expect("Poisoned lock").scratch_write_log() {
+            log.stop();
+        }
     }
 
     fn scratch_descriptor(&self) -> Option<RawFd> {
@@ -808,7 +849,7 @@ impl CaptureService {
     /// log first: a write that completed before the start is in the file the clone copies, and
     /// one that completes after it is logged. Any failure leaves no pre-clone, and the freeze
     /// clones whole as before.
-    fn pre_clone(&self, destination: RawFd) -> Option<PreClone> {
+    fn pre_clone(&self, destination: RawFd) -> Option<(PreClone, u64)> {
         let (scratch, log) = {
             let vmm = self.vmm.lock().expect("Poisoned lock");
             (vmm.scratch_descriptor()?, vmm.scratch_write_log()?)
@@ -820,11 +861,14 @@ impl CaptureService {
                     "Farplane pre-cloned the scratch disk ({} extents, {} chunks, longest {} us) in {} us",
                     done.extents, done.chunks, done.longest_chunk_us, done.clone_us
                 );
-                Some(PreClone {
-                    log,
-                    clone_us: done.clone_us,
-                    extents: done.extents,
-                })
+                Some((
+                    PreClone {
+                        log,
+                        clone_us: done.clone_us,
+                        extents: done.extents,
+                    },
+                    done.longest_chunk_us,
+                ))
             }
             Err(err) => {
                 log.stop();

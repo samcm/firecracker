@@ -1461,6 +1461,101 @@ fn rearm_frames_numbers_and_bodies() {
 }
 
 #[test]
+fn disarm_frames_numbers_and_bodies() {
+    assert_eq!(
+        [MsgType::Disarm, MsgType::Disarmed].map(|msg| msg as u16),
+        [35, 36]
+    );
+    for value in 35..=36 {
+        assert_eq!(MsgType::from_u16(value).unwrap() as u16, value);
+    }
+    assert_eq!(MsgType::from_u16(34), None);
+    assert_eq!(MsgType::from_u16(37), None);
+    assert_eq!(ErrorCode::NotArmed as u32, 35);
+    validate_command(MsgType::Disarm, 0, 0).unwrap();
+    validate_command(MsgType::Disarm, 0, 1).unwrap_err();
+    validate_command(MsgType::Disarm, 8, 0).unwrap_err();
+    validate_command(MsgType::Disarmed, 0, 0).unwrap_err();
+    // The armed reply names the pre-clone, or u64::MAX extents for none.
+    let body = encode_capture_buffers_armed(Some((3224, 147_939, 11_402)));
+    assert_eq!(body[..8], 3224u64.to_le_bytes());
+    assert_eq!(body[8..16], 147_939u64.to_le_bytes());
+    assert_eq!(body[16..], 11_402u64.to_le_bytes());
+    let none = encode_capture_buffers_armed(None);
+    assert_eq!(none[..8], u64::MAX.to_le_bytes());
+    assert_eq!(none[8..], [0; 16]);
+}
+
+/// A disarm drops an armed capture that was never quiesced and is refused, holding everything,
+/// for a quiesced one; with nothing armed it is refused as `not_armed`.
+#[test]
+fn disarm_drops_only_an_armed_capture_outside_a_quiesce() {
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("SKIP: real capture dispatcher requires /dev/kvm");
+        return;
+    }
+    let vmm = Arc::new(Mutex::new(crate::builder::tests::default_vmm()));
+    let (sock, peer) = UnixStream::pair().unwrap();
+    let mut service = CaptureService {
+        channel: MemoryChannel {
+            sock,
+            regions: vec![protocol::RegionRecord {
+                guest_addr: 0,
+                size: 128 * 1024 * 1024,
+            }],
+        },
+        vmm,
+        vm_info: VmInfo::default(),
+        buffers: None,
+        order: EpochOrder::default(),
+        replies: ReplyCache::default(),
+        pending: None,
+        tracker: None,
+        standing: None,
+    };
+    let previous_state = BackendState::load();
+    let disarm = |service: &mut CaptureService, id| {
+        protocol::send_frame(&peer, MsgType::Disarm, id, &[], &[]).unwrap();
+        service.serve_one().unwrap();
+        let reply = protocol::recv_frame(&peer).unwrap();
+        assert!(reply.fds.is_empty());
+        reply
+    };
+    let armed = || {
+        let log = Arc::new(WriteLog::default());
+        log.start(16, 1 << 20);
+        Some(CaptureBuffers {
+            vmstate: File::from(memfd(c"vmstate", 0)),
+            disk_clone: Some(File::from(memfd(c"destination", 0))),
+            pre_cloned: Some(PreClone {
+                log,
+                clone_us: 1,
+                extents: 1,
+            }),
+        })
+    };
+    let refused = |reply: protocol::Incoming| {
+        assert_eq!(reply.header.msg(), MsgType::Error);
+        assert_eq!(reply.body[..4], (ErrorCode::NotArmed as u32).to_le_bytes());
+    };
+
+    BackendState::Ready.store();
+    refused(disarm(&mut service, 1));
+
+    service.buffers = armed();
+    BackendState::Quiesced.store();
+    refused(disarm(&mut service, 2));
+    assert!(service.buffers.is_some());
+
+    BackendState::Ready.store();
+    let reply = disarm(&mut service, 3);
+    assert_eq!(reply.header.msg(), MsgType::Disarmed);
+    assert!(reply.body.is_empty());
+    assert!(service.buffers.is_none());
+    previous_state.store();
+}
+
+#[test]
 fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
     if !std::path::Path::new("/dev/kvm").exists() {
         eprintln!("SKIP: real capture dispatcher requires /dev/kvm");

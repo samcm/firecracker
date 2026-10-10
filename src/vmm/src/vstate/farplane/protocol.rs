@@ -122,6 +122,13 @@ pub enum MsgType {
     Rearm = 32,
     /// Firecracker confirms the tracker stands on the flat version a `rearm` handed over.
     Rearmed = 33,
+    /// Pagemaster abandons the armed capture before any quiesce: Firecracker drops its capture
+    /// buffers (the vmstate buffer, the clone destination and any pre-clone) and stops the scratch
+    /// write log. No body, no descriptor. Firecracker answers `disarmed`, or rejects with
+    /// `not_armed` when no capture is armed, which is equally a proof that nothing is held.
+    Disarm = 35,
+    /// Firecracker confirms it holds no capture buffers and records no scratch writes.
+    Disarmed = 36,
 }
 
 impl MsgType {
@@ -150,6 +157,8 @@ impl MsgType {
             31 => Some(Self::Refreshed),
             32 => Some(Self::Rearm),
             33 => Some(Self::Rearmed),
+            35 => Some(Self::Disarm),
+            36 => Some(Self::Disarmed),
             // Reserved /6 tags, including 18-21, must never be interpreted as /8 commands.
             _ => None,
         }
@@ -234,6 +243,8 @@ pub enum ErrorCode {
     /// is tracked, or the kernel refused it because the standing version moved. The tracker
     /// still stands where it stood.
     RearmFailed = 34,
+    /// A `disarm` found no armed capture outside a quiesce: nothing is held.
+    NotArmed = 35,
 }
 
 /// Architecture Firecracker is running on.
@@ -937,6 +948,7 @@ mod tests {
         assert_eq!(ErrorCode::RebaseFailed as u32, 27);
         assert_eq!(ErrorCode::FreeSummaryUnavailable as u32, 28);
         assert_eq!(ErrorCode::ReplayUnavailable as u32, 33);
+        assert_eq!(ErrorCode::NotArmed as u32, 35);
         assert_eq!(MsgType::FreeSummary as u16, 22);
         assert_eq!(MsgType::FreeSummaryDone as u16, 23);
         assert_eq!(MsgType::Drives as u16, 24);
