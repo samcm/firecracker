@@ -302,8 +302,80 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
     .unwrap_err();
 }
 
-/// On a reflink filesystem (FARPLANE_REFLINK_DIR, e.g. XFS on a slot): a pre-clone taken while
-/// a writer runs, caught up from its log after the writer drains, equals a whole clone taken at
+/// The chunk walk covers [0, size) in consecutive chunks without gap or overlap, each holding at
+/// most `per_chunk` extents, ending at the file's end, also when the extents move between calls
+/// and when the walk would not advance.
+#[test]
+fn a_chunked_clone_covers_the_file_once_in_bounded_chunks() {
+    fn walk(
+        size: u64,
+        per_chunk: u32,
+        starts: &dyn Fn(u64, u32) -> Vec<u64>,
+    ) -> (Vec<(u64, u64)>, ChunkedClone) {
+        let mut chunks = Vec::new();
+        let done = clone_chunks_with(
+            size,
+            per_chunk,
+            |from, want| Ok(starts(from, want)),
+            |offset, len| {
+                chunks.push((offset, len));
+                Ok(())
+            },
+        )
+        .unwrap();
+        (chunks, done)
+    }
+    let contiguous = |chunks: &[(u64, u64)], size: u64| {
+        let mut at = 0;
+        for &(offset, len) in chunks {
+            assert_eq!(offset, at, "a gap or overlap at {offset}");
+            assert!(len > 0);
+            at += len;
+        }
+        assert_eq!(at, size, "the chunks do not end at the file's end");
+    };
+    // 1000 extents of 3 blocks every 5 blocks, then a sparse tail.
+    let extents: Vec<u64> = (0..1000).map(|i| i * 5 * 4096).collect();
+    let size = 6000 * 4096 + 123;
+    let from_list = |list: Vec<u64>| {
+        move |from: u64, want: u32| -> Vec<u64> {
+            list.iter()
+                .copied()
+                .filter(|&s| s + 3 * 4096 > from)
+                .take(want as usize)
+                .collect()
+        }
+    };
+    let (chunks, done) = walk(size, 256, &from_list(extents.clone()));
+    contiguous(&chunks, size);
+    assert_eq!((done.chunks, done.extents), (4, 1000));
+    for &(offset, len) in &chunks {
+        let inside = extents
+            .iter()
+            .filter(|&&s| s >= offset && s < offset + len)
+            .count();
+        assert!(inside <= 256, "a chunk holds {inside} extents");
+    }
+    // Extents split between calls: each call sees twice as many.
+    let moving = std::cell::Cell::new(0u32);
+    let (chunks, _) = walk(size, 100, &|from, want| {
+        moving.set(moving.get() + 1);
+        (0..20_000u64)
+            .map(|i| i * 4096 / u64::from(moving.get().min(2)))
+            .filter(|&s| s >= from)
+            .take(want as usize)
+            .collect()
+    });
+    contiguous(&chunks, size);
+    // No extents at all, and a walk that would not advance: one chunk to the end.
+    let (chunks, _) = walk(size, 8, &|_, _| Vec::new());
+    assert_eq!(chunks, vec![(0, size)]);
+    let (chunks, _) = walk(size, 2, &|_, _| vec![0, 0, 0]);
+    assert_eq!(chunks, vec![(0, size)]);
+}
+
+/// On a reflink filesystem (FARPLANE_REFLINK_DIR, e.g. XFS on a slot): a chunked pre-clone taken
+/// while a writer runs between its chunks, caught up from its log after the writer drains, equals a whole clone taken at
 /// that instant, byte for byte. The writer logs each write when it completes, as a block device
 /// does, including one in flight when the log starts and one that ends in the file's partial
 /// last block. Skips without the directory.
@@ -358,13 +430,29 @@ fn a_caught_up_pre_clone_equals_a_whole_clone_at_the_freeze() {
     let in_flight = (5 * 4096 + 7, 300);
     log.start(1 << 20, u64::MAX);
     let destination = open("destination");
-    let clone_us = clone_scratch(destination.as_raw_fd(), live.as_raw_fd()).unwrap();
-    write(&log, in_flight.0, in_flight.1);
-    for _ in 0..500 {
-        let offset = next() % size;
-        let len = (1 + next() % (256 * 1024)).min(size - offset);
-        write(&log, offset, len);
-    }
+    // The pre-clone runs in chunks of at most 64 extents, and the writer runs between chunks,
+    // into chunks already cloned and chunks not yet cloned alike.
+    let mut first_chunk = true;
+    let chunked = clone_chunks_with(
+        size,
+        64,
+        |from, want| extents_from(live.as_raw_fd(), from, want),
+        |offset, len| {
+            clone_scratch_range(destination.as_raw_fd(), live.as_raw_fd(), offset, len)?;
+            if std::mem::take(&mut first_chunk) {
+                write(&log, in_flight.0, in_flight.1);
+            }
+            for _ in 0..12 {
+                let offset = next() % size;
+                let len = (1 + next() % (256 * 1024)).min(size - offset);
+                write(&log, offset, len);
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(chunked.chunks > 10, "only {} chunks", chunked.chunks);
+    let clone_us = chunked.clone_us;
     // A write into the file's partial last block.
     write(&log, size - 100, 100);
     live.sync_all().unwrap();

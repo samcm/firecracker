@@ -45,6 +45,19 @@ struct PreClone {
     extents: u64,
 }
 
+/// What a chunked pre-clone did, for its log line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ChunkedClone {
+    /// Microseconds from the first chunk to the last.
+    clone_us: u64,
+    /// Extents the walk met.
+    extents: u64,
+    /// FICLONERANGE calls.
+    chunks: u32,
+    /// The longest single chunk, the longest a guest disk write waited.
+    longest_chunk_us: u64,
+}
+
 /// A catch-up runs only while its ranges stay under this share of the file's extents (in
 /// tenths), and never past `CATCH_UP_MAX_RANGES`. Measured on XFS: a whole clone costs 14-18 µs
 /// per extent and a rewritten range 36-55 µs on Zen 2 (9-12 and 23-27 on Zen 4), so the catch-up
@@ -57,6 +70,10 @@ const CATCH_UP_MAX_RANGES: u64 = 1024;
 const WRITE_LOG_MAX_RANGES: usize = 65_536;
 /// Bytes a write log covers before it gives up and the freeze clones whole.
 const WRITE_LOG_MAX_BYTES: u64 = 64 << 20;
+/// Extents one pre-clone chunk covers. A clone holds the scratch inode's IO lock for its whole
+/// length, so a guest disk write waits for at most one chunk: a whole clone costs 38-46 µs per
+/// extent on fragmented production and Zen 2 sources, so 256 extents hold it ~10-12 ms.
+const PRE_CLONE_CHUNK_EXTENTS: u32 = 256;
 
 /// A successful epoch owns the CREATE result before any reply is attempted.
 #[derive(Debug, Default)]
@@ -797,15 +814,16 @@ impl CaptureService {
             (vmm.scratch_descriptor()?, vmm.scratch_write_log()?)
         };
         log.start(WRITE_LOG_MAX_RANGES, WRITE_LOG_MAX_BYTES);
-        match clone_scratch(destination, scratch)
-            .and_then(|clone_us| Ok((clone_us, extent_count(scratch)?)))
-        {
-            Ok((clone_us, extents)) => {
-                info!("Farplane pre-cloned the scratch disk ({extents} extents) in {clone_us} us");
+        match clone_scratch_chunked(destination, scratch) {
+            Ok(done) => {
+                info!(
+                    "Farplane pre-cloned the scratch disk ({} extents, {} chunks, longest {} us) in {} us",
+                    done.extents, done.chunks, done.longest_chunk_us, done.clone_us
+                );
                 Some(PreClone {
                     log,
-                    clone_us,
-                    extents,
+                    clone_us: done.clone_us,
+                    extents: done.extents,
                 })
             }
             Err(err) => {
@@ -1300,6 +1318,121 @@ fn clone_scratch_range(
 }
 
 /// The number of extents of `file`, read by a count-only FIEMAP: no extent records are copied.
+/// Clones the scratch disk into an empty `destination` as consecutive FICLONERANGE chunks of at
+/// most `PRE_CLONE_CHUNK_EXTENTS` extents, so the inode's IO lock is released between chunks.
+/// The chunks cover [0, size) without gap or overlap, holes included, and the last ends at the
+/// file's end, which sets the destination's size. It runs only under a started write log: a write
+/// that lands between two chunks is logged, so the freeze's catch-up repairs whatever a chunk
+/// copied before it.
+fn clone_scratch_chunked(destination: RawFd, scratch: RawFd) -> Result<ChunkedClone, io::Error> {
+    if file_size(destination)? != 0 {
+        return Err(io::Error::other("the armed destination is not empty"));
+    }
+    let size = file_size(scratch)?;
+    clone_chunks_with(
+        size,
+        PRE_CLONE_CHUNK_EXTENTS,
+        |from, want| extents_from(scratch, from, want),
+        |offset, len| clone_scratch_range(destination, scratch, offset, len),
+    )
+}
+
+/// The chunk walk behind `clone_scratch_chunked`. `extents_from(from, n)` names the logical
+/// starts of at most `n` extents at or overlapping `from`, in order; `clone_range` clones one
+/// chunk. Each chunk ends where the extent after its `per_chunk`th begins, so each covers at most
+/// `per_chunk` extents however the file changes between calls.
+fn clone_chunks_with(
+    size: u64,
+    per_chunk: u32,
+    mut extents_from: impl FnMut(u64, u32) -> Result<Vec<u64>, io::Error>,
+    mut clone_range: impl FnMut(u64, u64) -> Result<(), io::Error>,
+) -> Result<ChunkedClone, io::Error> {
+    let per_chunk = per_chunk.max(1);
+    let started = get_time_us(ClockType::Monotonic);
+    let mut done = ChunkedClone::default();
+    let mut start = 0;
+    while start < size {
+        let starts = extents_from(start, per_chunk + 1)?;
+        let mut end = size;
+        if let Some(&next) = starts.get(per_chunk as usize) {
+            if next <= start || next >= size {
+                // A chunk that would not advance, or an extent past the end: finish in one.
+                end = size;
+            } else {
+                end = next;
+            }
+            done.extents += u64::from(per_chunk);
+        } else {
+            done.extents += u64::try_from(starts.len()).unwrap_or(u64::MAX);
+        }
+        let chunk_started = get_time_us(ClockType::Monotonic);
+        clone_range(start, end - start)?;
+        done.longest_chunk_us = done
+            .longest_chunk_us
+            .max(get_time_us(ClockType::Monotonic) - chunk_started);
+        done.chunks += 1;
+        start = end;
+    }
+    done.clone_us = get_time_us(ClockType::Monotonic) - started;
+    Ok(done)
+}
+
+fn file_size(file: RawFd) -> Result<u64, io::Error> {
+    // SAFETY: stat is plain data.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor is open and stat is writable for the call.
+    if unsafe { libc::fstat(file, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u64::try_from(stat.st_size).map_err(|_| io::Error::from_raw_os_error(libc::EIO))
+}
+
+/// The logical starts of at most `want` extents of `file` at or overlapping `from`, by FIEMAP.
+fn extents_from(file: RawFd, from: u64, want: u32) -> Result<Vec<u64>, io::Error> {
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct FiemapExtent {
+        logical: u64,
+        physical: u64,
+        length: u64,
+        reserved64: [u64; 2],
+        flags: u32,
+        reserved: [u32; 3],
+    }
+    #[repr(C)]
+    struct Request {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped_extents: u32,
+        extent_count: u32,
+        reserved: u32,
+        extents: [FiemapExtent; PRE_CLONE_CHUNK_EXTENTS as usize + 1],
+    }
+    const FS_IOC_FIEMAP: libc::Ioctl = libc::_IOWR::<[u64; 4]>(b'f' as u32, 11);
+    let want = want.min(PRE_CLONE_CHUNK_EXTENTS + 1);
+    let mut request = Box::new(Request {
+        start: from,
+        length: u64::MAX - from,
+        flags: 0,
+        mapped_extents: 0,
+        extent_count: want,
+        reserved: 0,
+        extents: [FiemapExtent::default(); PRE_CLONE_CHUNK_EXTENTS as usize + 1],
+    });
+    // SAFETY: the request holds `want` extent slots after its header, which is all the kernel
+    // writes, and it stays live for the call.
+    if unsafe { libc::ioctl(file, FS_IOC_FIEMAP, &mut *request) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mapped = request.mapped_extents.min(want) as usize;
+    Ok(request.extents[..mapped]
+        .iter()
+        .map(|e| e.logical)
+        .collect())
+}
+
+#[cfg(test)]
 fn extent_count(file: RawFd) -> Result<u64, io::Error> {
     /// struct fiemap without its trailing extent array.
     #[repr(C)]
