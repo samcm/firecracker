@@ -739,11 +739,13 @@ impl CaptureService {
                     memversion::rebase(tracker.as_fd(), flat.as_fd())?;
                     Ok(flat)
                 });
+                // What the guest dirtied up to the rebase, while the old chain still held it;
+                // pages it writes after are the new standing version's to count.
+                let after = memversion::track_info(tracker.as_fd()).map_or(u64::MAX, |t| t.dirty_pages);
                 if bound.pages > 0 && flattened.is_ok() {
                     self.background.guard(tracker, bound.pages);
                 }
                 let paused = self.background.release(started);
-                let after = memversion::track_info(tracker.as_fd()).map_or(u64::MAX, |t| t.dirty_pages);
                 let version = match flattened {
                     Ok(flat) => flat,
                     Err(err) => {
