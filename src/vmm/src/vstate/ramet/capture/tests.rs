@@ -6,6 +6,7 @@ use vmm_sys_util::tempfile::TempFile;
 
 use super::*;
 
+
 fn memfd(name: &std::ffi::CStr, size: u64) -> OwnedFd {
     // SAFETY: name is NUL terminated and outlives the call.
     let fd =
@@ -925,6 +926,7 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         pending: None,
         tracker: None,
         standing: None,
+        background: Background::detached(),
     };
     let file = summary_buffer(4096);
     let budget = protocol::MAX_FREE_SUMMARY_MICROS.to_le_bytes();
@@ -1119,7 +1121,12 @@ fn track_and_refresh_frames_numbers_and_bodies() {
         protocol::parse_track(&vec![0; len]).unwrap_err();
     }
     validate_command(MsgType::Refresh, 0, 0).unwrap();
+    validate_command(MsgType::Refresh, 8, 0).unwrap();
     validate_command(MsgType::Refresh, 0, 1).unwrap_err();
+    validate_command(MsgType::Refresh, 4, 0).unwrap_err();
+    assert_eq!(protocol::parse_refresh_budget(&[]).unwrap(), 0);
+    assert_eq!(protocol::parse_refresh_budget(&9u64.to_le_bytes()).unwrap(), 9);
+    protocol::parse_refresh_budget(&[0; 4]).unwrap_err();
     // Replies are commands only Firecracker sends.
     validate_command(MsgType::Tracked, 40, 0).unwrap_err();
     validate_command(MsgType::Refreshed, 32, 1).unwrap_err();
@@ -1163,12 +1170,13 @@ fn track_and_refresh_frames_numbers_and_bodies() {
         nr_zero_runs: 4,
         folded_pages: 7,
         ..Default::default()
-    });
-    assert_eq!(body.len(), 32);
+    }, 8);
+    assert_eq!(body.len(), 40);
     assert_eq!(body[..8], 5u64.to_le_bytes());
     assert_eq!(body[8..16], 6u64.to_le_bytes());
     assert_eq!(body[16..24], [3, 0, 0, 0, 4, 0, 0, 0]);
-    assert_eq!(body[24..], 7u64.to_le_bytes());
+    assert_eq!(body[24..32], 7u64.to_le_bytes());
+    assert_eq!(body[32..], 8u64.to_le_bytes());
 }
 
 #[test]
@@ -1215,6 +1223,7 @@ fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
         pending: None,
         tracker: None,
         standing: None,
+        background: Background::detached(),
     };
     let previous_state = BackendState::load();
     let flat = memfd(c"flat", 0);

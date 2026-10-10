@@ -3,6 +3,7 @@
 
 /// Handshake that maps guest memory from pagemaster's backing plan.
 pub mod backend;
+mod background;
 /// Capture half of the memory channel, served on the microVM's event loop.
 pub mod capture;
 /// Exclusion that stops event dispatch for the whole of a capture epoch.

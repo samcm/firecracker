@@ -111,11 +111,13 @@ pub enum MsgType {
     /// equals dirty pages (an upper bound) otherwise. An untracked reply is zero after `tracked`.
     /// An fpmv4 kernel counts it (MV_IOC_TRACK_INFO2); an older one is counted by residency.
     Tracked = 29,
-    /// Pagemaster asks for the standing version to be refreshed while the guest runs.
+    /// Pagemaster asks for the standing version to be refreshed while the guest runs. The body
+    /// is empty or one LE u64 budget: the pages the guest may dirty while the refresh flattens
+    /// before its vCPUs pause until the rebase (empty or zero: never pause).
     Refresh = 30,
     /// Firecracker returns the new standing version, a flat copy of the fold, as the one
     /// descriptor, and the fold's counts: LE u64 own pages, u64 new pages, u32 depth,
-    /// u32 zero runs, u64 folded pages.
+    /// u32 zero runs, u64 folded pages, u64 microseconds the guest was paused for it.
     Refreshed = 31,
     /// Pagemaster hands over a flat version it made with FLATTEN of the standing version, after a
     /// transient capture published, and asks for the tracker to stand on it instead. No body, one
@@ -622,6 +624,16 @@ pub fn parse_track(body: &[u8]) -> Result<(u64, u64), ChannelError> {
             }
             Ok((u64::from_le_bytes(body[..8].try_into().unwrap()), flags))
         }
+        _ => Err(ChannelError::Malformed),
+    }
+}
+
+/// Parses a Refresh request: empty for no budget, or one LE u64: the pages the guest may dirty
+/// while the refresh flattens before its vCPUs pause until the rebase.
+pub fn parse_refresh_budget(body: &[u8]) -> Result<u64, ChannelError> {
+    match body.len() {
+        0 => Ok(0),
+        8 => Ok(u64::from_le_bytes(body.try_into().unwrap())),
         _ => Err(ChannelError::Malformed),
     }
 }

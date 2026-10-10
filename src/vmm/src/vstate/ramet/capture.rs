@@ -16,6 +16,7 @@ use super::backend::{
     validate_buffer_fd, validate_clone_destination,
 };
 use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
+use super::background::Background;
 use super::{dispatch, memversion};
 use crate::Vmm;
 use crate::logger::{IncMetric, METRICS, error, info};
@@ -268,7 +269,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Resume => (&[4], &[0]),
         MsgType::FreeSummary => (&[8], &[1]),
         MsgType::Track => (&[0, 8, 16], &[1, 2]),
-        MsgType::Refresh => (&[0], &[0]),
+        MsgType::Refresh => (&[0, 8], &[0]),
         MsgType::Untrack => (&[0], &[0]),
         MsgType::Rearm => (&[0], &[1]),
         _ => return Err(ChannelError::Malformed),
@@ -295,6 +296,9 @@ pub struct CaptureService {
     /// The last version a tracked capture or refresh produced, which the kernel's tracker
     /// also holds; kept to flatten it at the depth bound.
     standing: Option<Arc<OwnedFd>>,
+    /// Re-shares the pages a live fold refused and watches a refresh's flatten; a capture
+    /// fences it as a guest-memory writer.
+    background: Background,
 }
 
 /// The 40-byte `tracked` reply body. An untracked reply is zero after `tracked`.
@@ -374,13 +378,14 @@ fn encode_free_summary_done(pages: u64, included: u64, standing_id: u64) -> Vec<
 }
 
 /// The `refreshed` reply body.
-fn encode_refreshed(info: &memversion::Info2) -> Vec<u8> {
-    let mut body = Vec::with_capacity(32);
+fn encode_refreshed(info: &memversion::Info2, paused_us: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(40);
     body.extend_from_slice(&info.own_pages.to_le_bytes());
     body.extend_from_slice(&info.new_pages.to_le_bytes());
     body.extend_from_slice(&info.depth.to_le_bytes());
     body.extend_from_slice(&info.nr_zero_runs.to_le_bytes());
     body.extend_from_slice(&info.folded_pages.to_le_bytes());
+    body.extend_from_slice(&paused_us.to_le_bytes());
     body
 }
 
@@ -395,6 +400,16 @@ impl CaptureService {
         std::thread::Builder::new()
             .name("fc_ramet".to_string())
             .spawn(move || {
+                // Started before the filter, which allows no new thread; it installs the same
+                // filter on itself first.
+                let background = match Background::spawn(vmm.clone(), filter.clone()) {
+                    Ok(background) => background,
+                    Err(err) => {
+                        error!("Ramet channel could not start its background worker: {err}");
+                        BackendState::fail();
+                        return;
+                    }
+                };
                 if let Err(err) = crate::seccomp::apply_filter(&filter) {
                     error!("Ramet channel could not install its filter: {err}");
                     BackendState::fail();
@@ -410,6 +425,7 @@ impl CaptureService {
                     pending: None,
                     tracker: None,
                     standing: None,
+                    background,
                 };
                 loop {
                     if BackendState::load() == BackendState::ChannelFailed {
@@ -466,7 +482,7 @@ impl CaptureService {
             MsgType::Resume => self.resume(request_id, protocol::parse_u32(&incoming.body)?),
             MsgType::FreeSummary => self.free_summary(incoming),
             MsgType::Track => self.track(incoming),
-            MsgType::Refresh => self.refresh(request_id),
+            MsgType::Refresh => self.refresh(request_id, protocol::parse_refresh_budget(&incoming.body)?),
             MsgType::Untrack => self.untrack(request_id),
             MsgType::Rearm => self.rearm(incoming),
             _ => Err(ChannelError::Malformed),
@@ -652,7 +668,7 @@ impl CaptureService {
     /// The result is a base for the next fork's fold, never a capture: a running guest has no
     /// consistent instant. Optional: a refusal leaves the guest running and the next fork
     /// folds more.
-    fn refresh(&mut self, request_id: u64) -> Result<(), ChannelError> {
+    fn refresh(&mut self, request_id: u64, budget: u64) -> Result<(), ChannelError> {
         let Some(tracker) = self.tracker.as_ref() else {
             return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
         };
@@ -675,11 +691,26 @@ impl CaptureService {
                 // The tracker then stands on a flat copy of the fold, so the chain it keeps is
                 // one level: what it retains beyond the guest's own pages is only what the guest
                 // writes from here on, which the next refresh bounds. A flatten or rebase that
-                // fails leaves the tracker on the fold, which is still exact.
-                let version = match memversion::flatten(folded.as_fd()).and_then(|flat| {
+                // fails leaves the tracker on the fold, which is still exact. While it flattens,
+                // the guest's writes copy pages the old chain keeps: past the budget, the watch
+                // pauses the vCPUs until the rebase lets the old chain go.
+                let watching = budget > 0
+                    && memversion::track_info(tracker.as_fd())
+                        .map(|t| {
+                            self.background
+                                .start_watch(tracker.as_raw_fd(), t.dirty_pages, budget)
+                        })
+                        .is_ok();
+                let flattened = memversion::flatten(folded.as_fd()).and_then(|flat| {
                     memversion::rebase(tracker.as_fd(), flat.as_fd())?;
                     Ok(flat)
-                }) {
+                });
+                let paused = if watching {
+                    self.background.end_watch()
+                } else {
+                    Duration::ZERO
+                };
+                let version = match flattened {
                     Ok(flat) => flat,
                     Err(err) => {
                         error!("Ramet could not flatten the refreshed standing version: {err}");
@@ -697,12 +728,22 @@ impl CaptureService {
                 );
                 let version = Arc::new(version);
                 self.standing = Some(version.clone());
-                self.answer_with_version(
+                let paused_us = u64::try_from(paused.as_micros()).unwrap_or(u64::MAX);
+                let answered = self.answer_with_version(
                     request_id,
                     MsgType::Refreshed,
-                    encode_refreshed(&info),
+                    encode_refreshed(&info, paused_us),
                     Some(version),
-                )
+                );
+                // What the source still maps alone is what the fold refused and what the
+                // guest wrote since: re-share it so the next live fold takes it.
+                if let Some(tracker) = self.tracker.as_ref()
+                    && let Ok(regions) = memversion::geometry(&self.channel.regions)
+                    && let Ok(written) = memversion::written_pages(tracker.as_fd(), &regions)
+                {
+                    self.background.reshare(&regions, &written);
+                }
+                answered
             }
             Err(err) => {
                 error!("Ramet could not refresh the standing version: {err}");
@@ -814,9 +855,12 @@ impl CaptureService {
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
         let pause_us = at();
+        // The background worker writes guest memory too: no touch runs past here.
+        self.background.fence();
         if let Err(err) = vmm.drain_guest_memory_writers() {
             error!("Ramet quiesce could not stop every guest-memory writer: {err}");
             hand_back_source(vmm, were_running);
+            self.background.unfence();
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
         }
         let destination = self
@@ -839,6 +883,8 @@ impl CaptureService {
                     error!("Ramet quiesce could not clone the scratch disk: {err}");
                     METRICS.ramet.disk_clone_failures.inc();
                     hand_back_source(vmm, were_running);
+                    self.background.unfence();
+            self.background.unfence();
                     return self.reject(request_id, ErrorCode::DiskCloneFailed, MsgType::Quiesce);
                 }
             }
@@ -979,6 +1025,7 @@ impl CaptureService {
         self.order.open();
         set_capture_buffers_armed(false);
         BackendState::Ready.store();
+        self.background.unfence();
         dispatch::gate().open();
         self.reply(
             request_id,
