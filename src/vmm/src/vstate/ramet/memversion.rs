@@ -978,6 +978,33 @@ pub(crate) fn untrack(device: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
+/// `struct mv_track_limit` of the rmv3 uapi.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct TrackLimit {
+    pub eventfd: i32,
+    pub flags: u32,
+    pub limit: u64,
+}
+
+ioctl_iow_nr!(MV_IOC_TRACK_LIMIT, 0x56, 0x4b, TrackLimit);
+
+/// Has the kernel signal `eventfd` as this process's tracker counts `limit` dirty pages, or at
+/// once if it already does; a fold restarts the count and keeps the limit. Limit 0 disarms.
+/// The tracker keeps the first eventfd it is given: later calls name the same one.
+pub(crate) fn track_limit(device: BorrowedFd<'_>, eventfd: BorrowedFd<'_>, limit: u64) -> io::Result<()> {
+    let request = TrackLimit {
+        eventfd: eventfd.as_raw_fd(),
+        flags: 0,
+        limit,
+    };
+    // SAFETY: the request reads one live mv_track_limit.
+    if unsafe { ioctl_with_ref(&device, MV_IOC_TRACK_LIMIT(), &request) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Replaces the tracker's standing version with `flat`, a FLATTEN of it.
 pub(crate) fn rebase(device: BorrowedFd<'_>, flat: BorrowedFd<'_>) -> io::Result<()> {
     let fd: i32 = flat.as_raw_fd();
@@ -1215,6 +1242,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Resident, nr_written), 40);
         assert_eq!(std::mem::offset_of!(Resident, flags), 48);
         assert_eq!(MV_IOC_RESIDENT(), 0xc0385649);
+        // struct mv_track_limit of the rmv3 uapi.
+        assert_eq!(size_of::<TrackLimit>(), 16);
+        assert_eq!(std::mem::offset_of!(TrackLimit, limit), 8);
+        assert_eq!(MV_IOC_TRACK_LIMIT(), 0x4010564b);
         assert_eq!(MV_RESIDENT_MAX_LEN, 1 << 30);
         // struct mv_track_info2 of the fpmv4 uapi.
         assert_eq!(size_of::<TrackInfo2>(), 64);

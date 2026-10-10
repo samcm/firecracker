@@ -724,6 +724,19 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Have the kernel signal the standing guard's eventfd at the tracker's dirty limit",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074812491,
+                        "comment": "MV_TRACK_LIMIT (0x4010564b)"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "comment": "Count the guest pages a quiesced tracked capture would newly retain",
                 "args": [
                     {

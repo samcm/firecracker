@@ -18,13 +18,15 @@
 //!
 //! Every page the standing version keeps beyond the guest's own is one the guest dirtied since
 //! the version's fold, so the tracker's dirty count bounds it. A refresh arms the guard with a
-//! dirty count: the worker reads the counter every millisecond and, once the guest reaches it,
-//! pauses the vCPUs until the next refresh's rebase lets the old copies go. Memory plane starts
-//! refreshes early enough that this is rare; the guard is what makes the bound hard.
+//! dirty count, which the kernel signals on an eventfd as the guest's writes reach it
+//! (MV_IOC_TRACK_LIMIT): the guard thread, blocked on that eventfd, then pauses the vCPUs until
+//! the next refresh's rebase lets the old copies go, so what the guest writes past the bound is
+//! only what it writes while its vCPUs are being paused. Memory plane starts refreshes early
+//! enough that this is rare; the guard is what makes the bound hard.
 
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,10 +39,6 @@ use crate::vmm_config::instance_info::VmState;
 /// second at most, off every vCPU thread.
 const TOUCH_BATCH: usize = 256;
 const TOUCH_PAUSE: Duration = Duration::from_millis(4);
-/// How often the guard reads the tracker's dirty counter: half the time the guest takes at its
-/// last rate to reach the guard, within these.
-const GUARD_MIN: Duration = Duration::from_millis(1);
-const GUARD_MAX: Duration = Duration::from_millis(50);
 
 /// One unit of background work.
 enum Job {
@@ -53,9 +51,6 @@ struct Guard {
     /// The channel's tracker descriptor, open while the guard is armed: untrack disarms first.
     tracker: RawFd,
     at: u64,
-    /// The last reading and when, for the rate; the wait until the next.
-    last: Option<(u64, Instant)>,
-    wait: Duration,
 }
 
 #[derive(Default)]
@@ -84,11 +79,13 @@ pub(crate) struct Paused {
     pub(crate) waited: Duration,
 }
 
-/// Handle on the background worker thread.
+/// Handle on the background worker and guard threads.
 #[derive(Clone)]
 pub(crate) struct Background {
     shared: Arc<(Mutex<State>, Condvar)>,
     vcpus: Arc<dyn Pauser>,
+    /// The eventfd the kernel signals at the guard's count; the guard thread reads it.
+    limit: Arc<OwnedFd>,
 }
 
 impl std::fmt::Debug for Background {
@@ -97,36 +94,56 @@ impl std::fmt::Debug for Background {
     }
 }
 
+/// A new eventfd, close-on-exec, for the kernel's limit signal.
+fn limit_eventfd() -> std::io::Result<OwnedFd> {
+    // SAFETY: eventfd takes no pointer; a non-negative result is a new descriptor we own.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 impl Background {
     /// A handle no worker serves: its jobs queue and never run. For tests of the channel.
     #[cfg(test)]
     pub(crate) fn detached() -> Self {
-        Self::new(Arc::new(NoVcpus))
+        Self::new(Arc::new(NoVcpus)).expect("eventfd")
     }
 
-    fn new(vcpus: Arc<dyn Pauser>) -> Self {
-        Self {
+    fn new(vcpus: Arc<dyn Pauser>) -> std::io::Result<Self> {
+        Ok(Self {
             shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
             vcpus,
-        }
+            limit: Arc::new(limit_eventfd()?),
+        })
     }
 
-    /// Starts the worker. It installs `filter` on itself before it does anything.
+    /// Starts the worker and the guard. Each installs `filter` on itself before it does
+    /// anything.
     pub(crate) fn spawn(
         vmm: Arc<Mutex<Vmm>>,
         filter: Arc<crate::seccomp::BpfProgram>,
     ) -> std::io::Result<Self> {
-        let bg = Self::new(Arc::new(VmmPauser(vmm)));
-        let worker = bg.clone();
-        std::thread::Builder::new()
-            .name("fc_ramet_bg".to_string())
-            .spawn(move || {
-                if let Err(err) = crate::seccomp::apply_filter(&filter) {
-                    error!("Ramet background worker could not install its filter: {err}");
-                    return;
-                }
-                worker.run();
-            })?;
+        let bg = Self::new(Arc::new(VmmPauser(vmm)))?;
+        for (name, guard) in [("fc_ramet_bg", false), ("fc_ramet_guard", true)] {
+            let worker = bg.clone();
+            let filter = filter.clone();
+            std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(move || {
+                    if let Err(err) = crate::seccomp::apply_filter(&filter) {
+                        error!("Ramet {name} could not install its filter: {err}");
+                        return;
+                    }
+                    if guard {
+                        worker.guard_run();
+                    } else {
+                        worker.run();
+                    }
+                })?;
+        }
         Ok(bg)
     }
 
@@ -137,49 +154,44 @@ impl Background {
                 let mut state = lock.lock().expect("Poisoned lock");
                 loop {
                     if let Some(job) = state.job.take() {
-                        break Some(job);
+                        break job;
                     }
-                    if let Some(wait) = state
-                        .guard
-                        .as_ref()
-                        .filter(|_| state.paused_at.is_none())
-                        .map(|g| g.wait)
-                    {
-                        state = cvar
-                            .wait_timeout(state, wait)
-                            .expect("Poisoned lock")
-                            .0;
-                        if state.job.is_none() {
-                            break None;
-                        }
-                    } else {
-                        state = cvar.wait(state).expect("Poisoned lock");
-                    }
+                    state = cvar.wait(state).expect("Poisoned lock");
                 }
             };
             match job {
-                Some(Job::Touch(pages)) => self.touch(&pages),
-                None => self.guard_check(),
+                Job::Touch(pages) => self.touch(&pages),
             }
         }
     }
 
-    /// Reads the counter once and pauses the guest if it reached the guard.
+    /// Waits for the kernel's signal and checks the guard on each.
+    fn guard_run(&self) {
+        let mut count = [0u8; 8];
+        loop {
+            // SAFETY: reads 8 bytes into a live buffer from the eventfd this handle owns.
+            let n = unsafe { libc::read(self.limit.as_raw_fd(), count.as_mut_ptr().cast(), 8) };
+            if n != 8 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                error!("Ramet standing guard cannot read its eventfd: {err}");
+                return;
+            }
+            self.guard_check();
+        }
+    }
+
+    /// Reads the counter and pauses the guest if it reached the guard.
     fn guard_check(&self) {
         let (lock, cvar) = &*self.shared;
         let mut state = lock.lock().expect("Poisoned lock");
-        let paused = state.paused_at.is_some();
-        let reached = match state.guard.as_mut() {
-            Some(guard) if !paused => {
+        let reached = match &state.guard {
+            Some(guard) if state.paused_at.is_none() => {
                 // SAFETY: the tracker stays open while the guard is armed.
                 let fd = unsafe { BorrowedFd::borrow_raw(guard.tracker) };
-                match memversion::track_info(fd) {
-                    Ok(info) => guard.read(info.dirty_pages),
-                    Err(_) => {
-                        guard.wait = GUARD_MAX;
-                        false
-                    }
-                }
+                memversion::track_info(fd).is_ok_and(|info| info.dirty_pages >= guard.at)
             }
             _ => false,
         };
@@ -205,8 +217,7 @@ impl Background {
     }
 
     /// Re-shares `pages`, a batch at a time between fence checks. A fence drops the rest: a
-    /// capture folds them, and its set is stale after it. The guard keeps reading between
-    /// batches.
+    /// capture folds them, and its set is stale after it.
     fn touch(&self, pages: &[u64]) {
         let (lock, cvar) = &*self.shared;
         let started = Instant::now();
@@ -225,15 +236,12 @@ impl Background {
                 unsafe { reshare(addr) };
             }
             done += batch.len();
-            {
-                let mut state = lock.lock().expect("Poisoned lock");
-                state.touching = false;
-                cvar.notify_all();
-                let _state = cvar
-                    .wait_timeout(state, TOUCH_PAUSE)
-                    .expect("Poisoned lock");
-            }
-            self.guard_check();
+            let mut state = lock.lock().expect("Poisoned lock");
+            state.touching = false;
+            cvar.notify_all();
+            let (_state, _) = cvar
+                .wait_timeout(state, TOUCH_PAUSE)
+                .expect("Poisoned lock");
         }
         if !pages.is_empty() {
             info!(
@@ -250,17 +258,23 @@ impl Background {
         lock.lock().expect("Poisoned lock").wake = Some(File::from(wake));
     }
 
-    /// Arms the guard, or moves it: pause the guest once `tracker` counts `at` dirty pages. A
-    /// guest already paused by it stays paused.
+    /// Arms the guard, or moves it: pause the guest once `tracker` counts `at` dirty pages, which
+    /// the kernel signals. A guest already paused by it stays paused.
     pub(crate) fn guard(&self, tracker: &impl AsRawFd, at: u64) {
-        let (lock, cvar) = &*self.shared;
-        lock.lock().expect("Poisoned lock").guard = Some(Guard {
-            tracker: tracker.as_raw_fd(),
-            at,
-            last: None,
-            wait: GUARD_MIN,
-        });
-        cvar.notify_all();
+        let fd = tracker.as_raw_fd();
+        {
+            let (lock, _) = &*self.shared;
+            lock.lock().expect("Poisoned lock").guard = Some(Guard { tracker: fd, at });
+        }
+        // SAFETY: the caller's tracker is open for this call.
+        let device = unsafe { BorrowedFd::borrow_raw(fd) };
+        // A zero count is reached already: the kernel takes 0 as off, so ask for 1 and check.
+        if let Err(err) = memversion::track_limit(device, self.limit.as_fd(), at.max(1)) {
+            error!("Ramet could not arm the standing guard at {at} pages: {err}");
+        }
+        if at == 0 {
+            self.guard_check();
+        }
     }
 
     /// Ends a refresh: resumes a guest the guard paused, and returns how long it was paused
@@ -296,7 +310,13 @@ impl Background {
     pub(crate) fn disarm(&self) {
         let (lock, cvar) = &*self.shared;
         let mut state = lock.lock().expect("Poisoned lock");
-        state.guard = None;
+        if let Some(guard) = state.guard.take() {
+            // SAFETY: the tracker stays open while the guard is armed.
+            let device = unsafe { BorrowedFd::borrow_raw(guard.tracker) };
+            if let Err(err) = memversion::track_limit(device, self.limit.as_fd(), 0) {
+                error!("Ramet could not disarm the standing guard: {err}");
+            }
+        }
         let mut state = cvar
             .wait_while(state, |s| s.guarding)
             .expect("Poisoned lock");
@@ -350,30 +370,6 @@ impl Background {
         }
         state.job = Some(Job::Touch(pages));
         cvar.notify_all();
-    }
-}
-
-impl Guard {
-    /// Takes a reading: whether the guest reached the guard, or would before the next reading
-    /// at its rate, and when to read again.
-    fn read(&mut self, dirty: u64) -> bool {
-        let now = Instant::now();
-        // Pages a second since the last reading; a count that fell (a new fold) starts over.
-        let rate = self.last.and_then(|(d, t)| {
-            let secs = now.duration_since(t).as_secs_f64();
-            (dirty >= d && secs > 0.0).then(|| (dirty - d) as f64 / secs)
-        });
-        self.last = Some((dirty, now));
-        if dirty as f64 + rate.unwrap_or(0.0) * GUARD_MIN.as_secs_f64() >= self.at as f64 {
-            return true;
-        }
-        self.wait = match rate {
-            Some(r) if r > 0.0 => Duration::from_secs_f64((self.at - dirty) as f64 / r / 2.0)
-                .clamp(GUARD_MIN, GUARD_MAX),
-            Some(_) => GUARD_MAX,
-            None => GUARD_MIN,
-        };
-        false
     }
 }
 
@@ -596,7 +592,7 @@ mod tests {
         // No tracker: an unreadable counter never trips the guard. The worker's count check is
         // the kernel's; here the guard state machine is driven through a tripped pause.
         let vcpus = Arc::new(Vcpus::default());
-        let bg = Background::new(vcpus.clone());
+        let bg = Background::new(vcpus.clone()).unwrap();
         let w = bg.clone();
         std::thread::spawn(move || w.run());
         bg.guard(&1_000_000, 0);
@@ -629,30 +625,6 @@ mod tests {
         let later = bg.release(Instant::now());
         assert!(later.total >= Duration::from_millis(5) && later.waited == later.total);
         assert_eq!(bg.release(Instant::now()), Paused::default());
-    }
-
-    #[test]
-    fn the_guard_reads_sooner_the_nearer_the_guest_writes_to_it() {
-        let mut g = Guard {
-            tracker: 1_000_000,
-            at: 1000,
-            last: None,
-            wait: GUARD_MIN,
-        };
-        assert!(!g.read(0));
-        assert_eq!(g.wait, GUARD_MIN, "no rate yet");
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(!g.read(0));
-        assert_eq!(g.wait, GUARD_MAX, "an idle guest");
-        std::thread::sleep(Duration::from_millis(10));
-        // About 10k pages a second, 900 pages away: 45 ms at most, halved.
-        assert!(!g.read(100));
-        assert!(g.wait > Duration::from_millis(10) && g.wait <= GUARD_MAX, "{:?}", g.wait);
-        // Writing fast enough that the next reading would be past it: trips now.
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(g.read(995), "5 pages away at tens of thousands a second");
-        let mut g = Guard { last: None, ..g };
-        assert!(g.read(1000), "at the guard");
     }
 
     #[test]
