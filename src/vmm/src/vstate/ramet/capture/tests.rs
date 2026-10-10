@@ -1100,21 +1100,28 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     validate_command(MsgType::Track, 8, 1).unwrap();
     validate_command(MsgType::Track, 8, 2).unwrap();
     validate_command(MsgType::Track, 8, 0).unwrap_err();
-    for len in [1, 4, 7, 9, 16] {
+    validate_command(MsgType::Track, 16, 1).unwrap();
+    for len in [1, 4, 7, 9, 15, 17, 24] {
         validate_command(MsgType::Track, len, 1).unwrap_err();
     }
-    assert_eq!(protocol::parse_track_bound(&[]).unwrap(), u64::MAX);
+    assert_eq!(protocol::parse_track(&[]).unwrap(), (u64::MAX, 0));
     assert_eq!(
-        protocol::parse_track_bound(&0x0102_0304_0506_0708u64.to_le_bytes()).unwrap(),
-        0x0102_0304_0506_0708
+        protocol::parse_track(&0x0102_0304_0506_0708u64.to_le_bytes()).unwrap(),
+        (0x0102_0304_0506_0708, 0)
     );
-    for len in [1, 4, 7, 9, 16] {
-        protocol::parse_track_bound(&vec![0; len]).unwrap_err();
+    let mut counted = 7u64.to_le_bytes().to_vec();
+    counted.extend_from_slice(&protocol::TRACK_COUNT_RETAINED.to_le_bytes());
+    assert_eq!(protocol::parse_track(&counted).unwrap(), (7, 1));
+    let mut unknown = 7u64.to_le_bytes().to_vec();
+    unknown.extend_from_slice(&2u64.to_le_bytes());
+    protocol::parse_track(&unknown).unwrap_err();
+    for len in [1, 4, 7, 9, 15, 17, 24] {
+        protocol::parse_track(&vec![0; len]).unwrap_err();
     }
     validate_command(MsgType::Refresh, 0, 0).unwrap();
     validate_command(MsgType::Refresh, 0, 1).unwrap_err();
     // Replies are commands only Firecracker sends.
-    validate_command(MsgType::Tracked, 32, 0).unwrap_err();
+    validate_command(MsgType::Tracked, 40, 0).unwrap_err();
     validate_command(MsgType::Refreshed, 32, 1).unwrap_err();
 
     let tracked = memversion::TrackInfo {
@@ -1126,16 +1133,17 @@ fn track_and_refresh_frames_numbers_and_bodies() {
         reserved: 4,
         retained_pages: 5,
     };
-    let body = encode_tracked(&tracked, 0x1112_1314_1516_1718);
-    assert_eq!(body.len(), 32);
+    let body = encode_tracked(&tracked, 0x1112_1314_1516_1718, 0x2122);
+    assert_eq!(body.len(), 40);
     assert_eq!(body[..8], [1, 0, 0, 0, 2, 0, 0, 0]);
     assert_eq!(body[8..16], 0x0102_0304_0506_0708u64.to_le_bytes());
     assert_eq!(body[16..24], 9u64.to_le_bytes());
-    assert_eq!(body[24..], 0x1112_1314_1516_1718u64.to_le_bytes());
+    assert_eq!(body[24..32], 0x1112_1314_1516_1718u64.to_le_bytes());
+    assert_eq!(body[32..], 0x2122u64.to_le_bytes());
     // An untracked reply, as Untrack sends, is zero after `tracked` whatever it was given.
     assert_eq!(
-        encode_tracked(&memversion::TrackInfo::default(), 0),
-        vec![0; 32]
+        encode_tracked(&memversion::TrackInfo::default(), 0, 0),
+        vec![0; 40]
     );
     assert_eq!(
         encode_tracked(
@@ -1143,9 +1151,10 @@ fn track_and_refresh_frames_numbers_and_bodies() {
                 tracked: 0,
                 ..tracked
             },
-            7
+            7,
+            8
         ),
-        vec![0; 32]
+        vec![0; 40]
     );
     let body = encode_refreshed(&memversion::Info2 {
         own_pages: 5,

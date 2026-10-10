@@ -686,8 +686,22 @@ pub(crate) fn track(
 }
 
 pub(crate) fn track_info(device: BorrowedFd<'_>) -> io::Result<TrackInfo> {
-    // flags stay 0: the retained walk is a diagnostic the commands never need.
-    let mut info = TrackInfo::default();
+    track_info_with(device, 0)
+}
+
+/// [`track_info`] that also counts `retained_pages`: a walk of the standing chain, which
+/// pauses nothing and never undercounts.
+pub(crate) fn track_info_retained(device: BorrowedFd<'_>) -> io::Result<TrackInfo> {
+    track_info_with(device, MV_TRACK_INFO_RETAINED)
+}
+
+const MV_TRACK_INFO_RETAINED: u32 = 0x1;
+
+fn track_info_with(device: BorrowedFd<'_>, flags: u32) -> io::Result<TrackInfo> {
+    let mut info = TrackInfo {
+        flags,
+        ..TrackInfo::default()
+    };
     // SAFETY: info is a live, writable struct of the exact request size.
     if unsafe { ioctl_with_mut_ref(&device, MV_IOC_TRACK_INFO(), &mut info) } != 0 {
         return Err(io::Error::last_os_error());

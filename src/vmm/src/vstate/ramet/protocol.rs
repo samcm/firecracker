@@ -105,15 +105,17 @@ pub enum MsgType {
     /// empty or one LE u64 bound in pages (empty means u64::MAX); see `Tracked`.
     Track = 28,
     /// Firecracker reports the tracker: LE u32 tracked, u32 depth, u64 dirty pages, u64
-    /// standing version id, u64 included pages. Included pages is exactly what the next CREATE
+    /// standing version id, u64 included pages, u64 retained pages (u64::MAX unless the request
+    /// asked for them while the guest runs). Included pages is exactly what the next CREATE
     /// would newly retain when the guest is quiesced and dirty pages exceed the Track bound, and
     /// equals dirty pages (an upper bound) otherwise. An untracked reply is zero after `tracked`.
     /// An fpmv4 kernel counts it (MV_IOC_TRACK_INFO2); an older one is counted by residency.
     Tracked = 29,
     /// Pagemaster asks for the standing version to be refreshed while the guest runs.
     Refresh = 30,
-    /// Firecracker returns the new standing version: LE u64 own pages, u64 new pages,
-    /// u32 depth, u32 zero runs, u64 folded pages.
+    /// Firecracker returns the new standing version, a flat copy of the fold, as the one
+    /// descriptor, and the fold's counts: LE u64 own pages, u64 new pages, u32 depth,
+    /// u32 zero runs, u64 folded pages.
     Refreshed = 31,
     /// Pagemaster hands over a flat version it made with FLATTEN of the standing version, after a
     /// transient capture published, and asks for the tracker to stand on it instead. No body, one
@@ -603,11 +605,23 @@ pub fn parse_free_summary_budget(body: &[u8]) -> Result<u64, ChannelError> {
     Ok(budget)
 }
 
-/// Parses the bound of a Track request: one LE u64 in pages, or an empty body for no bound.
-pub fn parse_track_bound(body: &[u8]) -> Result<u64, ChannelError> {
+/// With a Track request: also count the pages the standing chain retains that the guest no
+/// longer maps (a walk of the chain while the guest runs; never inside a freeze).
+pub const TRACK_COUNT_RETAINED: u64 = 1;
+
+/// Parses a Track request: empty for no bound, one LE u64 bound in pages, or the bound and an
+/// LE u64 of flags, of which only [`TRACK_COUNT_RETAINED`] is defined.
+pub fn parse_track(body: &[u8]) -> Result<(u64, u64), ChannelError> {
     match body.len() {
-        0 => Ok(u64::MAX),
-        8 => Ok(u64::from_le_bytes(body.try_into().unwrap())),
+        0 => Ok((u64::MAX, 0)),
+        8 => Ok((u64::from_le_bytes(body.try_into().unwrap()), 0)),
+        16 => {
+            let flags = u64::from_le_bytes(body[8..].try_into().unwrap());
+            if flags & !TRACK_COUNT_RETAINED != 0 {
+                return Err(ChannelError::Malformed);
+            }
+            Ok((u64::from_le_bytes(body[..8].try_into().unwrap()), flags))
+        }
         _ => Err(ChannelError::Malformed),
     }
 }

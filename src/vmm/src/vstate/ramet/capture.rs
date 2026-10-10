@@ -267,7 +267,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::WriteVmstate => (&[0], &[1]),
         MsgType::Resume => (&[4], &[0]),
         MsgType::FreeSummary => (&[8], &[1]),
-        MsgType::Track => (&[0, 8], &[1, 2]),
+        MsgType::Track => (&[0, 8, 16], &[1, 2]),
         MsgType::Refresh => (&[0], &[0]),
         MsgType::Untrack => (&[0], &[0]),
         MsgType::Rearm => (&[0], &[1]),
@@ -297,18 +297,19 @@ pub struct CaptureService {
     standing: Option<Arc<OwnedFd>>,
 }
 
-/// The 32-byte `tracked` reply body. An untracked reply is zero after `tracked`.
-fn encode_tracked(info: &memversion::TrackInfo, included_pages: u64) -> Vec<u8> {
-    let mut body = Vec::with_capacity(32);
+/// The 40-byte `tracked` reply body. An untracked reply is zero after `tracked`.
+fn encode_tracked(info: &memversion::TrackInfo, included_pages: u64, retained_pages: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(40);
     body.extend_from_slice(&info.tracked.to_le_bytes());
     if info.tracked == 0 {
-        body.resize(32, 0);
+        body.resize(40, 0);
         return body;
     }
     body.extend_from_slice(&info.depth.to_le_bytes());
     body.extend_from_slice(&info.dirty_pages.to_le_bytes());
     body.extend_from_slice(&info.standing_id.to_le_bytes());
     body.extend_from_slice(&included_pages.to_le_bytes());
+    body.extend_from_slice(&retained_pages.to_le_bytes());
     body
 }
 
@@ -556,7 +557,7 @@ impl CaptureService {
     /// which leaves out pages the guest reported free and has not written since.
     fn track(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
-        let bound = protocol::parse_track_bound(&incoming.body)?;
+        let (bound, flags) = protocol::parse_track(&incoming.body)?;
         let state = BackendState::load();
         if track_mode(state, self.tracker.is_some()) == TrackMode::Refuse {
             return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
@@ -580,7 +581,20 @@ impl CaptureService {
             self.tracker = Some(device);
         }
         let tracker = self.tracker.as_ref().expect("tracker set above");
-        let info = match memversion::track_info(tracker.as_fd()) {
+        // The retained walk runs only while the guest runs: a freeze never pays for it.
+        let count_retained =
+            flags & protocol::TRACK_COUNT_RETAINED != 0 && state == BackendState::Ready;
+        let read = if count_retained {
+            memversion::track_info_retained(tracker.as_fd())
+        } else {
+            memversion::track_info(tracker.as_fd())
+        };
+        let retained = if count_retained {
+            read.as_ref().map_or(u64::MAX, |info| info.retained_pages)
+        } else {
+            u64::MAX
+        };
+        let info = match read {
             Ok(info) => info,
             Err(err) => {
                 error!("Ramet could not read the memory tracker: {err}");
@@ -615,7 +629,7 @@ impl CaptureService {
         self.reply(
             request_id,
             MsgType::Tracked,
-            &encode_tracked(&info, included),
+            &encode_tracked(&info, included, retained),
         )
     }
 
@@ -656,11 +670,28 @@ impl CaptureService {
             })
             .and_then(|version| Ok((memversion::info2(version.as_fd())?, version)));
         match refreshed {
-            Ok((info, version)) => {
+            Ok((info, folded)) => {
+                let folded_us = started.elapsed().as_micros();
+                // The tracker then stands on a flat copy of the fold, so the chain it keeps is
+                // one level: what it retains beyond the guest's own pages is only what the guest
+                // writes from here on, which the next refresh bounds. A flatten or rebase that
+                // fails leaves the tracker on the fold, which is still exact.
+                let version = match memversion::flatten(folded.as_fd()).and_then(|flat| {
+                    memversion::rebase(tracker.as_fd(), flat.as_fd())?;
+                    Ok(flat)
+                }) {
+                    Ok(flat) => flat,
+                    Err(err) => {
+                        error!("Ramet could not flatten the refreshed standing version: {err}");
+                        folded
+                    }
+                };
                 info!(
-                    "Ramet refreshed the standing version in {} us: own={} folded={} depth={}",
+                    "Ramet refreshed the standing version in {} us (fold {folded_us} us): \
+                     own={} new={} folded={} depth={}",
                     started.elapsed().as_micros(),
                     info.own_pages,
+                    info.new_pages,
                     info.folded_pages,
                     info.depth
                 );
@@ -700,7 +731,7 @@ impl CaptureService {
         self.reply(
             request_id,
             MsgType::Tracked,
-            &encode_tracked(&memversion::TrackInfo::default(), 0),
+            &encode_tracked(&memversion::TrackInfo::default(), 0, 0),
         )
     }
 
