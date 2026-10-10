@@ -933,7 +933,10 @@ impl CaptureService {
     fn stand(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
         let [dest] = <[_; 1]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+        // Every refusal closes the descriptor before it answers: a reply proves Firecracker
+        // holds no reference to a destination it did not take.
         if BackendState::load() != BackendState::Ready || self.buffers.is_some() {
+            drop(dest);
             return self.reject(request_id, ErrorCode::CaptureOrderViolation, MsgType::Stand);
         }
         let (scratch, log) = {
@@ -941,9 +944,11 @@ impl CaptureService {
             (vmm.scratch_descriptor(), vmm.scratch_write_log())
         };
         let (Some(scratch), Some(log)) = (scratch, log) else {
+            drop(dest);
             return self.reject(request_id, ErrorCode::NoScratchDrive, MsgType::Stand);
         };
         if let Err(code) = validate_clone_destination(dest.as_raw_fd()) {
+            drop(dest);
             return self.reject(request_id, code, MsgType::Stand);
         }
         let ready = file_size(dest.as_raw_fd())
@@ -959,9 +964,11 @@ impl CaptureService {
             Ok(ready) => ready,
             Err(err) => {
                 error!("Farplane refused a standing destination: {err}");
+                drop(dest);
                 return self.reject(request_id, ErrorCode::BadCloneDestination, MsgType::Stand);
             }
         };
+        // The earlier standing clone, if any, is closed before the reply.
         self.stood = None;
         log.start(WRITE_LOG_MAX_RANGES, WRITE_LOG_MAX_BYTES);
         self.stood = Some(StandingDisk {
