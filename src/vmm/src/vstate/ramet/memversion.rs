@@ -6,7 +6,6 @@
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use vmm_sys_util::ioctl::{ioctl, ioctl_with_mut_ref, ioctl_with_ref};
 use vmm_sys_util::{ioctl_io_nr, ioctl_iow_nr, ioctl_iowr_nr};
@@ -526,9 +525,6 @@ const MV_MAP_PRIVATE: u32 = 1;
 /// the version on first fault. Kernels without it refuse the flag with EINVAL
 /// before touching the address space.
 const MV_MAP_LAZY: u32 = 4;
-/// Cleared once a kernel refuses MV_MAP_LAZY, so later regions map eagerly
-/// without another refused ioctl.
-static LAZY_IMPORT: AtomicBool = AtomicBool::new(true);
 
 fn map_with(version: BorrowedFd<'_>, region: u32, addr: u64, flags: u32) -> io::Result<()> {
     let request = Map {
@@ -544,19 +540,9 @@ fn map_with(version: BorrowedFd<'_>, region: u32, addr: u64, flags: u32) -> io::
 }
 
 /// Caller releases only its own reservation immediately before this NOREPLACE operation.
-/// Imports lazily where the kernel supports it, otherwise eagerly.
+/// Every import is lazy: the kernel ramet pins supports it, so there is no eager path.
 pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io::Result<()> {
-    if LAZY_IMPORT.load(Ordering::Relaxed) {
-        match map_with(version, region, addr, MV_MAP_PRIVATE | MV_MAP_LAZY) {
-            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
-                LAZY_IMPORT.store(false, Ordering::Relaxed);
-            }
-            // A version this kernel cannot import lazily still imports eagerly.
-            Err(err) if err.raw_os_error() == Some(libc::EOPNOTSUPP) => {}
-            other => return other,
-        }
-    }
-    map_with(version, region, addr, MV_MAP_PRIVATE)
+    map_with(version, region, addr, MV_MAP_PRIVATE | MV_MAP_LAZY)
 }
 
 // ABI v2: incremental versions. Every v1 request keeps its v1 meaning; a v1 kernel refuses
@@ -988,27 +974,14 @@ pub(crate) fn rebase(device: BorrowedFd<'_>, flat: BorrowedFd<'_>) -> io::Result
     Ok(())
 }
 
-/// Tracks the guest whose memory was imported from `base`, if any. A guest imported eagerly
-/// (a kernel or version that refused the lazy import) is tracked without a base: every present
-/// page starts dirty and the first fold copies it, as a v1 capture would.
+/// Tracks the guest, standing on `base` when its memory was imported from it (every import
+/// is lazy, so the imported version is the tracker's base) and on nothing for a booted guest.
 pub(crate) fn track_guest(
     device: BorrowedFd<'_>,
     regions: &[Region],
     base: Option<BorrowedFd<'_>>,
 ) -> io::Result<()> {
-    track_guest_with(base.is_some(), |with_base| {
-        track(device, regions, if with_base { base } else { None })
-    })
-}
-
-fn track_guest_with(
-    has_base: bool,
-    mut track: impl FnMut(bool) -> io::Result<()>,
-) -> io::Result<()> {
-    match track(has_base) {
-        Err(err) if has_base && err.raw_os_error() == Some(libc::EINVAL) => track(false),
-        other => other,
-    }
+    track(device, regions, base)
 }
 
 /// Refreshes the standing version while the guest runs: folds the pages written since it,
@@ -1586,38 +1559,6 @@ mod tests {
                 .raw_os_error(),
             enotty
         );
-    }
-
-    #[test]
-    fn track_falls_back_to_no_base_only_for_a_refused_base() {
-        let einval = || Err(io::Error::from_raw_os_error(libc::EINVAL));
-        // An eagerly imported guest refuses its base; tracked without one.
-        let mut calls = vec![];
-        track_guest_with(true, |base| {
-            calls.push(base);
-            if base { einval() } else { Ok(()) }
-        })
-        .unwrap();
-        assert_eq!(calls, [true, false]);
-        // A booted guest has no base to drop: EINVAL is final.
-        let mut calls = vec![];
-        let err = track_guest_with(false, |base| {
-            calls.push(base);
-            einval()
-        })
-        .unwrap_err();
-        assert_eq!(
-            (calls, err.raw_os_error()),
-            (vec![false], Some(libc::EINVAL))
-        );
-        // Any other refusal is final: no silent untracked retry.
-        let mut calls = vec![];
-        track_guest_with(true, |base| {
-            calls.push(base);
-            Err(io::Error::from_raw_os_error(libc::EBUSY))
-        })
-        .unwrap_err();
-        assert_eq!(calls, [true]);
     }
 
     #[test]
