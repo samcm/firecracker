@@ -302,6 +302,139 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
     .unwrap_err();
 }
 
+/// On a reflink filesystem (FARPLANE_REFLINK_DIR): a standing clone driven step by step while a
+/// writer runs between every step (through the clone, the background catch-ups and, with a log
+/// too small for the writes, an overflow that restarts the clone), then adopted and caught up at
+/// the freeze, equals the disk byte for byte and a whole clone taken at that instant.
+#[test]
+fn a_standing_clone_caught_up_at_the_freeze_equals_the_disk() {
+    use std::io::Read;
+    use std::os::unix::fs::FileExt;
+    let Ok(dir) = std::env::var("FARPLANE_REFLINK_DIR") else {
+        eprintln!("skipped: set FARPLANE_REFLINK_DIR to a reflink filesystem");
+        return;
+    };
+    for (variant, first_bound) in [("bounded", WRITE_LOG_MAX_RANGES), ("overflow", 64)] {
+        let path = |name: &str| {
+            std::path::Path::new(&dir).join(format!("{variant}-{name}-{}", std::process::id()))
+        };
+        let open = |name: &str| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path(name))
+                .unwrap()
+        };
+        let size = 64 * 1024 * 1024 + 1234;
+        let live = open("live");
+        live.set_len(size).unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        live.write_all_at(&vec![0x11; usize::try_from(size).unwrap()], 0)
+            .unwrap();
+        let shadow = open("shadow");
+        clone_scratch(shadow.as_raw_fd(), live.as_raw_fd()).unwrap();
+        for _ in 0..3000 {
+            let block = next() % (size / 4096);
+            live.write_all_at(&next().to_le_bytes().repeat(512), block * 4096)
+                .unwrap();
+        }
+        live.sync_all().unwrap();
+        let log = Arc::new(WriteLog::default());
+        let mut write = |log: &WriteLog| {
+            let offset = next() % size;
+            let len = (1 + next() % (64 * 1024)).min(size - offset);
+            let byte = u8::try_from((offset ^ len) % 251).unwrap() + 1;
+            live.write_all_at(&vec![byte; usize::try_from(len).unwrap()], offset)
+                .unwrap();
+            log.record(offset, len);
+        };
+        log.start(first_bound, WRITE_LOG_MAX_BYTES);
+        let dest = open("dest");
+        let mut stood = StandingDisk {
+            inode: inode_of(dest.as_raw_fd()).unwrap(),
+            dest,
+            log: log.clone(),
+            phase: StandingPhase::Cloning {
+                next: 0,
+                size,
+                done: ChunkedClone::default(),
+                started_us: 0,
+            },
+        };
+        let (mut steps, mut reclones, mut catch_ups) = (0, 0, 0);
+        // Three rounds: drive the standing clone until it is idle, writing between steps, then
+        // write enough to need a catch-up.
+        for _ in 0..3 {
+            while standing_has_work(&stood) {
+                let was_ready = matches!(stood.phase, StandingPhase::Ready { .. });
+                advance_standing(&mut stood, live.as_raw_fd()).unwrap();
+                if was_ready && matches!(stood.phase, StandingPhase::Cloning { .. }) {
+                    reclones += 1;
+                }
+                if matches!(&stood.phase, StandingPhase::Ready { pending, .. } if !pending.is_empty())
+                {
+                    catch_ups += 1;
+                }
+                for _ in 0..3 {
+                    write(&log);
+                }
+                steps += 1;
+                assert!(steps < 100_000, "the standing clone never went idle");
+            }
+            for _ in 0..(STANDING_CATCH_UP_RANGES + 10) {
+                write(&log);
+            }
+        }
+        assert!(catch_ups > 0, "{variant}: no background catch-up ran");
+        assert_eq!(
+            reclones > 0,
+            variant == "overflow",
+            "{variant}: {reclones} re-clones"
+        );
+        // A catch-up is left half applied at the arm on purpose: its ranges return to the log.
+        advance_standing(&mut stood, live.as_raw_fd()).unwrap();
+        write(&log);
+        let (dest, pre, _, _) = adopt_standing(stood, live.as_raw_fd()).unwrap();
+        write(&log);
+        live.sync_all().unwrap();
+        let (_, how) = finish_scratch_clone(dest.as_raw_fd(), live.as_raw_fd(), Some(pre)).unwrap();
+        assert!(
+            matches!(how, ScratchCloneHow::CaughtUp { .. }),
+            "{variant}: {how}"
+        );
+        let reference = open("reference");
+        clone_scratch(reference.as_raw_fd(), live.as_raw_fd()).unwrap();
+        let read = |mut file: &File| {
+            let mut bytes = Vec::new();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+        let (live_bytes, dest_bytes, ref_bytes) = (read(&live), read(&dest), read(&reference));
+        let first_difference = live_bytes.iter().zip(&dest_bytes).position(|(a, b)| a != b);
+        assert_eq!(
+            (dest_bytes.len(), first_difference),
+            (live_bytes.len(), None),
+            "{variant}: the adopted standing clone differs from the disk"
+        );
+        assert!(
+            dest_bytes == ref_bytes,
+            "{variant}: it differs from a whole clone"
+        );
+        for name in ["live", "shadow", "dest", "reference"] {
+            std::fs::remove_file(path(name)).unwrap();
+        }
+    }
+}
+
 /// The chunk walk covers [0, size) in consecutive chunks without gap or overlap, each holding at
 /// most `per_chunk` extents, ending at the file's end, also when the extents move between calls
 /// and when the walk would not advance.
@@ -1203,6 +1336,7 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         pending: None,
         tracker: None,
         standing: None,
+        stood: None,
     };
     let file = summary_buffer(4096);
     let budget = protocol::MAX_FREE_SUMMARY_MICROS.to_le_bytes();
@@ -1470,20 +1604,32 @@ fn disarm_frames_numbers_and_bodies() {
         assert_eq!(MsgType::from_u16(value).unwrap() as u16, value);
     }
     assert_eq!(MsgType::from_u16(34), None);
-    assert_eq!(MsgType::from_u16(37), None);
+    assert_eq!(
+        [MsgType::Stand, MsgType::Standing].map(|msg| msg as u16),
+        [37, 38]
+    );
+    assert_eq!(MsgType::from_u16(39), None);
     assert_eq!(ErrorCode::NotArmed as u32, 35);
+    // Disarm carries nothing, or {drop}: one byte that also drops the standing clone.
     validate_command(MsgType::Disarm, 0, 0).unwrap();
+    validate_command(MsgType::Disarm, 1, 0).unwrap();
     validate_command(MsgType::Disarm, 0, 1).unwrap_err();
     validate_command(MsgType::Disarm, 8, 0).unwrap_err();
     validate_command(MsgType::Disarmed, 0, 0).unwrap_err();
+    // Stand carries the standing destination and nothing else.
+    validate_command(MsgType::Stand, 0, 1).unwrap();
+    validate_command(MsgType::Stand, 0, 0).unwrap_err();
+    validate_command(MsgType::Stand, 1, 1).unwrap_err();
+    validate_command(MsgType::Standing, 0, 0).unwrap_err();
     // The armed reply names the pre-clone, or u64::MAX extents for none.
-    let body = encode_capture_buffers_armed(Some((3224, 147_939, 11_402)));
+    let body = encode_capture_buffers_armed(Some((3224, 147_939, 11_402)), 2_345);
     assert_eq!(body[..8], 3224u64.to_le_bytes());
     assert_eq!(body[8..16], 147_939u64.to_le_bytes());
-    assert_eq!(body[16..], 11_402u64.to_le_bytes());
-    let none = encode_capture_buffers_armed(None);
+    assert_eq!(body[16..24], 11_402u64.to_le_bytes());
+    assert_eq!(body[24..], 2_345u64.to_le_bytes());
+    let none = encode_capture_buffers_armed(None, 0);
     assert_eq!(none[..8], u64::MAX.to_le_bytes());
-    assert_eq!(none[8..], [0; 16]);
+    assert_eq!(none[8..], [0; 24]);
 }
 
 /// A disarm drops an armed capture that was never quiesced and is refused, holding everything,
@@ -1512,6 +1658,7 @@ fn disarm_drops_only_an_armed_capture_outside_a_quiesce() {
         pending: None,
         tracker: None,
         standing: None,
+        stood: None,
     };
     let previous_state = BackendState::load();
     let disarm = |service: &mut CaptureService, id| {
@@ -1532,6 +1679,7 @@ fn disarm_drops_only_an_armed_capture_outside_a_quiesce() {
                 clone_us: 1,
                 extents: 1,
             }),
+            adopted: None,
         })
     };
     let refused = |reply: protocol::Incoming| {
@@ -1579,6 +1727,7 @@ fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
         pending: None,
         tracker: None,
         standing: None,
+        stood: None,
     };
     let previous_state = BackendState::load();
     let flat = memfd(c"flat", 0);

@@ -32,6 +32,8 @@ struct CaptureBuffers {
     /// The scratch disk cloned into `disk_clone` at arm, while the guest ran, and the log of
     /// what it has written since: the freeze then catches up only that.
     pre_cloned: Option<PreClone>,
+    /// The standing destination this arm adopted, which a disarm returns to standing.
+    adopted: Option<Adopted>,
 }
 
 /// A scratch clone taken before the freeze. It is never used on its own: the freeze either
@@ -45,8 +47,50 @@ struct PreClone {
     extents: u64,
 }
 
+/// A standing scratch clone: a funded destination Firecracker keeps equal to the scratch disk
+/// except for the writes its log holds, so a capture that adopts it catches up only those.
+#[derive(Debug)]
+struct StandingDisk {
+    dest: File,
+    /// The destination's (st_dev, st_ino): a capture adopts it only when its own destination is
+    /// this inode.
+    inode: (u64, u64),
+    log: Arc<WriteLog>,
+    phase: StandingPhase,
+}
+
+#[derive(Debug)]
+enum StandingPhase {
+    /// The background clone is at `next` of `size`.
+    Cloning {
+        next: u64,
+        size: u64,
+        done: ChunkedClone,
+        started_us: u64,
+    },
+    /// The destination equals the disk except for what the log holds and `pending`, ranges
+    /// swapped out of the log that a background catch-up is applying.
+    Ready {
+        clone: ChunkedClone,
+        pending: Vec<(u64, u64)>,
+    },
+}
+
+/// A capture's adopted standing destination, kept so a disarm hands it back.
+#[derive(Debug)]
+struct Adopted {
+    inode: (u64, u64),
+    clone: ChunkedClone,
+}
+
+/// Ranges or bytes the log may hold before a background catch-up applies them.
+const STANDING_CATCH_UP_RANGES: usize = 256;
+const STANDING_CATCH_UP_BYTES: u64 = 16 << 20;
+/// Ranges one background catch-up step clones, keeping each lock hold short.
+const STANDING_CATCH_UP_STEP: usize = 64;
+
 /// What a chunked pre-clone did, for its log line.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ChunkedClone {
     /// Microseconds from the first chunk to the last.
     clone_us: u64,
@@ -314,7 +358,8 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Refresh => (&[0], &[0]),
         MsgType::Untrack => (&[0], &[0]),
         MsgType::Rearm => (&[0], &[1]),
-        MsgType::Disarm => (&[0], &[0]),
+        MsgType::Disarm => (&[0, 1], &[0]),
+        MsgType::Stand => (&[0], &[1]),
         _ => return Err(ChannelError::Malformed),
     };
     if !lens.contains(&body_len) || !counts.contains(&fd_count) {
@@ -339,6 +384,8 @@ pub struct CaptureService {
     /// The last version a tracked capture or refresh produced, which the kernel's tracker
     /// also holds; kept to flatten it at the depth bound.
     standing: Option<Arc<OwnedFd>>,
+    /// The standing scratch clone a `stand` handed over, while no capture has adopted it.
+    stood: Option<StandingDisk>,
 }
 
 /// The 32-byte `tracked` reply body. An untracked reply is zero after `tracked`.
@@ -404,15 +451,16 @@ fn sample_tracked(
     }
 }
 
-/// The `capture_buffers_armed` body: the pre-clone's extent count, its duration and its longest
-/// chunk in microseconds, LE u64 each, or extents u64::MAX and zeros when the arm took no
-/// pre-clone (no destination, or the pre-clone failed and the freeze clones whole).
-fn encode_capture_buffers_armed(pre_clone: Option<(u64, u64, u64)>) -> [u8; 24] {
+/// The `capture_buffers_armed` body, LE u64 each: the adopted standing clone's extent count, its
+/// clone duration and its longest chunk in microseconds, then how long the arm waited for the
+/// standing clone to finish. Without one, extents u64::MAX and zeros: the freeze clones whole.
+fn encode_capture_buffers_armed(pre_clone: Option<(u64, u64, u64)>, wait_us: u64) -> [u8; 32] {
     let (extents, clone_us, longest_us) = pre_clone.unwrap_or((u64::MAX, 0, 0));
-    let mut body = [0; 24];
+    let mut body = [0; 32];
     body[..8].copy_from_slice(&extents.to_le_bytes());
     body[8..16].copy_from_slice(&clone_us.to_le_bytes());
-    body[16..].copy_from_slice(&longest_us.to_le_bytes());
+    body[16..24].copy_from_slice(&longest_us.to_le_bytes());
+    body[24..].copy_from_slice(&wait_us.to_le_bytes());
     body
 }
 
@@ -450,6 +498,14 @@ impl CaptureService {
         std::thread::Builder::new()
             .name("fc_farplane".to_string())
             .spawn(move || {
+                // The channel waits at most a second for a command, so a standing clone's
+                // catch-up runs even while no command arrives. Set before the filter, which does
+                // not admit setsockopt.
+                if let Err(err) = channel.sock.set_read_timeout(Some(Duration::from_secs(1))) {
+                    error!("Farplane channel could not set its receive timeout: {err}");
+                    BackendState::fail();
+                    return;
+                }
                 if let Err(err) = crate::seccomp::apply_filter(&filter) {
                     error!("Farplane channel could not install its filter: {err}");
                     BackendState::fail();
@@ -465,12 +521,13 @@ impl CaptureService {
                     pending: None,
                     tracker: None,
                     standing: None,
+                    stood: None,
                 };
                 loop {
                     if BackendState::load() == BackendState::ChannelFailed {
                         return;
                     }
-                    if let Err(err) = service.serve_one() {
+                    if let Err(err) = service.serve_or_work() {
                         error!("Farplane memory channel failed: {err}");
                         BackendState::fail();
                         return;
@@ -480,8 +537,28 @@ impl CaptureService {
             .expect("Failed to spawn the farplane memory channel thread");
     }
 
+    /// Serves the next command, or with none waiting runs one step of background work: a
+    /// command waits at most one chunk behind it.
+    fn serve_or_work(&mut self) -> Result<(), ChannelError> {
+        let busy = self.has_background_work();
+        match protocol::try_recv_frame(&self.channel.sock, busy)? {
+            Some(incoming) => self.serve(incoming),
+            None => {
+                if busy {
+                    self.background_step();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn serve_one(&mut self) -> Result<(), ChannelError> {
         let incoming = protocol::recv_frame(&self.channel.sock)?;
+        self.serve(incoming)
+    }
+
+    fn serve(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
         if request_id == 0 {
             return Err(ChannelError::Malformed);
@@ -524,7 +601,8 @@ impl CaptureService {
             MsgType::Refresh => self.refresh(request_id),
             MsgType::Untrack => self.untrack(request_id),
             MsgType::Rearm => self.rearm(incoming),
-            MsgType::Disarm => self.disarm(request_id),
+            MsgType::Disarm => self.disarm(request_id, &incoming.body),
+            MsgType::Stand => self.stand(incoming),
             _ => Err(ChannelError::Malformed),
         }
     }
@@ -803,37 +881,169 @@ impl CaptureService {
         {
             return self.reject(request_id, code, MsgType::CaptureBuffers);
         }
-        let disk_clone = destination.map(File::from);
-        // An earlier arm's recording must not outlive it, whatever this arm holds.
-        self.stop_write_log();
-        let pre_cloned = disk_clone
+        let mut disk_clone = destination.map(File::from);
+        // A capture whose destination is the standing clone's inode adopts it; any other arm
+        // leaves no standing clone and no recording behind, and its freeze clones whole.
+        let wanted = disk_clone
             .as_ref()
-            .and_then(|destination| self.pre_clone(destination.as_raw_fd()));
+            .and_then(|d| inode_of(d.as_raw_fd()).ok());
+        let (pre_cloned, adopted, wait_us) = match self.stood.take() {
+            Some(stood) if Some(stood.inode) == wanted => match self.adopt(stood) {
+                Ok((dest, pre, adopted, wait_us)) => {
+                    disk_clone = Some(dest);
+                    (Some(pre), Some(adopted), wait_us)
+                }
+                Err(err) => {
+                    error!("Farplane could not adopt the standing scratch clone: {err}");
+                    self.stop_write_log();
+                    (None, None, 0)
+                }
+            },
+            _ => {
+                self.stop_write_log();
+                (None, None, 0)
+            }
+        };
         let body = encode_capture_buffers_armed(
-            pre_cloned
+            adopted
                 .as_ref()
-                .map(|(pre, longest)| (pre.extents, pre.clone_us, *longest)),
+                .map(|a| (a.clone.extents, a.clone.clone_us, a.clone.longest_chunk_us)),
+            wait_us,
         );
         self.buffers = Some(CaptureBuffers {
             vmstate: File::from(vmstate),
             disk_clone,
-            pre_cloned: pre_cloned.map(|(pre, _)| pre),
+            pre_cloned,
+            adopted,
         });
         set_capture_buffers_armed(true);
         self.reply(request_id, MsgType::CaptureBuffersArmed, &body)
     }
 
-    /// Drops an armed capture that was never quiesced: its vmstate buffer, clone destination and
-    /// pre-clone, and stops the scratch write log. Refused with `not_armed` when nothing is armed
-    /// or a capture is quiesced, which a quiesced capture leaves only by `resume`.
-    fn disarm(&mut self, request_id: u64) -> Result<(), ChannelError> {
-        if BackendState::load() != BackendState::Ready || self.buffers.is_none() {
+    fn adopt(&mut self, stood: StandingDisk) -> Result<(File, PreClone, Adopted, u64), io::Error> {
+        let scratch = self
+            .scratch_descriptor()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
+        adopt_standing(stood, scratch)
+    }
+
+    /// Takes a funded, empty destination as the standing scratch clone: starts the write log,
+    /// then clones the disk into it in the background, between commands. An earlier standing
+    /// clone is dropped. Refused while a capture is armed or quiesced.
+    fn stand(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
+        let request_id = incoming.header.request_id;
+        let [dest] = <[_; 1]>::try_from(incoming.fds).map_err(|_| ChannelError::FdCountMismatch)?;
+        if BackendState::load() != BackendState::Ready || self.buffers.is_some() {
+            return self.reject(request_id, ErrorCode::CaptureOrderViolation, MsgType::Stand);
+        }
+        let (scratch, log) = {
+            let vmm = self.vmm.lock().expect("Poisoned lock");
+            (vmm.scratch_descriptor(), vmm.scratch_write_log())
+        };
+        let (Some(scratch), Some(log)) = (scratch, log) else {
+            return self.reject(request_id, ErrorCode::NoScratchDrive, MsgType::Stand);
+        };
+        if let Err(code) = validate_clone_destination(dest.as_raw_fd()) {
+            return self.reject(request_id, code, MsgType::Stand);
+        }
+        let ready = file_size(dest.as_raw_fd())
+            .and_then(|len| {
+                if len == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("the standing destination is not empty"))
+                }
+            })
+            .and_then(|()| Ok((inode_of(dest.as_raw_fd())?, file_size(scratch)?)));
+        let (inode, size) = match ready {
+            Ok(ready) => ready,
+            Err(err) => {
+                error!("Farplane refused a standing destination: {err}");
+                return self.reject(request_id, ErrorCode::BadCloneDestination, MsgType::Stand);
+            }
+        };
+        self.stood = None;
+        log.start(WRITE_LOG_MAX_RANGES, WRITE_LOG_MAX_BYTES);
+        self.stood = Some(StandingDisk {
+            dest: File::from(dest),
+            inode,
+            log,
+            phase: StandingPhase::Cloning {
+                next: 0,
+                size,
+                done: ChunkedClone::default(),
+                started_us: get_time_us(ClockType::Monotonic),
+            },
+        });
+        self.reply(request_id, MsgType::Standing, &[])
+    }
+
+    fn has_background_work(&self) -> bool {
+        self.stood.as_ref().is_some_and(standing_has_work)
+    }
+
+    /// One step of standing work. A failure drops the standing clone; the next capture's freeze
+    /// clones whole.
+    fn background_step(&mut self) {
+        let Some(mut stood) = self.stood.take() else {
+            return;
+        };
+        match self.advance(&mut stood) {
+            Ok(()) => self.stood = Some(stood),
+            Err(err) => {
+                error!("Farplane dropped the standing scratch clone: {err}");
+                stood.log.stop();
+            }
+        }
+    }
+
+    fn advance(&self, stood: &mut StandingDisk) -> Result<(), io::Error> {
+        let scratch = self
+            .scratch_descriptor()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
+        advance_standing(stood, scratch)
+    }
+
+    /// Drops an armed capture that was never quiesced: its vmstate buffer and clone destination.
+    /// An adopted standing clone returns to standing with its log still recording, so a
+    /// readmitted capture adopts it again; body {1} drops the standing clone too and stops the
+    /// log. Refused with `not_armed` when nothing it names is held, or a capture is quiesced,
+    /// which a quiesced capture leaves only by `resume`.
+    fn disarm(&mut self, request_id: u64, body: &[u8]) -> Result<(), ChannelError> {
+        let drop_standing = body == [1];
+        let held = self.buffers.is_some() || (drop_standing && self.stood.is_some());
+        if BackendState::load() != BackendState::Ready || !held {
             return self.reject(request_id, ErrorCode::NotArmed, MsgType::Disarm);
         }
-        self.buffers = None;
-        self.stop_write_log();
+        if let Some(buffers) = self.buffers.take()
+            && let (Some(adopted), Some(dest), Some(pre)) =
+                (buffers.adopted, buffers.disk_clone, buffers.pre_cloned)
+        {
+            self.stood = Some(StandingDisk {
+                dest,
+                inode: adopted.inode,
+                log: pre.log,
+                phase: StandingPhase::Ready {
+                    clone: adopted.clone,
+                    pending: Vec::new(),
+                },
+            });
+        }
+        if drop_standing {
+            self.stood = None;
+            self.stop_write_log();
+        } else if self.stood.is_none() {
+            self.stop_write_log();
+        }
         set_capture_buffers_armed(false);
-        info!("Farplane disarmed the capture");
+        info!(
+            "Farplane disarmed the capture{}",
+            if drop_standing {
+                " and dropped the standing scratch clone"
+            } else {
+                ""
+            }
+        );
         self.reply(request_id, MsgType::Disarmed, &[])
     }
 
@@ -845,41 +1055,6 @@ impl CaptureService {
 
     fn scratch_descriptor(&self) -> Option<RawFd> {
         self.vmm.lock().expect("Poisoned lock").scratch_descriptor()
-    }
-
-    /// Clones the scratch disk into `destination` while the guest runs, having started its write
-    /// log first: a write that completed before the start is in the file the clone copies, and
-    /// one that completes after it is logged. Any failure leaves no pre-clone, and the freeze
-    /// clones whole as before.
-    fn pre_clone(&self, destination: RawFd) -> Option<(PreClone, u64)> {
-        let (scratch, log) = {
-            let vmm = self.vmm.lock().expect("Poisoned lock");
-            (vmm.scratch_descriptor()?, vmm.scratch_write_log()?)
-        };
-        log.start(WRITE_LOG_MAX_RANGES, WRITE_LOG_MAX_BYTES);
-        match clone_scratch_chunked(destination, scratch) {
-            Ok(done) => {
-                info!(
-                    "Farplane pre-cloned the scratch disk ({} extents, {} chunks, longest {} us) in {} us",
-                    done.extents, done.chunks, done.longest_chunk_us, done.clone_us
-                );
-                Some((
-                    PreClone {
-                        log,
-                        clone_us: done.clone_us,
-                        extents: done.extents,
-                    },
-                    done.longest_chunk_us,
-                ))
-            }
-            Err(err) => {
-                log.stop();
-                error!(
-                    "Farplane could not pre-clone the scratch disk; the freeze clones it: {err}"
-                );
-                None
-            }
-        }
     }
 
     /// Close dispatch, pause, drain, then clone: no guest-memory or disk writer crosses the cut.
@@ -1364,71 +1539,185 @@ fn clone_scratch_range(
 }
 
 /// The number of extents of `file`, read by a count-only FIEMAP: no extent records are copied.
-/// Clones the scratch disk into an empty `destination` as consecutive FICLONERANGE chunks of at
-/// most `PRE_CLONE_CHUNK_EXTENTS` extents, so the inode's IO lock is released between chunks.
-/// The chunks cover [0, size) without gap or overlap, holes included, and the last ends at the
-/// file's end, which sets the destination's size. It runs only under a started write log: a write
-/// that lands between two chunks is logged, so the freeze's catch-up repairs whatever a chunk
-/// copied before it.
-fn clone_scratch_chunked(destination: RawFd, scratch: RawFd) -> Result<ChunkedClone, io::Error> {
-    if file_size(destination)? != 0 {
-        return Err(io::Error::other("the armed destination is not empty"));
+/// Whether a standing clone has work: an unfinished clone, a catch-up in progress, or a log past
+/// its catch-up threshold or overflowed.
+fn standing_has_work(stood: &StandingDisk) -> bool {
+    match &stood.phase {
+        StandingPhase::Cloning { .. } => true,
+        StandingPhase::Ready { pending, .. } if !pending.is_empty() => true,
+        StandingPhase::Ready { .. } => {
+            let (ranges, bytes, overflowed) = stood.log.pending();
+            overflowed || ranges >= STANDING_CATCH_UP_RANGES || bytes >= STANDING_CATCH_UP_BYTES
+        }
     }
-    let size = file_size(scratch)?;
-    clone_chunks_with(
-        size,
-        PRE_CLONE_CHUNK_EXTENTS,
-        |from, want| extents_from(scratch, from, want),
-        |offset, len| clone_scratch_range(destination, scratch, offset, len),
-    )
 }
 
-/// The chunk walk behind `clone_scratch_chunked`. `extents_from(from, n)` names the logical
+/// Advances a standing clone of `scratch` by one step: one chunk of the clone; or one batch of a
+/// catch-up; or, at a log past its threshold, swaps the log's ranges out for a catch-up; or, at
+/// an overflowed log, restarts the clone over the destination, which every chunk remaps.
+fn advance_standing(stood: &mut StandingDisk, scratch: RawFd) -> Result<(), io::Error> {
+    let dest = stood.dest.as_raw_fd();
+    match &mut stood.phase {
+        StandingPhase::Cloning {
+            next,
+            size,
+            done,
+            started_us,
+        } => {
+            *next = clone_chunk_step(
+                *next,
+                *size,
+                PRE_CLONE_CHUNK_EXTENTS,
+                &mut |from, want| extents_from(scratch, from, want),
+                &mut |offset, len| clone_scratch_range(dest, scratch, offset, len),
+                done,
+            )?;
+            if *next >= *size {
+                let mut clone = std::mem::take(done);
+                clone.clone_us = get_time_us(ClockType::Monotonic) - *started_us;
+                info!(
+                    "Farplane stood the scratch disk ({} extents, {} chunks, longest {} us) in {} us",
+                    clone.extents, clone.chunks, clone.longest_chunk_us, clone.clone_us
+                );
+                stood.phase = StandingPhase::Ready {
+                    clone,
+                    pending: Vec::new(),
+                };
+            }
+        }
+        StandingPhase::Ready { pending, .. } if !pending.is_empty() => {
+            let size = file_size(scratch)?;
+            let batch = pending.len().min(STANDING_CATCH_UP_STEP);
+            for (start, end) in pending.drain(..batch) {
+                let end = end.min(size);
+                if start < end {
+                    clone_scratch_range(dest, scratch, start, end - start)?;
+                }
+            }
+        }
+        StandingPhase::Ready { pending, .. } => {
+            let swapped = stood.log.swap();
+            if swapped.overflowed {
+                warn!("Farplane standing write log overflowed; cloning the disk again");
+                stood.log.start(WRITE_LOG_MAX_RANGES, WRITE_LOG_MAX_BYTES);
+                stood.phase = StandingPhase::Cloning {
+                    next: 0,
+                    size: file_size(scratch)?,
+                    done: ChunkedClone::default(),
+                    started_us: get_time_us(ClockType::Monotonic),
+                };
+            } else {
+                *pending = swapped.ranges;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Takes a standing clone into a capture: an unfinished background clone finishes its remaining
+/// chunks first (the wait the reply reports), and ranges swapped out for a background catch-up
+/// go back into the log, so the freeze catches up everything written since the clone.
+fn adopt_standing(
+    mut stood: StandingDisk,
+    scratch: RawFd,
+) -> Result<(File, PreClone, Adopted, u64), io::Error> {
+    let started = get_time_us(ClockType::Monotonic);
+    while matches!(stood.phase, StandingPhase::Cloning { .. }) {
+        advance_standing(&mut stood, scratch)?;
+    }
+    let StandingPhase::Ready { clone, pending } = stood.phase else {
+        unreachable!("the loop above leaves the clone ready")
+    };
+    for (start, end) in pending {
+        stood.log.record(start, end - start);
+    }
+    let wait_us = get_time_us(ClockType::Monotonic) - started;
+    let pre = PreClone {
+        log: stood.log,
+        clone_us: clone.clone_us,
+        extents: clone.extents,
+    };
+    let adopted = Adopted {
+        inode: stood.inode,
+        clone,
+    };
+    Ok((stood.dest, pre, adopted, wait_us))
+}
+
+/// The chunk walk of a standing clone, whole. `extents_from(from, n)` names the logical
 /// starts of at most `n` extents at or overlapping `from`, in order; `clone_range` clones one
 /// chunk. Each chunk ends where the extent after its `per_chunk`th begins, so each covers at most
 /// `per_chunk` extents however the file changes between calls.
+#[cfg(test)]
 fn clone_chunks_with(
     size: u64,
     per_chunk: u32,
     mut extents_from: impl FnMut(u64, u32) -> Result<Vec<u64>, io::Error>,
     mut clone_range: impl FnMut(u64, u64) -> Result<(), io::Error>,
 ) -> Result<ChunkedClone, io::Error> {
-    let per_chunk = per_chunk.max(1);
     let started = get_time_us(ClockType::Monotonic);
     let mut done = ChunkedClone::default();
     let mut start = 0;
     while start < size {
-        let starts = extents_from(start, per_chunk + 1)?;
-        let mut end = size;
-        if let Some(&next) = starts.get(per_chunk as usize) {
-            if next <= start || next >= size {
-                // A chunk that would not advance, or an extent past the end: finish in one.
-                end = size;
-            } else {
-                end = next;
-            }
-            done.extents += u64::from(per_chunk);
-        } else {
-            done.extents += u64::try_from(starts.len()).unwrap_or(u64::MAX);
-        }
-        let chunk_started = get_time_us(ClockType::Monotonic);
-        clone_range(start, end - start)?;
-        let chunk_us = get_time_us(ClockType::Monotonic) - chunk_started;
-        if chunk_us >= SLOW_PRE_CLONE_CHUNK_US {
-            // A chunk is ~10 ms by its extents; one far over that waited on something else,
-            // which its range and position name.
-            warn!(
-                "Farplane pre-clone chunk {} at {start}+{} took {chunk_us} us",
-                done.chunks,
-                end - start
-            );
-        }
-        done.longest_chunk_us = done.longest_chunk_us.max(chunk_us);
-        done.chunks += 1;
-        start = end;
+        start = clone_chunk_step(
+            start,
+            size,
+            per_chunk,
+            &mut extents_from,
+            &mut clone_range,
+            &mut done,
+        )?;
     }
     done.clone_us = get_time_us(ClockType::Monotonic) - started;
     Ok(done)
+}
+
+/// Clones the one chunk at `start` and returns where the next begins: it ends where the extent
+/// after its `per_chunk`th begins, or at `size`.
+fn clone_chunk_step(
+    start: u64,
+    size: u64,
+    per_chunk: u32,
+    extents_from: &mut impl FnMut(u64, u32) -> Result<Vec<u64>, io::Error>,
+    clone_range: &mut impl FnMut(u64, u64) -> Result<(), io::Error>,
+    done: &mut ChunkedClone,
+) -> Result<u64, io::Error> {
+    let per_chunk = per_chunk.max(1);
+    let starts = extents_from(start, per_chunk + 1)?;
+    let mut end = size;
+    if let Some(&next) = starts.get(per_chunk as usize) {
+        if next > start && next < size {
+            end = next;
+        }
+        done.extents += u64::from(per_chunk);
+    } else {
+        done.extents += u64::try_from(starts.len()).unwrap_or(u64::MAX);
+    }
+    let chunk_started = get_time_us(ClockType::Monotonic);
+    clone_range(start, end - start)?;
+    let chunk_us = get_time_us(ClockType::Monotonic) - chunk_started;
+    if chunk_us >= SLOW_PRE_CLONE_CHUNK_US {
+        // A chunk is ~10 ms by its extents; one far over that waited on something else, which
+        // its range and position name.
+        warn!(
+            "Farplane pre-clone chunk {} at {start}+{} took {chunk_us} us",
+            done.chunks,
+            end - start
+        );
+    }
+    done.longest_chunk_us = done.longest_chunk_us.max(chunk_us);
+    done.chunks += 1;
+    Ok(end)
+}
+
+fn inode_of(file: RawFd) -> Result<(u64, u64), io::Error> {
+    // SAFETY: stat is plain data.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor is open and stat is writable for the call.
+    if unsafe { libc::fstat(file, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((stat.st_dev, stat.st_ino))
 }
 
 fn file_size(file: RawFd) -> Result<u64, io::Error> {

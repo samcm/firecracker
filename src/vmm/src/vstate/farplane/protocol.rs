@@ -129,6 +129,13 @@ pub enum MsgType {
     Disarm = 35,
     /// Firecracker confirms it holds no capture buffers and records no scratch writes.
     Disarmed = 36,
+    /// Pagemaster hands over an empty, funded destination for a standing scratch clone: Firecracker
+    /// starts the scratch write log and clones the scratch disk into it in the background, between
+    /// commands, then keeps it caught up. A later capture whose clone destination is the same
+    /// inode adopts it. No body, one descriptor. Answered `standing` at once.
+    Stand = 37,
+    /// Firecracker owns the standing destination a `stand` handed over, and dropped any earlier one.
+    Standing = 38,
 }
 
 impl MsgType {
@@ -159,6 +166,8 @@ impl MsgType {
             33 => Some(Self::Rearmed),
             35 => Some(Self::Disarm),
             36 => Some(Self::Disarmed),
+            37 => Some(Self::Stand),
+            38 => Some(Self::Standing),
             // Reserved /6 tags, including 18-21, must never be interpreted as /8 commands.
             _ => None,
         }
@@ -462,6 +471,29 @@ fn control_len<T: TryFrom<usize>>(len: usize) -> T {
 /// Receives exactly one frame. A datagram whose payload or control message did not fit is a
 /// protocol violation, never a partially parsed frame.
 pub fn recv_frame(sock: &UnixStream) -> Result<Incoming, ChannelError> {
+    recv_frame_flags(sock, 0)
+}
+
+/// Receives one frame if one arrives before the socket's receive timeout, or at once with
+/// `nonblocking`; `None` when none did. Firecracker's channel thread waits this way so it can
+/// run background work between commands.
+pub fn try_recv_frame(
+    sock: &UnixStream,
+    nonblocking: bool,
+) -> Result<Option<Incoming>, ChannelError> {
+    let flags = if nonblocking { libc::MSG_DONTWAIT } else { 0 };
+    match recv_frame_flags(sock, flags) {
+        Ok(incoming) => Ok(Some(incoming)),
+        Err(ChannelError::Io(err))
+            if matches!(err.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR)) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn recv_frame_flags(sock: &UnixStream, flags: libc::c_int) -> Result<Incoming, ChannelError> {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut control = [0u64; CONTROL_WORDS];
     let mut iov = libc::iovec {
@@ -476,7 +508,8 @@ pub fn recv_frame(sock: &UnixStream) -> Result<Incoming, ChannelError> {
     msg.msg_controllen = control_len(std::mem::size_of_val(&control));
 
     // SAFETY: the socket is open, and the buffers outlive the call.
-    let nbytes = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    let nbytes =
+        unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC | flags) };
     if nbytes < 0 {
         return Err(ChannelError::Io(io::Error::last_os_error()));
     }

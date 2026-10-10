@@ -115,6 +115,28 @@ impl WriteLog {
         taken
     }
 
+    /// Returns what the recording holds and empties it, while it keeps recording: a write that
+    /// completes after the swap lands in the emptied set. An overflowed recording swaps nothing
+    /// and stays overflowed.
+    pub fn swap(&self) -> WrittenRanges {
+        let mut ranges = self.ranges.lock().expect("Poisoned lock");
+        let taken = WrittenRanges {
+            ranges: ranges.set.iter().map(|(s, e)| (*s, *e)).collect(),
+            overflowed: ranges.overflowed,
+        };
+        if !ranges.overflowed {
+            ranges.set.clear();
+            ranges.bytes = 0;
+        }
+        taken
+    }
+
+    /// Merged ranges and bytes the recording holds, and whether it overflowed.
+    pub fn pending(&self) -> (usize, u64, bool) {
+        let ranges = self.ranges.lock().expect("Poisoned lock");
+        (ranges.set.len(), ranges.bytes, ranges.overflowed)
+    }
+
     /// Ends the recording and drops what it holds.
     pub fn stop(&self) {
         let _ = self.take();
@@ -155,6 +177,26 @@ mod tests {
         log.record(0, 4096);
         assert!(!log.recording());
         assert_eq!(log.take(), WrittenRanges::default());
+    }
+
+    #[test]
+    fn a_swap_empties_the_set_and_keeps_recording() {
+        let log = WriteLog::default();
+        log.start(16, 1 << 30);
+        log.record(0, 4096);
+        log.record(8192, 4096);
+        assert_eq!(log.pending(), (2, 8192, false));
+        assert_eq!(log.swap().ranges, vec![(0, 4096), (8192, 12288)]);
+        assert_eq!(log.pending(), (0, 0, false));
+        assert!(log.recording());
+        log.record(4096, 4096);
+        assert_eq!(log.take().ranges, vec![(4096, 8192)]);
+        // An overflowed recording stays overflowed across a swap.
+        log.start(1, 1 << 30);
+        log.record(0, 4096);
+        log.record(8192, 4096);
+        assert!(log.swap().overflowed);
+        assert!(log.pending().2);
     }
 
     #[test]
