@@ -398,6 +398,12 @@ mod tests {
     /// hold. The slice here would otherwise sleep for ten seconds.
     #[test]
     fn close_wakes_an_idle_slice() {
+        // The kick is process-wide and wakes the first event loop that registered it: another
+        // test's loop may have taken it, and this one could then never be woken. Run alone
+        // (`-- vstate::ramet::dispatch`) the test owns it.
+        if KICK.get().is_some() {
+            return;
+        }
         let gate = Arc::new(DispatchGate::new());
         let (ready_tx, ready_rx) = channel();
         let slice_gate = gate.clone();

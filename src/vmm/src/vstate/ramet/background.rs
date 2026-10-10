@@ -238,23 +238,24 @@ impl Background {
         lock.lock().expect("Poisoned lock").fenced = false;
     }
 
+    /// Re-shares the pages `written` marks in `regions` on the calling thread, with the worker
+    /// fenced meanwhile: a refresh does it before its fold, so the fold takes them. Returns how
+    /// many it touched.
+    pub(crate) fn reshare_now(&self, regions: &[Region], written: &[Vec<u64>]) -> usize {
+        let pages = marked_pages(regions, written);
+        self.fence();
+        for &addr in &pages {
+            // SAFETY: as in `touch`.
+            unsafe { reshare(addr) };
+        }
+        self.unfence();
+        pages.len()
+    }
+
     /// Queues the re-share of the pages `written` marks in `regions`: the pages the source
     /// maps exclusively, which after a live fold are the ones it refused and any written since.
     pub(crate) fn reshare(&self, regions: &[Region], written: &[Vec<u64>]) {
-        let mut pages = Vec::new();
-        for (region, words) in regions.iter().zip(written) {
-            for (w, &word) in words.iter().enumerate() {
-                let mut bits = word;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as u64;
-                    bits &= bits - 1;
-                    let page = w as u64 * 64 + bit;
-                    if page * 4096 < region.len {
-                        pages.push(region.addr + page * 4096);
-                    }
-                }
-            }
-        }
+        let pages = marked_pages(regions, written);
         let (lock, cvar) = &*self.shared;
         let mut state = lock.lock().expect("Poisoned lock");
         if state.fenced || state.job.is_some() {
@@ -290,6 +291,25 @@ impl Background {
         state.watch_end = false;
         state.watched.take().unwrap_or_default()
     }
+}
+
+/// The host addresses of the pages `written` marks in `regions`.
+fn marked_pages(regions: &[Region], written: &[Vec<u64>]) -> Vec<u64> {
+    let mut pages = Vec::new();
+    for (region, words) in regions.iter().zip(written) {
+        for (w, &word) in words.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as u64;
+                bits &= bits - 1;
+                let page = w as u64 * 64 + bit;
+                if page * 4096 < region.len {
+                    pages.push(region.addr + page * 4096);
+                }
+            }
+        }
+    }
+    pages
 }
 
 /// Takes a write fault on the page at `addr` without changing it.

@@ -681,6 +681,15 @@ impl CaptureService {
         // The pages the old chain may hold beyond the guest's own: what is dirty before the
         // fold, and what is dirty once the rebase lets the old chain go.
         let before = memversion::track_info(tracker.as_fd()).map_or(u64::MAX, |t| t.dirty_pages);
+        // Pages un-shared since the last fold would be refused by this one and kept by the
+        // standing version for another round: re-share them first, so the fold takes them.
+        let reshared = memversion::geometry(&self.channel.regions)
+            .and_then(|regions| {
+                let written = memversion::written_pages(tracker.as_fd(), &regions)?;
+                Ok(self.background.reshare_now(&regions, &written))
+            })
+            .unwrap_or(0);
+        let reshared_us = started.elapsed().as_micros();
         let refreshed = memversion::geometry(&self.channel.regions)
             .and_then(|regions| {
                 memversion::refresh(
@@ -725,8 +734,8 @@ impl CaptureService {
                     }
                 };
                 info!(
-                    "Ramet refreshed the standing version in {} us (fold {folded_us} us): \
-                     own={} new={} folded={} depth={}",
+                    "Ramet refreshed the standing version in {} us (re-shared {reshared} pages \
+                     in {reshared_us} us, fold {folded_us} us): own={} new={} folded={} depth={}",
                     started.elapsed().as_micros(),
                     info.own_pages,
                     info.new_pages,
