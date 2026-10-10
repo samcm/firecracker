@@ -19,7 +19,7 @@ use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
 use super::{dispatch, memversion};
 use crate::Vmm;
 use crate::devices::virtio::block::virtio::write_log::WriteLog;
-use crate::logger::{IncMetric, METRICS, error, info};
+use crate::logger::{IncMetric, METRICS, error, info, warn};
 use crate::persist::{MicrovmState, VmInfo};
 use crate::snapshot::Snapshot;
 use crate::utils::{u64_to_usize, usize_to_u64};
@@ -74,6 +74,8 @@ const WRITE_LOG_MAX_BYTES: u64 = 64 << 20;
 /// length, so a guest disk write waits for at most one chunk: a whole clone costs 38-46 µs per
 /// extent on fragmented production and Zen 2 sources, so 256 extents hold it ~10-12 ms.
 const PRE_CLONE_CHUNK_EXTENTS: u32 = 256;
+/// A pre-clone chunk this slow is logged with its range.
+const SLOW_PRE_CLONE_CHUNK_US: u64 = 20_000;
 
 /// A successful epoch owns the CREATE result before any reply is attempted.
 #[derive(Debug, Default)]
@@ -1411,9 +1413,17 @@ fn clone_chunks_with(
         }
         let chunk_started = get_time_us(ClockType::Monotonic);
         clone_range(start, end - start)?;
-        done.longest_chunk_us = done
-            .longest_chunk_us
-            .max(get_time_us(ClockType::Monotonic) - chunk_started);
+        let chunk_us = get_time_us(ClockType::Monotonic) - chunk_started;
+        if chunk_us >= SLOW_PRE_CLONE_CHUNK_US {
+            // A chunk is ~10 ms by its extents; one far over that waited on something else,
+            // which its range and position name.
+            warn!(
+                "Farplane pre-clone chunk {} at {start}+{} took {chunk_us} us",
+                done.chunks,
+                end - start
+            );
+        }
+        done.longest_chunk_us = done.longest_chunk_us.max(chunk_us);
         done.chunks += 1;
         start = end;
     }
