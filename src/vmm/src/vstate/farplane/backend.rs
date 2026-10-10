@@ -374,14 +374,6 @@ struct MappedRegion {
     guest_addr: u64,
     size: u64,
     host_base: usize,
-    extents: Vec<MappedExtent>,
-}
-
-/// One extent mapping: the VMA that owns the folios of a range of guest memory.
-#[derive(Debug)]
-struct MappedExtent {
-    len: u64,
-    host_base: usize,
 }
 
 /// Runs the handshake through to `backend_ready` and publishes the channel. Every failure before
@@ -954,7 +946,6 @@ fn map_plan(
         }
 
         let region_end = region.guest_addr + region.size;
-        let mut mapped_extents = Vec::new();
         for extent in extents.iter().filter(|extent| {
             extent.guest_addr >= region.guest_addr && extent.guest_addr < region_end
         }) {
@@ -976,17 +967,12 @@ fn map_plan(
             if addr == libc::MAP_FAILED {
                 return Err(BackendError::Map(io::Error::last_os_error()));
             }
-            mapped_extents.push(MappedExtent {
-                len: extent.len,
-                host_base: addr as usize,
-            });
         }
 
         mapped.push(MappedRegion {
             guest_addr: region.guest_addr,
             size: region.size,
             host_base: reservation as usize,
-            extents: mapped_extents,
         });
     }
     Ok(mapped)
@@ -1051,38 +1037,34 @@ fn create_uffd() -> Result<Uffd, BackendError> {
     Ok(unsafe { Uffd::from_raw_fd(raw) })
 }
 
-/// Registers missing, minor and write-protect faults over every extent mapping.
+/// Registers missing, minor and write-protect faults over each region, which its extents tile.
 fn register_uffd(uffd: &Uffd, mapped: &[MappedRegion]) -> Result<(), BackendError> {
     let mode = RegisterMode::MISSING | RegisterMode::MINOR | RegisterMode::WRITE_PROTECT;
     for region in mapped {
-        for extent in &region.extents {
-            uffd.register_with_mode(
-                extent.host_base as *mut libc::c_void,
-                u64_to_usize(extent.len),
-                mode,
-            )
-            .map_err(|err| BackendError::Uffd(io::Error::other(err)))?;
-        }
+        uffd.register_with_mode(
+            region.host_base as *mut libc::c_void,
+            u64_to_usize(region.size),
+            mode,
+        )
+        .map_err(|err| BackendError::Uffd(io::Error::other(err)))?;
     }
     Ok(())
 }
 
-/// Locks guest memory on fault and keeps it out of transparent huge pages.
+/// Locks guest memory on fault and keeps it out of transparent huge pages, one call per region.
 fn apply_residency(mapped: &[MappedRegion]) -> Result<(), BackendError> {
     for region in mapped {
-        for extent in &region.extents {
-            let addr = extent.host_base as *mut libc::c_void;
-            let len = u64_to_usize(extent.len);
-            // SAFETY: `addr` and `len` describe a mapping this process just established.
-            let ret = unsafe { libc::mlock2(addr, len, libc::MLOCK_ONFAULT) };
-            if ret != 0 {
-                return Err(BackendError::Map(io::Error::last_os_error()));
-            }
-            // SAFETY: same mapping; `MADV_NOHUGEPAGE` only changes fault-time page size policy.
-            let ret = unsafe { libc::madvise(addr, len, libc::MADV_NOHUGEPAGE) };
-            if ret != 0 {
-                return Err(BackendError::Map(io::Error::last_os_error()));
-            }
+        let addr = region.host_base as *mut libc::c_void;
+        let len = u64_to_usize(region.size);
+        // SAFETY: `addr`, `len` span our reservation, which the extent mappings tile with no gap.
+        let ret = unsafe { libc::mlock2(addr, len, libc::MLOCK_ONFAULT) };
+        if ret != 0 {
+            return Err(BackendError::Map(io::Error::last_os_error()));
+        }
+        // SAFETY: same range; `MADV_NOHUGEPAGE` only changes fault-time page size policy.
+        let ret = unsafe { libc::madvise(addr, len, libc::MADV_NOHUGEPAGE) };
+        if ret != 0 {
+            return Err(BackendError::Map(io::Error::last_os_error()));
         }
     }
     Ok(())
