@@ -846,6 +846,12 @@ impl CaptureService {
         if BackendState::load() != BackendState::Ready {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::CaptureBuffers);
         }
+        // An armed capture's fold takes over what the standing guard bounds, and memory plane
+        // refreshes nothing until it flips, while the capture needs the guest running for its
+        // barrier and the event loop for its pause: a guard pause from here on would wait for
+        // a refresh that waits for the capture. The next refresh arms it anew and reports the
+        // pause.
+        self.background.disarm();
         let mut fds = incoming.fds;
         let destination = (fds.len() == 2).then(|| fds.remove(1));
         let [vmstate] = <[_; 1]>::try_from(fds).map_err(|_| ChannelError::FdCountMismatch)?;
