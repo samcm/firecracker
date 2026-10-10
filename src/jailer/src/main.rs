@@ -99,6 +99,8 @@ pub enum JailerError {
     RmOldRootDir(io::Error),
     #[error("--root-fd is not a descriptor number: {0}")]
     RootFdArgument(String),
+    #[error("Failed to close fd 3, which native mode leaves unused: {0}")]
+    NativeSlot(io::Error),
     #[error("{0} must have a nonzero size")]
     ImageFdEmpty(&'static str),
     #[error("Failed to inspect {0}: {1}")]
@@ -198,6 +200,10 @@ pub fn build_arg_parser() -> ArgParser<'static> {
         .arg(Argument::new("scratch-fd").takes_value(true).help(
             "Inherited read-write, O_DIRECT descriptor of the scratch block device, which is a \
              regular non-empty file. It is validated and handed to Firecracker as fd 5.",
+        ))
+        .arg(Argument::new("native").takes_value(false).help(
+            "Jail a native-mode Firecracker: no userfaultfd device is opened or handed \
+                     over, and fd 3 is left closed.",
         ))
         .arg(
             Argument::new("chroot-base-dir")

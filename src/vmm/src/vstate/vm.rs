@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
@@ -71,6 +71,16 @@ pub struct RoutingEntry {
     masked: bool,
 }
 
+/// One line interrupt's IRQFD registration, in the journal [`KvmVm::detach_irqfds`] keeps.
+#[derive(Debug)]
+struct IrqfdRegistration {
+    /// A duplicate of the registered eventfd.
+    evt: EventFd,
+    gsi: u32,
+    /// Whether KVM has the registration now.
+    attached: bool,
+}
+
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
 pub struct VmCommon {
@@ -82,6 +92,10 @@ pub struct VmCommon {
     next_kvm_slot: AtomicU32,
     /// Interrupts used by KvmVm's devices
     pub interrupts: Mutex<HashMap<u32, RoutingEntry>>,
+    /// Journal of every eventfd/GSI pair registered as a line interrupt's IRQFD: a duplicate of
+    /// the eventfd, so the exact registration can be detached and attached again, and whether it
+    /// is attached now.
+    irqfds: Mutex<Vec<IrqfdRegistration>>,
     /// Allocator for VM resources
     pub resource_allocator: Mutex<ResourceAllocator>,
     /// MMIO bus
@@ -150,6 +164,67 @@ pub enum VmError {
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
     MemoryError(#[from] MemoryError),
+    /// Cannot adopt guest memory: {0}
+    AdoptGuestMemory(#[from] AdoptGuestMemoryError),
+    /// Cannot detach or attach the IRQFD of GSI {0}: {1}
+    Irqfd(u32, errno::Error),
+    /// Detaching the IRQFD of GSI {0} failed ({1}), and attaching GSI {2} again failed too: {3}
+    IrqfdRollback(u32, errno::Error, u32, errno::Error),
+}
+
+/// Error type for [`KvmVm::adopt_guest_memory`].
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
+pub enum AdoptGuestMemoryError {
+    /// the VM already owns guest memory
+    NotFresh,
+    /// geometry {got:?} does not match the vmstate {want:?}
+    Geometry {
+        /// Geometry of the adopted memory.
+        got: GuestMemoryState,
+        /// Geometry recorded in the vmstate.
+        want: GuestMemoryState,
+    },
+    /// region at {addr:#x} is registered under slot {slot}, but this VM's next slot is {fresh}
+    Slot {
+        /// Guest physical base address of the region.
+        addr: u64,
+        /// Slot the region was registered under.
+        slot: u32,
+        /// Slot this VM would assign.
+        fresh: u32,
+    },
+}
+
+/// Checks that `memory` matches `state` and that its regions, in address order, carry exactly
+/// the slots a VM whose next free slot is `first_slot` would assign.
+fn check_adoption(
+    memory: &GuestMemoryMmap,
+    state: &GuestMemoryState,
+    first_slot: u32,
+    max_memslots: u32,
+) -> Result<(), VmError> {
+    let got = memory.describe();
+    if got != *state {
+        return Err(AdoptGuestMemoryError::Geometry {
+            got,
+            want: state.clone(),
+        }
+        .into());
+    }
+    for (fresh, region) in (first_slot..).zip(memory.iter()) {
+        if max_memslots <= fresh {
+            return Err(VmError::NotEnoughMemorySlots(max_memslots));
+        }
+        if region.slot != fresh {
+            return Err(AdoptGuestMemoryError::Slot {
+                addr: region.start_addr().0,
+                slot: region.slot,
+                fresh,
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// VM abstraction: either a KVM-based VM or (in the future) a Nitro Enclave.
@@ -238,6 +313,7 @@ impl KvmVm {
             guest_memory: GuestMemoryMmap::default(),
             next_kvm_slot: AtomicU32::new(0),
             interrupts: Mutex::new(HashMap::with_capacity(GSI_MSI_END as usize + 1)),
+            irqfds: Mutex::new(Vec::new()),
             resource_allocator: Mutex::new(ResourceAllocator::new()),
             mmio_bus: Arc::new(Bus::new()),
             kvm,
@@ -284,19 +360,9 @@ impl KvmVm {
         self.common.vcpus_handles.lock().expect("Poisoned lock")
     }
 
-    /// Starts the microVM vCPUs.
-    ///
-    /// Sets the terminal to raw/non-blocking mode, then spawns a thread per vCPU
-    /// and stores the resulting handles. The barrier is used to synchronize TLS
-    /// initialization across all vCPU threads before returning.
-    pub fn start_vcpus(
-        self: &Arc<Self>,
-        mut vcpus: Vec<Vcpu>,
-        vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
-    ) -> Result<(), StartVcpusError> {
-        let vcpu_count = vcpus.len();
-        let barrier = Arc::new(Barrier::new(vcpu_count + 1));
-
+    /// Puts the terminal into raw, non-blocking mode for an interactive serial console, as the
+    /// default mode does before starting its vCPUs. Native mode never acquires the terminal.
+    pub fn acquire_terminal() -> Result<(), StartVcpusError> {
         let stdin = std::io::stdin().lock();
         stdin.set_raw_mode().inspect_err(|&err| {
             crate::logger::warn!("Cannot set raw mode for the terminal. {:?}", err);
@@ -304,24 +370,67 @@ impl KvmVm {
         stdin.set_non_block(true).inspect_err(|&err| {
             crate::logger::warn!("Cannot set non block for the terminal. {:?}", err);
         })?;
+        Ok(())
+    }
 
+    /// Starts the microVM vCPUs.
+    ///
+    /// Starts a thread per vCPU, each ready with its kick handler and filter before the next one
+    /// starts, and stores the handles. On failure the vCPUs started so far are stopped again and
+    /// every vCPU is returned.
+    pub fn start_vcpus(
+        self: &Arc<Self>,
+        vcpus: Vec<Vcpu>,
+        vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+    ) -> Result<(), (StartVcpusError, Vec<Vcpu>)> {
         let mut handles = self.vcpus_handles();
-        handles.reserve(vcpu_count);
-        for mut vcpu in vcpus.drain(..) {
+        let first = handles.len();
+        handles.reserve(vcpus.len());
+        let mut pending = vcpus.into_iter();
+        for index in 0.. {
+            let Some(mut vcpu) = pending.next() else {
+                break;
+            };
             vcpu.set_mmio_bus(self.common.mmio_bus.clone());
             #[cfg(target_arch = "x86_64")]
             vcpu.kvm_vcpu.set_pio_bus(self.pio_bus.clone());
 
-            handles.push(vcpu.start_threaded(
-                self,
-                vcpu_seccomp_filter.clone(),
-                barrier.clone(),
-            )?);
+            #[cfg(test)]
+            let vcpu_seccomp_filter = if tests::FAIL_VCPU_START.get() == Some(index) {
+                // A filter the kernel refuses fails this vCPU's start after the earlier ones ran.
+                Arc::new(vec![0; crate::seccomp::BPF_MAX_LEN + 1])
+            } else {
+                vcpu_seccomp_filter.clone()
+            };
+            #[cfg(not(test))]
+            let _ = index;
+            match vcpu.start_threaded(self, vcpu_seccomp_filter.clone()) {
+                Ok(handle) => handles.push(handle),
+                Err((err, vcpu)) => {
+                    let mut vcpus = Self::stop_handles(handles.drain(first..).collect());
+                    vcpus.push(vcpu);
+                    vcpus.extend(pending);
+                    return Err((err.into(), vcpus));
+                }
+            }
         }
-        drop(handles);
-        barrier.wait();
 
         Ok(())
+    }
+
+    /// Stops every vCPU worker and returns the vCPUs in start order. All are told to finish
+    /// before any is joined, so once this returns no vCPU runs, and none ran on after another's
+    /// return.
+    pub fn stop_vcpus(&self) -> Vec<Vcpu> {
+        let handles = self.vcpus_handles().drain(..).collect();
+        Self::stop_handles(handles)
+    }
+
+    fn stop_handles(mut handles: Vec<VcpuHandle>) -> Vec<Vcpu> {
+        for handle in &mut handles {
+            handle.finish();
+        }
+        handles.into_iter().map(VcpuHandle::join).collect()
     }
 
     /// Sends a pause event to all vCPUs and waits for acknowledgement.
@@ -729,6 +838,51 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Adopts an owned clone of guest memory registered by another [`KvmVm`] of this process,
+    /// such as the copy of the source VM a fork child inherits.
+    ///
+    /// Cloning a [`GuestMemoryMmap`] clones its region `Arc`s, not RAM, so this VM keeps the
+    /// mappings alive once the original owners drop. The geometry must match `state`, every
+    /// region keeps the slot it was registered under, and this VM must not own memory yet. The
+    /// collection is owned before the first slot is registered, so a partial registration failure
+    /// never leaves KVM referencing a mapping this VM does not keep alive.
+    ///
+    /// Admission is fixed and sequential: a fresh VM assigns slots from 0 in address order, and
+    /// only memory whose slots are exactly that sequence is adopted; sparse or reordered slots are
+    /// rejected, never renumbered. A cold native boot satisfies this, because
+    /// [`KvmVm::register_memory_regions`] reserves one slot per region in address order on a VM
+    /// that has no other slots.
+    ///
+    /// The host dirty bitmaps are shared by every clone of the collection and are cleared here;
+    /// adopt only where the original owner no longer harvests them. KVM's log for the new slots
+    /// is the caller's to baseline, as after [`KvmVm::restore_memory_regions`].
+    pub fn adopt_guest_memory(
+        &mut self,
+        memory: GuestMemoryMmap,
+        state: &GuestMemoryState,
+    ) -> Result<(), VmError> {
+        if self.common.guest_memory.num_regions() != 0 {
+            return Err(AdoptGuestMemoryError::NotFresh.into());
+        }
+        let next_slot = self.common.next_kvm_slot.get_mut();
+        check_adoption(&memory, state, *next_slot, self.common.max_memslots)?;
+        // Bounded by max_memslots, which is a u32, in check_adoption.
+        *next_slot += u32::try_from(memory.num_regions()).unwrap();
+
+        memory.reset_dirty();
+        self.common.guest_memory = memory;
+        for region in self.common.guest_memory.iter() {
+            self.set_user_memory_region(region.into())?;
+            let words = u64_to_usize(region.len())
+                .div_ceil(host_page_size())
+                .div_ceil(64);
+            self.pending_dirty_union()
+                .insert(region.slot, vec![0u64; words]);
+        }
+
+        Ok(())
+    }
+
     /// Gets a reference to the kvm file descriptor owned by this VM.
     pub fn fd(&self) -> &VmFd {
         &self.common.fd
@@ -972,7 +1126,15 @@ impl KvmVm {
 
     /// Register a device IRQ
     pub fn register_irq(&self, fd: &EventFd, gsi: u32) -> Result<(), errno::Error> {
+        // The tracking duplicate comes first: a registration it failed to track could never be
+        // detached exactly.
+        let tracked = fd.try_clone()?;
         self.common.fd.register_irqfd(fd, gsi)?;
+        self.irqfds().push(IrqfdRegistration {
+            evt: tracked,
+            gsi,
+            attached: true,
+        });
 
         let mut entry = kvm_irq_routing_entry {
             gsi,
@@ -1000,6 +1162,73 @@ impl KvmVm {
                     masked: false,
                 },
             );
+        Ok(())
+    }
+
+    fn irqfds(&self) -> MutexGuard<'_, Vec<IrqfdRegistration>> {
+        self.common.irqfds.lock().expect("Poisoned lock")
+    }
+
+    /// Detaches every attached line interrupt's IRQFD, exactly the eventfd/GSI pairs
+    /// registered: an assignment with a different pair would detach nothing and still succeed.
+    /// KVM's deassign completes that registration's pending injection before returning, so
+    /// with every producer stopped, no device interrupt is in flight into the interrupt
+    /// controller afterwards.
+    ///
+    /// On failure the pairs this call detached are attached again. If that rollback fails too,
+    /// [`VmError::IrqfdRollback`] reports it; the journal still records exactly which pairs are
+    /// attached.
+    pub fn detach_irqfds(&self) -> Result<(), VmError> {
+        let mut irqfds = self.irqfds();
+        let mut detached = Vec::new();
+        for (index, registration) in irqfds.iter_mut().enumerate() {
+            if !registration.attached {
+                continue;
+            }
+            match self
+                .common
+                .fd
+                .unregister_irqfd(&registration.evt, registration.gsi)
+            {
+                Ok(()) => {
+                    registration.attached = false;
+                    detached.push(index);
+                }
+                Err(err) => {
+                    let failed = registration.gsi;
+                    for index in detached {
+                        let registration = &mut irqfds[index];
+                        if let Err(rollback) = self
+                            .common
+                            .fd
+                            .register_irqfd(&registration.evt, registration.gsi)
+                        {
+                            return Err(VmError::IrqfdRollback(
+                                failed,
+                                err,
+                                registration.gsi,
+                                rollback,
+                            ));
+                        }
+                        registration.attached = true;
+                    }
+                    return Err(VmError::Irqfd(failed, err));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attaches again every IRQFD the journal records as detached. A failure leaves the pairs
+    /// attached so far attached, as the journal records.
+    pub fn attach_irqfds(&self) -> Result<(), VmError> {
+        for registration in self.irqfds().iter_mut().filter(|r| !r.attached) {
+            self.common
+                .fd
+                .register_irqfd(&registration.evt, registration.gsi)
+                .map_err(|err| VmError::Irqfd(registration.gsi, err))?;
+            registration.attached = true;
+        }
         Ok(())
     }
 
@@ -1072,8 +1301,8 @@ impl KvmVm {
 pub(crate) mod tests {
     use std::sync::atomic::Ordering;
 
-    use vm_memory::GuestAddress;
     use vm_memory::mmap::MmapRegionBuilder;
+    use vm_memory::{Bytes, GuestAddress};
 
     use super::*;
     use crate::pci::PciSBDF;
@@ -1082,7 +1311,7 @@ pub(crate) mod tests {
     use crate::utils::mib_to_bytes;
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::Bitmap;
-    use crate::vstate::memory::GuestRegionMmap;
+    use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionMmap};
 
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> KvmVm {
@@ -1096,6 +1325,200 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_memory_regions(gm).unwrap();
         vm
+    }
+
+    fn slotted_memory(layout: &[(GuestAddress, usize)], slots: &[u32]) -> GuestMemoryMmap {
+        let regions = crate::test_utils::multi_region_mem_raw(layout)
+            .into_iter()
+            .zip(slots)
+            .map(|(region, &slot)| GuestRegionMmapExt::from_mmap_region(region, slot))
+            .collect();
+        GuestMemoryMmap::from_regions(regions).unwrap()
+    }
+
+    #[test]
+    fn test_adoption_rejects_asymmetric_geometry() {
+        let page_size = host_page_size();
+        let layout = [
+            (GuestAddress(0), 4 * page_size),
+            (GuestAddress(0x10_0000), 2 * page_size),
+        ];
+        let memory = slotted_memory(&layout, &[0, 1]);
+        check_adoption(&memory, &memory.describe(), 0, 32).unwrap();
+
+        let mut resized = memory.describe();
+        resized.regions[1].size = 4 * page_size;
+        let mut moved = memory.describe();
+        moved.regions[1].base_address = 0x20_0000;
+        let mut truncated = memory.describe();
+        truncated.regions.pop();
+        let mut extended = memory.describe();
+        extended.regions.push(GuestMemoryRegionState {
+            base_address: 0x30_0000,
+            size: page_size,
+        });
+        for want in [resized, moved, truncated, extended] {
+            assert_eq!(
+                check_adoption(&memory, &want, 0, 32)
+                    .unwrap_err()
+                    .to_string(),
+                VmError::from(AdoptGuestMemoryError::Geometry {
+                    got: memory.describe(),
+                    want: want.clone(),
+                })
+                .to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn test_adoption_preserves_slot_ids() {
+        let page_size = host_page_size();
+        let layout = [
+            (GuestAddress(0), page_size),
+            (GuestAddress(0x10_0000), page_size),
+        ];
+        let slot_error = |memory: &GuestMemoryMmap, first_slot, max_memslots| match check_adoption(
+            memory,
+            &memory.describe(),
+            first_slot,
+            max_memslots,
+        ) {
+            Err(VmError::AdoptGuestMemory(err)) => err,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let memory = slotted_memory(&layout, &[0, 1]);
+        // A VM that already reserved a slot would silently renumber the regions.
+        assert_eq!(
+            slot_error(&memory, 1, 32),
+            AdoptGuestMemoryError::Slot {
+                addr: 0,
+                slot: 0,
+                fresh: 1
+            }
+        );
+        // Slots must follow address order, as the source assigned them.
+        assert_eq!(
+            slot_error(&slotted_memory(&layout, &[1, 0]), 0, 32),
+            AdoptGuestMemoryError::Slot {
+                addr: 0,
+                slot: 1,
+                fresh: 0
+            }
+        );
+        assert_eq!(
+            slot_error(&slotted_memory(&layout, &[0, 2]), 0, 32),
+            AdoptGuestMemoryError::Slot {
+                addr: 0x10_0000,
+                slot: 2,
+                fresh: 1
+            }
+        );
+        assert!(matches!(
+            check_adoption(&memory, &memory.describe(), 0, 1),
+            Err(VmError::NotEnoughMemorySlots(1))
+        ));
+    }
+
+    #[test]
+    fn test_cold_native_memory_is_adoptable() {
+        // Native boot registers its private anonymous RAM on a fresh VM, the admission contract
+        // adoption relies on.
+        let regions = crate::arch::arch_memory_regions(mib_to_bytes(64));
+        let mut source = setup_vm();
+        source
+            .register_memory_regions(crate::vstate::memory::anonymous(&regions).unwrap())
+            .unwrap();
+        let memory = source.guest_memory().clone();
+        let state = memory.describe();
+        check_adoption(&memory, &state, 0, source.common.max_memslots).unwrap();
+        let mut child = setup_vm();
+        child.adopt_guest_memory(memory, &state).unwrap();
+    }
+
+    #[test]
+    fn test_adopt_guest_memory() {
+        let page_size = host_page_size();
+        let mut source = setup_vm();
+        source
+            .register_memory_regions(crate::test_utils::multi_region_mem_raw(&[
+                (GuestAddress(0), 2 * page_size),
+                (GuestAddress(0x10_0000), 2 * page_size),
+            ]))
+            .unwrap();
+        let written = GuestAddress(0x10_0000 + page_size as u64);
+        source.guest_memory().write_obj(0xabu8, written).unwrap();
+        let any_dirty = |memory: &GuestMemoryMmap| {
+            memory.iter().any(|region| {
+                let bitmap = (**region).bitmap().as_ref().unwrap();
+                (0..u64_to_usize(region.len()))
+                    .step_by(page_size)
+                    .any(|offset| bitmap.dirty_at(offset))
+            })
+        };
+        assert!(any_dirty(source.guest_memory()));
+        let state = source.guest_memory().describe();
+        let memory = source.guest_memory().clone();
+        // The adopted RAM must outlive every original owner.
+        drop(source);
+
+        let mut child = setup_vm();
+        child.adopt_guest_memory(memory, &state).unwrap();
+        let adopted = child.guest_memory();
+        assert_eq!(
+            adopted.iter().map(|region| region.slot).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(adopted.read_obj::<u8>(written).unwrap(), 0xab);
+        // The source's host accumulator does not leak into the child's first harvest.
+        assert!(!any_dirty(adopted));
+        let mut union_slots: Vec<_> = child.pending_dirty_union().keys().copied().collect();
+        union_slots.sort_unstable();
+        assert_eq!(union_slots, [0, 1]);
+        // The next slot follows the adopted ones.
+        assert_eq!(child.next_kvm_slot(1), Some(2));
+
+        let again = child.guest_memory().clone();
+        assert!(matches!(
+            child.adopt_guest_memory(again, &state),
+            Err(VmError::AdoptGuestMemory(AdoptGuestMemoryError::NotFresh))
+        ));
+    }
+
+    thread_local! {
+        /// Index of the vCPU whose start [`KvmVm::start_vcpus`] fails, if any.
+        pub(super) static FAIL_VCPU_START: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[test]
+    fn test_start_vcpus_recovers_every_vcpu_after_nth_failure() {
+        use crate::vstate::vcpu::StartThreadedError;
+        use crate::vstate::worker::WorkerStartError;
+
+        let mut vm = setup_vm_with_memory(mib_to_bytes(128));
+        let vcpus = vm.create_vcpus(3).unwrap();
+        let vm = Arc::new(vm);
+        let indexes = |vcpus: &[Vcpu]| vcpus.iter().map(|v| v.kvm_vcpu.index).collect::<Vec<_>>();
+
+        FAIL_VCPU_START.set(Some(1));
+        let (err, vcpus) = vm.start_vcpus(vcpus, Arc::new(vec![])).unwrap_err();
+        FAIL_VCPU_START.set(None);
+        assert!(matches!(
+            err,
+            StartVcpusError::VcpuHandle(StartThreadedError::Worker(WorkerStartError::Filter(_)))
+        ));
+        // The vCPU already running was stopped again: none is left running, none is lost.
+        assert!(vm.vcpus_handles().is_empty());
+        assert_eq!(indexes(&vcpus), [0, 1, 2]);
+
+        vm.start_vcpus(vcpus, Arc::new(vec![]))
+            .map_err(|(err, _)| err)
+            .unwrap();
+        let vcpus = vm.stop_vcpus();
+        assert!(vm.vcpus_handles().is_empty());
+        assert_eq!(indexes(&vcpus), [0, 1, 2]);
     }
 
     #[test]

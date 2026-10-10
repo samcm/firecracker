@@ -33,6 +33,8 @@ pub enum ResourcesError {
     File(#[from] std::io::Error),
     /// Invalid JSON: {0}
     InvalidJson(#[from] serde_json::Error),
+    /// Unsupported native configuration: {0}
+    NativeProfile(#[from] NativeProfileError),
     /// Logger error: {0}
     Logger(#[from] crate::logger::LoggerUpdateError),
     /// Metrics error: {0}
@@ -98,6 +100,45 @@ pub struct VmResources {
     pub serial_out_path: Option<PathBuf>,
     /// Optional rate limiter config for serial output.
     pub serial_rate_limiter_cfg: Option<TokenBucketConfig>,
+    /// Whether this microVM runs standalone in native mode, owning its guest memory.
+    pub native: bool,
+}
+
+/// Configuration the native profile does not support.
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
+pub enum NativeProfileError {
+    /// Native mode does not support network devices
+    Network,
+    /// Native mode does not support vsock
+    Vsock,
+    /// Native mode does not support the entropy device
+    Entropy,
+    /// Native mode does not support PCI transport
+    Pci,
+    /// Native mode does not support a GDB server
+    Gdb,
+    /// Native mode supports a root drive and at most one scratch drive
+    TooManyDrives,
+    /// Native mode supports only the synchronous block engine
+    AsyncBlock,
+    /// Native mode does not support drive rate limiters
+    RateLimiter,
+}
+
+impl NativeProfileError {
+    /// Rejects a drive outside the native profile before it is built.
+    pub fn check_drive(config: &crate::vmm_config::drive::BlockDeviceConfig) -> Result<(), Self> {
+        if config.file_engine_type
+            == Some(crate::devices::virtio::block::virtio::device::FileEngineType::Async)
+        {
+            return Err(NativeProfileError::AsyncBlock);
+        }
+        // A limiter's timer and token budget have no capture contract across a clone.
+        if config.rate_limiter.is_some() {
+            return Err(NativeProfileError::RateLimiter);
+        }
+        Ok(())
+    }
 }
 
 impl VmResources {
@@ -112,10 +153,69 @@ impl VmResources {
         })
     }
 
+    /// Rejects configuration outside the native profile, before any of it is built.
+    pub fn check_native_profile(&self) -> Result<(), NativeProfileError> {
+        if self.net_builder.iter().next().is_some() {
+            return Err(NativeProfileError::Network);
+        }
+        if self.vsock.get().is_some() {
+            return Err(NativeProfileError::Vsock);
+        }
+        if self.entropy.get().is_some() {
+            return Err(NativeProfileError::Entropy);
+        }
+        if self.pci_enabled {
+            return Err(NativeProfileError::Pci);
+        }
+        #[cfg(feature = "gdb")]
+        if self.machine_config.gdb_socket_path.is_some() {
+            return Err(NativeProfileError::Gdb);
+        }
+        // A limiter's timer and token budget have no capture contract across a clone.
+        if self.serial_rate_limiter_cfg.is_some() {
+            return Err(NativeProfileError::RateLimiter);
+        }
+        if self.block.devices.len() > 2 {
+            return Err(NativeProfileError::TooManyDrives);
+        }
+        for drive in &self.block.devices {
+            NativeProfileError::check_drive(&drive.lock().expect("Poisoned lock").config())?;
+        }
+        Ok(())
+    }
+
     /// Configures Vmm resources as described by the `config_json` param.
     pub fn from_json(config_json: &str) -> Result<Self, ResourcesError> {
-        let vmm_config = serde_json::from_str::<VmmConfig>(config_json)?;
+        Self::from_config(serde_json::from_str::<VmmConfig>(config_json)?)
+    }
 
+    /// Configures native-mode resources from `config_json`, rejecting configuration outside
+    /// the native profile before any device, such as a tap, is built from it.
+    pub fn from_native_json(config_json: &str) -> Result<Self, ResourcesError> {
+        let vmm_config = serde_json::from_str::<VmmConfig>(config_json)?;
+        if !vmm_config.network_interfaces.is_empty() {
+            return Err(NativeProfileError::Network.into());
+        }
+        if vmm_config.vsock.is_some() {
+            return Err(NativeProfileError::Vsock.into());
+        }
+        if vmm_config.entropy.is_some() {
+            return Err(NativeProfileError::Entropy.into());
+        }
+        if vmm_config.drives.len() > 2 {
+            return Err(NativeProfileError::TooManyDrives.into());
+        }
+        for drive in &vmm_config.drives {
+            NativeProfileError::check_drive(drive)?;
+        }
+        let mut resources = Self::from_config(vmm_config)?;
+        resources.native = true;
+        // Covers the rest, such as a GDB socket in the machine configuration.
+        resources.check_native_profile()?;
+        Ok(resources)
+    }
+
+    fn from_config(vmm_config: VmmConfig) -> Result<Self, ResourcesError> {
         if let Some(logger_config) = vmm_config.logger {
             crate::logger::LOGGER.update(logger_config)?;
         }
@@ -233,10 +333,14 @@ impl VmResources {
         self.entropy.insert(body)
     }
 
-    /// Allocates guest memory in a configuration most appropriate for these [`VmResources`].
+    /// Allocates guest memory in a configuration most appropriate for these [`VmResources`]:
+    /// private anonymous memory in native mode, the Farplane channel's otherwise.
     pub fn allocate_guest_memory(&self) -> Result<Vec<GuestRegionMmap>, MemoryError> {
         let regions =
             crate::arch::arch_memory_regions(mib_to_bytes(self.machine_config.mem_size_mib));
+        if self.native {
+            return crate::vstate::memory::anonymous(&regions);
+        }
         FarplaneBackend::construct_boot(&regions)
             .map_err(|err| MemoryError::Farplane(err.to_string()))
     }
@@ -357,7 +461,48 @@ mod tests {
             pci_enabled: false,
             serial_out_path: None,
             serial_rate_limiter_cfg: None,
+            native: false,
         }
+    }
+
+    #[test]
+    fn test_native_profile_and_memory() {
+        use crate::utils::u64_to_usize;
+        use crate::vstate::memory::GuestMemoryRegion;
+
+        // The network fixture needs a tap device; the entropy and PCI checks share its path.
+        let mut resources = VmResources {
+            native: true,
+            pci_enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resources.check_native_profile(),
+            Err(NativeProfileError::Pci)
+        );
+        resources.pci_enabled = false;
+        resources.check_native_profile().unwrap();
+        resources
+            .build_entropy_device(EntropyDeviceConfig::default())
+            .unwrap();
+        assert_eq!(
+            resources.check_native_profile(),
+            Err(NativeProfileError::Entropy)
+        );
+
+        // Native memory is this process's own anonymous RAM in the architecture's layout; no
+        // Farplane channel exists here, so taking that path would fail.
+        let regions = resources.allocate_guest_memory().unwrap();
+        let layout: Vec<_> = regions
+            .iter()
+            .map(|region| (region.start_addr(), u64_to_usize(region.len())))
+            .collect();
+        assert_eq!(
+            layout,
+            crate::arch::arch_memory_regions(mib_to_bytes(resources.machine_config.mem_size_mib))
+        );
+        resources.native = false;
+        resources.allocate_guest_memory().unwrap_err();
     }
 
     #[test]

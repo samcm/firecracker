@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Local build tooling only. Orbs do not expose KVM; hardware tests run elsewhere.
+missing=()
+for package in cmake musl-tools libclang-dev libseccomp-dev gperf autoconf automake libtool linux-libc-dev strace busybox-static squashfs-tools; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    sudo apt-get update -qq
+    sudo apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
+# Match tools/devctr/Dockerfile's musl libseccomp version, without altering HOME
+# or global linker configuration. GNU builds use the distro static library.
+seccomp_prefix="$HOME/.cache/firecracker/libseccomp-v2.6.0-musl"
+if [[ ! -f "$seccomp_prefix/lib/libseccomp.a" ]]; then
+    musl_include="/usr/include/$(uname -m)-linux-musl"
+    for header in asm linux asm-generic; do
+        if [[ ! -e "$musl_include/$header" && ! -L "$musl_include/$header" ]]; then
+            target="../$header"
+            [[ "$header" != asm ]] || target="../$(gcc -dumpmachine)/asm"
+            sudo ln -s "$target" "$musl_include/$header"
+        fi
+    done
+    source_dir=$(mktemp -d)
+    trap 'rm -rf "$source_dir"' EXIT
+    git clone --quiet --depth 1 --branch v2.6.0 \
+        https://github.com/seccomp/libseccomp "$source_dir"
+    (
+        cd "$source_dir"
+        ./autogen.sh
+        CC="musl-gcc -static" ./configure --prefix="$seccomp_prefix" \
+            --enable-static=yes --enable-shared=false
+        make -j2
+        make install
+    )
+fi
+
+if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs |
+        sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+fi
+
+toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+"$HOME/.cargo/bin/rustup" toolchain install "$toolchain" --profile minimal \
+    --component rustfmt --component clippy \
+    --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
+"$HOME/.cargo/bin/cargo" --version
+printf 'GNU LIBSECCOMP_LIB_PATH=/usr/lib/%s\n' "$(gcc -dumpmachine)"
+printf 'musl LIBSECCOMP_LIB_PATH=%s/lib\n' "$seccomp_prefix"

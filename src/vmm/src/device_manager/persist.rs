@@ -315,6 +315,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                     let serial = crate::DeviceManager::setup_serial_device(
                         constructor_args.event_manager,
                         constructor_args.vm_resources.serial_out_path.as_ref(),
+                        !constructor_args.vm_resources.native,
                         serial_state.as_ref(),
                         constructor_args.vm_resources.serial_rate_limiter(),
                     )?;

@@ -129,10 +129,13 @@ impl DeviceManager {
         }
     }
 
-    /// Sets up the serial device.
+    /// Sets up the serial device. Without an output file, an interactive console takes the
+    /// process's stdin and stdout; a non-interactive one, as in native mode, discards its output
+    /// and leaves both, which the process shares with its launcher, untouched.
     fn setup_serial_device(
         event_manager: &mut EventManager,
         output: Option<&PathBuf>,
+        interactive: bool,
         state: Option<&serial::SerialState>,
         rate_limiter: Option<TokenBucket>,
     ) -> Result<Arc<Mutex<SerialDevice>>, std::io::Error> {
@@ -144,6 +147,7 @@ impl DeviceManager {
                     rate_limiter,
                 ),
             ),
+            None if !interactive => (None, SerialOut::new(SerialOutInner::Sink, rate_limiter)),
             None => {
                 Self::set_stdout_nonblocking();
 
@@ -188,6 +192,7 @@ impl DeviceManager {
         vcpus_exit_evt: &EventFd,
         vm: &KvmVm,
         serial_output: Option<&PathBuf>,
+        interactive_serial: bool,
         serial_state: Option<&serial::SerialState>,
         serial_rate_limiter: Option<TokenBucket>,
     ) -> Result<PortIODeviceManager, DeviceManagerCreateError> {
@@ -195,6 +200,7 @@ impl DeviceManager {
         let serial = Self::setup_serial_device(
             event_manager,
             serial_output,
+            interactive_serial,
             serial_state,
             serial_rate_limiter,
         )?;
@@ -219,6 +225,7 @@ impl DeviceManager {
         vcpus_exit_evt: &EventFd,
         vm: &KvmVm,
         serial_output: Option<&PathBuf>,
+        interactive_serial: bool,
         serial_rate_limiter: Option<TokenBucket>,
     ) -> Result<Self, DeviceManagerCreateError> {
         #[cfg(target_arch = "x86_64")]
@@ -227,6 +234,7 @@ impl DeviceManager {
             vcpus_exit_evt,
             vm,
             serial_output,
+            interactive_serial,
             None,
             serial_rate_limiter,
         )?;
@@ -330,6 +338,7 @@ impl DeviceManager {
             let serial = Self::setup_serial_device(
                 event_manager,
                 serial_out_path,
+                true,
                 None,
                 serial_rate_limiter,
             )?;
@@ -539,6 +548,7 @@ impl<'a> Persist<'a> for DeviceManager {
             constructor_args.vcpus_exit_evt,
             constructor_args.vm,
             constructor_args.vm_resources.serial_out_path.as_ref(),
+            !constructor_args.vm_resources.native,
             serial_state.as_ref(),
             constructor_args.vm_resources.serial_rate_limiter(),
         )?;

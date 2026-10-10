@@ -685,3 +685,84 @@ fn test_reject_root_alias_refuses_one_inode_in_both_slots() {
     close(root).unwrap();
     close(scratch).unwrap();
 }
+
+#[test]
+fn test_native_flag_is_parsed() {
+    let arg_parser = build_arg_parser();
+    let mut arguments = arg_parser.arguments().clone();
+    arguments
+        .parse(&cmdline("7", &["--chroot-base-dir", "/", "--native"]))
+        .unwrap();
+    let env = Env::new(&arguments, 0, 0).unwrap();
+    assert!(env.native);
+    assert_eq!(env.highest_reserved_fd(), ROOT_FILENO);
+}
+
+/// Native placement when the caller passes the root image at 3 and a stray socket at 4: the
+/// root lands in its own slot, inheritable, slot 3 is left closed, and no userfaultfd device
+/// is opened. It rearranges descriptors, so it runs in a forked child.
+#[test]
+fn test_native_install_leaves_slot_3_closed_without_userfaultfd() {
+    let sealed = memfd(4096, REQUIRED_IMAGE_SEALS);
+    let root = reopen_read_only(sealed);
+    let mut pair = [-1; 2];
+    assert_eq!(
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+        0
+    );
+    let arg_parser = build_arg_parser();
+    let mut arguments = arg_parser.arguments().clone();
+    arguments
+        .parse(&cmdline("3", &["--chroot-base-dir", "/", "--native"]))
+        .unwrap();
+    let env = Env::new(&arguments, 0, 0).unwrap();
+
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        // Only descriptor syscalls from here on; the exit status reports the failed check.
+        let check = |ok: bool, code: i32| {
+            if !ok {
+                unsafe { libc::_exit(code) }
+            }
+        };
+        unsafe {
+            check(libc::dup2(root, 3) == 3, 10);
+            check(libc::dup2(pair[0], 4) == 4, 11);
+        }
+        check(env.install_inherited_fds().is_ok(), 12);
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        unsafe {
+            check(libc::fcntl(3, libc::F_GETFD) < 0, 13);
+            check(libc::fstat(ROOT_FILENO, stat.as_mut_ptr()) == 0, 15);
+            check(
+                stat.assume_init().st_mode & libc::S_IFMT == libc::S_IFREG,
+                16,
+            );
+            check(
+                libc::fcntl(ROOT_FILENO, libc::F_GET_SEALS) & REQUIRED_IMAGE_SEALS
+                    == REQUIRED_IMAGE_SEALS,
+                17,
+            );
+            check(libc::fcntl(ROOT_FILENO, libc::F_GETFD) == 0, 19);
+            // No descriptor refers to the userfaultfd device.
+            let mut link = [0u8; 64];
+            for fd in 0..256 {
+                let path = format!("/proc/self/fd/{fd}\0");
+                let len = libc::readlink(path.as_ptr().cast(), link.as_mut_ptr().cast(), 64);
+                check(
+                    len < 0 || &link[..usize::try_from(len).unwrap()] != b"/dev/userfaultfd",
+                    20,
+                );
+            }
+            libc::_exit(0);
+        }
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status), "{status}");
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    for fd in [sealed, root, pair[0], pair[1]] {
+        close(fd).unwrap();
+    }
+}

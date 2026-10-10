@@ -11,12 +11,14 @@ mod api_server;
 mod api_server_adapter;
 mod generated;
 mod metrics;
+mod native;
 mod seccomp;
 
 use std::fs::{self, File};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, panic};
 
@@ -91,6 +93,14 @@ enum MainError {
     RunWithApi(ApiServerError),
     /// RunWithoutApiError error: {0}
     RunWithoutApiError(RunWithoutApiError),
+    /// Cannot install the native main thread's seccomp filter: {0}
+    NativeMainFilter(vmm::seccomp::InstallationError),
+    /// Cannot have the kernel reap clone children: {0}
+    NativeChildReaping(io::Error),
+    /// Native mode does not run as a namespace's init: its clones would die with it
+    NativeInit,
+    /// Native mode failed: {0}
+    Native(native::NativeError),
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -129,6 +139,9 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether this process runs in native mode, read by the panic hook.
+static NATIVE: AtomicBool = AtomicBool::new(false);
+
 fn main_exec() -> Result<(), MainError> {
     // Initialize the logger.
     LOGGER.init().map_err(MainError::SetLogger)?;
@@ -152,7 +165,10 @@ fn main_exec() -> Result<(), MainError> {
         // origin of the panic, including the payload passed to panic! and the source code location
         // from which the panic originated.
         error_unrestricted!("Firecracker {}", info);
-        if let Err(err) = stdin.lock().set_canon_mode() {
+        // Native mode never takes the terminal it shares with its launcher.
+        if !NATIVE.load(Ordering::Relaxed)
+            && let Err(err) = stdin.lock().set_canon_mode()
+        {
             error_unrestricted!(
                 "Failure while trying to reset stdin to canonical mode: {}",
                 err
@@ -288,6 +304,15 @@ fn main_exec() -> Result<(), MainError> {
                 Argument::new("farplane-mem-socket")
                     .takes_value(true)
                     .help("Path to the pagemaster SEQPACKET memory channel."),
+            )
+            .arg(
+                Argument::new("native")
+                    .takes_value(false)
+                    .forbids(vec!["farplane-mem-socket", "enable-pci"])
+                    .help(
+                        "Run standalone: the process owns guest memory, needs no memory channel \
+                         and serves the API on its main thread.",
+                    ),
             );
 
     arg_parser.parse_from_cmdline()?;
@@ -317,19 +342,21 @@ fn main_exec() -> Result<(), MainError> {
         return Ok(());
     }
 
-    let farplane_socket = arguments
-        .single_value("farplane-mem-socket")
-        .ok_or(MainError::MissingFarplaneSocket)?;
-    vmm::vstate::farplane::FarplaneBackend::set_socket_path(PathBuf::from(farplane_socket));
+    let native = arguments.flag_present("native");
+    NATIVE.store(native, Ordering::Relaxed);
+    if !native {
+        let farplane_socket = arguments
+            .single_value("farplane-mem-socket")
+            .ok_or(MainError::MissingFarplaneSocket)?;
+        vmm::vstate::farplane::FarplaneBackend::set_socket_path(PathBuf::from(farplane_socket));
+    }
 
     // It's safe to unwrap here because the field's been provided with a default value.
     let instance_id = arguments.single_value("id").unwrap();
     validate_instance_id(instance_id.as_str()).expect("Invalid instance ID");
 
     // Apply the logger configuration.
-    vmm::logger::INSTANCE_ID
-        .set(String::from(instance_id))
-        .unwrap();
+    vmm::logger::set_instance_id(String::from(instance_id));
     let log_path = arguments.single_value("log-path").map(PathBuf::from);
     let level = arguments
         .single_value("level")
@@ -404,6 +431,24 @@ fn main_exec() -> Result<(), MainError> {
     .and_then(seccomp::get_filters)
     .map_err(MainError::SeccompFilter)?;
 
+    if native {
+        // Every process in a PID namespace dies with its init, published clones included.
+        if std::process::id() == 1 {
+            return Err(MainError::NativeInit);
+        }
+        // A clone's child is this process's child: the kernel reaps it when it exits, without a
+        // waiting thread, and a published child survives this process's death regardless.
+        // SAFETY: setting a signal's disposition to ignore.
+        if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) } == libc::SIG_ERR {
+            return Err(MainError::NativeChildReaping(io::Error::last_os_error()));
+        }
+        // Main's baseline, installed once before any configuration is read, parsed or built. The
+        // workers main starts inherit it beneath their own role filters.
+        let native_main =
+            seccomp::native_main_filter(&seccomp_filters).map_err(MainError::SeccompFilter)?;
+        vmm::seccomp::apply_filter(&native_main).map_err(MainError::NativeMainFilter)?;
+    }
+
     let vmm_config_json = arguments
         .single_value("config-file")
         .map(fs::read_to_string)
@@ -421,6 +466,32 @@ fn main_exec() -> Result<(), MainError> {
         })
         // Safe to unwrap as we provide a default value.
         .unwrap();
+
+    if native {
+        let result = if !api_enabled {
+            // Safe to unwrap since '--no-api' requires this to be set.
+            native::run_json(
+                &seccomp_filters,
+                &vmm_config_json.unwrap(),
+                instance_info,
+                boot_timer_enabled,
+            )
+        } else {
+            let bind_path = arguments
+                .single_value("api-sock")
+                .map(PathBuf::from)
+                .expect("Missing argument: api-sock");
+            native::run_api(
+                &seccomp_filters,
+                vmm_config_json.as_deref(),
+                bind_path,
+                instance_info,
+                boot_timer_enabled,
+                api_payload_limit,
+            )
+        };
+        return result.map_err(MainError::Native);
+    }
 
     if api_enabled {
         let bind_path = arguments

@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::thread;
 
 use log::{Log, Metadata, Record};
@@ -20,8 +20,14 @@ use crate::utils::open_file_nonblock;
 pub const DEFAULT_LEVEL: log::LevelFilter = log::LevelFilter::Info;
 /// Default instance id.
 pub const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
-/// Instance id.
-pub static INSTANCE_ID: OnceLock<String> = OnceLock::new();
+/// Instance id, set by [`set_instance_id`].
+static INSTANCE_ID: Mutex<Option<String>> = Mutex::new(None);
+
+/// Names this process's microVM in every log line from now on: at startup, and again in a
+/// clone's child, which must not log under its source's name.
+pub fn set_instance_id(id: String) {
+    *INSTANCE_ID.lock().unwrap() = Some(id);
+}
 
 /// The logger.
 ///
@@ -48,6 +54,15 @@ impl Logger {
     pub fn init(&'static self) -> Result<(), LoggerInitError> {
         log::set_logger(self)?;
         log::set_max_level(DEFAULT_LEVEL);
+        Ok(())
+    }
+
+    /// Writes log lines to `path` from now on, keeping the level and format: a clone's child
+    /// logs to its own destination as its source was configured to. The previous target, an
+    /// unbuffered file, only closes.
+    pub fn redirect(&self, path: &std::path::Path) -> Result<(), LoggerUpdateError> {
+        let file = open_file_nonblock(path).map_err(LoggerUpdateError)?;
+        self.0.lock().unwrap().target = Some(file);
         Ok(())
     }
 
@@ -159,8 +174,9 @@ impl Log for Logger {
                 "{} [{}:{thread}{level}{origin}] {}\n",
                 LocalTime::now(),
                 INSTANCE_ID
-                    .get()
-                    .map(|s| s.as_str())
+                    .lock()
+                    .unwrap()
+                    .as_deref()
                     .unwrap_or(DEFAULT_INSTANCE_ID),
                 record.args()
             );
@@ -429,5 +445,28 @@ mod tests {
             })
             .unwrap();
         assert!(logger.0.lock().unwrap().target.is_some());
+    }
+
+    /// A redirect keeps the format and filter and leaves the previous destination as it was.
+    #[test]
+    fn test_logger_redirect_keeps_format_and_source_destination() {
+        let source = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let logger = Logger(Mutex::new(LoggerConfiguration {
+            target: Some(source.as_file().try_clone().unwrap()),
+            filter: LogFilter {
+                module: Some("chosen".to_string()),
+            },
+            format: LogFormat {
+                show_level: true,
+                show_log_origin: true,
+            },
+        }));
+        let child = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        logger.redirect(child.as_path()).unwrap();
+        let config = logger.0.lock().unwrap();
+        assert!(config.format.show_level && config.format.show_log_origin);
+        assert_eq!(config.filter.module.as_deref(), Some("chosen"));
+        assert!(config.target.is_some());
+        assert_eq!(std::fs::read_to_string(source.as_path()).unwrap(), "");
     }
 }
