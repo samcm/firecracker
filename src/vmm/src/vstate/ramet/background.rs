@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The memory channel's background worker. It re-shares the pages a live fold refused, and
-//! watches the standing version's growth while a refresh flattens it.
+//! guards the standing version's bound while the guest runs.
 //!
 //! A live fold refuses a page the source maps exclusively and read-only: it cannot tell it
 //! from a page a pin is racing for. GUP's unshare leaves exactly that behind when it pins a
@@ -15,7 +15,14 @@
 //!
 //! The worker is a guest-memory writer, so a capture fences it before CREATE and the disk
 //! clone, as it stops every other writer.
+//!
+//! Every page the standing version keeps beyond the guest's own is one the guest dirtied since
+//! the version's fold, so the tracker's dirty count bounds it. A refresh arms the guard with a
+//! dirty count: the worker reads the counter every millisecond and, once the guest reaches it,
+//! pauses the vCPUs until the next refresh's rebase lets the old copies go. Memory plane starts
+//! refreshes early enough that this is rare; the guard is what makes the bound hard.
 
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,16 +35,25 @@ use crate::vmm_config::instance_info::VmState;
 /// second at most, off every vCPU thread.
 const TOUCH_BATCH: usize = 256;
 const TOUCH_PAUSE: Duration = Duration::from_millis(4);
-/// How often a refresh's watch reads the tracker's dirty counter.
-const WATCH_PERIOD: Duration = Duration::from_millis(1);
+/// How often the guard reads the tracker's dirty counter: half the time the guest takes at its
+/// last rate to reach the guard, within these.
+const GUARD_MIN: Duration = Duration::from_millis(1);
+const GUARD_MAX: Duration = Duration::from_millis(50);
 
 /// One unit of background work.
 enum Job {
     /// Re-share these pages: host addresses of the pages a live fold left exclusive.
     Touch(Vec<u64>),
-    /// Watch the tracker while a refresh flattens: pause the vCPUs if the guest dirties
-    /// `budget` pages beyond `base`, and resume them when the watch ends.
-    Watch { tracker: i32, base: u64, budget: u64 },
+}
+
+/// The armed guard: pause the vCPUs once the tracker counts `at` dirty pages.
+struct Guard {
+    /// The channel's tracker descriptor, open while the guard is armed: untrack disarms first.
+    tracker: RawFd,
+    at: u64,
+    /// The last reading and when, for the rate; the wait until the next.
+    last: Option<(u64, Instant)>,
+    wait: Duration,
 }
 
 #[derive(Default)]
@@ -47,16 +63,27 @@ struct State {
     fenced: bool,
     /// A batch of touches is running.
     touching: bool,
-    /// The watch is asked to end.
-    watch_end: bool,
-    /// The watch's result: how long it held the vCPUs paused.
-    watched: Option<Duration>,
+    guard: Option<Guard>,
+    /// The guard is reading the counter or pausing the guest.
+    guarding: bool,
+    /// When the guard paused the guest, while it holds it paused.
+    paused_at: Option<Instant>,
+    /// Guard pauses another path ended (a capture or untrack), not yet reported.
+    unreported: Duration,
+}
+
+/// How long the guard held a guest paused, and how much of it came before a refresh started.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Paused {
+    pub(crate) total: Duration,
+    pub(crate) waited: Duration,
 }
 
 /// Handle on the background worker thread.
 #[derive(Clone)]
 pub(crate) struct Background {
     shared: Arc<(Mutex<State>, Condvar)>,
+    vcpus: Arc<dyn Pauser>,
 }
 
 impl std::fmt::Debug for Background {
@@ -69,8 +96,13 @@ impl Background {
     /// A handle no worker serves: its jobs queue and never run. For tests of the channel.
     #[cfg(test)]
     pub(crate) fn detached() -> Self {
+        Self::new(Arc::new(NoVcpus))
+    }
+
+    fn new(vcpus: Arc<dyn Pauser>) -> Self {
         Self {
             shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
+            vcpus,
         }
     }
 
@@ -79,9 +111,7 @@ impl Background {
         vmm: Arc<Mutex<Vmm>>,
         filter: Arc<crate::seccomp::BpfProgram>,
     ) -> std::io::Result<Self> {
-        let bg = Self {
-            shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
-        };
+        let bg = Self::new(Arc::new(VmmPauser(vmm)));
         let worker = bg.clone();
         std::thread::Builder::new()
             .name("fc_ramet_bg".to_string())
@@ -90,41 +120,83 @@ impl Background {
                     error!("Ramet background worker could not install its filter: {err}");
                     return;
                 }
-                worker.run(&vmm);
+                worker.run();
             })?;
         Ok(bg)
     }
 
-    fn run(&self, vmm: &Arc<Mutex<Vmm>>) {
+    fn run(&self) {
         let (lock, cvar) = &*self.shared;
         loop {
             let job = {
                 let mut state = lock.lock().expect("Poisoned lock");
                 loop {
                     if let Some(job) = state.job.take() {
-                        break job;
+                        break Some(job);
                     }
-                    state = cvar.wait(state).expect("Poisoned lock");
+                    if let Some(wait) = state
+                        .guard
+                        .as_ref()
+                        .filter(|_| state.paused_at.is_none())
+                        .map(|g| g.wait)
+                    {
+                        state = cvar
+                            .wait_timeout(state, wait)
+                            .expect("Poisoned lock")
+                            .0;
+                        if state.job.is_none() {
+                            break None;
+                        }
+                    } else {
+                        state = cvar.wait(state).expect("Poisoned lock");
+                    }
                 }
             };
             match job {
-                Job::Touch(pages) => self.touch(&pages),
-                Job::Watch {
-                    tracker,
-                    base,
-                    budget,
-                } => {
-                    let paused = self.watch(vmm, tracker, base, budget);
-                    let mut state = lock.lock().expect("Poisoned lock");
-                    state.watched = Some(paused);
-                    cvar.notify_all();
-                }
+                Some(Job::Touch(pages)) => self.touch(&pages),
+                None => self.guard_check(),
             }
         }
     }
 
+    /// Reads the counter once and pauses the guest if it reached the guard.
+    fn guard_check(&self) {
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock.lock().expect("Poisoned lock");
+        let paused = state.paused_at.is_some();
+        let reached = match state.guard.as_mut() {
+            Some(guard) if !paused => {
+                // SAFETY: the tracker stays open while the guard is armed.
+                let fd = unsafe { BorrowedFd::borrow_raw(guard.tracker) };
+                match memversion::track_info(fd) {
+                    Ok(info) => guard.read(info.dirty_pages),
+                    Err(_) => {
+                        guard.wait = GUARD_MAX;
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+        if !reached {
+            return;
+        }
+        // Pausing takes the VMM lock, which a capture's quiesce holds: never with the state
+        // lock held. `guarding` keeps a disarm waiting until the pause is recorded.
+        state.guarding = true;
+        drop(state);
+        let paused = self.vcpus.pause();
+        let mut state = lock.lock().expect("Poisoned lock");
+        state.guarding = false;
+        if paused {
+            state.paused_at = Some(Instant::now());
+        }
+        cvar.notify_all();
+    }
+
     /// Re-shares `pages`, a batch at a time between fence checks. A fence drops the rest: a
-    /// capture folds them, and its set is stale after it.
+    /// capture folds them, and its set is stale after it. The guard keeps reading between
+    /// batches.
     fn touch(&self, pages: &[u64]) {
         let (lock, cvar) = &*self.shared;
         let started = Instant::now();
@@ -143,12 +215,15 @@ impl Background {
                 unsafe { reshare(addr) };
             }
             done += batch.len();
-            let mut state = lock.lock().expect("Poisoned lock");
-            state.touching = false;
-            cvar.notify_all();
-            let (_state, _) = cvar
-                .wait_timeout(state, TOUCH_PAUSE)
-                .expect("Poisoned lock");
+            {
+                let mut state = lock.lock().expect("Poisoned lock");
+                state.touching = false;
+                cvar.notify_all();
+                let _state = cvar
+                    .wait_timeout(state, TOUCH_PAUSE)
+                    .expect("Poisoned lock");
+            }
+            self.guard_check();
         }
         if !pages.is_empty() {
             info!(
@@ -159,64 +234,60 @@ impl Background {
         }
     }
 
-    fn watch(&self, vmm: &Arc<Mutex<Vmm>>, tracker: i32, base: u64, budget: u64) -> Duration {
+    /// Arms the guard, or moves it: pause the guest once `tracker` counts `at` dirty pages. A
+    /// guest already paused by it stays paused.
+    pub(crate) fn guard(&self, tracker: &impl AsRawFd, at: u64) {
         let (lock, cvar) = &*self.shared;
-        let mut paused_at: Option<Instant> = None;
-        let mut we_paused = false;
-        loop {
-            {
-                let state = lock.lock().expect("Poisoned lock");
-                let (state, _) = cvar
-                    .wait_timeout_while(state, WATCH_PERIOD, |s| !s.watch_end)
-                    .expect("Poisoned lock");
-                if state.watch_end {
-                    break;
-                }
-            }
-            if paused_at.is_some() {
-                continue;
-            }
-            // SAFETY: the tracker descriptor stays open for the refresh the watch belongs to.
-            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(tracker) };
-            let Ok(info) = memversion::track_info(fd) else {
-                continue;
-            };
-            if info.dirty_pages.saturating_sub(base) < budget {
-                continue;
-            }
-            super::dispatch::gate().close();
-            let mut vmm = vmm.lock().expect("Poisoned lock");
-            if vmm.instance_info.state == VmState::Running {
-                match vmm.pause_vm() {
-                    Ok(()) => we_paused = true,
-                    Err(err) => error!("Ramet could not pause the guest for the refresh: {err}"),
-                }
-            }
-            drop(vmm);
-            if !we_paused {
-                super::dispatch::gate().open();
-            }
-            paused_at = Some(Instant::now());
+        lock.lock().expect("Poisoned lock").guard = Some(Guard {
+            tracker: tracker.as_raw_fd(),
+            at,
+            last: None,
+            wait: GUARD_MIN,
+        });
+        cvar.notify_all();
+    }
+
+    /// Ends a refresh: resumes a guest the guard paused, and returns how long it was paused
+    /// in all, and of that how long before `refresh_started`, guard pauses another path ended
+    /// included. The guard stays as armed.
+    pub(crate) fn release(&self, refresh_started: Instant) -> Paused {
+        let (lock, cvar) = &*self.shared;
+        let mut state = cvar
+            .wait_while(lock.lock().expect("Poisoned lock"), |s| s.guarding)
+            .expect("Poisoned lock");
+        let unreported = std::mem::take(&mut state.unreported);
+        let mut paused = Paused {
+            total: unreported,
+            waited: unreported,
+        };
+        if let Some(at) = state.paused_at.take() {
+            self.vcpus.resume();
+            paused.total += at.elapsed();
+            paused.waited += refresh_started.saturating_duration_since(at);
+            info!(
+                "Ramet paused the guest {} us until the refresh caught up",
+                at.elapsed().as_micros()
+            );
         }
-        let mut held = Duration::ZERO;
-        if let Some(at) = paused_at {
-            held = at.elapsed();
-            if we_paused {
-                let mut vmm = vmm.lock().expect("Poisoned lock");
-                if let Err(err) = vmm.resume_vm() {
-                    error!("Ramet could not resume the guest after the refresh: {err}");
-                }
-                drop(vmm);
-                super::dispatch::gate().open();
-                info!(
-                    "Ramet paused the guest {} us while the refresh caught up",
-                    held.as_micros()
-                );
-            } else {
-                held = Duration::ZERO;
-            }
+        drop(state);
+        cvar.notify_all();
+        paused
+    }
+
+    /// Disarms the guard, waiting out a check in flight, and resumes a guest it paused: a
+    /// capture, an untrack, a new tracker or a failed refresh ends what the guard was for. The
+    /// next refresh reports the pause.
+    pub(crate) fn disarm(&self) {
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock.lock().expect("Poisoned lock");
+        state.guard = None;
+        let mut state = cvar
+            .wait_while(state, |s| s.guarding)
+            .expect("Poisoned lock");
+        if let Some(at) = state.paused_at.take() {
+            self.vcpus.resume();
+            state.unreported += at.elapsed();
         }
-        held
     }
 
     /// Stops every touch: returns once none runs, and keeps any from starting until `unfence`.
@@ -264,32 +335,82 @@ impl Background {
         state.job = Some(Job::Touch(pages));
         cvar.notify_all();
     }
+}
 
-    /// Starts the watch for one refresh's flatten. The current touch job, if any, ends first.
-    pub(crate) fn start_watch(&self, tracker: i32, base: u64, budget: u64) {
-        let (lock, cvar) = &*self.shared;
-        let mut state = lock.lock().expect("Poisoned lock");
-        state.watch_end = false;
-        state.watched = None;
-        state.job = Some(Job::Watch {
-            tracker,
-            base,
-            budget,
+impl Guard {
+    /// Takes a reading: whether the guest reached the guard, or would before the next reading
+    /// at its rate, and when to read again.
+    fn read(&mut self, dirty: u64) -> bool {
+        let now = Instant::now();
+        // Pages a second since the last reading; a count that fell (a new fold) starts over.
+        let rate = self.last.and_then(|(d, t)| {
+            let secs = now.duration_since(t).as_secs_f64();
+            (dirty >= d && secs > 0.0).then(|| (dirty - d) as f64 / secs)
         });
-        cvar.notify_all();
+        self.last = Some((dirty, now));
+        if dirty as f64 + rate.unwrap_or(0.0) * GUARD_MIN.as_secs_f64() >= self.at as f64 {
+            return true;
+        }
+        self.wait = match rate {
+            Some(r) if r > 0.0 => Duration::from_secs_f64((self.at - dirty) as f64 / r / 2.0)
+                .clamp(GUARD_MIN, GUARD_MAX),
+            Some(_) => GUARD_MAX,
+            None => GUARD_MIN,
+        };
+        false
+    }
+}
+
+/// Pauses and resumes the guest's vCPUs for the guard.
+pub(crate) trait Pauser: Send + Sync {
+    /// Pauses a running guest; false if it was not running or could not be paused.
+    fn pause(&self) -> bool;
+    /// Resumes a guest `pause` paused.
+    fn resume(&self);
+}
+
+/// No guest: for a handle no worker serves, and for tests.
+#[cfg(test)]
+pub(crate) struct NoVcpus;
+
+#[cfg(test)]
+impl Pauser for NoVcpus {
+    fn pause(&self) -> bool {
+        false
     }
 
-    /// Ends the watch and returns how long it held the guest paused.
-    pub(crate) fn end_watch(&self) -> Duration {
-        let (lock, cvar) = &*self.shared;
-        let mut state = lock.lock().expect("Poisoned lock");
-        state.watch_end = true;
-        cvar.notify_all();
-        let mut state = cvar
-            .wait_while(state, |s| s.watched.is_none())
-            .expect("Poisoned lock");
-        state.watch_end = false;
-        state.watched.take().unwrap_or_default()
+    fn resume(&self) {}
+}
+
+/// The VMM's vCPUs, with dispatch closed while they are paused, as a capture's quiesce does.
+pub(crate) struct VmmPauser(pub(crate) Arc<Mutex<Vmm>>);
+
+impl Pauser for VmmPauser {
+    fn pause(&self) -> bool {
+        super::dispatch::gate().close();
+        let mut vmm = self.0.lock().expect("Poisoned lock");
+        let paused = vmm.instance_info.state == VmState::Running
+            && match vmm.pause_vm() {
+                Ok(()) => true,
+                Err(err) => {
+                    error!("Ramet could not pause the guest at its standing bound: {err}");
+                    false
+                }
+            };
+        drop(vmm);
+        if !paused {
+            super::dispatch::gate().open();
+        }
+        paused
+    }
+
+    fn resume(&self) {
+        let mut vmm = self.0.lock().expect("Poisoned lock");
+        if let Err(err) = vmm.resume_vm() {
+            error!("Ramet could not resume the guest after its standing bound: {err}");
+        }
+        drop(vmm);
+        super::dispatch::gate().open();
     }
 }
 
@@ -339,27 +460,9 @@ mod tests {
     use super::*;
 
     fn worker() -> Background {
-        let bg = Background {
-            shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
-        };
+        let bg = Background::detached();
         let w = bg.clone();
-        std::thread::spawn(move || {
-            let (lock, cvar) = &*w.shared;
-            loop {
-                let job = {
-                    let mut state = lock.lock().unwrap();
-                    loop {
-                        if let Some(job) = state.job.take() {
-                            break job;
-                        }
-                        state = cvar.wait(state).unwrap();
-                    }
-                };
-                if let Job::Touch(pages) = job {
-                    w.touch(&pages);
-                }
-            }
-        });
+        std::thread::spawn(move || w.run());
         bg
     }
 
@@ -453,11 +556,92 @@ mod tests {
         assert!(queued, "the lifted fence queued nothing");
     }
 
+    /// Counts the pauses and resumes the guard asks for.
+    #[derive(Default)]
+    struct Vcpus {
+        paused: AtomicBool,
+        pauses: AtomicU64,
+    }
+
+    impl Pauser for Vcpus {
+        fn pause(&self) -> bool {
+            assert!(!self.paused.swap(true, Ordering::SeqCst), "paused twice");
+            self.pauses.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+
+        fn resume(&self) {
+            assert!(self.paused.swap(false, Ordering::SeqCst), "resumed a running guest");
+        }
+    }
+
+    #[test]
+    fn the_guard_pauses_at_its_count_until_released_and_reports_the_wait() {
+        // No tracker: an unreadable counter never trips the guard. The worker's count check is
+        // the kernel's; here the guard state machine is driven through a tripped pause.
+        let vcpus = Arc::new(Vcpus::default());
+        let bg = Background::new(vcpus.clone());
+        let w = bg.clone();
+        std::thread::spawn(move || w.run());
+        bg.guard(&1_000_000, 0);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(vcpus.pauses.load(Ordering::SeqCst), 0, "an unreadable counter paused");
+        // Trip it by hand, as a reached count does, then release as a refresh would.
+        {
+            let (lock, _) = &*bg.shared;
+            let mut state = lock.lock().unwrap();
+            assert!(vcpus.pause());
+            state.paused_at = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        let refresh = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let paused = bg.release(refresh);
+        assert!(!vcpus.paused.load(Ordering::SeqCst), "release left the guest paused");
+        assert!(paused.waited >= Duration::from_millis(10) && paused.waited < paused.total);
+        assert!(paused.total >= Duration::from_millis(15));
+        // A pause a capture ends is reported by the next release.
+        {
+            let (lock, _) = &*bg.shared;
+            let mut state = lock.lock().unwrap();
+            assert!(vcpus.pause());
+            state.paused_at = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        bg.disarm();
+        assert!(!vcpus.paused.load(Ordering::SeqCst), "disarm left the guest paused");
+        let later = bg.release(Instant::now());
+        assert!(later.total >= Duration::from_millis(5) && later.waited == later.total);
+        assert_eq!(bg.release(Instant::now()), Paused::default());
+    }
+
+    #[test]
+    fn the_guard_reads_sooner_the_nearer_the_guest_writes_to_it() {
+        let mut g = Guard {
+            tracker: 1_000_000,
+            at: 1000,
+            last: None,
+            wait: GUARD_MIN,
+        };
+        assert!(!g.read(0));
+        assert_eq!(g.wait, GUARD_MIN, "no rate yet");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(!g.read(0));
+        assert_eq!(g.wait, GUARD_MAX, "an idle guest");
+        std::thread::sleep(Duration::from_millis(10));
+        // About 10k pages a second, 900 pages away: 45 ms at most, halved.
+        assert!(!g.read(100));
+        assert!(g.wait > Duration::from_millis(10) && g.wait <= GUARD_MAX, "{:?}", g.wait);
+        // Writing fast enough that the next reading would be past it: trips now.
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(g.read(995), "5 pages away at tens of thousands a second");
+        let mut g = Guard { last: None, ..g };
+        assert!(g.read(1000), "at the guard");
+    }
+
     #[test]
     fn reshare_lists_every_marked_page_inside_its_region() {
-        let bg = Background {
-            shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
-        };
+        let bg = Background::detached();
         let regions = [
             Region { addr: 0x1000_0000, len: 3 * 4096 },
             Region { addr: 0x2000_0000, len: 70 * 4096 },

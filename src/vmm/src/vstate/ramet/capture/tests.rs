@@ -1121,12 +1121,19 @@ fn track_and_refresh_frames_numbers_and_bodies() {
         protocol::parse_track(&vec![0; len]).unwrap_err();
     }
     validate_command(MsgType::Refresh, 0, 0).unwrap();
-    validate_command(MsgType::Refresh, 8, 0).unwrap();
+    validate_command(MsgType::Refresh, 16, 0).unwrap();
     validate_command(MsgType::Refresh, 0, 1).unwrap_err();
-    validate_command(MsgType::Refresh, 4, 0).unwrap_err();
-    assert_eq!(protocol::parse_refresh_budget(&[]).unwrap(), 0);
-    assert_eq!(protocol::parse_refresh_budget(&9u64.to_le_bytes()).unwrap(), 9);
-    protocol::parse_refresh_budget(&[0; 4]).unwrap_err();
+    validate_command(MsgType::Refresh, 8, 0).unwrap_err();
+    assert_eq!(protocol::parse_refresh(&[]).unwrap(), RefreshBound::default());
+    let mut bound = 9u64.to_le_bytes().to_vec();
+    bound.extend_from_slice(&1u64.to_le_bytes());
+    assert_eq!(
+        protocol::parse_refresh(&bound).unwrap(),
+        RefreshBound { pages: 9, old_chain_counts: true }
+    );
+    bound[8] = 2;
+    protocol::parse_refresh(&bound).unwrap_err();
+    protocol::parse_refresh(&[0; 8]).unwrap_err();
     // Replies are commands only Firecracker sends.
     validate_command(MsgType::Tracked, 40, 0).unwrap_err();
     validate_command(MsgType::Refreshed, 32, 1).unwrap_err();
@@ -1170,15 +1177,16 @@ fn track_and_refresh_frames_numbers_and_bodies() {
         nr_zero_runs: 4,
         folded_pages: 7,
         ..Default::default()
-    }, 8, 9, 10);
-    assert_eq!(body.len(), 56);
+    }, Paused { total: Duration::from_micros(8), waited: Duration::from_micros(11) }, 9, 10);
+    assert_eq!(body.len(), 64);
     assert_eq!(body[..8], 5u64.to_le_bytes());
     assert_eq!(body[8..16], 6u64.to_le_bytes());
     assert_eq!(body[16..24], [3, 0, 0, 0, 4, 0, 0, 0]);
     assert_eq!(body[24..32], 7u64.to_le_bytes());
     assert_eq!(body[32..40], 8u64.to_le_bytes());
     assert_eq!(body[40..48], 9u64.to_le_bytes());
-    assert_eq!(body[48..], 10u64.to_le_bytes());
+    assert_eq!(body[48..56], 10u64.to_le_bytes());
+    assert_eq!(body[56..], 11u64.to_le_bytes());
 }
 
 #[test]

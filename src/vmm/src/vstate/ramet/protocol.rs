@@ -112,14 +112,18 @@ pub enum MsgType {
     /// An fpmv4 kernel counts it (MV_IOC_TRACK_INFO2); an older one is counted by residency.
     Tracked = 29,
     /// Pagemaster asks for the standing version to be refreshed while the guest runs. The body
-    /// is empty or one LE u64 budget: the pages the guest may dirty while the refresh flattens
-    /// before its vCPUs pause until the rebase (empty or zero: never pause).
+    /// is empty, or LE u64 bound pages and u64 flags: from then on the guest's vCPUs pause
+    /// whenever the standing version would keep more than the bound beyond the guest's own
+    /// pages, until the next refresh. Flag bit 0: the chain this refresh replaces is the
+    /// standing version's, so what was dirty before the fold counts until the rebase. A
+    /// capture or an untrack disarms the guard; empty or zero bound pages arms none.
     Refresh = 30,
     /// Firecracker returns the new standing version, a flat copy of the fold, as the one
     /// descriptor, and the fold's counts: LE u64 own pages, u64 new pages, u32 depth,
-    /// u32 zero runs, u64 folded pages, u64 microseconds the guest was paused for it, u64 dirty
-    /// pages before the fold and u64 dirty pages after the rebase (u64::MAX when unread): their
-    /// sum bounds what the old chain held beyond the guest's own pages.
+    /// u32 zero runs, u64 folded pages, u64 microseconds the guard held the guest paused since
+    /// the last report, u64 dirty pages before the fold and u64 dirty pages after the rebase
+    /// (u64::MAX when unread), whose sum bounds what the old chain held beyond the guest's own
+    /// pages, and u64 microseconds of the pause that came before this refresh started.
     Refreshed = 31,
     /// Pagemaster hands over a flat version it made with FLATTEN of the standing version, after a
     /// transient capture published, and asks for the tracker to stand on it instead. No body, one
@@ -630,12 +634,32 @@ pub fn parse_track(body: &[u8]) -> Result<(u64, u64), ChannelError> {
     }
 }
 
-/// Parses a Refresh request: empty for no budget, or one LE u64: the pages the guest may dirty
-/// while the refresh flattens before its vCPUs pause until the rebase.
-pub fn parse_refresh_budget(body: &[u8]) -> Result<u64, ChannelError> {
+/// The standing bound a Refresh arms: the most pages the standing version may keep beyond the
+/// guest's own, zero for none, and whether the chain the refresh replaces is the standing
+/// version's to count (not a published generation's, which its charge covers).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshBound {
+    /// The bound in pages; zero arms no guard.
+    pub pages: u64,
+    /// The pages dirty before the fold count against the bound until the rebase.
+    pub old_chain_counts: bool,
+}
+
+/// Parses a Refresh request: empty for no bound, or LE u64 bound pages and u64 flags (bit 0: the
+/// old chain counts).
+pub fn parse_refresh(body: &[u8]) -> Result<RefreshBound, ChannelError> {
     match body.len() {
-        0 => Ok(0),
-        8 => Ok(u64::from_le_bytes(body.try_into().unwrap())),
+        0 => Ok(RefreshBound::default()),
+        16 => {
+            let flags = u64::from_le_bytes(body[8..].try_into().unwrap());
+            if flags & !1 != 0 {
+                return Err(ChannelError::Malformed);
+            }
+            Ok(RefreshBound {
+                pages: u64::from_le_bytes(body[..8].try_into().unwrap()),
+                old_chain_counts: flags & 1 != 0,
+            })
+        }
         _ => Err(ChannelError::Malformed),
     }
 }

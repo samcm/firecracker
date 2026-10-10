@@ -15,8 +15,8 @@ use super::backend::{
     BackendState, MemoryChannel, VMSTATE_CAPACITY_BYTES, set_capture_buffers_armed,
     validate_buffer_fd, validate_clone_destination,
 };
-use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType};
-use super::background::Background;
+use super::protocol::{self, ChannelError, ErrorCode, Incoming, MsgType, RefreshBound};
+use super::background::{Background, Paused};
 use super::{dispatch, memversion};
 use crate::Vmm;
 use crate::logger::{IncMetric, METRICS, error, info};
@@ -269,7 +269,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Resume => (&[4], &[0]),
         MsgType::FreeSummary => (&[8], &[1]),
         MsgType::Track => (&[0, 8, 16], &[1, 2]),
-        MsgType::Refresh => (&[0, 8], &[0]),
+        MsgType::Refresh => (&[0, 16], &[0]),
         MsgType::Untrack => (&[0], &[0]),
         MsgType::Rearm => (&[0], &[1]),
         _ => return Err(ChannelError::Malformed),
@@ -296,7 +296,7 @@ pub struct CaptureService {
     /// The last version a tracked capture or refresh produced, which the kernel's tracker
     /// also holds; kept to flatten it at the depth bound.
     standing: Option<Arc<OwnedFd>>,
-    /// Re-shares the pages a live fold refused and watches a refresh's flatten; a capture
+    /// Re-shares the pages a live fold refused and guards the standing bound; a capture
     /// fences it as a guest-memory writer.
     background: Background,
 }
@@ -378,16 +378,23 @@ fn encode_free_summary_done(pages: u64, included: u64, standing_id: u64) -> Vec<
 }
 
 /// The `refreshed` reply body.
-fn encode_refreshed(info: &memversion::Info2, paused_us: u64, before: u64, after: u64) -> Vec<u8> {
-    let mut body = Vec::with_capacity(56);
+fn encode_refreshed(
+    info: &memversion::Info2,
+    paused: Paused,
+    before: u64,
+    after: u64,
+) -> Vec<u8> {
+    let us = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+    let mut body = Vec::with_capacity(64);
     body.extend_from_slice(&info.own_pages.to_le_bytes());
     body.extend_from_slice(&info.new_pages.to_le_bytes());
     body.extend_from_slice(&info.depth.to_le_bytes());
     body.extend_from_slice(&info.nr_zero_runs.to_le_bytes());
     body.extend_from_slice(&info.folded_pages.to_le_bytes());
-    body.extend_from_slice(&paused_us.to_le_bytes());
+    body.extend_from_slice(&us(paused.total).to_le_bytes());
     body.extend_from_slice(&before.to_le_bytes());
     body.extend_from_slice(&after.to_le_bytes());
+    body.extend_from_slice(&us(paused.waited).to_le_bytes());
     body
 }
 
@@ -484,7 +491,7 @@ impl CaptureService {
             MsgType::Resume => self.resume(request_id, protocol::parse_u32(&incoming.body)?),
             MsgType::FreeSummary => self.free_summary(incoming),
             MsgType::Track => self.track(incoming),
-            MsgType::Refresh => self.refresh(request_id, protocol::parse_refresh_budget(&incoming.body)?),
+            MsgType::Refresh => self.refresh(request_id, protocol::parse_refresh(&incoming.body)?),
             MsgType::Untrack => self.untrack(request_id),
             MsgType::Rearm => self.rearm(incoming),
             _ => Err(ChannelError::Malformed),
@@ -670,7 +677,7 @@ impl CaptureService {
     /// The result is a base for the next fork's fold, never a capture: a running guest has no
     /// consistent instant. Optional: a refusal leaves the guest running and the next fork
     /// folds more.
-    fn refresh(&mut self, request_id: u64, budget: u64) -> Result<(), ChannelError> {
+    fn refresh(&mut self, request_id: u64, bound: RefreshBound) -> Result<(), ChannelError> {
         let Some(tracker) = self.tracker.as_ref() else {
             return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
         };
@@ -705,26 +712,26 @@ impl CaptureService {
                 // The tracker then stands on a flat copy of the fold, so the chain it keeps is
                 // one level: what it retains beyond the guest's own pages is only what the guest
                 // writes from here on, which the next refresh bounds. A flatten or rebase that
-                // fails leaves the tracker on the fold, which is still exact. While it flattens,
-                // the guest's writes copy pages the old chain keeps: past the budget, the watch
-                // pauses the vCPUs until the rebase lets the old chain go.
-                let base = memversion::track_info(tracker.as_fd())
-                    .map(|t| t.dirty_pages)
-                    .ok();
-                let watching = budget > 0 && base.is_some();
-                if let (true, Some(base)) = (watching, base) {
+                // fails leaves the tracker on the fold, which is still exact. The fold restarted
+                // the dirty count; until the rebase lets the old chain go, it keeps what was dirty
+                // before the fold too, so the guard leaves the guest only the rest of the bound.
+                if bound.pages > 0 {
+                    let held = if bound.old_chain_counts && before != u64::MAX {
+                        before
+                    } else {
+                        0
+                    };
                     self.background
-                        .start_watch(tracker.as_raw_fd(), base, budget);
+                        .guard(tracker, bound.pages.saturating_sub(held));
                 }
                 let flattened = memversion::flatten(folded.as_fd()).and_then(|flat| {
                     memversion::rebase(tracker.as_fd(), flat.as_fd())?;
                     Ok(flat)
                 });
-                let paused = if watching {
-                    self.background.end_watch()
-                } else {
-                    Duration::ZERO
-                };
+                if bound.pages > 0 && flattened.is_ok() {
+                    self.background.guard(tracker, bound.pages);
+                }
+                let paused = self.background.release(started);
                 let after = memversion::track_info(tracker.as_fd()).map_or(u64::MAX, |t| t.dirty_pages);
                 let version = match flattened {
                     Ok(flat) => flat,
@@ -744,11 +751,10 @@ impl CaptureService {
                 );
                 let version = Arc::new(version);
                 self.standing = Some(version.clone());
-                let paused_us = u64::try_from(paused.as_micros()).unwrap_or(u64::MAX);
                 let answered = self.answer_with_version(
                     request_id,
                     MsgType::Refreshed,
-                    encode_refreshed(&info, paused_us, before, after),
+                    encode_refreshed(&info, paused, before, after),
                     Some(version),
                 );
                 // What the source still maps alone is what the fold refused and what the
@@ -763,6 +769,9 @@ impl CaptureService {
             }
             Err(err) => {
                 error!("Ramet could not refresh the standing version: {err}");
+                // The guard waited for this refresh: the guest runs again, and the next refresh
+                // reports the pause and arms the guard anew.
+                self.background.disarm();
                 self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh)
             }
         }
@@ -777,6 +786,8 @@ impl CaptureService {
             return self.reject(request_id, ErrorCode::UntrackFailed, MsgType::Untrack);
         }
         if let Some(tracker) = self.tracker.as_ref() {
+            // The guard reads this tracker: it goes first.
+            self.background.disarm();
             if let Err(err) = memversion::untrack(tracker.as_fd()) {
                 error!("Ramet could not untrack guest memory: {err}");
                 return self.reject(request_id, ErrorCode::UntrackFailed, MsgType::Untrack);
@@ -858,6 +869,9 @@ impl CaptureService {
         // Each stage's end, in microseconds from the quiesce request, for one timing line.
         let started = Instant::now();
         let at = || u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        // The capture's fold ends what the standing guard bounds, and the guest it paused
+        // pauses again below; the next refresh arms it anew and reports its pause.
+        self.background.disarm();
         // Wait for in-flight handlers before taking the VMM lock they may need.
         dispatch::gate().close();
         let gate_us = at();
