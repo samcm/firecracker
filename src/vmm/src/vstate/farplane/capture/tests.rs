@@ -200,13 +200,20 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
             log,
             clone_us: 1,
             extents,
+            remainder: None,
         })
     };
     let wholes = std::cell::Cell::new(0);
     let never = |_, _| -> io::Result<()> { panic!("caught up") };
+    #[allow(clippy::unnecessary_wraps)]
+    fn no_rest_fn(_: u64, _: u64) -> io::Result<u64> {
+        panic!("no remainder")
+    }
     // No pre-clone: the whole clone, as before.
-    let (_, how) =
-        finish_scratch_clone_with(scratch.as_raw_fd(), None, never, || whole(&wholes)).unwrap();
+    let (_, how) = finish_scratch_clone_with(scratch.as_raw_fd(), None, no_rest_fn, never, || {
+        whole(&wholes)
+    })
+    .unwrap();
     assert_eq!((how, wholes.get()), (ScratchCloneHow::Whole, 1));
     // Two ranges are within 0.3 per extent of a 7-extent file: caught up, the range past the
     // last full block cut at the file's end.
@@ -214,6 +221,7 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
     let (_, how) = finish_scratch_clone_with(
         scratch.as_raw_fd(),
         pre_clone(7, &[(0, 1), (10 * 4096 + 50, 10)]),
+        no_rest_fn,
         |offset, len| {
             ranges.push((offset, len));
             Ok(())
@@ -226,7 +234,8 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
         ScratchCloneHow::CaughtUp {
             ranges: 2,
             extents: 7,
-            pre_clone_us: 1
+            pre_clone_us: 1,
+            remainder_extents: 0,
         }
     );
     assert_eq!(ranges, [(0, 4096), (10 * 4096, 100)]);
@@ -234,6 +243,7 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
     let (_, how) = finish_scratch_clone_with(
         scratch.as_raw_fd(),
         pre_clone(6, &[(0, 1), (10 * 4096 + 50, 10)]),
+        no_rest_fn,
         never,
         || whole(&wholes),
     )
@@ -259,6 +269,7 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
                 (8 * 4096, 1),
             ],
         ),
+        no_rest_fn,
         never,
         || whole(&wholes),
     )
@@ -283,7 +294,9 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
             log,
             clone_us: 1,
             extents: u64::MAX / 10,
+            remainder: None,
         }),
+        no_rest_fn,
         never,
         || whole(&wholes),
     )
@@ -296,6 +309,7 @@ fn a_freeze_catches_a_pre_clone_up_only_when_that_costs_less_than_a_whole_clone(
     finish_scratch_clone_with(
         scratch.as_raw_fd(),
         pre_clone(1 << 20, &[(0, 1)]),
+        no_rest_fn,
         |_, _| Err(io::Error::from_raw_os_error(libc::EIO)),
         || panic!("cloned whole"),
     )
@@ -595,6 +609,7 @@ fn a_caught_up_pre_clone_equals_a_whole_clone_at_the_freeze() {
         log,
         clone_us,
         extents,
+        remainder: None,
     });
     let (_, how) =
         finish_scratch_clone(destination.as_raw_fd(), live.as_raw_fd(), pre_cloned).unwrap();
@@ -1622,14 +1637,15 @@ fn disarm_frames_numbers_and_bodies() {
     validate_command(MsgType::Stand, 1, 1).unwrap_err();
     validate_command(MsgType::Standing, 0, 0).unwrap_err();
     // The armed reply names the pre-clone, or u64::MAX extents for none.
-    let body = encode_capture_buffers_armed(Some((3224, 147_939, 11_402)), 2_345);
+    let body = encode_capture_buffers_armed(Some((3224, 147_939, 11_402)), 2_345, 777);
     assert_eq!(body[..8], 3224u64.to_le_bytes());
     assert_eq!(body[8..16], 147_939u64.to_le_bytes());
     assert_eq!(body[16..24], 11_402u64.to_le_bytes());
-    assert_eq!(body[24..], 2_345u64.to_le_bytes());
-    let none = encode_capture_buffers_armed(None, 0);
+    assert_eq!(body[24..32], 2_345u64.to_le_bytes());
+    assert_eq!(body[32..], 777u64.to_le_bytes());
+    let none = encode_capture_buffers_armed(None, 0, 0);
     assert_eq!(none[..8], u64::MAX.to_le_bytes());
-    assert_eq!(none[8..], [0; 24]);
+    assert_eq!(none[8..], [0; 32]);
 }
 
 /// A disarm drops an armed capture that was never quiesced and is refused, holding everything,
@@ -1678,6 +1694,7 @@ fn disarm_drops_only_an_armed_capture_outside_a_quiesce() {
                 log,
                 clone_us: 1,
                 extents: 1,
+                remainder: None,
             }),
             adopted: None,
         })

@@ -45,6 +45,9 @@ struct PreClone {
     clone_us: u64,
     /// The scratch disk's extent count at the pre-clone, which a whole clone's cost follows.
     extents: u64,
+    /// Where an unfinished standing clone stopped when the capture adopted it, and the disk size
+    /// it was cloning to: the freeze clones the rest before it catches up.
+    remainder: Option<(u64, u64)>,
 }
 
 /// A standing scratch clone: a funded destination Firecracker keeps equal to the scratch disk
@@ -81,7 +84,14 @@ enum StandingPhase {
 struct Adopted {
     inode: (u64, u64),
     clone: ChunkedClone,
+    /// When the standing clone started, for an unfinished one a disarm hands back.
+    started_us: u64,
 }
+
+/// An arm finding more than this many extents still to clone leaves them to the freeze rather
+/// than waiting: a back-to-back fork then pays the remainder inside the freeze, at most what a
+/// whole clone there costs, instead of a wait that widens the window its charge must cover.
+const STANDING_WAIT_MAX_EXTENTS: u64 = PRE_CLONE_CHUNK_EXTENTS as u64;
 
 /// Ranges or bytes the log may hold before a background catch-up applies them.
 const STANDING_CATCH_UP_RANGES: usize = 256;
@@ -452,15 +462,20 @@ fn sample_tracked(
 }
 
 /// The `capture_buffers_armed` body, LE u64 each: the adopted standing clone's extent count, its
-/// clone duration and its longest chunk in microseconds, then how long the arm waited for the
-/// standing clone to finish. Without one, extents u64::MAX and zeros: the freeze clones whole.
-fn encode_capture_buffers_armed(pre_clone: Option<(u64, u64, u64)>, wait_us: u64) -> [u8; 32] {
+/// clone duration and its longest chunk in microseconds, how long the arm waited for it, and the
+/// extents it left to the freeze. Without one, extents u64::MAX and zeros: the freeze clones whole.
+fn encode_capture_buffers_armed(
+    pre_clone: Option<(u64, u64, u64)>,
+    wait_us: u64,
+    remainder_extents: u64,
+) -> [u8; 40] {
     let (extents, clone_us, longest_us) = pre_clone.unwrap_or((u64::MAX, 0, 0));
-    let mut body = [0; 32];
+    let mut body = [0; 40];
     body[..8].copy_from_slice(&extents.to_le_bytes());
     body[8..16].copy_from_slice(&clone_us.to_le_bytes());
     body[16..24].copy_from_slice(&longest_us.to_le_bytes());
-    body[24..].copy_from_slice(&wait_us.to_le_bytes());
+    body[24..32].copy_from_slice(&wait_us.to_le_bytes());
+    body[32..].copy_from_slice(&remainder_extents.to_le_bytes());
     body
 }
 
@@ -892,21 +907,21 @@ impl CaptureService {
         let wanted = disk_clone
             .as_ref()
             .and_then(|d| inode_of(d.as_raw_fd()).ok());
-        let (pre_cloned, adopted, wait_us) = match self.stood.take() {
+        let (pre_cloned, adopted, wait_us, left) = match self.stood.take() {
             Some(stood) if Some(stood.inode) == wanted => match self.adopt(stood) {
-                Ok((dest, pre, adopted, wait_us)) => {
+                Ok((dest, pre, adopted, wait_us, left)) => {
                     disk_clone = Some(dest);
-                    (Some(pre), Some(adopted), wait_us)
+                    (Some(pre), Some(adopted), wait_us, left)
                 }
                 Err(err) => {
                     error!("Farplane could not adopt the standing scratch clone: {err}");
                     self.stop_write_log();
-                    (None, None, 0)
+                    (None, None, 0, 0)
                 }
             },
             _ => {
                 self.stop_write_log();
-                (None, None, 0)
+                (None, None, 0, 0)
             }
         };
         let body = encode_capture_buffers_armed(
@@ -914,6 +929,7 @@ impl CaptureService {
                 .as_ref()
                 .map(|a| (a.clone.extents, a.clone.clone_us, a.clone.longest_chunk_us)),
             wait_us,
+            left,
         );
         self.buffers = Some(CaptureBuffers {
             vmstate: File::from(vmstate),
@@ -925,7 +941,10 @@ impl CaptureService {
         self.reply(request_id, MsgType::CaptureBuffersArmed, &body)
     }
 
-    fn adopt(&mut self, stood: StandingDisk) -> Result<(File, PreClone, Adopted, u64), io::Error> {
+    fn adopt(
+        &mut self,
+        stood: StandingDisk,
+    ) -> Result<(File, PreClone, Adopted, u64, u64), io::Error> {
         let scratch = self
             .scratch_descriptor()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
@@ -1046,14 +1065,24 @@ impl CaptureService {
             && let (Some(adopted), Some(dest), Some(pre)) =
                 (buffers.adopted, buffers.disk_clone, buffers.pre_cloned)
         {
+            let phase = match pre.remainder {
+                // An unfinished walk resumes where the arm left it.
+                Some((next, size)) => StandingPhase::Cloning {
+                    next,
+                    size,
+                    done: adopted.clone,
+                    started_us: adopted.started_us,
+                },
+                None => StandingPhase::Ready {
+                    clone: adopted.clone,
+                    pending: Vec::new(),
+                },
+            };
             self.stood = Some(StandingDisk {
                 dest,
                 inode: adopted.inode,
                 log: pre.log,
-                phase: StandingPhase::Ready {
-                    clone: adopted.clone,
-                    pending: Vec::new(),
-                },
+                phase,
             });
         }
         if drop_standing {
@@ -1450,6 +1479,8 @@ enum ScratchCloneHow {
         ranges: usize,
         extents: u64,
         pre_clone_us: u64,
+        /// Extents of an unfinished standing clone's remainder cloned in the freeze.
+        remainder_extents: u64,
     },
 }
 
@@ -1469,9 +1500,10 @@ impl std::fmt::Display for ScratchCloneHow {
                 ranges,
                 extents,
                 pre_clone_us,
+                remainder_extents,
             } => write!(
                 f,
-                "caught up; ranges={ranges} extents={extents} pre_clone_us={pre_clone_us}"
+                "caught up; ranges={ranges} extents={extents} pre_clone_us={pre_clone_us} remainder_extents={remainder_extents}"
             ),
         }
     }
@@ -1487,6 +1519,21 @@ fn finish_scratch_clone(
     finish_scratch_clone_with(
         scratch,
         pre_cloned,
+        |next, size| {
+            let mut done = ChunkedClone::default();
+            let mut at = next;
+            while at < size {
+                at = clone_chunk_step(
+                    at,
+                    size,
+                    PRE_CLONE_CHUNK_EXTENTS,
+                    &mut |from, want| extents_from(scratch, from, want),
+                    &mut |offset, len| clone_scratch_range(destination, scratch, offset, len),
+                    &mut done,
+                )?;
+            }
+            Ok(done.extents)
+        },
         |offset, len| clone_scratch_range(destination, scratch, offset, len),
         || clone_scratch(destination, scratch),
     )
@@ -1495,6 +1542,7 @@ fn finish_scratch_clone(
 fn finish_scratch_clone_with(
     scratch: RawFd,
     pre_cloned: Option<PreClone>,
+    clone_rest: impl FnOnce(u64, u64) -> Result<u64, io::Error>,
     mut clone_range: impl FnMut(u64, u64) -> Result<(), io::Error>,
     clone_whole: impl FnOnce() -> Result<u64, io::Error>,
 ) -> Result<(u64, ScratchCloneHow), io::Error> {
@@ -1502,6 +1550,7 @@ fn finish_scratch_clone_with(
         log,
         clone_us,
         extents,
+        remainder,
     }) = pre_cloned
     else {
         return Ok((clone_whole()?, ScratchCloneHow::Whole));
@@ -1526,6 +1575,12 @@ fn finish_scratch_clone_with(
         return Err(io::Error::last_os_error());
     }
     let size = u64::try_from(stat.st_size).map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+    // The writers are drained, so the remainder an unfinished standing clone left is cloned as it
+    // stands; logged ranges inside it are cloned again below, harmlessly.
+    let remainder_extents = match remainder {
+        Some((next, _)) if next < size => clone_rest(next, size)?,
+        _ => 0,
+    };
     for (start, end) in written.ranges {
         // A range widened past the file's last block ends at the file's end, which
         // FICLONERANGE accepts unaligned.
@@ -1541,6 +1596,7 @@ fn finish_scratch_clone_with(
             ranges,
             extents,
             pre_clone_us: clone_us,
+            remainder_extents,
         },
     ))
 }
@@ -1641,34 +1697,80 @@ fn advance_standing(stood: &mut StandingDisk, scratch: RawFd) -> Result<(), io::
     Ok(())
 }
 
-/// Takes a standing clone into a capture: an unfinished background clone finishes its remaining
-/// chunks first (the wait the reply reports), and ranges swapped out for a background catch-up
-/// go back into the log, so the freeze catches up everything written since the clone.
+/// Takes a standing clone into a capture. An unfinished clone with at most
+/// `STANDING_WAIT_MAX_EXTENTS` extents left finishes now (the wait the reply reports); with more
+/// left, the freeze clones the remainder. Ranges swapped out for a background catch-up go back
+/// into the log, so the freeze catches up everything written since the clone. Returns the
+/// destination, the pre-clone, what a disarm needs to hand it back, the wait and the extents left
+/// to the freeze.
 fn adopt_standing(
     mut stood: StandingDisk,
     scratch: RawFd,
-) -> Result<(File, PreClone, Adopted, u64), io::Error> {
+) -> Result<(File, PreClone, Adopted, u64, u64), io::Error> {
     let started = get_time_us(ClockType::Monotonic);
-    while matches!(stood.phase, StandingPhase::Cloning { .. }) {
-        advance_standing(&mut stood, scratch)?;
+    let mut remainder = None;
+    let mut left = 0;
+    if let StandingPhase::Cloning { next, size, .. } = &stood.phase {
+        let count = extents_count_from(scratch, *next)?;
+        if count > STANDING_WAIT_MAX_EXTENTS {
+            remainder = Some((*next, *size));
+            left = count;
+        }
     }
-    let StandingPhase::Ready { clone, pending } = stood.phase else {
-        unreachable!("the loop above leaves the clone ready")
+    if remainder.is_none() {
+        while matches!(stood.phase, StandingPhase::Cloning { .. }) {
+            advance_standing(&mut stood, scratch)?;
+        }
+    }
+    let (clone, started_us) = match stood.phase {
+        StandingPhase::Ready { clone, pending } => {
+            for (start, end) in pending {
+                stood.log.record(start, end - start);
+            }
+            (clone, 0)
+        }
+        StandingPhase::Cloning {
+            done, started_us, ..
+        } => (done, started_us),
     };
-    for (start, end) in pending {
-        stood.log.record(start, end - start);
-    }
     let wait_us = get_time_us(ClockType::Monotonic) - started;
     let pre = PreClone {
         log: stood.log,
         clone_us: clone.clone_us,
         extents: clone.extents,
+        remainder,
     };
     let adopted = Adopted {
         inode: stood.inode,
         clone,
+        started_us,
     };
-    Ok((stood.dest, pre, adopted, wait_us))
+    Ok((stood.dest, pre, adopted, wait_us, left))
+}
+
+/// The extent count of `file` from `from` to its end, by a count-only FIEMAP.
+fn extents_count_from(file: RawFd, from: u64) -> Result<u64, io::Error> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Fiemap {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped_extents: u32,
+        extent_count: u32,
+        reserved: u32,
+    }
+    const FS_IOC_FIEMAP: libc::Ioctl = libc::_IOWR::<Fiemap>(b'f' as u32, 11);
+    let mut request = Fiemap {
+        start: from,
+        length: u64::MAX - from,
+        ..Default::default()
+    };
+    // SAFETY: with extent_count 0 the kernel writes only mapped_extents into the live request.
+    if unsafe { libc::ioctl(file, FS_IOC_FIEMAP, &mut request) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(request.mapped_extents))
 }
 
 /// The chunk walk of a standing clone, whole. `extents_from(from, n)` names the logical
