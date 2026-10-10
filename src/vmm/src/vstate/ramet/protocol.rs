@@ -116,7 +116,9 @@ pub enum MsgType {
     /// whenever the standing version would keep more than the bound beyond the guest's own
     /// pages, until the next refresh. Flag bit 0: the chain this refresh replaces is the
     /// standing version's, so what was dirty before the fold counts until the rebase. A
-    /// capture or an untrack disarms the guard; empty or zero bound pages arms none.
+    /// capture or an untrack disarms the guard; empty or zero bound pages arms none. An
+    /// optional descriptor is an eventfd the guard signals each time it pauses the guest, so
+    /// memory plane starts the refresh that releases it at once.
     Refresh = 30,
     /// Firecracker returns the new standing version, a flat copy of the fold, as the one
     /// descriptor, and the fold's counts: LE u64 own pages, u64 new pages, u32 depth,

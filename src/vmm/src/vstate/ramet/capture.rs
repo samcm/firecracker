@@ -269,7 +269,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Resume => (&[4], &[0]),
         MsgType::FreeSummary => (&[8], &[1]),
         MsgType::Track => (&[0, 8, 16], &[1, 2]),
-        MsgType::Refresh => (&[0, 16], &[0]),
+        MsgType::Refresh => (&[0, 16], &[0, 1]),
         MsgType::Untrack => (&[0], &[0]),
         MsgType::Rearm => (&[0], &[1]),
         _ => return Err(ChannelError::Malformed),
@@ -491,7 +491,10 @@ impl CaptureService {
             MsgType::Resume => self.resume(request_id, protocol::parse_u32(&incoming.body)?),
             MsgType::FreeSummary => self.free_summary(incoming),
             MsgType::Track => self.track(incoming),
-            MsgType::Refresh => self.refresh(request_id, protocol::parse_refresh(&incoming.body)?),
+            MsgType::Refresh => {
+                let bound = protocol::parse_refresh(&incoming.body)?;
+                self.refresh(request_id, bound, incoming.fds.into_iter().next())
+            }
             MsgType::Untrack => self.untrack(request_id),
             MsgType::Rearm => self.rearm(incoming),
             _ => Err(ChannelError::Malformed),
@@ -677,7 +680,15 @@ impl CaptureService {
     /// The result is a base for the next fork's fold, never a capture: a running guest has no
     /// consistent instant. Optional: a refusal leaves the guest running and the next fork
     /// folds more.
-    fn refresh(&mut self, request_id: u64, bound: RefreshBound) -> Result<(), ChannelError> {
+    fn refresh(
+        &mut self,
+        request_id: u64,
+        bound: RefreshBound,
+        wake: Option<OwnedFd>,
+    ) -> Result<(), ChannelError> {
+        if let Some(wake) = wake {
+            self.background.wake_with(wake);
+        }
         let Some(tracker) = self.tracker.as_ref() else {
             return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
         };

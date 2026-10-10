@@ -1122,7 +1122,8 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     }
     validate_command(MsgType::Refresh, 0, 0).unwrap();
     validate_command(MsgType::Refresh, 16, 0).unwrap();
-    validate_command(MsgType::Refresh, 0, 1).unwrap_err();
+    validate_command(MsgType::Refresh, 16, 1).unwrap();
+    validate_command(MsgType::Refresh, 16, 2).unwrap_err();
     validate_command(MsgType::Refresh, 8, 0).unwrap_err();
     assert_eq!(protocol::parse_refresh(&[]).unwrap(), RefreshBound::default());
     let mut bound = 9u64.to_le_bytes().to_vec();

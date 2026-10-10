@@ -22,7 +22,9 @@
 //! pauses the vCPUs until the next refresh's rebase lets the old copies go. Memory plane starts
 //! refreshes early enough that this is rare; the guard is what makes the bound hard.
 
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -70,6 +72,9 @@ struct State {
     paused_at: Option<Instant>,
     /// Guard pauses another path ended (a capture or untrack), not yet reported.
     unreported: Duration,
+    /// Memory plane's eventfd, signalled when the guard pauses the guest, so its refresh
+    /// starts at once instead of at its next reading of the counter.
+    wake: Option<File>,
 }
 
 /// How long the guard held a guest paused, and how much of it came before a refresh started.
@@ -190,6 +195,11 @@ impl Background {
         state.guarding = false;
         if paused {
             state.paused_at = Some(Instant::now());
+            if let Some(wake) = state.wake.as_mut()
+                && let Err(err) = wake.write_all(&1u64.to_ne_bytes())
+            {
+                error!("Ramet could not wake memory plane at the standing bound: {err}");
+            }
         }
         cvar.notify_all();
     }
@@ -232,6 +242,12 @@ impl Background {
                 started.elapsed().as_micros()
             );
         }
+    }
+
+    /// Replaces the eventfd the guard signals when it pauses the guest.
+    pub(crate) fn wake_with(&self, wake: OwnedFd) {
+        let (lock, _) = &*self.shared;
+        lock.lock().expect("Poisoned lock").wake = Some(File::from(wake));
     }
 
     /// Arms the guard, or moves it: pause the guest once `tracker` counts `at` dirty pages. A
