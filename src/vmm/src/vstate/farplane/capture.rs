@@ -558,7 +558,7 @@ impl CaptureService {
         self.serve(incoming)
     }
 
-    fn serve(&mut self, incoming: Incoming) -> Result<(), ChannelError> {
+    fn serve(&mut self, mut incoming: Incoming) -> Result<(), ChannelError> {
         let request_id = incoming.header.request_id;
         if request_id == 0 {
             return Err(ChannelError::Malformed);
@@ -569,9 +569,13 @@ impl CaptureService {
         match self.replies.disposition(request_id, &command) {
             FrameDisposition::Serve => self.replies.acknowledge_before(request_id),
             FrameDisposition::Replay(msg, body, version) => {
+                // A frame answered without being served closes what it carried before the
+                // answer goes out: a reply proves Firecracker holds no descriptor it delivered.
+                drop(std::mem::take(&mut incoming.fds));
                 return send_reply(&self.channel.sock, msg, request_id, &body, version.as_ref());
             }
             FrameDisposition::ReplayUnavailable => {
+                drop(std::mem::take(&mut incoming.fds));
                 return protocol::send_frame(
                     &self.channel.sock,
                     MsgType::Error,
@@ -581,6 +585,7 @@ impl CaptureService {
                 );
             }
             FrameDisposition::Reused => {
+                drop(std::mem::take(&mut incoming.fds));
                 return protocol::send_frame(
                     &self.channel.sock,
                     MsgType::Error,
@@ -1014,12 +1019,27 @@ impl CaptureService {
     /// Drops an armed capture that was never quiesced: its vmstate buffer and clone destination.
     /// An adopted standing clone returns to standing with its log still recording, so a
     /// readmitted capture adopts it again; body {1} drops the standing clone too and stops the
-    /// log. Refused with `not_armed` when nothing it names is held, or a capture is quiesced,
-    /// which a quiesced capture leaves only by `resume`.
+    /// log. On a ready backend with nothing it names held it is refused `not_armed`; a quiesced
+    /// capture, which it leaves only by `resume`, is refused `already_quiesced`.
     fn disarm(&mut self, request_id: u64, body: &[u8]) -> Result<(), ChannelError> {
         let drop_standing = body == [1];
+        // `not_armed` is a proof that nothing it names is held, so it answers only a ready
+        // backend: a quiesced capture still owns its buffers and is refused as such.
+        match BackendState::load() {
+            BackendState::Ready => {}
+            BackendState::Quiesced => {
+                return self.reject(request_id, ErrorCode::AlreadyQuiesced, MsgType::Disarm);
+            }
+            _ => {
+                return self.reject(
+                    request_id,
+                    ErrorCode::CaptureOrderViolation,
+                    MsgType::Disarm,
+                );
+            }
+        }
         let held = self.buffers.is_some() || (drop_standing && self.stood.is_some());
-        if BackendState::load() != BackendState::Ready || !held {
+        if !held {
             return self.reject(request_id, ErrorCode::NotArmed, MsgType::Disarm);
         }
         if let Some(buffers) = self.buffers.take()

@@ -1692,7 +1692,13 @@ fn disarm_drops_only_an_armed_capture_outside_a_quiesce() {
 
     service.buffers = armed();
     BackendState::Quiesced.store();
-    refused(disarm(&mut service, 2));
+    let reply = disarm(&mut service, 2);
+    assert_eq!(reply.header.msg(), MsgType::Error);
+    assert_eq!(
+        reply.body[..4],
+        (ErrorCode::AlreadyQuiesced as u32).to_le_bytes(),
+        "a quiesced capture's disarm must not read as nothing held"
+    );
     assert!(service.buffers.is_some());
 
     BackendState::Ready.store();
