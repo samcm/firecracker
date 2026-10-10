@@ -243,7 +243,6 @@ fn next_request_releases_answered_versions_and_a_late_retry_is_refused() {
         vec![7],
         Some(version.clone()),
     );
-    replies.record(2, plain.clone(), MsgType::Resumed, vec![], None);
     // Until a newer request arrives, the answer and its version replay exactly.
     assert_eq!(Arc::strong_count(&version), 2);
     assert!(matches!(
@@ -262,6 +261,7 @@ fn next_request_releases_answered_versions_and_a_late_retry_is_refused() {
         replies.disposition(1, &key),
         FrameDisposition::ReplayUnavailable
     ));
+    replies.record(2, plain.clone(), MsgType::Resumed, vec![], None);
     // An answer that carried no version still replays, and a reused id is still refused.
     assert!(matches!(
         replies.disposition(2, &plain),
@@ -388,7 +388,7 @@ fn a_newer_answer_releases_an_older_version_and_refuses_its_id() {
     assert!(weak.upgrade().is_none(), "an answered version outlived the next request");
     assert!(matches!(
         replies.disposition(1, &command(MsgType::WriteVmstate)),
-        FrameDisposition::Reused
+        FrameDisposition::ReplayUnavailable
     ));
     assert!(matches!(
         replies.disposition(2, &command(MsgType::Resume)),
