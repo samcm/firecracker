@@ -1179,8 +1179,8 @@ fn track_and_refresh_frames_numbers_and_bodies() {
         nr_zero_runs: 4,
         folded_pages: 7,
         ..Default::default()
-    }, Paused { total: Duration::from_micros(8), waited: Duration::from_micros(11) }, 9, 10);
-    assert_eq!(body.len(), 64);
+    }, Paused { total: Duration::from_micros(8), waited: Duration::from_micros(11) }, 9, 10, 12);
+    assert_eq!(body.len(), 72);
     assert_eq!(body[..8], 5u64.to_le_bytes());
     assert_eq!(body[8..16], 6u64.to_le_bytes());
     assert_eq!(body[16..24], [3, 0, 0, 0, 4, 0, 0, 0]);
@@ -1188,7 +1188,8 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     assert_eq!(body[32..40], 8u64.to_le_bytes());
     assert_eq!(body[40..48], 9u64.to_le_bytes());
     assert_eq!(body[48..56], 10u64.to_le_bytes());
-    assert_eq!(body[56..], 11u64.to_le_bytes());
+    assert_eq!(body[56..64], 11u64.to_le_bytes());
+    assert_eq!(body[64..], 12u64.to_le_bytes());
 }
 
 #[test]

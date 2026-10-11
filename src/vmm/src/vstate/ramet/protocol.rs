@@ -24,7 +24,7 @@ pub const MAX_SCM_FDS: usize = 253;
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
 /// the handshake and the capture command order a peer must speak.
-pub const FEATURE_IDENTITY: &str = "ramet/2";
+pub const FEATURE_IDENTITY: &str = "ramet/3";
 /// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
 /// it was captured under. It changes only when those do, so a channel change alone leaves every
 /// stored vmstate restorable.
@@ -1021,6 +1021,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "ramet/2");
+        assert_eq!(FEATURE_IDENTITY, "ramet/3");
     }
 }

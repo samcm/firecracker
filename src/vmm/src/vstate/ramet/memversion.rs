@@ -1026,22 +1026,36 @@ pub(crate) fn track_guest(
 }
 
 /// Refreshes the standing version while the guest runs: folds the pages written since it,
-/// without free-page exclusions (a running guest may write an excluded page; the next
-/// quiesced fold applies them). At the depth bound the standing version is flattened and
-/// rebased first, still without pausing anything. Returns the new standing version.
+/// leaving out `exclusions`, the pages the guest reported free and has not written since. The
+/// version reads zero there and the kernel marks them again (ABI 4), so a page the guest takes
+/// back meanwhile is folded next time, and a refresh never keeps a free page's stale bytes. At
+/// the depth bound the standing version is flattened and rebased first, still without pausing
+/// anything. Returns the new standing version and whether the exclusions were applied: a core
+/// before ABI 4 refuses a live fold with exclusions, and then every marked page is folded.
 pub(crate) fn refresh(
     device: BorrowedFd<'_>,
     regions: &[Region],
     standing: Option<BorrowedFd<'_>>,
-) -> io::Result<OwnedFd> {
-    refresh_with(
-        || create_tracked(device, regions, &[], Fold::Live),
+    exclusions: &[Exclusion],
+) -> io::Result<(OwnedFd, bool)> {
+    let mut applied = !exclusions.is_empty();
+    let version = refresh_with(
+        || {
+            if applied {
+                match create_tracked(device, regions, exclusions, Fold::Live) {
+                    Err(err) if err.raw_os_error() == Some(libc::EINVAL) => applied = false,
+                    other => return other,
+                }
+            }
+            create_tracked(device, regions, &[], Fold::Live)
+        },
         || {
             let standing = standing.ok_or_else(|| io::Error::from_raw_os_error(libc::E2BIG))?;
             let flat = flatten(standing)?;
             rebase(device, flat.as_fd())
         },
-    )
+    )?;
+    Ok((version, applied))
 }
 
 fn refresh_with(

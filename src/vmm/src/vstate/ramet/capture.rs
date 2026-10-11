@@ -386,9 +386,10 @@ fn encode_refreshed(
     paused: Paused,
     before: u64,
     after: u64,
+    excluded: u64,
 ) -> Vec<u8> {
     let us = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-    let mut body = Vec::with_capacity(64);
+    let mut body = Vec::with_capacity(72);
     body.extend_from_slice(&info.own_pages.to_le_bytes());
     body.extend_from_slice(&info.new_pages.to_le_bytes());
     body.extend_from_slice(&info.depth.to_le_bytes());
@@ -398,6 +399,7 @@ fn encode_refreshed(
     body.extend_from_slice(&before.to_le_bytes());
     body.extend_from_slice(&after.to_le_bytes());
     body.extend_from_slice(&us(paused.waited).to_le_bytes());
+    body.extend_from_slice(&excluded.to_le_bytes());
     body
 }
 
@@ -670,14 +672,18 @@ impl CaptureService {
     /// are reads; neither retires dirty evidence.
     fn included_pages(&self, tracker: BorrowedFd<'_>) -> io::Result<memversion::Included> {
         let regions = memversion::geometry(&self.channel.regions)?;
-        let exclusions = {
-            let vmm = self.vmm.lock().expect("Poisoned lock");
-            let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
-            let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
-            let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
-            memversion::exclusions(&regions, &free, &dirty)?
-        };
+        let exclusions = self.free_exclusions(&regions)?;
         memversion::included_pages(tracker, &regions, &exclusions.runs)
+    }
+
+    /// The pages the guest reported free and has not written since, from both logs read under
+    /// the VMM lock: what a CREATE leaves out.
+    fn free_exclusions(&self, regions: &[memversion::Region]) -> io::Result<memversion::Exclusions> {
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+        let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
+        let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
+        let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
+        memversion::exclusions(regions, &free, &dirty)
     }
 
     /// Folds what the guest wrote since the standing version into a new one, without a pause.
@@ -701,9 +707,22 @@ impl CaptureService {
             return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
         }
         let started = Instant::now();
-        // The pages the old chain may hold beyond the guest's own: what is dirty before the
-        // fold, and what is dirty once the rebase lets the old chain go.
-        let before = memversion::track_info(tracker.as_fd()).map_or(u64::MAX, |t| t.dirty_pages);
+        // The fold leaves out the pages the guest reported free and has not written since, and
+        // the kernel marks them again (ABI 4): their marks are no writes, and the old chain keeps
+        // nothing of them beyond the guest's own pages, so they count neither toward what it
+        // held nor toward the guard's bound.
+        let exclusions = memversion::geometry(&self.channel.regions)
+            .and_then(|regions| self.free_exclusions(&regions))
+            .map(|e| e.runs)
+            .unwrap_or_default();
+        // The pages the old chain may hold beyond the guest's own: what is written before the
+        // fold, and what is written once the rebase lets the old chain go.
+        let written = |tracker: BorrowedFd<'_>| {
+            memversion::geometry(&self.channel.regions)
+                .and_then(|regions| memversion::included_pages(tracker, &regions, &exclusions))
+                .map_or(u64::MAX, |included| included.pages())
+        };
+        let before = written(tracker.as_fd());
         // Pages un-shared since the last fold would be refused by this one and kept by the
         // standing version for another round: re-share them first, so the fold takes them.
         let reshared = memversion::geometry(&self.channel.regions)
@@ -719,11 +738,19 @@ impl CaptureService {
                     tracker.as_fd(),
                     &regions,
                     self.standing.as_ref().map(|fd| fd.as_fd()),
+                    &exclusions,
                 )
             })
-            .and_then(|version| Ok((memversion::info2(version.as_fd())?, version)));
+            .and_then(|(version, applied)| Ok((memversion::info2(version.as_fd())?, version, applied)));
         match refreshed {
-            Ok((info, folded)) => {
+            Ok((info, folded, applied)) => {
+                // Every excluded page is marked once the fold stands: the guard counts beyond them.
+                let page = crate::arch::host_page_size() as u64;
+                let excluded = if applied {
+                    exclusions.iter().map(|x| x.len / page).sum::<u64>()
+                } else {
+                    0
+                };
                 let folded_us = started.elapsed().as_micros();
                 // The tracker then stands on a flat copy of the fold, so the chain it keeps is
                 // one level: what it retains beyond the guest's own pages is only what the guest
@@ -738,17 +765,17 @@ impl CaptureService {
                         0
                     };
                     self.background
-                        .guard(tracker, bound.pages.saturating_sub(held));
+                        .guard(tracker, excluded + bound.pages.saturating_sub(held));
                 }
                 let flattened = memversion::flatten(folded.as_fd()).and_then(|flat| {
                     memversion::rebase(tracker.as_fd(), flat.as_fd())?;
                     Ok(flat)
                 });
-                // What the guest dirtied up to the rebase, while the old chain still held it;
+                // What the guest wrote up to the rebase, while the old chain still held it;
                 // pages it writes after are the new standing version's to count.
-                let after = memversion::track_info(tracker.as_fd()).map_or(u64::MAX, |t| t.dirty_pages);
+                let after = written(tracker.as_fd());
                 if bound.pages > 0 && flattened.is_ok() {
-                    self.background.guard(tracker, bound.pages);
+                    self.background.guard(tracker, excluded + bound.pages);
                 }
                 let paused = self.background.release(started);
                 let version = match flattened {
@@ -772,7 +799,7 @@ impl CaptureService {
                 let answered = self.answer_with_version(
                     request_id,
                     MsgType::Refreshed,
-                    encode_refreshed(&info, paused, before, after),
+                    encode_refreshed(&info, paused, before, after, excluded),
                     Some(version),
                 );
                 // What the source still maps alone is what the fold refused and what the
