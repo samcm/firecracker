@@ -28,7 +28,7 @@ use vmm_sys_util::terminal::Terminal;
 use crate::Vcpu;
 use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
-use crate::logger::{debug, info};
+use crate::logger::{debug, error, info};
 use crate::utils::u64_to_usize;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
@@ -600,6 +600,30 @@ impl KvmVm {
                 u64_to_usize(first * page_size),
                 u64_to_usize((last - first) * page_size),
             );
+        }
+        drop(free);
+        drop(pending);
+        // The host may drop what the guest reported free, as free page reporting allows: a
+        // discarded page reads zero again, also where a child imported it lazily (the kernel
+        // makes the range ordinary first), and the kernel marks it in the memversion tracker
+        // after the zap, so the next fold records it as zero instead of keeping its old bytes,
+        // and its memory goes back to the host. The capture's dispatch gate fences this as it
+        // fences the recording above. A refused discard leaves the pages recorded as before.
+        let bytes = u64_to_usize((last - first) * page_size);
+        match region.get_host_address(vm_memory::MemoryRegionAddress(first * page_size)) {
+            Ok(host) => {
+                // SAFETY: the range lies within this region's mapping, and the guest holds the
+                // pages isolated until the report is answered.
+                let ret = unsafe { libc::madvise(host.cast(), bytes, libc::MADV_DONTNEED_LOCKED) };
+                if ret != 0 {
+                    error!(
+                        "free page reporting: could not discard {:#x}+{bytes:#x}: {}",
+                        region_start + first * page_size,
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+            Err(err) => error!("free page reporting: no host address for a report: {err}"),
         }
         Ok(last - first)
     }
@@ -1261,6 +1285,29 @@ pub(crate) mod tests {
             set_pages(&vm.free_summary().unwrap()[0]),
             (64..192).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_report_free_gives_back_whole_groups_only() {
+        use crate::vstate::memory::Bytes;
+        let page_size = host_page_size() as u64;
+        let addr = |page: u64| GuestAddress(page * page_size);
+        let vm = setup_vm_with_memory(u64_to_usize(256 * page_size));
+        let mem = vm.guest_memory();
+        for page in [10u64, 64, 100, 191, 192] {
+            mem.write_obj(0xa5a5_a5a5_a5a5_a5a5u64 ^ page, addr(page)).unwrap();
+        }
+        assert_eq!(vm.report_free(addr(10), 190 * page_size).unwrap(), 128);
+        // The recorded groups were discarded and read zero; pages outside them keep their bytes.
+        for page in [64u64, 100, 191] {
+            assert_eq!(mem.read_obj::<u64>(addr(page)).unwrap(), 0, "page {page}");
+        }
+        for page in [10u64, 192] {
+            assert_eq!(mem.read_obj::<u64>(addr(page)).unwrap(), 0xa5a5_a5a5_a5a5_a5a5 ^ page);
+        }
+        // A reported page the guest takes back holds what it writes next.
+        mem.write_obj(0x1234_5678u64, addr(100)).unwrap();
+        assert_eq!(mem.read_obj::<u64>(addr(100)).unwrap(), 0x1234_5678);
     }
 
     #[test]
