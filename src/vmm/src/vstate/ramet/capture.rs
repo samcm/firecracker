@@ -1075,6 +1075,9 @@ impl CaptureService {
         if BackendState::load() != BackendState::Quiesced {
             return self.reject(request_id, ErrorCode::NotQuiesced, MsgType::Resume);
         }
+        // Logged before any vCPU can run again, so the line's timestamp bounds the guest's resume
+        // from below: the lab checks it falls after the plane published the capture.
+        info!("Ramet capture resume began (run_vcpus={run_vcpus})");
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
         if run_vcpus > 0
             && vmm.instance_info.state != VmState::Running
