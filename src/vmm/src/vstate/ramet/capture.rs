@@ -272,6 +272,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Refresh => (&[0, 16], &[0, 1]),
         MsgType::Untrack => (&[0], &[0]),
         MsgType::Rearm => (&[0], &[1]),
+        MsgType::RecordHotSet => (&[0, 1], &[0]),
         _ => return Err(ChannelError::Malformed),
     };
     if !lens.contains(&body_len) || !counts.contains(&fd_count) {
@@ -306,6 +307,9 @@ pub struct CaptureService {
     /// Re-shares the pages a live fold refused and guards the standing bound; a capture
     /// fences it as a guest-memory writer.
     background: Background,
+    /// The pages present when Pagemaster marked the hot set (at guest ready), which its record
+    /// keeps first: touched first, they are the bring-up.
+    hot_set_mark: Vec<u64>,
 }
 
 /// The 40-byte `tracked` reply body. An untracked reply is zero after `tracked`.
@@ -446,6 +450,7 @@ impl CaptureService {
                     standing_exclusions: Vec::new(),
                     guard_pages: 0,
                     background,
+                    hot_set_mark: Vec::new(),
                 };
                 loop {
                     if BackendState::load() == BackendState::ChannelFailed {
@@ -508,7 +513,71 @@ impl CaptureService {
             }
             MsgType::Untrack => self.untrack(request_id),
             MsgType::Rearm => self.rearm(incoming),
+            MsgType::RecordHotSet => {
+                let mark = protocol::parse_record_hot_set(&incoming.body)?;
+                self.record_hot_set(request_id, mark)
+            }
             _ => Err(ChannelError::Malformed),
+        }
+    }
+
+    /// Records the bring-up hot set: the guest pages this child touched since resume, which a
+    /// later child of the lineage prefaults. With `mark`, it only notes which pages are present
+    /// now, which the record keeps first if the set outgrows its caps, and answers empty. A set
+    /// this process cannot have (no import, a kernel without RESIDENT) is an empty answer. A
+    /// recorder that fails is refused with `hot_set_failed`, logged and counted, so a broken
+    /// recorder is never mistaken for an empty set. RESIDENT goes through the tracker's
+    /// memversion device and reports only on this process's own mm; the scan never holds the
+    /// VMM lock.
+    fn record_hot_set(&mut self, request_id: u64, mark: bool) -> Result<(), ChannelError> {
+        let Some(device) = self.tracker.as_ref() else {
+            return self.reply(request_id, MsgType::HotSetRecorded, &[]);
+        };
+        let vm = self
+            .vmm
+            .try_lock()
+            .ok()
+            .and_then(|vmm| vmm.kvm_vm().cloned());
+        let Some(vm) = vm else {
+            crate::logger::warn!("Bring-up hot set: the VM is busy or gone");
+            METRICS.ramet.hot_set_failures.inc();
+            return self.reject(request_id, ErrorCode::HotSetFailed, MsgType::RecordHotSet);
+        };
+        let mut skipped = Vec::new();
+        let recorded = if mark {
+            super::hot_set::mark(vm.guest_memory(), device.as_fd(), &mut skipped).map(|marked| {
+                self.hot_set_mark = marked.unwrap_or_default();
+                None
+            })
+        } else {
+            super::hot_set::record(
+                vm.guest_memory(),
+                device.as_fd(),
+                &self.hot_set_mark,
+                &mut skipped,
+            )
+        };
+        for err in &skipped {
+            crate::logger::warn!("Bring-up hot set skipped a guest region: {err}");
+            METRICS.ramet.hot_set_failures.inc();
+        }
+        match recorded {
+            Ok(Some(set)) => {
+                METRICS.ramet.hot_set_pages.add(set.pages());
+                info!(
+                    "Bring-up hot set: {} pages in {} entries, {} marked first",
+                    set.pages(),
+                    set.ranges().len(),
+                    self.hot_set_mark.len()
+                );
+                self.reply(request_id, MsgType::HotSetRecorded, &set.encode())
+            }
+            Ok(None) => self.reply(request_id, MsgType::HotSetRecorded, &[]),
+            Err(err) => {
+                crate::logger::warn!("Bring-up hot set could not be recorded: {err}");
+                METRICS.ramet.hot_set_failures.inc();
+                self.reject(request_id, ErrorCode::HotSetFailed, MsgType::RecordHotSet)
+            }
         }
     }
 

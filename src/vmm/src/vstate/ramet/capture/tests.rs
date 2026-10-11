@@ -929,6 +929,7 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         guard_pages: 0,
         background: Background::detached(),
         standing_exclusions: Vec::new(),
+        hot_set_mark: Vec::new(),
     };
     let file = summary_buffer(4096);
     let budget = protocol::MAX_FREE_SUMMARY_MICROS.to_le_bytes();
@@ -1240,6 +1241,7 @@ fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
         guard_pages: 0,
         background: Background::detached(),
         standing_exclusions: Vec::new(),
+        hot_set_mark: Vec::new(),
     };
     let previous_state = BackendState::load();
     let flat = memfd(c"flat", 0);

@@ -24,7 +24,7 @@ pub const MAX_SCM_FDS: usize = 253;
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
 /// the handshake and the capture command order a peer must speak.
-pub const FEATURE_IDENTITY: &str = "ramet/3";
+pub const FEATURE_IDENTITY: &str = "ramet/4";
 /// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
 /// it was captured under. It changes only when those do, so a channel change alone leaves every
 /// stored vmstate restorable.
@@ -104,6 +104,12 @@ pub enum MsgType {
     /// imported guest, and asks for the guest's memory to be tracked from now on. The body is
     /// empty or one LE u64 bound in pages (empty means u64::MAX); see `Tracked`.
     Track = 28,
+    /// Pagemaster asks which guest pages this child touched since resume. The body is empty, or
+    /// one byte 1 to mark the pages present now, which the record then keeps first; a mark is
+    /// answered with an empty set.
+    RecordHotSet = 26,
+    /// Firecracker answers with an FPHS v1 hot set, or an empty body when none is available.
+    HotSetRecorded = 27,
     /// Firecracker reports the tracker: LE u32 tracked, u32 depth, u64 dirty pages, u64
     /// standing version id, u64 included pages, u64 retained pages (u64::MAX unless the request
     /// asked for them while the guest runs). Included pages is exactly what the next CREATE
@@ -156,6 +162,8 @@ impl MsgType {
             23 => Some(Self::FreeSummaryDone),
             24 => Some(Self::Drives),
             25 => Some(Self::Untrack),
+            26 => Some(Self::RecordHotSet),
+            27 => Some(Self::HotSetRecorded),
             28 => Some(Self::Track),
             29 => Some(Self::Tracked),
             30 => Some(Self::Refresh),
@@ -246,6 +254,8 @@ pub enum ErrorCode {
     /// is tracked, or the kernel refused it because the standing version moved. The tracker
     /// still stands where it stood.
     RearmFailed = 34,
+    /// The bring-up hot set could not be recorded; an empty answer means only that none exists.
+    HotSetFailed = 35,
 }
 
 /// Architecture Firecracker is running on.
@@ -647,6 +657,15 @@ pub struct RefreshBound {
     pub old_chain_counts: bool,
 }
 
+/// Parses a RecordHotSet request: whether it only marks.
+pub fn parse_record_hot_set(body: &[u8]) -> Result<bool, ChannelError> {
+    match body {
+        [] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(ChannelError::Malformed),
+    }
+}
+
 /// Parses a Refresh request: empty for no bound, or LE u64 bound pages and u64 flags (bit 0: the
 /// old chain counts).
 pub fn parse_refresh(body: &[u8]) -> Result<RefreshBound, ChannelError> {
@@ -679,6 +698,19 @@ pub struct BackingPlanBody {
     pub regions: Vec<RegionRecord>,
     /// Exact producer digest from immutable snapshot provenance, present on restore only.
     pub expected_producer: Option<[u8; 32]>,
+    /// The bring-up hot set an earlier child of the lineage recorded, present on a restore whose
+    /// flags say so: the pre-COW budget in bytes and the encoded set. Only the framing is checked
+    /// here; the set is a hint, and one that does not decode is dropped where it is used.
+    pub hot_set: Option<HotSetTail>,
+}
+
+/// The optional tail of a restore plan: what to warm before the vCPUs first run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotSetTail {
+    /// Most bytes the child may copy privately ahead of the guest's writes.
+    pub precow_budget: u64,
+    /// The encoded hot set.
+    pub encoded: Vec<u8>,
 }
 
 impl BackingPlanBody {
@@ -689,6 +721,8 @@ impl BackingPlanBody {
 
     /// Flag bit stating a vmstate descriptor rides on the frame.
     pub const FLAG_VMSTATE: u32 = 1;
+    /// Flag bit stating a hot-set tail follows the producer digest. Valid on a restore only.
+    pub const FLAG_HOT_SET: u32 = 2;
 }
 
 /// Parses a `backing_plan` body.
@@ -700,12 +734,20 @@ pub fn parse_backing_plan(body: &[u8]) -> Result<BackingPlanBody, ChannelError> 
     let region_count = u32::from_le_bytes(body[4..8].try_into().unwrap());
     let extent_count = u32::from_le_bytes(body[8..12].try_into().unwrap());
     let flags = u32::from_le_bytes(body[12..16].try_into().unwrap());
-    if flags & !BackingPlanBody::FLAG_VMSTATE != 0 || extent_count != 0 {
+    if flags & !(BackingPlanBody::FLAG_VMSTATE | BackingPlanBody::FLAG_HOT_SET) != 0
+        || extent_count != 0
+    {
         return Err(ChannelError::Malformed);
     }
     let restore = flags & BackingPlanBody::FLAG_VMSTATE != 0;
-    let expected = 16 + region_count as usize * REGION_RECORD_LEN + usize::from(restore) * 32;
-    if body.len() != expected {
+    let hot = flags & BackingPlanBody::FLAG_HOT_SET != 0;
+    if hot && !restore {
+        return Err(ChannelError::Malformed);
+    }
+    let fixed = 16 + region_count as usize * REGION_RECORD_LEN + usize::from(restore) * 32;
+    // The hot-set tail is its budget and at least an empty encoding's worth of bytes; how long
+    // the encoding is, the encoding itself says.
+    if (!hot && body.len() != fixed) || (hot && body.len() <= fixed + 8) {
         return Err(ChannelError::Malformed);
     }
     let mut regions = Vec::with_capacity(region_count as usize);
@@ -720,6 +762,10 @@ pub fn parse_backing_plan(body: &[u8]) -> Result<BackingPlanBody, ChannelError> 
         flags,
         regions,
         expected_producer: restore.then(|| body[off..off + 32].try_into().unwrap()),
+        hot_set: hot.then(|| HotSetTail {
+            precow_budget: u64::from_le_bytes(body[fixed..fixed + 8].try_into().unwrap()),
+            encoded: body[fixed + 8..].to_vec(),
+        }),
     })
 }
 
@@ -913,7 +959,7 @@ mod tests {
         body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
-        body.extend_from_slice(&0b10u32.to_le_bytes());
+        body.extend_from_slice(&0b100u32.to_le_bytes());
         assert!(matches!(
             parse_backing_plan(&body),
             Err(ChannelError::Malformed)
@@ -1021,6 +1067,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "ramet/3");
+        assert_eq!(FEATURE_IDENTITY, "ramet/4");
     }
 }
