@@ -296,6 +296,10 @@ pub struct CaptureService {
     /// The last version a tracked capture or refresh produced, which the kernel's tracker
     /// also holds; kept to flatten it at the depth bound.
     standing: Option<Arc<OwnedFd>>,
+    /// The pages the version the tracker stands on reads zero at because its CREATE excluded
+    /// them. They stay marked, and the old chain keeps nothing of them, so a write there is
+    /// none the standing bound counts.
+    standing_exclusions: Vec<memversion::Exclusion>,
     /// Where the last refresh armed the standing guard, beyond the dirty count its fold left;
     /// a capture's resume arms it again there, beyond what the capture's CREATE left marked.
     guard_pages: u64,
@@ -439,6 +443,7 @@ impl CaptureService {
                     pending: None,
                     tracker: None,
                     standing: None,
+                    standing_exclusions: Vec::new(),
                     guard_pages: 0,
                     background,
                 };
@@ -613,6 +618,7 @@ impl CaptureService {
                 started.elapsed().as_micros()
             );
             self.tracker = Some(device);
+            self.standing_exclusions.clear();
         }
         let tracker = self.tracker.as_ref().expect("tracker set above");
         // The retained walk runs only while the guest runs: a freeze never pays for it.
@@ -715,14 +721,17 @@ impl CaptureService {
             .and_then(|regions| self.free_exclusions(&regions))
             .map(|e| e.runs)
             .unwrap_or_default();
-        // The pages the old chain may hold beyond the guest's own: what is written before the
-        // fold, and what is written once the rebase lets the old chain go.
-        let written = |tracker: BorrowedFd<'_>| {
+        // The pages the old chain may hold beyond the guest's own: the marked pages its versions
+        // hold a page for. Before the fold that is all but what the standing version excluded,
+        // whatever the guest freed or wrote there since: it reads zero there, and the guest's
+        // page was its own all along. After the fold, until the rebase lets the old chain go, it
+        // is all but what this fold excludes.
+        let written = |tracker: BorrowedFd<'_>, excluded: &[memversion::Exclusion]| {
             memversion::geometry(&self.channel.regions)
-                .and_then(|regions| memversion::included_pages(tracker, &regions, &exclusions))
+                .and_then(|regions| memversion::included_pages(tracker, &regions, excluded))
                 .map_or(u64::MAX, |included| included.pages())
         };
-        let before = written(tracker.as_fd());
+        let before = written(tracker.as_fd(), &self.standing_exclusions);
         // Pages un-shared since the last fold would be refused by this one and kept by the
         // standing version for another round: re-share them first, so the fold takes them.
         let reshared = memversion::geometry(&self.channel.regions)
@@ -773,7 +782,7 @@ impl CaptureService {
                 });
                 // What the guest wrote up to the rebase, while the old chain still held it;
                 // pages it writes after are the new standing version's to count.
-                let after = written(tracker.as_fd());
+                let after = written(tracker.as_fd(), if applied { &exclusions } else { &[] });
                 if bound.pages > 0 && flattened.is_ok() {
                     self.background.guard(tracker, excluded + bound.pages);
                 }
@@ -796,6 +805,7 @@ impl CaptureService {
                 );
                 let version = Arc::new(version);
                 self.standing = Some(version.clone());
+                self.standing_exclusions = if applied { exclusions } else { Vec::new() };
                 let answered = self.answer_with_version(
                     request_id,
                     MsgType::Refreshed,
@@ -839,6 +849,7 @@ impl CaptureService {
             }
             self.tracker = None;
             self.standing = None;
+            self.standing_exclusions.clear();
             info!("Ramet untracked guest memory");
         }
         self.reply(
@@ -1019,6 +1030,8 @@ impl CaptureService {
             tracker,
             ..
         } = self;
+        // What the CREATE excluded, which the version reads zero at; none on a replay.
+        let mut excluded = None;
         let result = serve_write_vmstate(order, || {
             // Keep the lock through device preparation, serialization and CREATE.
             let mut vmm = vmm.lock().expect("Poisoned lock");
@@ -1028,7 +1041,7 @@ impl CaptureService {
             })?;
             let bytes = serialize_vmstate(&mut buffers.as_mut().unwrap().vmstate, state)?;
             vmm.mark_virtio_queues_dirty();
-            let version = (|| -> io::Result<OwnedFd> {
+            let (version, exclusions_taken) = (|| -> io::Result<(OwnedFd, Vec<memversion::Exclusion>)> {
                 let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
                 let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
                 let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
@@ -1046,7 +1059,8 @@ impl CaptureService {
                     memversion::exclusion_cap()
                 );
                 if tracker.is_none() {
-                    return memversion::create(device.as_fd(), &regions, &exclusions);
+                    return memversion::create(device.as_fd(), &regions, &exclusions)
+                        .map(|version| (version, exclusions));
                 }
                 // A tracked source folds only the pages written since the standing version.
                 // A failed fold leaves the tracker marking everything, so a whole copy is
@@ -1061,6 +1075,7 @@ impl CaptureService {
                     error!("Ramet tracked capture fell back to a whole copy: {err}");
                     memversion::create(device.as_fd(), &regions, &exclusions)
                 })
+                .map(|version| (version, exclusions))
             })()
             .map_err(|err| {
                 error!("Ramet capture could not create the memory version: {err}");
@@ -1068,6 +1083,7 @@ impl CaptureService {
             })?;
             // Deliberately do not clear dirty logs: accumulating evidence is conservative and
             // avoids a fallible step after CREATE. Retirement can be optimized separately.
+            excluded = Some(exclusions_taken);
             Ok((bytes, version))
         });
         match result {
@@ -1086,6 +1102,9 @@ impl CaptureService {
                         .is_ok_and(|info| info.id == track.standing_id)
                 {
                     self.standing = Some(version);
+                    if let Some(excluded) = excluded {
+                        self.standing_exclusions = excluded;
+                    }
                 }
                 answered
             }
