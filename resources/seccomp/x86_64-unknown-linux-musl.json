@@ -266,19 +266,6 @@
             },
             {
                 "syscall": "madvise",
-                "args": [
-                    {
-                        "index": 2,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 24,
-                        "comment": "libc::MADV_DONTNEED_LOCKED"
-                    }
-                ],
-                "comment": "Used by free page reporting to give the host back the locked guest pages the guest reported free"
-            },
-            {
-                "syscall": "madvise",
                 "comment": "Used by aws-lc during random number generation. It marks a memory page with MADV_WIPEONFORK to be able to detect forks.",
                 "args": [
                     {
