@@ -272,6 +272,7 @@ fn validate_command(msg: MsgType, body_len: usize, fd_count: usize) -> Result<()
         MsgType::Refresh => (&[0, 16], &[0, 1]),
         MsgType::Untrack => (&[0], &[0]),
         MsgType::Rearm => (&[0], &[1]),
+        MsgType::RecordHotSet => (&[0], &[0]),
         _ => return Err(ChannelError::Malformed),
     };
     if !lens.contains(&body_len) || !counts.contains(&fd_count) {
@@ -501,7 +502,49 @@ impl CaptureService {
             }
             MsgType::Untrack => self.untrack(request_id),
             MsgType::Rearm => self.rearm(incoming),
+            MsgType::RecordHotSet => self.record_hot_set(request_id),
             _ => Err(ChannelError::Malformed),
+        }
+    }
+
+    /// Records the bring-up hot set: the guest pages this child touched since resume, which a
+    /// later child of the lineage prefaults. A set this process cannot have (no import, a
+    /// kernel without RESIDENT, a set over the caps) is an empty answer. A recorder that fails
+    /// is refused with `hot_set_failed`, logged and counted, so a broken recorder is never
+    /// mistaken for an empty set. RESIDENT goes through the tracker's memversion device and
+    /// reports only on this process's own mm; the scan never holds the VMM lock.
+    fn record_hot_set(&mut self, request_id: u64) -> Result<(), ChannelError> {
+        let Some(device) = self.tracker.as_ref() else {
+            return self.reply(request_id, MsgType::HotSetRecorded, &[]);
+        };
+        let vm = self
+            .vmm
+            .try_lock()
+            .ok()
+            .and_then(|vmm| vmm.kvm_vm().cloned());
+        let Some(vm) = vm else {
+            crate::logger::warn!("Bring-up hot set: the VM is busy or gone");
+            METRICS.ramet.hot_set_failures.inc();
+            return self.reject(request_id, ErrorCode::HotSetFailed, MsgType::RecordHotSet);
+        };
+        let mut skipped = Vec::new();
+        let recorded = super::hot_set::record(vm.guest_memory(), device.as_fd(), &mut skipped);
+        for err in &skipped {
+            crate::logger::warn!("Bring-up hot set skipped a guest region: {err}");
+            METRICS.ramet.hot_set_failures.inc();
+        }
+        match recorded {
+            Ok(Some(set)) => {
+                METRICS.ramet.hot_set_pages.add(set.pages());
+                info!("Bring-up hot set: {} pages in {} entries", set.pages(), set.ranges().len());
+                self.reply(request_id, MsgType::HotSetRecorded, &set.encode())
+            }
+            Ok(None) => self.reply(request_id, MsgType::HotSetRecorded, &[]),
+            Err(err) => {
+                crate::logger::warn!("Bring-up hot set could not be recorded: {err}");
+                METRICS.ramet.hot_set_failures.inc();
+                self.reject(request_id, ErrorCode::HotSetFailed, MsgType::RecordHotSet)
+            }
         }
     }
 

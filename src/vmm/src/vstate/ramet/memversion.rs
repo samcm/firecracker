@@ -172,6 +172,9 @@ pub(crate) fn map_regions(
     regions: &[Region],
     version: Option<BorrowedFd<'_>>,
 ) -> Result<Vec<Mapping>, MappingError> {
+    if version.is_some() {
+        IMPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     map_regions_with(regions, version.is_some(), |index, addr| {
         map_private(
             version.expect("import only runs with a version"),
@@ -608,6 +611,49 @@ ioctl_iow_nr!(MV_IOC_TRACK_DROP, 0x56, 0x48, u32);
 
 /// The longest range one MV_IOC_RESIDENT request reports.
 pub(crate) const MV_RESIDENT_MAX_LEN: u64 = 1 << 30;
+
+/// Set once this process imported its guest memory from a version. Every import is lazy, so
+/// then, and only then, are its present guest pages the pages it touched (see `hot_set`).
+static IMPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process's guest memory was imported (lazily) from a version.
+pub(crate) fn imported_only_lazily() -> bool {
+    IMPORTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Fills `present` and `written` (one bit per page from `addr`, least significant first) for
+/// the range, which must be page aligned and at most [`MV_RESIDENT_MAX_LEN`]. `handle` is any
+/// memversion descriptor (the device or a version); the kernel reports only on this process's
+/// own mm. `Ok(None)` when the kernel has no RESIDENT (ENOTTY); every other errno is a failure.
+pub(crate) fn resident(
+    handle: BorrowedFd<'_>,
+    addr: u64,
+    len: u64,
+    present: &mut [u64],
+    written: &mut [u64],
+) -> io::Result<Option<(u64, u64)>> {
+    let words = usize::try_from(len.div_ceil(4096).div_ceil(64)).map_err(io::Error::other)?;
+    if len == 0 || len > MV_RESIDENT_MAX_LEN || present.len() < words || written.len() < words {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let mut request = Resident {
+        addr,
+        len,
+        present: present.as_mut_ptr() as u64,
+        written: written.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    // SAFETY: the request is live and correctly sized; its two pointers name live buffers of at
+    // least ceil(len / 4096 / 64) words each, which is all the kernel writes.
+    if unsafe { ioctl_with_mut_ref(&handle, MV_IOC_RESIDENT(), &mut request) } != 0 {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ENOTTY) => Ok(None),
+            _ => Err(err),
+        };
+    }
+    Ok(Some((request.nr_present, request.nr_written)))
+}
 
 /// Residency of a page-aligned range of the caller's own mm. `present` and `written` point at
 /// u64-word bitmaps, one bit per page, least significant first, which the kernel writes in full;

@@ -768,6 +768,10 @@ impl VmmMetrics {
 /// Metrics of the ramet capture channel.
 #[derive(Debug, Default, Serialize)]
 pub struct RametMetrics {
+    /// Number of bring-up hot set recordings that failed, and guest regions a recording skipped.
+    pub hot_set_failures: SharedIncMetric,
+    /// Pages named by the bring-up hot sets this process recorded.
+    pub hot_set_pages: SharedIncMetric,
     /// Number of scratch disk reflinks taken inside a capture quiesce.
     pub disk_clones: SharedIncMetric,
     /// Provides Min/max/sum for the reflink of the scratch disk, which is part of the freeze.
@@ -779,6 +783,8 @@ impl RametMetrics {
     /// Const default construction.
     pub const fn new() -> Self {
         Self {
+            hot_set_failures: SharedIncMetric::new(),
+            hot_set_pages: SharedIncMetric::new(),
             disk_clones: SharedIncMetric::new(),
             disk_clone_agg: LatencyAggregateMetrics::new(),
             disk_clone_failures: SharedIncMetric::new(),
