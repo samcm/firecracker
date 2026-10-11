@@ -822,12 +822,19 @@ impl CaptureService {
             .and_then(|(version, applied)| Ok((memversion::info2(version.as_fd())?, version, applied)));
         match refreshed {
             Ok((info, folded, applied)) => {
-                // Every excluded page is marked once the fold stands: the guard counts beyond them.
+                // Every excluded page is marked once the fold stands. A core before ABI 5 counts
+                // those marks, so the guard counts beyond them; from ABI 5 they are armed, out of
+                // the count until the guest writes one, which the guard then sees.
                 let page = crate::arch::host_page_size() as u64;
                 let excluded = if applied {
                     exclusions.iter().map(|x| x.len / page).sum::<u64>()
                 } else {
                     0
+                };
+                let marked = if memversion::arms_exclusions(tracker.as_fd()) {
+                    0
+                } else {
+                    excluded
                 };
                 let folded_us = started.elapsed().as_micros();
                 // The tracker then stands on a flat copy of the fold, so the chain it keeps is
@@ -843,7 +850,7 @@ impl CaptureService {
                         0
                     };
                     self.background
-                        .guard(tracker, excluded + bound.pages.saturating_sub(held));
+                        .guard(tracker, marked + bound.pages.saturating_sub(held));
                 }
                 let flattened = memversion::flatten(folded.as_fd()).and_then(|flat| {
                     memversion::rebase(tracker.as_fd(), flat.as_fd())?;
@@ -853,7 +860,7 @@ impl CaptureService {
                 // pages it writes after are the new standing version's to count.
                 let after = written(tracker.as_fd(), if applied { &exclusions } else { &[] });
                 if bound.pages > 0 && flattened.is_ok() {
-                    self.background.guard(tracker, excluded + bound.pages);
+                    self.background.guard(tracker, marked + bound.pages);
                 }
                 let paused = self.background.release(started);
                 let version = match flattened {

@@ -693,11 +693,25 @@ struct TrackInfo2 {
     exclusions: u64,
     /// With MV_TRACK_INFO_INCLUDED: `dirty_pages` less the dirty pages inside the exclusions.
     included_pages: u64,
-    reserved: u32,
+    /// Zero in; out, the core's ABI from ABI 5 (earlier cores leave it zero).
+    abi: u32,
     reserved2: u32,
 }
 
 ioctl_iowr_nr!(MV_IOC_TRACK_INFO2, 0x56, 0x4a, TrackInfo2);
+
+/// The core ABI from which a CREATE arms the pages it excludes: they stay marked but out of the
+/// tracker's dirty count until the guest writes one, which faults and counts it.
+pub(crate) const MV_ABI_ARMED_EXCLUSIONS: u32 = 5;
+
+/// Whether the core arms the pages a CREATE excludes (ABI 5), so the dirty count after a fold
+/// holds only writes. `device` is the memversion device.
+pub(crate) fn arms_exclusions(device: BorrowedFd<'_>) -> bool {
+    let mut request = TrackInfo2::default();
+    // SAFETY: request is live and writable and names no exclusions.
+    let ok = unsafe { ioctl_with_mut_ref(&device, MV_IOC_TRACK_INFO2(), &mut request) } == 0;
+    ok && request.abi >= MV_ABI_ARMED_EXCLUSIONS
+}
 
 /// How a CREATE treats the caller's tracked mm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1314,7 +1328,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(TrackInfo2, retained_pages), 32);
         assert_eq!(std::mem::offset_of!(TrackInfo2, exclusions), 40);
         assert_eq!(std::mem::offset_of!(TrackInfo2, included_pages), 48);
-        assert_eq!(std::mem::offset_of!(TrackInfo2, reserved), 56);
+        assert_eq!(std::mem::offset_of!(TrackInfo2, abi), 56);
         assert_eq!(MV_IOC_TRACK_INFO2(), 0xc040564a);
         assert_eq!(MV_TRACK_INFO_INCLUDED, 0x2);
     }
@@ -1343,7 +1357,7 @@ mod tests {
                     (request.flags, request.nr_exclusions, request.exclusions),
                     (MV_TRACK_INFO_INCLUDED, 2, excluded.as_ptr() as u64)
                 );
-                assert_eq!((request.reserved, request.reserved2), (0, 0));
+                assert_eq!((request.abi, request.reserved2), (0, 0));
                 request.tracked = 1;
                 request.depth = 3;
                 request.dirty_pages = 700;
