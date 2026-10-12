@@ -295,6 +295,14 @@ fn main_exec() -> Result<(), MainError> {
                     .help("Enables PCIe support."),
             )
             .arg(
+                Argument::new("ramet-prewarm")
+                    .takes_value(false)
+                    .help(
+                        "Builds the KVM VM, irqchip and PIT before the claim; the load creates \
+                         the vCPUs for its shape.",
+                    ),
+            )
+            .arg(
                 Argument::new("ramet-mem-socket")
                     .takes_value(true)
                     .help("Path to the pagemaster SEQPACKET memory channel."),
@@ -386,6 +394,10 @@ fn main_exec() -> Result<(), MainError> {
     register_signal_handlers().map_err(MainError::RegisterSignalHandlers)?;
     arm_parent_death_signal()?;
     lock_working_set()?;
+    // On this, the main thread, which later loads the snapshot that takes the skeleton.
+    if arguments.flag_present("ramet-prewarm") {
+        vmm::vstate::ramet::skeleton::prewarm();
+    }
 
     #[cfg(target_arch = "aarch64")]
     enable_ssbd_mitigation();

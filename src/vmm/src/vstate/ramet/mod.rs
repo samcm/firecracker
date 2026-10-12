@@ -17,6 +17,8 @@ pub(crate) mod memversion;
 pub mod prefault;
 /// Wire format of the pagemaster memory channel.
 pub mod protocol;
+/// The KVM skeleton a warm Firecracker builds before its claim.
+pub mod skeleton;
 
 pub use backend::{BackendError, BackendState, RametBackend, RametState, seal_process, set_source_commit};
 pub use capture::CaptureService;

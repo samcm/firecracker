@@ -48,7 +48,7 @@ use crate::snapshot::Persist;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vstate::ramet::{CaptureService, RametBackend};
-use crate::vstate::kvm::{Kvm, KvmError};
+use crate::vstate::kvm::KvmError;
 use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
@@ -180,11 +180,12 @@ pub fn build_microvm_for_boot(
         .cpu_template
         .get_cpu_template()?;
 
-    let kvm = Kvm::new(cpu_template.kvm_capabilities.clone())?;
-    // Set up KVM VM and register memory regions.
-    // Build custom CPU config if a custom template is provided.
-    let mut vm = KvmVm::new(kvm)?;
-    let mut vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
+    // A boot builds on the warm skeleton too, unless its template modifies KVM capabilities.
+    let (mut vm, mut vcpus) = crate::vstate::ramet::skeleton::vm_with_vcpus(
+        vm_resources.machine_config.vcpu_count,
+        &cpu_template.kvm_capabilities,
+    )
+    .map_err(skeleton_error)?;
     vm.register_memory_regions(guest_memory)?;
 
     let kvm_vm = Arc::new(vm);
@@ -419,6 +420,13 @@ pub enum BuildMicrovmFromSnapshotError {
     UnsupportedClockRealtime,
 }
 
+fn skeleton_error(err: crate::vstate::ramet::skeleton::SkeletonError) -> StartMicrovmError {
+    match err {
+        crate::vstate::ramet::skeleton::SkeletonError::Kvm(err) => StartMicrovmError::Kvm(err),
+        crate::vstate::ramet::skeleton::SkeletonError::Vm(err) => StartMicrovmError::KvmVm(err),
+    }
+}
+
 /// Builds and starts a microVM based on the provided MicrovmState.
 ///
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
@@ -436,15 +444,13 @@ pub fn build_microvm_from_snapshot(
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
 
-    let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
-        .map_err(StartMicrovmError::Kvm)?;
-    // Set up KVM VM and register memory regions.
-    // Build custom CPU config if a custom template is provided.
-    let mut vm = KvmVm::new(kvm).map_err(StartMicrovmError::KvmVm)?;
-
-    let mut vcpus = vm
-        .create_vcpus(vm_resources.machine_config.vcpu_count)
-        .map_err(StartMicrovmError::KvmVm)?;
+    // A warm Firecracker built the VM and its interrupt controller before the claim; the vCPUs
+    // are created now, for the snapshot's count.
+    let (mut vm, mut vcpus) = crate::vstate::ramet::skeleton::vm_with_vcpus(
+        vm_resources.machine_config.vcpu_count,
+        &microvm_state.kvm_state.kvm_cap_modifiers,
+    )
+    .map_err(skeleton_error)?;
 
     // A restored VM's memory was written by no userspace loader, so its slots start with a clear
     // KVM dirty log and this VM's first harvest reports only post-restore writes, with no clear
