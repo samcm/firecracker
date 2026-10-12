@@ -167,21 +167,59 @@ impl Mapping {
     }
 }
 
-/// Reserve all ranges before importing any. Failure drops only mappings we still own.
+/// A hot set for an import: the (gpa, size, written) ranges a recording child touched, ascending
+/// and disjoint, and the most bytes the import may copy privately for the written ones.
+#[derive(Debug, Default)]
+pub(crate) struct ImportHotSet {
+    pub ranges: Vec<(u64, u64, bool)>,
+    pub copy_budget: u64,
+}
+
+/// What MAP2 did with a hot set, over every region.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HotMapped {
+    pub covered: u64,
+    pub copied: u64,
+}
+
+/// Reserve all ranges before importing any. Failure drops only mappings we still own. An import
+/// with a hot set maps it at once (MAP2): the pages the chain holds are present before the guest
+/// runs, the written ones privately copied within the budget.
 pub(crate) fn map_regions(
     regions: &[Region],
     version: Option<BorrowedFd<'_>>,
-) -> Result<Vec<Mapping>, MappingError> {
+    hot: Option<&ImportHotSet>,
+) -> Result<(Vec<Mapping>, HotMapped), MappingError> {
     if version.is_some() {
         IMPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    map_regions_with(regions, version.is_some(), |index, addr| {
-        map_private(
-            version.expect("import only runs with a version"),
-            index,
-            addr,
-        )
-    })
+    let mut done = HotMapped::default();
+    let mut budget = hot.map_or(0, |hot| hot.copy_budget);
+    let mappings = map_regions_with(regions, version.is_some(), |index, addr| {
+        let version = version.expect("import only runs with a version");
+        let Some(hot) = hot else {
+            return map_private(version, index, addr);
+        };
+        let region = regions[index as usize];
+        let ranges: Vec<HotRange> = hot
+            .ranges
+            .iter()
+            .map(|&(gpa, size, written)| (GUEST_RAM_BASE + gpa, size, written))
+            .filter(|&(host, size, _)| host >= region.addr && host + size <= region.addr + region.len)
+            .map(|(host, size, written)| HotRange {
+                addr: host,
+                len: size,
+                flags: if written { MV_HOT_COPY } else { 0 },
+                reserved: 0,
+            })
+            .collect();
+        let mapped = map_private_hot(version, index, addr, &ranges, budget)?;
+        budget = budget.saturating_sub(mapped.copied);
+        done.covered += mapped.covered;
+        done.copied += mapped.copied;
+        Ok(())
+    })?;
+    Ok((mappings, done))
 }
 
 fn map_regions_with(
@@ -271,6 +309,30 @@ struct Map {
     addr: u64,
 }
 
+/// One hot range of MAP2: host address and length, and MV_HOT_COPY for a private copy.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct HotRange {
+    addr: u64,
+    len: u64,
+    flags: u32,
+    reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+struct Map2 {
+    region: u32,
+    flags: u32,
+    addr: u64,
+    hot: u64,
+    nr_hot: u32,
+    reserved: u32,
+    copy_budget: u64,
+    covered: u64,
+    copied: u64,
+}
+
 #[repr(C)]
 #[derive(Debug)]
 struct Info {
@@ -284,6 +346,7 @@ struct Info {
 
 ioctl_iowr_nr!(MV_IOC_CREATE, 0x56, 0x40, Create);
 ioctl_iow_nr!(MV_IOC_MAP, 0x56, 0x41, Map);
+ioctl_iowr_nr!(MV_IOC_MAP2, 0x56, 0x4c, Map2);
 ioctl_iowr_nr!(MV_IOC_INFO, 0x56, 0x42, Info);
 
 fn invalid() -> io::Error {
@@ -546,6 +609,39 @@ fn map_with(version: BorrowedFd<'_>, region: u32, addr: u64, flags: u32) -> io::
 /// Every import is lazy: the kernel ramet pins supports it, so there is no eager path.
 pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io::Result<()> {
     map_with(version, region, addr, MV_MAP_PRIVATE | MV_MAP_LAZY)
+}
+
+/// With MAP2: a hot range whose pages the import copies privately, within the budget.
+const MV_HOT_COPY: u32 = 1;
+
+/// A lazy private import that maps `hot` at once (MAP2, core ABI 7): the pages the chain holds
+/// are mapped read-only as the version's, or privately copied for MV_HOT_COPY ranges while
+/// `copy_budget` bytes last. Ranges are ascending and disjoint, inside the region.
+fn map_private_hot(
+    version: BorrowedFd<'_>,
+    region: u32,
+    addr: u64,
+    hot: &[HotRange],
+    copy_budget: u64,
+) -> io::Result<HotMapped> {
+    let mut request = Map2 {
+        region,
+        flags: MV_MAP_PRIVATE | MV_MAP_LAZY,
+        addr,
+        hot: hot.as_ptr() as u64,
+        nr_hot: u32::try_from(hot.len()).map_err(|_| invalid())?,
+        copy_budget,
+        ..Default::default()
+    };
+    // SAFETY: the request and the ranges it points at stay live across the call; the kernel
+    // reads nr_hot ranges and writes back only the request's counters.
+    if unsafe { ioctl_with_mut_ref(&version, MV_IOC_MAP2(), &mut request) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(HotMapped {
+        covered: request.covered,
+        copied: request.copied,
+    })
 }
 
 // ABI v2: incremental versions. Every v1 request keeps its v1 meaning; a v1 kernel refuses
@@ -1172,12 +1268,12 @@ mod tests {
         drop(reservation);
         let null = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(
-            map_regions(&regions, Some(null.as_fd()))
+            map_regions(&regions, Some(null.as_fd()), None).map(|(m, _)| m)
                 .unwrap_err()
                 .raw_os_error(),
             Some(libc::ENOTTY)
         );
-        let boot = map_regions(&regions, None).unwrap();
+        let boot = map_regions(&regions, None, None).map(|(m, _)| m).unwrap();
         for mapping in &boot {
             assert_no_huge_pages(mapping);
         }
@@ -1187,7 +1283,7 @@ mod tests {
             (boot[0].addr as *mut u8).write(0x5a);
         }
         assert_eq!(
-            map_regions(&regions, None).unwrap_err().raw_os_error(),
+            map_regions(&regions, None, None).map(|(m, _)| m).unwrap_err().raw_os_error(),
             Some(libc::EEXIST)
         );
         // SAFETY: failed NOREPLACE did not change the owned mapping.
@@ -1206,7 +1302,7 @@ mod tests {
                 );
             }
             // Model a successful NOREPLACE import, without claiming a kernel version proof.
-            let mapped = map_regions(&[regions[index as usize]], None)
+            let mapped = map_regions(&[regions[index as usize]], None, None).map(|(m, _)| m)
                 .unwrap()
                 .pop()
                 .unwrap();
@@ -1235,7 +1331,7 @@ mod tests {
         let mut collision = None;
         assert_eq!(
             map_regions_with(&regions, true, |index, _| {
-                let mapped = map_regions(&[regions[index as usize]], None)
+                let mapped = map_regions(&[regions[index as usize]], None, None).map(|(m, _)| m)
                     .unwrap()
                     .pop()
                     .unwrap();
@@ -1258,7 +1354,7 @@ mod tests {
             Some(libc::EEXIST)
         );
         drop(collision);
-        drop(map_regions(&regions, None).unwrap());
+        drop(map_regions(&regions, None, None).map(|(m, _)| m).unwrap());
     }
 
     #[test]
@@ -2037,7 +2133,7 @@ mod tests {
             addr: GUEST_RAM_BASE,
             len: pages * page,
         }];
-        let source = map_regions(&regions, None).unwrap();
+        let source = map_regions(&regions, None, None).map(|(m, _)| m).unwrap();
         let at = |p: u64| (GUEST_RAM_BASE + p * page) as *mut u64;
         for p in 0..pages {
             // SAFETY: every page lies in the live, writable source mapping.
@@ -2076,7 +2172,7 @@ mod tests {
         assert_eq!(info.new_pages, pages - excluded, "{info:?}");
         drop(source);
 
-        let imported = map_regions(&regions, Some(version.as_fd())).unwrap();
+        let imported = map_regions(&regions, Some(version.as_fd()), None).map(|(m, _)| m).unwrap();
         // SAFETY: every page lies in the live imported mapping.
         let read = |p: u64| unsafe { at(p).read() };
         // A kept single-page run, the long run and the last kept run read zero.
@@ -2112,7 +2208,7 @@ mod tests {
             addr: GUEST_RAM_BASE,
             len: pages * page,
         }];
-        let source = map_regions(&regions, None).unwrap();
+        let source = map_regions(&regions, None, None).map(|(m, _)| m).unwrap();
         let at = |p: u64| (GUEST_RAM_BASE + p * page) as *mut u64;
         let fill = |range: std::ops::Range<u64>, tag: u64| {
             for p in range {

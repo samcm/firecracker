@@ -505,11 +505,34 @@ fn commit_plan(
             })?;
     }
 
-    let mapped = memversion::map_regions(&geometry, incoming.fds.first().map(AsFd::as_fd))
-        .map_err(|err| BackendError::Map(io::Error::other(err)))
-        .inspect_err(|_| {
-            reject(&sock, &incoming, ErrorCode::MapFailed);
-        })?;
+    // A hot set is mapped by the import itself (MAP2): its pages are present, and its written
+    // pages copied within the pre-COW budget, before any vCPU exists. The bring-up prefault is
+    // then left only the stage-2 tables. A set that does not decode is ignored, as the prefault
+    // ignores it.
+    let hot = plan.hot_set.as_ref().and_then(|tail| {
+        super::prefault::decode_entries(&tail.encoded).map(|ranges| memversion::ImportHotSet {
+            ranges,
+            copy_budget: tail.precow_budget,
+        })
+    });
+    let hot_started = std::time::Instant::now();
+    let (mapped, hot_mapped) = memversion::map_regions(
+        &geometry,
+        incoming.fds.first().map(AsFd::as_fd),
+        hot.as_ref(),
+    )
+    .map_err(|err| BackendError::Map(io::Error::other(err)))
+    .inspect_err(|_| {
+        reject(&sock, &incoming, ErrorCode::MapFailed);
+    })?;
+    if hot.is_some() {
+        crate::logger::info!(
+            "Ramet mapped the hot set at import: {} B covered, {} B copied, in {} us",
+            hot_mapped.covered,
+            hot_mapped.copied,
+            hot_started.elapsed().as_micros()
+        );
+    }
     for region in &mapped {
         region
             .lock_on_fault()
@@ -565,7 +588,13 @@ fn commit_plan(
         &[],
     )?;
 
-    *HOT_SET.lock().expect("Poisoned lock") = plan.hot_set;
+    // What the import copied is done: the prefault copies nothing more.
+    *HOT_SET.lock().expect("Poisoned lock") = plan.hot_set.map(|mut tail| {
+        if hot.is_some() {
+            tail.precow_budget = 0;
+        }
+        tail
+    });
     *CHANNEL.lock().expect("Poisoned lock") = Some(MemoryChannel {
         sock,
         regions: plan.regions,
