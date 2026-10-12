@@ -407,8 +407,8 @@ pub(crate) struct Exclusions {
 /// plus one per run edge in it, never one per page.
 pub(crate) fn exclusions(
     regions: &[Region],
-    free: &[Vec<u64>],
-    dirty: &[Vec<u64>],
+    free: &[impl AsRef<[u64]>],
+    dirty: &[impl AsRef<[u64]>],
 ) -> io::Result<Exclusions> {
     exclusions_within(regions, free, dirty, exclusion_cap())
 }
@@ -440,8 +440,8 @@ fn keep_longest(runs: &mut Vec<Exclusion>, limit: usize) -> u64 {
 
 fn exclusions_within(
     regions: &[Region],
-    free: &[Vec<u64>],
-    dirty: &[Vec<u64>],
+    free: &[impl AsRef<[u64]>],
+    dirty: &[impl AsRef<[u64]>],
     limit: usize,
 ) -> io::Result<Exclusions> {
     let page = crate::arch::host_page_size() as u64;
@@ -454,7 +454,8 @@ fn exclusions_within(
     for (index, region) in regions.iter().enumerate() {
         let pages = region.len / page;
         let words = usize::try_from(pages.div_ceil(64)).map_err(|_| invalid())?;
-        if free[index].len() != words || dirty[index].len() != words {
+        let (free, dirty) = (free[index].as_ref(), dirty[index].as_ref());
+        if free.len() != words || dirty.len() != words {
             return Err(invalid());
         }
         let region_index = u32::try_from(index).map_err(|_| invalid())?;
@@ -474,7 +475,7 @@ fn exclusions_within(
         // The first page of the run still open at the current bit, which may continue from an
         // earlier word.
         let mut run = None;
-        for (word, (free, dirty)) in (0u64..).zip(free[index].iter().zip(&dirty[index])) {
+        for (word, (free, dirty)) in (0u64..).zip(free.iter().zip(dirty)) {
             let first = word * 64;
             let mut bits = free & !dirty;
             // Bits past the region's last page describe no guest page.

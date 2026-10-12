@@ -756,9 +756,9 @@ impl CaptureService {
     fn free_exclusions(&self, regions: &[memversion::Region]) -> io::Result<memversion::Exclusions> {
         let vmm = self.vmm.lock().expect("Poisoned lock");
         let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
-        let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
-        let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
-        memversion::exclusions(regions, &free, &dirty)
+        kvm_vm
+            .with_harvest(|free, dirty| memversion::exclusions(regions, free, dirty))
+            .map_err(io::Error::other)?
     }
 
     /// Folds what the guest wrote since the standing version into a new one, without a pause.
@@ -1119,14 +1119,14 @@ impl CaptureService {
             vmm.mark_virtio_queues_dirty();
             let (version, exclusions_taken) = (|| -> io::Result<(OwnedFd, Vec<memversion::Exclusion>)> {
                 let kvm_vm = vmm.kvm_vm().ok_or_else(|| io::Error::other("no KVM VM"))?;
-                let dirty = kvm_vm.snapshot_dirty_log().map_err(io::Error::other)?;
-                let free = kvm_vm.snapshot_free_log().map_err(io::Error::other)?;
                 let regions = memversion::geometry(&channel.regions)?;
                 let memversion::Exclusions {
                     runs: exclusions,
                     found,
                     dropped_pages,
-                } = memversion::exclusions(&regions, &free, &dirty)?;
+                } = kvm_vm
+                    .with_harvest(|free, dirty| memversion::exclusions(&regions, free, dirty))
+                    .map_err(io::Error::other)??;
                 // One line per capture, so how close guests come to the run limit is visible.
                 info!(
                     "Ramet capture excludes {} of {found} free runs (cap {}); {dropped_pages} \

@@ -5,11 +5,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::num::NonZeroUsize;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use serde::{Deserialize, Serialize};
-pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
+use vm_memory::bitmap::{NewBitmap, RefSlice, WithBitmapSlice};
+pub use vm_memory::bitmap::{BS, Bitmap, BitmapSlice};
 pub use vm_memory::mmap::MmapRegionBuilder;
 pub use vm_memory::{
     Address, ByteValued, Bytes, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion,
@@ -18,6 +21,130 @@ pub use vm_memory::{
 use vm_memory::{GuestMemoryRegionBytes, VolatileSlice};
 
 use crate::utils::u64_to_usize;
+
+/// The host-write accumulator of a guest region: one bit per page the VMM wrote. It is
+/// vm-memory's `AtomicBitmap` with word readers added, so a harvest moves the set bits out
+/// word by word, in place and atomically, rather than cloning the whole map to read it.
+#[derive(Debug)]
+pub struct AtomicBitmap {
+    map: Vec<AtomicU64>,
+    size: usize,
+    byte_size: usize,
+    page_size: NonZeroUsize,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl AtomicBitmap {
+    /// A clear bitmap of one bit per page of `byte_size` bytes.
+    pub fn new(byte_size: usize, page_size: NonZeroUsize) -> Self {
+        let size = byte_size.div_ceil(page_size.get());
+        AtomicBitmap {
+            map: (0..size.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            size,
+            byte_size,
+            page_size,
+        }
+    }
+
+    /// Whether bit `index` is set. Bits past the end are always clear.
+    pub fn is_bit_set(&self, index: usize) -> bool {
+        index < self.size && self.map[index >> 6].load(Ordering::Acquire) & (1 << (index & 63)) != 0
+    }
+
+    fn set_reset_addr_range(&self, start_addr: usize, len: usize, set: bool) {
+        if len == 0 {
+            return;
+        }
+        let first = start_addr / self.page_size;
+        let last = start_addr.saturating_add(len - 1) / self.page_size;
+        for n in (first..=last).take_while(|&n| n < self.size) {
+            if set {
+                self.map[n >> 6].fetch_or(1 << (n & 63), Ordering::SeqCst);
+            } else {
+                self.map[n >> 6].fetch_and(!(1 << (n & 63)), Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Sets the bits of the pages `[start_addr, start_addr + len)` touches.
+    pub fn set_addr_range(&self, start_addr: usize, len: usize) {
+        self.set_reset_addr_range(start_addr, len, true);
+    }
+
+    /// Clears the bits of the pages `[start_addr, start_addr + len)` touches.
+    pub fn reset_addr_range(&self, start_addr: usize, len: usize) {
+        self.set_reset_addr_range(start_addr, len, false);
+    }
+
+    /// The number of pages the bitmap tracks.
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// The number of bytes the bitmap tracks.
+    pub fn byte_size(&self) -> usize {
+        self.byte_size
+    }
+
+    /// The number of 64-bit words of the map.
+    pub fn words(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Word `index` as it reads now.
+    pub fn word(&self, index: usize) -> u64 {
+        self.map[index].load(Ordering::Acquire)
+    }
+
+    /// Moves every set bit into `dst`, word for word: each word is ORed into `dst` and cleared
+    /// in one atomic step, so a write racing the move lands either in `dst` or in the map, never
+    /// in neither. Clear words are only read. `dst` must have [`AtomicBitmap::words`] words.
+    pub fn take_into(&self, dst: &mut [u64]) {
+        debug_assert_eq!(dst.len(), self.map.len());
+        for (word, dst) in self.map.iter().zip(dst) {
+            if word.load(Ordering::Relaxed) != 0 {
+                *dst |= word.swap(0, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Clears every bit.
+    pub fn reset(&self) {
+        for word in &self.map {
+            word.store(0, Ordering::Release);
+        }
+    }
+}
+
+impl<'a> WithBitmapSlice<'a> for AtomicBitmap {
+    type S = RefSlice<'a, Self>;
+}
+
+impl Bitmap for AtomicBitmap {
+    fn mark_dirty(&self, offset: usize, len: usize) {
+        self.set_addr_range(offset, len)
+    }
+
+    fn dirty_at(&self, offset: usize) -> bool {
+        self.is_bit_set(offset / self.page_size)
+    }
+
+    fn slice_at(&self, offset: usize) -> <Self as WithBitmapSlice<'_>>::S {
+        RefSlice::new(self, offset)
+    }
+}
+
+impl Default for AtomicBitmap {
+    fn default() -> Self {
+        AtomicBitmap::new(0, NonZeroUsize::new(4096).unwrap())
+    }
+}
+
+impl NewBitmap for AtomicBitmap {
+    fn with_len(len: usize) -> Self {
+        AtomicBitmap::new(len, NonZeroUsize::new(crate::arch::host_page_size()).unwrap())
+    }
+}
 
 /// Guest region and, for externally imported RAM, ownership of its virtual mapping.
 /// The mapping outlives every device/vCPU Arc referring to this region, not just the channel.
