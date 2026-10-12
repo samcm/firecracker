@@ -522,18 +522,10 @@ pub fn build_microvm_from_snapshot(
         device_manager,
     };
 
-    // The vCPU state is restored and nothing has run: warm the stage-2 tables over the hot set
-    // until resume. Started before this thread is confined, like the channel's thread below.
-    if let Some(hot_set) = RametBackend::take_hot_set() {
-        start_bring_up_prefault(
-            &kvm_vm,
-            &vcpus[0],
-            hot_set,
-            seccomp_filters
-                .get("vmm")
-                .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?,
-        );
-    }
+    // The vCPU state is restored and nothing has run: the stage-2 tables are warmed over the hot
+    // set until resume. The worker is prepared here, while a vCPU is at hand, and started last.
+    let prefault = RametBackend::take_hot_set()
+        .and_then(|hot_set| prepare_bring_up_prefault(&kvm_vm, &vcpus[0], hot_set));
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     kvm_vm.start_vcpus(
@@ -562,6 +554,18 @@ pub fn build_microvm_from_snapshot(
             .clone(),
     );
 
+    // The prefault's MADV_POPULATE_WRITE holds the mmap lock for read, and the vCPU and channel
+    // threads above map their stacks: started before them, it held them off (~1.7 ms nested).
+    // Started before this thread is confined, like the channel's thread.
+    if let Some(prefault) = prefault {
+        start_bring_up_prefault(
+            prefault,
+            seccomp_filters
+                .get("vmm")
+                .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?,
+        );
+    }
+
     // Load seccomp filters for the VMM thread.
     // Keep this as the last step of the building process.
     crate::seccomp::apply_filter(
@@ -574,15 +578,22 @@ pub fn build_microvm_from_snapshot(
     Ok(vmm)
 }
 
-/// Starts the bring-up prefault over a hot set an earlier child of this lineage recorded. The set
-/// is a hint: one that does not decode, or a worker that cannot start, leaves the guest to fault
-/// its pages the ordinary way, and the restore goes on.
-fn start_bring_up_prefault(
+/// A bring-up prefault ready to start: a vCPU descriptor of its own, the resolved ranges and the
+/// pre-copy budget.
+struct BringUpPrefault {
+    vcpu_fd: std::os::fd::OwnedFd,
+    ranges: Vec<crate::vstate::ramet::prefault::PrefaultRange>,
+    precow_budget: u64,
+}
+
+/// Prepares the bring-up prefault over a hot set an earlier child of this lineage recorded. The
+/// set is a hint: one that does not decode, or a descriptor that cannot be had, leaves the guest
+/// to fault its pages the ordinary way, and the restore goes on.
+fn prepare_bring_up_prefault(
     kvm_vm: &KvmVm,
     vcpu: &crate::vstate::vcpu::Vcpu,
     hot_set: crate::vstate::ramet::protocol::HotSetTail,
-    filter: &Arc<crate::seccomp::BpfProgram>,
-) {
+) -> Option<BringUpPrefault> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     use crate::logger::warn;
@@ -590,7 +601,7 @@ fn start_bring_up_prefault(
 
     let Some(entries) = prefault::decode_entries(&hot_set.encoded) else {
         warn!("Bring-up prefault: the hot set does not decode; it is ignored");
-        return;
+        return None;
     };
     let (ranges, dropped) = prefault::resolve(kvm_vm.guest_memory(), entries);
     if dropped > 0 {
@@ -603,14 +614,27 @@ fn start_bring_up_prefault(
             "Bring-up prefault: no vCPU descriptor: {}",
             std::io::Error::last_os_error()
         );
-        return;
+        return None;
     }
     // SAFETY: `dup` is a descriptor this function just created and nothing else owns.
     let vcpu_fd = unsafe { OwnedFd::from_raw_fd(dup) };
-    if let Err(err) =
-        prefault::Prefaulter::start(vcpu_fd, ranges, hot_set.precow_budget, filter.clone())
-    {
-        warn!("Bring-up prefault did not start: {err}");
+    Some(BringUpPrefault {
+        vcpu_fd,
+        ranges,
+        precow_budget: hot_set.precow_budget,
+    })
+}
+
+/// Starts a prepared bring-up prefault; a worker that cannot start leaves the guest to fault its
+/// pages the ordinary way.
+fn start_bring_up_prefault(prefault: BringUpPrefault, filter: &Arc<crate::seccomp::BpfProgram>) {
+    if let Err(err) = crate::vstate::ramet::prefault::Prefaulter::start(
+        prefault.vcpu_fd,
+        prefault.ranges,
+        prefault.precow_budget,
+        filter.clone(),
+    ) {
+        crate::logger::warn!("Bring-up prefault did not start: {err}");
     }
 }
 
