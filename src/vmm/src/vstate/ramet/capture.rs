@@ -310,6 +310,12 @@ pub struct CaptureService {
     /// The pages present when Pagemaster marked the hot set (at guest ready), which its record
     /// keeps first: touched first, they are the bring-up.
     hot_set_mark: Vec<u64>,
+    /// The pages the last fold shared with the standing version (present, not the guest's
+    /// own), as the refresh read them after its rebase; empty before the first. A page of
+    /// them the guest maps as its own again is one it rewrote.
+    folded: Vec<Vec<u64>>,
+    /// The pages the last refresh left out as hot; empty after any fold that took them.
+    hot: Vec<Vec<u64>>,
 }
 
 /// The 40-byte `tracked` reply body. An untracked reply is zero after `tracked`.
@@ -395,9 +401,10 @@ fn encode_refreshed(
     before: u64,
     after: u64,
     excluded: u64,
+    hot: u64,
 ) -> Vec<u8> {
     let us = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-    let mut body = Vec::with_capacity(72);
+    let mut body = Vec::with_capacity(80);
     body.extend_from_slice(&info.own_pages.to_le_bytes());
     body.extend_from_slice(&info.new_pages.to_le_bytes());
     body.extend_from_slice(&info.depth.to_le_bytes());
@@ -408,7 +415,26 @@ fn encode_refreshed(
     body.extend_from_slice(&after.to_le_bytes());
     body.extend_from_slice(&us(paused.waited).to_le_bytes());
     body.extend_from_slice(&excluded.to_le_bytes());
+    body.extend_from_slice(&hot.to_le_bytes());
     body
+}
+
+/// The guest's hot pages: those it maps as its own (`written`) that the last fold shared
+/// (`folded`) or the last refresh left out as hot (`hot`). Either map may be empty: none.
+fn rewritten(written: &[Vec<u64>], folded: &[Vec<u64>], hot: &[Vec<u64>]) -> Vec<Vec<u64>> {
+    let word = |maps: &[Vec<u64>], i: usize, j: usize| {
+        maps.get(i).and_then(|m| m.get(j)).copied().unwrap_or(0)
+    };
+    written
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            w.iter()
+                .enumerate()
+                .map(|(j, w)| w & (word(folded, i, j) | word(hot, i, j)))
+                .collect()
+        })
+        .collect()
 }
 
 impl CaptureService {
@@ -451,6 +477,8 @@ impl CaptureService {
                     guard_pages: 0,
                     background,
                     hot_set_mark: Vec::new(),
+                    folded: Vec::new(),
+                    hot: Vec::new(),
                 };
                 loop {
                     if BackendState::load() == BackendState::ChannelFailed {
@@ -688,6 +716,8 @@ impl CaptureService {
             );
             self.tracker = Some(device);
             self.standing_exclusions.clear();
+            self.folded.clear();
+            self.hot.clear();
         }
         let tracker = self.tracker.as_ref().expect("tracker set above");
         // The retained walk runs only while the guest runs: a freeze never pays for it.
@@ -803,13 +833,38 @@ impl CaptureService {
         let before = written(tracker.as_fd(), &self.standing_exclusions);
         // Pages un-shared since the last fold would be refused by this one and kept by the
         // standing version for another round: re-share them first, so the fold takes them.
-        let reshared = memversion::geometry(&self.channel.regions)
+        let (reshared, written_now) = memversion::geometry(&self.channel.regions)
             .and_then(|regions| {
                 let written = memversion::written_pages(tracker.as_fd(), &regions)?;
-                Ok(self.background.reshare_now(&regions, &written))
+                Ok((self.background.reshare_now(&regions, &written), written))
             })
-            .unwrap_or(0);
+            .unwrap_or_default();
         let reshared_us = started.elapsed().as_micros();
+        // The pages the guest keeps rewriting stay out of the fold (core ABI 10): those the last
+        // fold shared that it maps as its own again, and those the last refresh left out that
+        // it still does. Folding them would only write-protect them again, a copy on write
+        // each on the guest's next pass, while the standing version keeps no copy of them
+        // left out. A capture's pre-copy folds them, as any refresh without the flag does.
+        let leave_hot = bound.leave_hot
+            && memversion::core_abi(tracker.as_fd()) >= memversion::MV_ABI_HOT_EXCLUSIONS;
+        let exclusions = if leave_hot {
+            memversion::geometry(&self.channel.regions)
+                .and_then(|regions| {
+                    let written = if reshared > 0 || written_now.is_empty() {
+                        memversion::written_pages(tracker.as_fd(), &regions)?
+                    } else {
+                        written_now
+                    };
+                    let hot = rewritten(&written, &self.folded, &self.hot);
+                    memversion::with_hot_runs(&regions, &exclusions, &hot)
+                })
+                .unwrap_or_else(|err| {
+                    error!("Ramet could not find the guest's hot pages: {err}");
+                    exclusions
+                })
+        } else {
+            exclusions
+        };
         let refreshed = memversion::geometry(&self.channel.regions)
             .and_then(|regions| {
                 memversion::refresh(
@@ -826,11 +881,37 @@ impl CaptureService {
                 // those marks, so the guard counts beyond them; from ABI 5 they are armed, out of
                 // the count until the guest writes one, which the guard then sees.
                 let page = crate::arch::host_page_size() as u64;
-                let excluded = if applied {
-                    exclusions.iter().map(|x| x.len / page).sum::<u64>()
-                } else {
-                    0
+                let pages_of = |hot: bool| {
+                    exclusions
+                        .iter()
+                        .filter(|x| (x.flags & memversion::EXCLUSION_HOT != 0) == hot)
+                        .map(|x| x.len / page)
+                        .sum::<u64>()
                 };
+                let (excluded, hot) = if applied {
+                    (pages_of(false), pages_of(true))
+                } else {
+                    (0, 0)
+                };
+                // What this fold left out as hot, for the next refresh to keep out while the
+                // guest still maps it as its own.
+                self.hot.clear();
+                if hot > 0
+                    && let Ok(regions) = memversion::geometry(&self.channel.regions)
+                {
+                    let mut maps: Vec<Vec<u64>> = regions
+                        .iter()
+                        .map(|r| vec![0; usize::try_from((r.len / page).div_ceil(64)).unwrap_or(0)])
+                        .collect();
+                    let runs: Vec<_> = exclusions
+                        .iter()
+                        .filter(|x| x.flags & memversion::EXCLUSION_HOT != 0)
+                        .copied()
+                        .collect();
+                    if memversion::mark_runs(&regions, &mut maps, &runs, true).is_ok() {
+                        self.hot = maps;
+                    }
+                }
                 let marked = if memversion::arms_exclusions(tracker.as_fd()) {
                     0
                 } else {
@@ -872,7 +953,8 @@ impl CaptureService {
                 };
                 info!(
                     "Ramet refreshed the standing version in {} us (re-shared {reshared} pages \
-                     in {reshared_us} us, fold {folded_us} us): own={} new={} folded={} depth={}",
+                     in {reshared_us} us, fold {folded_us} us): own={} new={} folded={} depth={} \
+                     hot={hot}",
                     started.elapsed().as_micros(),
                     info.own_pages,
                     info.new_pages,
@@ -885,16 +967,23 @@ impl CaptureService {
                 let answered = self.answer_with_version(
                     request_id,
                     MsgType::Refreshed,
-                    encode_refreshed(&info, paused, before, after, excluded),
+                    encode_refreshed(&info, paused, before, after, excluded, hot),
                     Some(version),
                 );
-                // What the source still maps alone is what the fold refused and what the
-                // guest wrote since: re-share it so the next live fold takes it.
+                // What the source still maps alone is what the fold refused, what it left out
+                // as hot and what the guest wrote since: re-share it so the next live fold takes
+                // it. What it maps and does not own is what the fold shared.
+                self.folded.clear();
                 if let Some(tracker) = self.tracker.as_ref()
                     && let Ok(regions) = memversion::geometry(&self.channel.regions)
-                    && let Ok(written) = memversion::written_pages(tracker.as_fd(), &regions)
+                    && let Ok((present, written)) = memversion::residency(tracker.as_fd(), &regions)
                 {
                     self.background.reshare(&regions, &written);
+                    self.folded = present
+                        .iter()
+                        .zip(&written)
+                        .map(|(p, w)| p.iter().zip(w).map(|(p, w)| p & !w).collect())
+                        .collect();
                 }
                 answered
             }
@@ -926,6 +1015,8 @@ impl CaptureService {
             self.tracker = None;
             self.standing = None;
             self.standing_exclusions.clear();
+            self.folded.clear();
+            self.hot.clear();
             info!("Ramet untracked guest memory");
         }
         self.reply(
@@ -1181,6 +1272,9 @@ impl CaptureService {
                     if let Some(excluded) = excluded {
                         self.standing_exclusions = excluded;
                     }
+                    // The capture folded every hot page: the guest rewriting one again copies
+                    // on write and maps it as its own, which `folded` still sees.
+                    self.hot.clear();
                 }
                 answered
             }

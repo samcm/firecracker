@@ -655,6 +655,10 @@ pub struct RefreshBound {
     pub pages: u64,
     /// The pages dirty before the fold count against the bound until the rebase.
     pub old_chain_counts: bool,
+    /// The fold leaves out the pages the guest keeps rewriting (core ABI 10): those it
+    /// rewrote since the last fold took them, and those the last refresh left out that it
+    /// still maps as its own. Without it the fold takes every page it may.
+    pub leave_hot: bool,
 }
 
 /// Parses a RecordHotSet request: whether it only marks.
@@ -667,18 +671,19 @@ pub fn parse_record_hot_set(body: &[u8]) -> Result<bool, ChannelError> {
 }
 
 /// Parses a Refresh request: empty for no bound, or LE u64 bound pages and u64 flags (bit 0: the
-/// old chain counts).
+/// old chain counts; bit 1: leave the hot pages out).
 pub fn parse_refresh(body: &[u8]) -> Result<RefreshBound, ChannelError> {
     match body.len() {
         0 => Ok(RefreshBound::default()),
         16 => {
             let flags = u64::from_le_bytes(body[8..].try_into().unwrap());
-            if flags & !1 != 0 {
+            if flags & !3 != 0 {
                 return Err(ChannelError::Malformed);
             }
             Ok(RefreshBound {
                 pages: u64::from_le_bytes(body[..8].try_into().unwrap()),
                 old_chain_counts: flags & 1 != 0,
+                leave_hot: flags & 2 != 0,
             })
         }
         _ => Err(ChannelError::Malformed),

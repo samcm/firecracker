@@ -285,7 +285,8 @@ pub(crate) struct Region {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Exclusion {
     pub region: u32,
-    pub reserved: u32,
+    /// 0, or [`EXCLUSION_HOT`] (core ABI 10).
+    pub flags: u32,
     pub offset: u64,
     pub len: u64,
 }
@@ -464,7 +465,7 @@ fn exclusions_within(
             found += 1;
             out.push(Exclusion {
                 region: region_index,
-                reserved: 0,
+                flags: 0,
                 offset: start * page,
                 len: (end - start) * page,
             });
@@ -801,13 +802,26 @@ ioctl_iowr_nr!(MV_IOC_TRACK_INFO2, 0x56, 0x4a, TrackInfo2);
 /// tracker's dirty count until the guest writes one, which faults and counts it.
 pub(crate) const MV_ABI_ARMED_EXCLUSIONS: u32 = 5;
 
-/// Whether the core arms the pages a CREATE excludes (ABI 5), so the dirty count after a fold
-/// holds only writes. `device` is the memversion device.
-pub(crate) fn arms_exclusions(device: BorrowedFd<'_>) -> bool {
+/// The core ABI from which a live CREATE takes hot exclusions ([`EXCLUSION_HOT`]): left out
+/// and armed but neither write-protected nor counted, so the guest rewrites them freely and the
+/// standing version keeps no copy of them.
+pub(crate) const MV_ABI_HOT_EXCLUSIONS: u32 = 10;
+/// An exclusion's flag for a hot run (core ABI 10).
+pub(crate) const EXCLUSION_HOT: u32 = 1;
+
+/// The core's ABI as MV_IOC_TRACK_INFO2 reports it, 0 if it does not. `device` is the
+/// memversion device.
+pub(crate) fn core_abi(device: BorrowedFd<'_>) -> u32 {
     let mut request = TrackInfo2::default();
     // SAFETY: request is live and writable and names no exclusions.
     let ok = unsafe { ioctl_with_mut_ref(&device, MV_IOC_TRACK_INFO2(), &mut request) } == 0;
-    ok && request.abi >= MV_ABI_ARMED_EXCLUSIONS
+    if ok { request.abi } else { 0 }
+}
+
+/// Whether the core arms the pages a CREATE excludes (ABI 5), so the dirty count after a fold
+/// holds only writes. `device` is the memversion device.
+pub(crate) fn arms_exclusions(device: BorrowedFd<'_>) -> bool {
+    core_abi(device) >= MV_ABI_ARMED_EXCLUSIONS
 }
 
 /// How a CREATE treats the caller's tracked mm.
@@ -873,7 +887,16 @@ pub(crate) fn written_pages(
     device: BorrowedFd<'_>,
     regions: &[Region],
 ) -> io::Result<Vec<Vec<u64>>> {
-    written_pages_with(regions, |addr, len, present, written| {
+    Ok(residency(device, regions)?.1)
+}
+
+/// The pages of each region this process maps (present), and those of them it maps exclusively
+/// (written), as bitmaps shaped like the dirty log.
+pub(crate) fn residency(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+) -> io::Result<(Vec<Vec<u64>>, Vec<Vec<u64>>)> {
+    residency_with(regions, |addr, len, present, written| {
         let mut request = Resident {
             addr,
             len,
@@ -892,10 +915,20 @@ pub(crate) fn written_pages(
 
 /// Splits each region into RESIDENT ranges and assembles their `written` bitmaps. `resident`
 /// gets a range's address and length and its `present` and `written` words.
+#[cfg(test)]
 fn written_pages_with(
     regions: &[Region],
-    mut resident: impl FnMut(u64, u64, &mut [u64], &mut [u64]) -> io::Result<()>,
+    resident: impl FnMut(u64, u64, &mut [u64], &mut [u64]) -> io::Result<()>,
 ) -> io::Result<Vec<Vec<u64>>> {
+    Ok(residency_with(regions, resident)?.1)
+}
+
+/// Splits each region into RESIDENT ranges and assembles their `present` and `written`
+/// bitmaps. `resident` gets a range's address and length and its `present` and `written` words.
+fn residency_with(
+    regions: &[Region],
+    mut resident: impl FnMut(u64, u64, &mut [u64], &mut [u64]) -> io::Result<()>,
+) -> io::Result<(Vec<Vec<u64>>, Vec<Vec<u64>>)> {
     let page = crate::arch::host_page_size() as u64;
     let chunk_pages = MV_RESIDENT_MAX_LEN / page;
     // A range then starts on a bitmap word, so its words concatenate into the region's.
@@ -903,66 +936,66 @@ fn written_pages_with(
         return Err(invalid());
     }
     let words_of = |pages: u64| usize::try_from(pages.div_ceil(64)).map_err(|_| invalid());
-    regions
-        .iter()
-        .map(|region| {
-            if region.len == 0 || !region.len.is_multiple_of(page) {
-                return Err(invalid());
-            }
-            let pages = region.len / page;
-            let mut written = vec![0u64; words_of(pages)?];
-            let mut present = vec![0u64; words_of(chunk_pages.min(pages))?];
-            let mut first = 0;
-            while first < pages {
-                let count = chunk_pages.min(pages - first);
-                let words = words_of(count)?;
-                let start = words_of(first)?;
-                resident(
-                    region.addr + first * page,
-                    count * page,
-                    &mut present[..words],
-                    &mut written[start..start + words],
-                )?;
-                first += count;
-            }
-            // Bits past the region's last page describe no guest page.
-            if !pages.is_multiple_of(64) {
-                *written.last_mut().expect("nonempty region") &= (1u64 << (pages % 64)) - 1;
-            }
-            Ok(written)
-        })
-        .collect()
+    let mut out = (Vec::new(), Vec::new());
+    for region in regions {
+        if region.len == 0 || !region.len.is_multiple_of(page) {
+            return Err(invalid());
+        }
+        let pages = region.len / page;
+        let mut present = vec![0u64; words_of(pages)?];
+        let mut written = vec![0u64; words_of(pages)?];
+        let mut first = 0;
+        while first < pages {
+            let count = chunk_pages.min(pages - first);
+            let words = words_of(count)?;
+            let start = words_of(first)?;
+            resident(
+                region.addr + first * page,
+                count * page,
+                &mut present[start..start + words],
+                &mut written[start..start + words],
+            )?;
+            first += count;
+        }
+        // Bits past the region's last page describe no guest page.
+        if !pages.is_multiple_of(64) {
+            let mask = (1u64 << (pages % 64)) - 1;
+            *present.last_mut().expect("nonempty region") &= mask;
+            *written.last_mut().expect("nonempty region") &= mask;
+        }
+        out.0.push(present);
+        out.1.push(written);
+    }
+    Ok(out)
 }
 
-/// The pages a quiesced tracked CREATE would newly retain: those written since the standing
-/// version (`written`, from [`written_pages`]) that are outside its `exclusions`.
-pub(crate) fn newly_retained(
+/// Sets (or clears) the bits of `runs` in `maps`, one bitmap per region shaped like the dirty
+/// log. Fails on a run outside its region or a map of the wrong shape.
+pub(crate) fn mark_runs(
     regions: &[Region],
-    mut written: Vec<Vec<u64>>,
-    exclusions: &[Exclusion],
-) -> io::Result<u64> {
+    maps: &mut [Vec<u64>],
+    runs: &[Exclusion],
+    set: bool,
+) -> io::Result<()> {
     let page = crate::arch::host_page_size() as u64;
-    if written.len() != regions.len() {
+    if maps.len() != regions.len() {
         return Err(invalid());
     }
-    for (region, words) in regions.iter().zip(&written) {
+    for (region, words) in regions.iter().zip(maps.iter()) {
         if u64::try_from(words.len()).map_err(|_| invalid())? != (region.len / page).div_ceil(64) {
             return Err(invalid());
         }
     }
-    for exclusion in exclusions {
-        let index = usize::try_from(exclusion.region).map_err(|_| invalid())?;
-        let (Some(region), Some(words)) = (regions.get(index), written.get_mut(index)) else {
+    for run in runs {
+        let index = usize::try_from(run.region).map_err(|_| invalid())?;
+        let (Some(region), Some(words)) = (regions.get(index), maps.get_mut(index)) else {
             return Err(invalid());
         };
-        let end = exclusion
-            .offset
-            .checked_add(exclusion.len)
-            .ok_or_else(invalid)?;
-        if !exclusion.offset.is_multiple_of(page) || !end.is_multiple_of(page) || end > region.len {
+        let end = run.offset.checked_add(run.len).ok_or_else(invalid)?;
+        if !run.offset.is_multiple_of(page) || !end.is_multiple_of(page) || end > region.len {
             return Err(invalid());
         }
-        let mut first = exclusion.offset / page;
+        let mut first = run.offset / page;
         let last = end / page;
         while first < last {
             let bit = first % 64;
@@ -972,10 +1005,47 @@ pub(crate) fn newly_retained(
             } else {
                 ((1u64 << count) - 1) << bit
             };
-            words[usize::try_from(first / 64).map_err(|_| invalid())?] &= !mask;
+            let word = &mut words[usize::try_from(first / 64).map_err(|_| invalid())?];
+            if set {
+                *word |= mask;
+            } else {
+                *word &= !mask;
+            }
             first += count;
         }
     }
+    Ok(())
+}
+
+/// The exclusions of a refresh that leaves the guest's hot pages out (core ABI 10): `free`, the
+/// free runs as [`exclusions`] made them, plus the runs of `hot` that are not free, flagged
+/// [`EXCLUSION_HOT`], sorted and disjoint. The hot runs get what room the [`exclusion_cap`]
+/// leaves, longest first: a hot page left in is folded, which is always correct.
+pub(crate) fn with_hot_runs(
+    regions: &[Region],
+    free: &[Exclusion],
+    hot: &[Vec<u64>],
+) -> io::Result<Vec<Exclusion>> {
+    let mut free_bits: Vec<Vec<u64>> = hot.iter().map(|words| vec![0; words.len()]).collect();
+    mark_runs(regions, &mut free_bits, free, true)?;
+    let room = exclusion_cap().saturating_sub(free.len());
+    let mut runs = exclusions_within(regions, hot, &free_bits, room)?.runs;
+    for run in &mut runs {
+        run.flags = EXCLUSION_HOT;
+    }
+    runs.extend_from_slice(free);
+    runs.sort_unstable_by_key(|x| (x.region, x.offset));
+    Ok(runs)
+}
+
+/// The pages a quiesced tracked CREATE would newly retain: those written since the standing
+/// version (`written`, from [`written_pages`]) that are outside its `exclusions`.
+pub(crate) fn newly_retained(
+    regions: &[Region],
+    mut written: Vec<Vec<u64>>,
+    exclusions: &[Exclusion],
+) -> io::Result<u64> {
+    mark_runs(regions, &mut written, exclusions, false)?;
     Ok(written
         .iter()
         .flatten()
@@ -1435,13 +1505,13 @@ mod tests {
         let excluded = [
             Exclusion {
                 region: 0,
-                reserved: 0,
+                flags: 0,
                 offset: 0,
                 len: 4096,
             },
             Exclusion {
                 region: 1,
-                reserved: 0,
+                flags: 0,
                 offset: 8192,
                 len: 4096,
             },
@@ -1528,6 +1598,45 @@ mod tests {
                 .unwrap_err()
                 .raw_os_error(),
             Some(libc::ENOTTY)
+        );
+    }
+
+    #[test]
+    fn hot_runs_leave_free_pages_free_and_sort_among_them() {
+        let page = crate::arch::host_page_size() as u64;
+        let regions = [
+            Region {
+                addr: 0x10_0000,
+                len: 128 * page,
+            },
+            Region {
+                addr: 0x100_0000,
+                len: 64 * page,
+            },
+        ];
+        let run = |region, first: u64, count: u64, flags| Exclusion {
+            region,
+            flags,
+            offset: first * page,
+            len: count * page,
+        };
+        let free = vec![run(0, 4, 4, 0), run(1, 0, 2, 0)];
+        // Hot: region 0 pages 2..6 (half of it free) and 100, region 1 pages 1..3 (page 1 free).
+        let hot = vec![vec![0b11_1100, 1 << (100 - 64)], vec![0b110]];
+        assert_eq!(
+            with_hot_runs(&regions, &free, &hot).unwrap(),
+            vec![
+                run(0, 2, 2, EXCLUSION_HOT),
+                run(0, 4, 4, 0),
+                run(0, 100, 1, EXCLUSION_HOT),
+                run(1, 0, 2, 0),
+                run(1, 2, 1, EXCLUSION_HOT),
+            ]
+        );
+        // Nothing hot leaves the free runs as they are.
+        assert_eq!(
+            with_hot_runs(&regions, &free, &[vec![0, 0], vec![0]]).unwrap(),
+            free
         );
     }
 
@@ -1662,7 +1771,7 @@ mod tests {
         // region 1's page 1 (but not region 0's), one covers only unwritten pages.
         let exclusion = |region, first: u64, count: u64| Exclusion {
             region,
-            reserved: 0,
+            flags: 0,
             offset: first * page,
             len: count * page,
         };
@@ -1843,19 +1952,19 @@ mod tests {
             vec![
                 Exclusion {
                     region: 0,
-                    reserved: 0,
+                    flags: 0,
                     offset: 0,
                     len: 8192
                 },
                 Exclusion {
                     region: 0,
-                    reserved: 0,
+                    flags: 0,
                     offset: 12288,
                     len: 8192
                 },
                 Exclusion {
                     region: 1,
-                    reserved: 0,
+                    flags: 0,
                     offset: 0,
                     len: 4096
                 }
@@ -1890,7 +1999,7 @@ mod tests {
                 } else if let Some(start) = run.take() {
                     out.push(Exclusion {
                         region: u32::try_from(index).unwrap(),
-                        reserved: 0,
+                        flags: 0,
                         offset: start * page,
                         len: (p - start) * page,
                     });

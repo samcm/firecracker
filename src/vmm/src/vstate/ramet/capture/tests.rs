@@ -930,6 +930,8 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         background: Background::detached(),
         standing_exclusions: Vec::new(),
         hot_set_mark: Vec::new(),
+        folded: Vec::new(),
+        hot: Vec::new(),
     };
     let file = summary_buffer(4096);
     let budget = protocol::MAX_FREE_SUMMARY_MICROS.to_le_bytes();
@@ -1133,9 +1135,14 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     bound.extend_from_slice(&1u64.to_le_bytes());
     assert_eq!(
         protocol::parse_refresh(&bound).unwrap(),
-        RefreshBound { pages: 9, old_chain_counts: true }
+        RefreshBound { pages: 9, old_chain_counts: true, leave_hot: false }
     );
     bound[8] = 2;
+    assert_eq!(
+        protocol::parse_refresh(&bound).unwrap(),
+        RefreshBound { pages: 9, old_chain_counts: false, leave_hot: true }
+    );
+    bound[8] = 4;
     protocol::parse_refresh(&bound).unwrap_err();
     protocol::parse_refresh(&[0; 8]).unwrap_err();
     // Replies are commands only Firecracker sends.
@@ -1181,8 +1188,8 @@ fn track_and_refresh_frames_numbers_and_bodies() {
         nr_zero_runs: 4,
         folded_pages: 7,
         ..Default::default()
-    }, Paused { total: Duration::from_micros(8), waited: Duration::from_micros(11) }, 9, 10, 12);
-    assert_eq!(body.len(), 72);
+    }, Paused { total: Duration::from_micros(8), waited: Duration::from_micros(11) }, 9, 10, 12, 13);
+    assert_eq!(body.len(), 80);
     assert_eq!(body[..8], 5u64.to_le_bytes());
     assert_eq!(body[8..16], 6u64.to_le_bytes());
     assert_eq!(body[16..24], [3, 0, 0, 0, 4, 0, 0, 0]);
@@ -1191,7 +1198,8 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     assert_eq!(body[40..48], 9u64.to_le_bytes());
     assert_eq!(body[48..56], 10u64.to_le_bytes());
     assert_eq!(body[56..64], 11u64.to_le_bytes());
-    assert_eq!(body[64..], 12u64.to_le_bytes());
+    assert_eq!(body[64..72], 12u64.to_le_bytes());
+    assert_eq!(body[72..], 13u64.to_le_bytes());
 }
 
 #[test]
@@ -1242,6 +1250,8 @@ fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
         background: Background::detached(),
         standing_exclusions: Vec::new(),
         hot_set_mark: Vec::new(),
+        folded: Vec::new(),
+        hot: Vec::new(),
     };
     let previous_state = BackendState::load();
     let flat = memfd(c"flat", 0);
@@ -1279,4 +1289,17 @@ fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
     assert!(service.tracker.is_some());
     assert!(Arc::ptr_eq(service.standing.as_ref().unwrap(), &standing));
     previous_state.store();
+}
+
+#[test]
+fn hot_pages_are_rewrites_of_what_the_last_fold_shared_or_left_out() {
+    // Page 0: shared by the last fold, the guest's own again (rewritten). Page 1: the guest's
+    // own, never shared (a first write). Page 2: left out hot, still its own. Page 3: shared,
+    // not rewritten. Page 4: left out hot, since shared again (not its own).
+    let written = vec![vec![0b0_0111]];
+    let folded = vec![vec![0b0_1001]];
+    let hot = vec![vec![0b1_0100]];
+    assert_eq!(super::rewritten(&written, &folded, &hot), vec![vec![0b0_0101]]);
+    // Before any fold was read, nothing is a rewrite.
+    assert_eq!(super::rewritten(&written, &[], &[]), vec![vec![0]]);
 }
