@@ -421,6 +421,23 @@ fn encode_refreshed(
 
 /// The guest's hot pages: those it maps as its own (`written`) that the last fold shared
 /// (`folded`) or the last refresh left out as hot (`hot`). Either map may be empty: none.
+/// The pages `written` marks that `hot` does not. A hot page is the guest's own and writable:
+/// touching it re-shares nothing, and once a fold that takes the hot set has write-protected it,
+/// a touch is a copy on write the VMM makes and the guard cannot pause.
+fn without(written: &[Vec<u64>], hot: &[Vec<u64>]) -> Vec<Vec<u64>> {
+    written
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let hot = hot.get(i);
+            w.iter()
+                .enumerate()
+                .map(|(j, w)| w & !hot.and_then(|m| m.get(j)).copied().unwrap_or(0))
+                .collect()
+        })
+        .collect()
+}
+
 fn rewritten(written: &[Vec<u64>], folded: &[Vec<u64>], hot: &[Vec<u64>]) -> Vec<Vec<u64>> {
     let word = |maps: &[Vec<u64>], i: usize, j: usize| {
         maps.get(i).and_then(|m| m.get(j)).copied().unwrap_or(0)
@@ -836,7 +853,7 @@ impl CaptureService {
         let (reshared, written_now) = memversion::geometry(&self.channel.regions)
             .and_then(|regions| {
                 let written = memversion::written_pages(tracker.as_fd(), &regions)?;
-                Ok((self.background.reshare_now(&regions, &written), written))
+                Ok((self.background.reshare_now(&regions, &without(&written, &self.hot)), written))
             })
             .unwrap_or_default();
         let reshared_us = started.elapsed().as_micros();
@@ -989,7 +1006,7 @@ impl CaptureService {
                     && let Ok(regions) = memversion::geometry(&self.channel.regions)
                     && let Ok((present, written)) = memversion::residency(tracker.as_fd(), &regions)
                 {
-                    self.background.reshare(&regions, &written);
+                    self.background.reshare(&regions, &without(&written, &self.hot));
                     self.folded = present
                         .iter()
                         .zip(&written)

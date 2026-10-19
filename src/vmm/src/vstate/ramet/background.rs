@@ -58,6 +58,8 @@ struct State {
     job: Option<Job>,
     /// A capture holds the fence: no touch may run.
     fenced: bool,
+    /// Fences taken: a touch that began before the latest one is stale and ends.
+    fences: u64,
     /// A batch of touches is running.
     touching: bool,
     guard: Option<Guard>,
@@ -226,11 +228,12 @@ impl Background {
     fn touch(&self, pages: &[u64]) {
         let (lock, cvar) = &*self.shared;
         let started = Instant::now();
+        let fences = lock.lock().expect("Poisoned lock").fences;
         let mut done = 0;
         for batch in pages.chunks(TOUCH_BATCH) {
             {
                 let mut state = lock.lock().expect("Poisoned lock");
-                if state.fenced || state.job.is_some() {
+                if state.fenced || state.job.is_some() || state.fences != fences {
                     break;
                 }
                 state.touching = true;
@@ -339,6 +342,7 @@ impl Background {
         let (lock, cvar) = &*self.shared;
         let mut state = lock.lock().expect("Poisoned lock");
         state.fenced = true;
+        state.fences += 1;
         if matches!(state.job, Some(Job::Touch(_))) {
             state.job = None;
         }
