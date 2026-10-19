@@ -865,6 +865,14 @@ impl CaptureService {
         } else {
             exclusions
         };
+        // A fold that takes the hot set runs long, and the pages the guest writes meanwhile are
+        // kept beside what the old chain still holds: from its start, the guard leaves the guest
+        // only the rest of the bound, not just from its end.
+        if !leave_hot && !self.hot.is_empty() && bound.pages > 0 && before != u64::MAX {
+            let held = if bound.old_chain_counts { before } else { 0 };
+            self.background
+                .guard(tracker, bound.pages.saturating_sub(held));
+        }
         let refreshed = memversion::geometry(&self.channel.regions)
             .and_then(|regions| {
                 memversion::refresh(
