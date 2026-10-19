@@ -179,21 +179,26 @@ impl Background {
                 error!("Ramet standing guard cannot read its eventfd: {err}");
                 return;
             }
-            self.guard_check();
+            self.guard_check(true);
         }
     }
 
-    /// Reads the counter and pauses the guest if it reached the guard.
-    fn guard_check(&self) {
+    /// Pauses the guest if the count reached the guard: on the kernel's signal, which it sends
+    /// only as the count reaches the limit, or when the counter says so.
+    fn guard_check(&self, signalled: bool) {
         let (lock, cvar) = &*self.shared;
         let mut state = lock.lock().expect("Poisoned lock");
         let reached = match &state.guard {
-            Some(guard) if state.paused_at.is_none() => {
+            Some(_) if state.guarding || state.paused_at.is_some() => false,
+            // The counter is read under the tracker lock, which a live fold holds to its end: a
+            // guard that waited for it would pause the guest only once the fold stood.
+            Some(_) if signalled => true,
+            Some(guard) => {
                 // SAFETY: the tracker stays open while the guard is armed.
                 let fd = unsafe { BorrowedFd::borrow_raw(guard.tracker) };
                 memversion::track_info(fd).is_ok_and(|info| info.dirty_pages >= guard.at)
             }
-            _ => false,
+            None => false,
         };
         if !reached {
             return;
@@ -273,7 +278,7 @@ impl Background {
             error!("Ramet could not arm the standing guard at {at} pages: {err}");
         }
         if at == 0 {
-            self.guard_check();
+            self.guard_check(false);
         }
     }
 
@@ -303,7 +308,7 @@ impl Background {
         cvar.notify_all();
         // A guest the refresh leaves at or past the bound gets no new signal: the kernel signals
         // a count reaching the limit, and this one already has.
-        self.guard_check();
+        self.guard_check(false);
         paused
     }
 
