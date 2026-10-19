@@ -868,10 +868,12 @@ impl CaptureService {
         // A fold that takes the hot set runs long, and the pages the guest writes meanwhile are
         // kept beside what the old chain still holds: from its start, the guard leaves the guest
         // only the rest of the bound, not just from its end.
+        let mut fold_guard = None;
         if !leave_hot && !self.hot.is_empty() && bound.pages > 0 && before != u64::MAX {
             let held = if bound.old_chain_counts { before } else { 0 };
-            self.background
-                .guard(tracker, bound.pages.saturating_sub(held));
+            let at = bound.pages.saturating_sub(held);
+            self.background.guard(tracker, at);
+            fold_guard = Some(at);
         }
         let refreshed = memversion::geometry(&self.channel.regions)
             .and_then(|regions| {
@@ -962,12 +964,13 @@ impl CaptureService {
                 info!(
                     "Ramet refreshed the standing version in {} us (re-shared {reshared} pages \
                      in {reshared_us} us, fold {folded_us} us): own={} new={} folded={} depth={} \
-                     hot={hot}",
+                     hot={hot} fold_guard={fold_guard:?} after={after} dirty_now={}",
                     started.elapsed().as_micros(),
                     info.own_pages,
                     info.new_pages,
                     info.folded_pages,
-                    info.depth
+                    info.depth,
+                    memversion::track_info(tracker.as_fd()).map_or(u64::MAX, |t| t.dirty_pages)
                 );
                 let version = Arc::new(version);
                 self.standing = Some(version.clone());

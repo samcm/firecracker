@@ -301,6 +301,9 @@ impl Background {
         }
         drop(state);
         cvar.notify_all();
+        // A guest the refresh leaves at or past the bound gets no new signal: the kernel signals
+        // a count reaching the limit, and this one already has.
+        self.guard_check();
         paused
     }
 
