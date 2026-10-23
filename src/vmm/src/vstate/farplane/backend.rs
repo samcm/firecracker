@@ -486,11 +486,15 @@ fn commit_plan(
             })?;
     }
 
-    let mapped = memversion::map_regions(&geometry, incoming.fds.first().map(AsFd::as_fd))
-        .map_err(|err| BackendError::Map(io::Error::other(err)))
-        .inspect_err(|_| {
-            reject(&sock, &incoming, ErrorCode::MapFailed);
-        })?;
+    let mapped = memversion::map_regions(
+        &geometry,
+        incoming.fds.first().map(AsFd::as_fd),
+        plan.eager_import(),
+    )
+    .map_err(|err| BackendError::Map(io::Error::other(err)))
+    .inspect_err(|_| {
+        reject(&sock, &incoming, ErrorCode::MapFailed);
+    })?;
     for region in &mapped {
         region
             .lock_on_fault()
@@ -995,6 +999,6 @@ mod tests {
     fn test_farplane_vmstate_and_channel_identities_are_distinct() {
         assert_ne!(protocol::VMSTATE_IDENTITY, protocol::FEATURE_IDENTITY);
         assert_eq!(protocol::VMSTATE_IDENTITY, "farplane/8");
-        assert_eq!(protocol::FEATURE_IDENTITY, "farplane/10");
+        assert_eq!(protocol::FEATURE_IDENTITY, "farplane/11");
     }
 }

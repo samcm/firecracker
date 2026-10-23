@@ -169,16 +169,20 @@ impl Mapping {
 }
 
 /// Reserve all ranges before importing any. Failure drops only mappings we still own.
+/// An eager import maps every page of the version at import, so the guest's mapping holds no
+/// reference to the version; otherwise the import is lazy where the kernel supports it.
 pub(crate) fn map_regions(
     regions: &[Region],
     version: Option<BorrowedFd<'_>>,
+    eager: bool,
 ) -> Result<Vec<Mapping>, MappingError> {
     map_regions_with(regions, version.is_some(), |index, addr| {
-        map_private(
-            version.expect("import only runs with a version"),
-            index,
-            addr,
-        )
+        let version = version.expect("import only runs with a version");
+        if eager {
+            map_with(version, index, addr, MV_MAP_PRIVATE)
+        } else {
+            map_private(version, index, addr)
+        }
     })
 }
 
@@ -1084,12 +1088,12 @@ mod tests {
         drop(reservation);
         let null = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(
-            map_regions(&regions, Some(null.as_fd()))
+            map_regions(&regions, Some(null.as_fd()), false)
                 .unwrap_err()
                 .raw_os_error(),
             Some(libc::ENOTTY)
         );
-        let boot = map_regions(&regions, None).unwrap();
+        let boot = map_regions(&regions, None, false).unwrap();
         for mapping in &boot {
             assert_no_huge_pages(mapping);
         }
@@ -1099,7 +1103,9 @@ mod tests {
             (boot[0].addr as *mut u8).write(0x5a);
         }
         assert_eq!(
-            map_regions(&regions, None).unwrap_err().raw_os_error(),
+            map_regions(&regions, None, false)
+                .unwrap_err()
+                .raw_os_error(),
             Some(libc::EEXIST)
         );
         // SAFETY: failed NOREPLACE did not change the owned mapping.
@@ -1118,7 +1124,7 @@ mod tests {
                 );
             }
             // Model a successful NOREPLACE import, without claiming a kernel version proof.
-            let mapped = map_regions(&[regions[index as usize]], None)
+            let mapped = map_regions(&[regions[index as usize]], None, false)
                 .unwrap()
                 .pop()
                 .unwrap();
@@ -1147,7 +1153,7 @@ mod tests {
         let mut collision = None;
         assert_eq!(
             map_regions_with(&regions, true, |index, _| {
-                let mapped = map_regions(&[regions[index as usize]], None)
+                let mapped = map_regions(&[regions[index as usize]], None, false)
                     .unwrap()
                     .pop()
                     .unwrap();
@@ -1170,7 +1176,7 @@ mod tests {
             Some(libc::EEXIST)
         );
         drop(collision);
-        drop(map_regions(&regions, None).unwrap());
+        drop(map_regions(&regions, None, false).unwrap());
     }
 
     #[test]
@@ -1977,7 +1983,7 @@ mod tests {
             addr: GUEST_RAM_BASE,
             len: pages * page,
         }];
-        let source = map_regions(&regions, None).unwrap();
+        let source = map_regions(&regions, None, false).unwrap();
         let at = |p: u64| (GUEST_RAM_BASE + p * page) as *mut u64;
         for p in 0..pages {
             // SAFETY: every page lies in the live, writable source mapping.
@@ -2016,7 +2022,7 @@ mod tests {
         assert_eq!(info.new_pages, pages - excluded, "{info:?}");
         drop(source);
 
-        let imported = map_regions(&regions, Some(version.as_fd())).unwrap();
+        let imported = map_regions(&regions, Some(version.as_fd()), false).unwrap();
         // SAFETY: every page lies in the live imported mapping.
         let read = |p: u64| unsafe { at(p).read() };
         // A kept single-page run, the long run and the last kept run read zero.
@@ -2052,7 +2058,7 @@ mod tests {
             addr: GUEST_RAM_BASE,
             len: pages * page,
         }];
-        let source = map_regions(&regions, None).unwrap();
+        let source = map_regions(&regions, None, false).unwrap();
         let at = |p: u64| (GUEST_RAM_BASE + p * page) as *mut u64;
         let fill = |range: std::ops::Range<u64>, tag: u64| {
             for p in range {

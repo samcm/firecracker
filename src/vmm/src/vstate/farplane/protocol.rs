@@ -24,7 +24,7 @@ pub const MAX_SCM_FDS: usize = 253;
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
 /// the handshake and the capture command order a peer must speak.
-pub const FEATURE_IDENTITY: &str = "farplane/10";
+pub const FEATURE_IDENTITY: &str = "farplane/11";
 /// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
 /// it was captured under. It changes only when those do, so a channel change alone leaves every
 /// stored vmstate restorable.
@@ -619,7 +619,8 @@ pub struct BackingPlanBody {
     pub pm_pid: u32,
     /// Reserved /6 field, required to be zero.
     pub extent_count: u32,
-    /// Frame flags; bit 0 states version and vmstate descriptors ride along.
+    /// Frame flags; bit 0 states version and vmstate descriptors ride along, and bit 1 that the
+    /// version is imported eagerly.
     pub flags: u32,
     /// Checkpoint geometry of the single multi-region version.
     pub regions: Vec<RegionRecord>,
@@ -633,8 +634,17 @@ impl BackingPlanBody {
         self.flags & Self::FLAG_VMSTATE != 0
     }
 
+    /// States whether the version is imported eagerly: every page mapped at import, so the
+    /// guest holds no reference to the version and its pages are the guest's own once the
+    /// version's other holders close it.
+    pub fn eager_import(&self) -> bool {
+        self.flags & Self::FLAG_EAGER_IMPORT != 0
+    }
+
     /// Flag bit stating a vmstate descriptor rides on the frame.
     pub const FLAG_VMSTATE: u32 = 1;
+    /// Flag bit asking for an eager import of the restore's version. Only a restore carries it.
+    pub const FLAG_EAGER_IMPORT: u32 = 2;
 }
 
 /// Parses a `backing_plan` body.
@@ -646,10 +656,14 @@ pub fn parse_backing_plan(body: &[u8]) -> Result<BackingPlanBody, ChannelError> 
     let region_count = u32::from_le_bytes(body[4..8].try_into().unwrap());
     let extent_count = u32::from_le_bytes(body[8..12].try_into().unwrap());
     let flags = u32::from_le_bytes(body[12..16].try_into().unwrap());
-    if flags & !BackingPlanBody::FLAG_VMSTATE != 0 || extent_count != 0 {
+    let known = BackingPlanBody::FLAG_VMSTATE | BackingPlanBody::FLAG_EAGER_IMPORT;
+    if flags & !known != 0 || extent_count != 0 {
         return Err(ChannelError::Malformed);
     }
     let restore = flags & BackingPlanBody::FLAG_VMSTATE != 0;
+    if flags & BackingPlanBody::FLAG_EAGER_IMPORT != 0 && !restore {
+        return Err(ChannelError::Malformed);
+    }
     let expected = 16 + region_count as usize * REGION_RECORD_LEN + usize::from(restore) * 32;
     if body.len() != expected {
         return Err(ChannelError::Malformed);
@@ -859,9 +873,40 @@ mod tests {
         body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
-        body.extend_from_slice(&0b10u32.to_le_bytes());
+        body.extend_from_slice(&0b100u32.to_le_bytes());
         assert!(matches!(
             parse_backing_plan(&body),
+            Err(ChannelError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn backing_plan_eager_import_is_a_restore_flag() {
+        let plan = |flags: u32| {
+            let mut body = [1u32, 1, 0, flags]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            body.extend_from_slice(
+                &RegionRecord {
+                    guest_addr: 0,
+                    size: 4096,
+                }
+                .encode(),
+            );
+            if flags & BackingPlanBody::FLAG_VMSTATE != 0 {
+                body.extend_from_slice(&[7u8; 32]);
+            }
+            parse_backing_plan(&body)
+        };
+        let restore = plan(BackingPlanBody::FLAG_VMSTATE).unwrap();
+        assert!(!restore.eager_import());
+        let eager =
+            plan(BackingPlanBody::FLAG_VMSTATE | BackingPlanBody::FLAG_EAGER_IMPORT).unwrap();
+        assert!(eager.has_vmstate() && eager.eager_import());
+        // A boot imports nothing, so it cannot ask for an eager import.
+        assert!(matches!(
+            plan(BackingPlanBody::FLAG_EAGER_IMPORT),
             Err(ChannelError::Malformed)
         ));
     }
@@ -967,6 +1012,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/10");
+        assert_eq!(FEATURE_IDENTITY, "farplane/11");
     }
 }
