@@ -531,7 +531,7 @@ pub fn build_microvm_from_snapshot(
     // The vCPU state is restored and nothing has run: the stage-2 tables are warmed over the hot
     // set until resume. The worker is prepared here, while a vCPU is at hand, and started last.
     let prefault = RametBackend::take_hot_set()
-        .and_then(|hot_set| prepare_bring_up_prefault(&kvm_vm, &vcpus[0], hot_set));
+        .and_then(|hot_set| prepare_bring_up_prefault(&kvm_vm, &vcpus, hot_set));
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     kvm_vm.start_vcpus(
@@ -587,7 +587,7 @@ pub fn build_microvm_from_snapshot(
 /// A bring-up prefault ready to start: a vCPU descriptor of its own, the resolved ranges and the
 /// pre-copy budget.
 struct BringUpPrefault {
-    vcpu_fd: std::os::fd::OwnedFd,
+    vcpu_fds: Vec<std::os::fd::OwnedFd>,
     ranges: Vec<crate::vstate::ramet::prefault::PrefaultRange>,
     precow_budget: u64,
 }
@@ -597,7 +597,7 @@ struct BringUpPrefault {
 /// to fault its pages the ordinary way, and the restore goes on.
 fn prepare_bring_up_prefault(
     kvm_vm: &KvmVm,
-    vcpu: &crate::vstate::vcpu::Vcpu,
+    vcpus: &[crate::vstate::vcpu::Vcpu],
     hot_set: crate::vstate::ramet::protocol::HotSetTail,
 ) -> Option<BringUpPrefault> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -613,19 +613,27 @@ fn prepare_bring_up_prefault(
     if dropped > 0 {
         warn!("Bring-up prefault: {dropped} hot-set entries lie outside guest memory");
     }
-    // SAFETY: F_DUPFD_CLOEXEC duplicates a descriptor this process holds open.
-    let dup = unsafe { libc::fcntl(vcpu.kvm_vcpu.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if dup < 0 {
-        warn!(
-            "Bring-up prefault: no vCPU descriptor: {}",
-            std::io::Error::last_os_error()
-        );
+    // One worker per vCPU: KVM_PRE_FAULT_MEMORY takes the vCPU's lock, and the
+    // vCPUs do not run until resume stops every worker.
+    let mut vcpu_fds = Vec::with_capacity(vcpus.len());
+    for vcpu in vcpus {
+        // SAFETY: F_DUPFD_CLOEXEC duplicates a descriptor this process holds open.
+        let dup = unsafe { libc::fcntl(vcpu.kvm_vcpu.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            warn!(
+                "Bring-up prefault: no vCPU descriptor: {}",
+                std::io::Error::last_os_error()
+            );
+            break;
+        }
+        // SAFETY: `dup` is a descriptor this function just created and nothing else owns.
+        vcpu_fds.push(unsafe { OwnedFd::from_raw_fd(dup) });
+    }
+    if vcpu_fds.is_empty() {
         return None;
     }
-    // SAFETY: `dup` is a descriptor this function just created and nothing else owns.
-    let vcpu_fd = unsafe { OwnedFd::from_raw_fd(dup) };
     Some(BringUpPrefault {
-        vcpu_fd,
+        vcpu_fds,
         ranges,
         precow_budget: hot_set.precow_budget,
     })
@@ -635,7 +643,7 @@ fn prepare_bring_up_prefault(
 /// pages the ordinary way.
 fn start_bring_up_prefault(prefault: BringUpPrefault, filter: &Arc<crate::seccomp::BpfProgram>) {
     if let Err(err) = crate::vstate::ramet::prefault::Prefaulter::start(
-        prefault.vcpu_fd,
+        prefault.vcpu_fds,
         prefault.ranges,
         prefault.precow_budget,
         filter.clone(),

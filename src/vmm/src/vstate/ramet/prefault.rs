@@ -240,7 +240,7 @@ impl PrefaultOps for KvmOps {
 #[derive(Debug)]
 pub struct Prefaulter {
     stop: Arc<AtomicBool>,
-    handle: JoinHandle<PrefaultReport>,
+    handles: Vec<JoinHandle<PrefaultReport>>,
     /// Signalled (dropped) when the worker returns; the drain waits on it with a futex.
     done: std::sync::mpsc::Receiver<()>,
 }
@@ -249,30 +249,47 @@ pub struct Prefaulter {
 static ACTIVE: Mutex<Option<Prefaulter>> = Mutex::new(None);
 
 impl Prefaulter {
-    /// Starts the worker on its own thread, confined by `filter`. `vcpu` is a duplicate of a
-    /// vCPU descriptor of this VM; the vCPU must not run until the worker is stopped, because
-    /// `KVM_PRE_FAULT_MEMORY` and `KVM_RUN` take the same vCPU lock.
+    /// Starts one worker per vCPU descriptor, each on its own thread confined by `filter`, over
+    /// an interleaved share of the ranges and of the precow budget. Each `vcpus` entry is a
+    /// duplicate of a vCPU descriptor of this VM; the vCPUs must not run until the workers are
+    /// stopped, because `KVM_PRE_FAULT_MEMORY` and `KVM_RUN` take the same vCPU lock.
     pub fn start(
-        vcpu: OwnedFd,
+        vcpus: Vec<OwnedFd>,
         ranges: Vec<PrefaultRange>,
         precow_budget: u64,
         filter: Arc<crate::seccomp::BpfProgram>,
     ) -> io::Result<()> {
         let stop = Arc::new(AtomicBool::new(false));
-        let raised = stop.clone();
         let (tx, done) = std::sync::mpsc::channel::<()>();
-        let handle = std::thread::Builder::new()
-            .name("fc_prefault".to_string())
-            .spawn(move || {
-                if let Err(err) = crate::seccomp::apply_filter(&filter) {
-                    error!("Bring-up prefault could not install its filter: {err}");
-                    return PrefaultReport::default();
-                }
-                let report = run(&mut KvmOps { vcpu }, &ranges, precow_budget, &raised);
-                drop(tx);
-                report
-            })?;
-        *ACTIVE.lock().expect("Poisoned lock") = Some(Self { stop, handle, done });
+        let workers = vcpus.len().max(1);
+        let mut handles = Vec::with_capacity(workers);
+        for (i, vcpu) in vcpus.into_iter().enumerate() {
+            let share: Vec<PrefaultRange> =
+                ranges.iter().skip(i).step_by(workers).copied().collect();
+            let raised = stop.clone();
+            let filter = filter.clone();
+            let tx = tx.clone();
+            let budget = precow_budget / workers as u64;
+            let started = std::thread::Builder::new()
+                .name(format!("fc_prefault{i}"))
+                .spawn(move || {
+                    if let Err(err) = crate::seccomp::apply_filter(&filter) {
+                        error!("Bring-up prefault could not install its filter: {err}");
+                        return PrefaultReport::default();
+                    }
+                    let report = run(&mut KvmOps { vcpu }, &share, budget, &raised);
+                    drop(tx);
+                    report
+                });
+            match started {
+                Ok(handle) => handles.push(handle),
+                Err(err) if handles.is_empty() => return Err(err),
+                Err(_) => break,
+            }
+        }
+        // The drain waits until every worker has dropped its sender.
+        drop(tx);
+        *ACTIVE.lock().expect("Poisoned lock") = Some(Self { stop, handles, done });
         Ok(())
     }
 
@@ -286,7 +303,15 @@ impl Prefaulter {
         // when it returns.
         let _ = prefaulter.done.recv_timeout(DRAIN);
         prefaulter.stop.store(true, Ordering::Release);
-        let report = prefaulter.handle.join().unwrap_or_default();
+        let mut report = PrefaultReport::default();
+        for handle in prefaulter.handles {
+            let r = handle.join().unwrap_or_default();
+            report.precow_bytes += r.precow_bytes;
+            report.prefaulted_bytes += r.prefaulted_bytes;
+            report.abandoned_ranges += r.abandoned_ranges;
+            report.stopped |= r.stopped;
+            report.micros = report.micros.max(r.micros);
+        }
         info!(
             "Bring-up prefault: precow {} B, prefaulted {} B, abandoned {} ranges, stopped {}, \
              {} us",
