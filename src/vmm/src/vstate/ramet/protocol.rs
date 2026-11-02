@@ -24,7 +24,7 @@ pub const MAX_SCM_FDS: usize = 253;
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
 /// the handshake and the capture command order a peer must speak.
-pub const FEATURE_IDENTITY: &str = "ramet/4";
+pub const FEATURE_IDENTITY: &str = "ramet/5";
 /// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
 /// it was captured under. It changes only when those do, so a channel change alone leaves every
 /// stored vmstate restorable.
@@ -659,6 +659,9 @@ pub struct RefreshBound {
     /// rewrote since the last fold took them, and those the last refresh left out that it
     /// still maps as its own. Without it the fold takes every page it may.
     pub leave_hot: bool,
+    /// A capture arms right after this fold: the walk of what the fold shared, which only the
+    /// next refresh's hot set and re-share use, is left out rather than delay the capture.
+    pub capture_next: bool,
 }
 
 /// Parses a RecordHotSet request: whether it only marks.
@@ -671,19 +674,20 @@ pub fn parse_record_hot_set(body: &[u8]) -> Result<bool, ChannelError> {
 }
 
 /// Parses a Refresh request: empty for no bound, or LE u64 bound pages and u64 flags (bit 0: the
-/// old chain counts; bit 1: leave the hot pages out).
+/// old chain counts; bit 1: leave the hot pages out; bit 2: a capture arms next).
 pub fn parse_refresh(body: &[u8]) -> Result<RefreshBound, ChannelError> {
     match body.len() {
         0 => Ok(RefreshBound::default()),
         16 => {
             let flags = u64::from_le_bytes(body[8..].try_into().unwrap());
-            if flags & !3 != 0 {
+            if flags & !7 != 0 {
                 return Err(ChannelError::Malformed);
             }
             Ok(RefreshBound {
                 pages: u64::from_le_bytes(body[..8].try_into().unwrap()),
                 old_chain_counts: flags & 1 != 0,
                 leave_hot: flags & 2 != 0,
+                capture_next: flags & 4 != 0,
             })
         }
         _ => Err(ChannelError::Malformed),

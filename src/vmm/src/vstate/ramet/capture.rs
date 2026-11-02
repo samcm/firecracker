@@ -316,6 +316,10 @@ pub struct CaptureService {
     folded: Vec<Vec<u64>>,
     /// The pages the last refresh left out as hot; empty after any fold that took them.
     hot: Vec<Vec<u64>>,
+    /// Folds a capture's pre-copy replaced with their flat copies, kept open until the capture
+    /// resumes: the last close of a version releases it in the kernel, as long as a fold on a
+    /// large guest, and the capture would wait for it.
+    parked: Vec<OwnedFd>,
 }
 
 /// The 40-byte `tracked` reply body. An untracked reply is zero after `tracked`.
@@ -495,6 +499,7 @@ impl CaptureService {
                     background,
                     hot_set_mark: Vec::new(),
                     folded: Vec::new(),
+                    parked: Vec::new(),
                     hot: Vec::new(),
                 };
                 loop {
@@ -822,6 +827,7 @@ impl CaptureService {
             self.background.wake_with(wake);
         }
         self.guard_pages = bound.pages;
+        self.parked.clear();
         let Some(tracker) = self.tracker.as_ref() else {
             return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
         };
@@ -972,7 +978,12 @@ impl CaptureService {
                 }
                 let paused = self.background.release(started);
                 let version = match flattened {
-                    Ok(flat) => flat,
+                    Ok(flat) => {
+                        if bound.capture_next {
+                            self.parked.push(folded);
+                        }
+                        flat
+                    }
                     Err(err) => {
                         error!("Ramet could not flatten the refreshed standing version: {err}");
                         folded
@@ -1001,8 +1012,11 @@ impl CaptureService {
                 // What the source still maps alone is what the fold refused, what it left out
                 // as hot and what the guest wrote since: re-share it so the next live fold takes
                 // it. What it maps and does not own is what the fold shared.
+                // A capture arming next folds the rest itself, and a walk of the guest's memory
+                // here would hold it up: the next refresh then finds no hot set to leave out.
                 self.folded.clear();
-                if let Some(tracker) = self.tracker.as_ref()
+                if !bound.capture_next
+                    && let Some(tracker) = self.tracker.as_ref()
                     && let Ok(regions) = memversion::geometry(&self.channel.regions)
                     && let Ok((present, written)) = memversion::residency(tracker.as_fd(), &regions)
                 {
@@ -1348,11 +1362,14 @@ impl CaptureService {
         }
         self.background.unfence();
         dispatch::gate().open();
-        self.reply(
+        let replied = self.reply(
             request_id,
             MsgType::Resumed,
             &u32::from(running).to_le_bytes(),
-        )
+        );
+        // The pre-copy's folds are released once the capture has answered.
+        self.parked.clear();
+        replied
     }
 
     fn reply(&mut self, request_id: u64, msg: MsgType, body: &[u8]) -> Result<(), ChannelError> {

@@ -931,6 +931,7 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         standing_exclusions: Vec::new(),
         hot_set_mark: Vec::new(),
         folded: Vec::new(),
+        parked: Vec::new(),
         hot: Vec::new(),
     };
     let file = summary_buffer(4096);
@@ -1135,14 +1136,19 @@ fn track_and_refresh_frames_numbers_and_bodies() {
     bound.extend_from_slice(&1u64.to_le_bytes());
     assert_eq!(
         protocol::parse_refresh(&bound).unwrap(),
-        RefreshBound { pages: 9, old_chain_counts: true, leave_hot: false }
+        RefreshBound { pages: 9, old_chain_counts: true, leave_hot: false, capture_next: false }
     );
     bound[8] = 2;
     assert_eq!(
         protocol::parse_refresh(&bound).unwrap(),
-        RefreshBound { pages: 9, old_chain_counts: false, leave_hot: true }
+        RefreshBound { pages: 9, old_chain_counts: false, leave_hot: true, capture_next: false }
     );
     bound[8] = 4;
+    assert_eq!(
+        protocol::parse_refresh(&bound).unwrap(),
+        RefreshBound { pages: 9, old_chain_counts: false, leave_hot: false, capture_next: true }
+    );
+    bound[8] = 8;
     protocol::parse_refresh(&bound).unwrap_err();
     protocol::parse_refresh(&[0; 8]).unwrap_err();
     // Replies are commands only Firecracker sends.
@@ -1251,6 +1257,7 @@ fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
         standing_exclusions: Vec::new(),
         hot_set_mark: Vec::new(),
         folded: Vec::new(),
+        parked: Vec::new(),
         hot: Vec::new(),
     };
     let previous_state = BackendState::load();
