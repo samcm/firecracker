@@ -520,6 +520,7 @@ fn commit_plan(
         &geometry,
         incoming.fds.first().map(AsFd::as_fd),
         hot.as_ref(),
+        plan.eager(),
     )
     .map_err(|err| BackendError::Map(io::Error::other(err)))
     .inspect_err(|_| {
@@ -1044,6 +1045,6 @@ mod tests {
     fn test_farplane_vmstate_and_channel_identities_are_distinct() {
         assert_ne!(protocol::VMSTATE_IDENTITY, protocol::FEATURE_IDENTITY);
         assert_eq!(protocol::VMSTATE_IDENTITY, "farplane-vmstate/1");
-        assert_eq!(protocol::FEATURE_IDENTITY, "farplane/20");
+        assert_eq!(protocol::FEATURE_IDENTITY, "farplane/21");
     }
 }

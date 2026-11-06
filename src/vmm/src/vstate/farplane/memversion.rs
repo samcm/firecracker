@@ -185,18 +185,24 @@ pub(crate) struct HotMapped {
 /// Reserve all ranges before importing any. Failure drops only mappings we still own. An import
 /// with a hot set maps it at once (MAP2): the pages the chain holds are present before the guest
 /// runs, the written ones privately copied within the budget.
+/// An eager import shares every page the version holds at once and keeps no reference to the
+/// version; it takes no hot set, and its present pages are not the pages the guest touched.
 pub(crate) fn map_regions(
     regions: &[Region],
     version: Option<BorrowedFd<'_>>,
     hot: Option<&ImportHotSet>,
+    eager: bool,
 ) -> Result<(Vec<Mapping>, HotMapped), MappingError> {
-    if version.is_some() {
+    if version.is_some() && !eager {
         IMPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let mut done = HotMapped::default();
     let mut budget = hot.map_or(0, |hot| hot.copy_budget);
     let mappings = map_regions_with(regions, version.is_some(), |index, addr| {
         let version = version.expect("import only runs with a version");
+        if eager {
+            return map_with(version, index, addr, MV_MAP_PRIVATE);
+        }
         let Some(hot) = hot else {
             return map_private(version, index, addr);
         };
@@ -608,7 +614,7 @@ fn map_with(version: BorrowedFd<'_>, region: u32, addr: u64, flags: u32) -> io::
 }
 
 /// Caller releases only its own reservation immediately before this NOREPLACE operation.
-/// Every import is lazy: the kernel farplane pins supports it, so there is no eager path.
+/// A lazy import: the mapping holds the version until it is unmapped.
 pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io::Result<()> {
     map_with(version, region, addr, MV_MAP_PRIVATE | MV_MAP_LAZY)
 }
@@ -710,8 +716,8 @@ ioctl_iow_nr!(MV_IOC_TRACK_DROP, 0x56, 0x48, u32);
 /// The longest range one MV_IOC_RESIDENT request reports.
 pub(crate) const MV_RESIDENT_MAX_LEN: u64 = 1 << 30;
 
-/// Set once this process imported its guest memory from a version. Every import is lazy, so
-/// then, and only then, are its present guest pages the pages it touched (see `hot_set`).
+/// Set once this process imported its guest memory lazily from a version: then, and only then,
+/// are its present guest pages the pages it touched (see `hot_set`).
 static IMPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether this process's guest memory was imported (lazily) from a version.
@@ -1342,12 +1348,12 @@ mod tests {
         drop(reservation);
         let null = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(
-            map_regions(&regions, Some(null.as_fd()), None).map(|(m, _)| m)
+            map_regions(&regions, Some(null.as_fd()), None, false).map(|(m, _)| m)
                 .unwrap_err()
                 .raw_os_error(),
             Some(libc::ENOTTY)
         );
-        let boot = map_regions(&regions, None, None).map(|(m, _)| m).unwrap();
+        let boot = map_regions(&regions, None, None, false).map(|(m, _)| m).unwrap();
         for mapping in &boot {
             assert_no_huge_pages(mapping);
         }
@@ -1357,7 +1363,7 @@ mod tests {
             (boot[0].addr as *mut u8).write(0x5a);
         }
         assert_eq!(
-            map_regions(&regions, None, None).map(|(m, _)| m).unwrap_err().raw_os_error(),
+            map_regions(&regions, None, None, false).map(|(m, _)| m).unwrap_err().raw_os_error(),
             Some(libc::EEXIST)
         );
         // SAFETY: failed NOREPLACE did not change the owned mapping.
@@ -1376,7 +1382,7 @@ mod tests {
                 );
             }
             // Model a successful NOREPLACE import, without claiming a kernel version proof.
-            let mapped = map_regions(&[regions[index as usize]], None, None).map(|(m, _)| m)
+            let mapped = map_regions(&[regions[index as usize]], None, None, false).map(|(m, _)| m)
                 .unwrap()
                 .pop()
                 .unwrap();
@@ -1405,7 +1411,7 @@ mod tests {
         let mut collision = None;
         assert_eq!(
             map_regions_with(&regions, true, |index, _| {
-                let mapped = map_regions(&[regions[index as usize]], None, None).map(|(m, _)| m)
+                let mapped = map_regions(&[regions[index as usize]], None, None, false).map(|(m, _)| m)
                     .unwrap()
                     .pop()
                     .unwrap();
@@ -1428,7 +1434,7 @@ mod tests {
             Some(libc::EEXIST)
         );
         drop(collision);
-        drop(map_regions(&regions, None, None).map(|(m, _)| m).unwrap());
+        drop(map_regions(&regions, None, None, false).map(|(m, _)| m).unwrap());
     }
 
     #[test]
@@ -2246,7 +2252,7 @@ mod tests {
             addr: GUEST_RAM_BASE,
             len: pages * page,
         }];
-        let source = map_regions(&regions, None, None).map(|(m, _)| m).unwrap();
+        let source = map_regions(&regions, None, None, false).map(|(m, _)| m).unwrap();
         let at = |p: u64| (GUEST_RAM_BASE + p * page) as *mut u64;
         for p in 0..pages {
             // SAFETY: every page lies in the live, writable source mapping.
@@ -2285,7 +2291,7 @@ mod tests {
         assert_eq!(info.new_pages, pages - excluded, "{info:?}");
         drop(source);
 
-        let imported = map_regions(&regions, Some(version.as_fd()), None).map(|(m, _)| m).unwrap();
+        let imported = map_regions(&regions, Some(version.as_fd()), None, false).map(|(m, _)| m).unwrap();
         // SAFETY: every page lies in the live imported mapping.
         let read = |p: u64| unsafe { at(p).read() };
         // A kept single-page run, the long run and the last kept run read zero.
@@ -2321,7 +2327,7 @@ mod tests {
             addr: GUEST_RAM_BASE,
             len: pages * page,
         }];
-        let source = map_regions(&regions, None, None).map(|(m, _)| m).unwrap();
+        let source = map_regions(&regions, None, None, false).map(|(m, _)| m).unwrap();
         let at = |p: u64| (GUEST_RAM_BASE + p * page) as *mut u64;
         let fill = |range: std::ops::Range<u64>, tag: u64| {
             for p in range {

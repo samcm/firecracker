@@ -24,7 +24,7 @@ pub const MAX_SCM_FDS: usize = 253;
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
 /// the handshake and the capture command order a peer must speak.
-pub const FEATURE_IDENTITY: &str = "farplane/20";
+pub const FEATURE_IDENTITY: &str = "farplane/21";
 /// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
 /// it was captured under. It changes only when those do, so a channel change alone leaves every
 /// stored vmstate restorable.
@@ -732,6 +732,18 @@ impl BackingPlanBody {
     pub const FLAG_VMSTATE: u32 = 1;
     /// Flag bit stating a hot-set tail follows the producer digest. Valid on a restore only.
     pub const FLAG_HOT_SET: u32 = 2;
+    /// Flag bit asking for the import to be mapped at once (MV_MAP_PRIVATE without
+    /// MV_MAP_LAZY): every page the version holds is shared into guest memory before the vCPUs
+    /// run, and the mapping keeps no reference to the version. Memory plane sets it for a
+    /// checkpoint restore, whose version nothing else imports, so that once memory plane lets
+    /// the version go a page the guest rewrites is freed rather than kept by the version. Valid
+    /// on a restore without a hot set (farplane/21).
+    pub const FLAG_EAGER: u32 = 4;
+
+    /// States whether the import is mapped at once rather than lazily.
+    pub fn eager(&self) -> bool {
+        self.flags & Self::FLAG_EAGER != 0
+    }
 }
 
 /// Parses a `backing_plan` body.
@@ -743,14 +755,19 @@ pub fn parse_backing_plan(body: &[u8]) -> Result<BackingPlanBody, ChannelError> 
     let region_count = u32::from_le_bytes(body[4..8].try_into().unwrap());
     let extent_count = u32::from_le_bytes(body[8..12].try_into().unwrap());
     let flags = u32::from_le_bytes(body[12..16].try_into().unwrap());
-    if flags & !(BackingPlanBody::FLAG_VMSTATE | BackingPlanBody::FLAG_HOT_SET) != 0
+    if flags
+        & !(BackingPlanBody::FLAG_VMSTATE
+            | BackingPlanBody::FLAG_HOT_SET
+            | BackingPlanBody::FLAG_EAGER)
+        != 0
         || extent_count != 0
     {
         return Err(ChannelError::Malformed);
     }
     let restore = flags & BackingPlanBody::FLAG_VMSTATE != 0;
     let hot = flags & BackingPlanBody::FLAG_HOT_SET != 0;
-    if hot && !restore {
+    let eager = flags & BackingPlanBody::FLAG_EAGER != 0;
+    if (hot || eager) && !restore || hot && eager {
         return Err(ChannelError::Malformed);
     }
     let fixed = 16 + region_count as usize * REGION_RECORD_LEN + usize::from(restore) * 32;
@@ -968,9 +985,42 @@ mod tests {
         body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
-        body.extend_from_slice(&0b100u32.to_le_bytes());
+        body.extend_from_slice(&0b1000u32.to_le_bytes());
         assert!(matches!(
             parse_backing_plan(&body),
+            Err(ChannelError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn backing_plan_eager_is_a_restore_without_a_hot_set() {
+        let plan = |flags: u32, tail: &[u8]| {
+            let mut body = [1u32, 1, 0, flags]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            body.extend_from_slice(
+                &RegionRecord {
+                    guest_addr: 0,
+                    size: 4096,
+                }
+                .encode(),
+            );
+            body.extend_from_slice(tail);
+            parse_backing_plan(&body)
+        };
+        let restore = BackingPlanBody::FLAG_VMSTATE;
+        let eager = BackingPlanBody::FLAG_EAGER;
+        assert!(plan(restore | eager, &[0xab; 32]).unwrap().eager());
+        assert!(!plan(restore, &[0xab; 32]).unwrap().eager());
+        assert!(matches!(plan(eager, &[]), Err(ChannelError::Malformed)));
+        let mut hot = vec![0xab; 32];
+        hot.extend_from_slice(&0u64.to_le_bytes());
+        hot.extend_from_slice(b"FPHS");
+        hot.extend_from_slice(&[0; 12]);
+        plan(restore | BackingPlanBody::FLAG_HOT_SET, &hot).unwrap();
+        assert!(matches!(
+            plan(restore | BackingPlanBody::FLAG_HOT_SET | eager, &hot),
             Err(ChannelError::Malformed)
         ));
     }
@@ -1076,6 +1126,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "farplane/20");
+        assert_eq!(FEATURE_IDENTITY, "farplane/21");
     }
 }
