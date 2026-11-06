@@ -846,7 +846,7 @@ definitions:
           channel alone.
         type: string
         enum:
-          - "ramet/5"
+          - "farplane/20"
       vmstate_identity:
         description:
           Identity of the vmstate this binary writes and restores, which moves only
@@ -854,7 +854,7 @@ definitions:
           channel. A capture records this value.
         type: string
         enum:
-          - "ramet-vmstate/1"
+          - "farplane-vmstate/1"
       source_commit:
         description:
           Commit of the source tree this binary was built from, the same value

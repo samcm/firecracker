@@ -38,7 +38,7 @@ MAGIC = 0x314D5046
 VERSION = 1
 MAX_DATAGRAM = 65536
 MAX_EXTENTS = 65536
-FEATURE_IDENTITY = "ramet-vmstate/1"
+FEATURE_IDENTITY = "farplane-vmstate/1"
 
 HEADER = struct.Struct("<IHHQIIQ")
 HELLO = struct.Struct("<IIHHI32s")

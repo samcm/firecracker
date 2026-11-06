@@ -24,11 +24,11 @@ pub const MAX_SCM_FDS: usize = 253;
 pub const MAX_RETRYABLE_REQUESTS: usize = 64;
 /// Compatibility identity of this memory channel: the startup connection, the `drives` frame,
 /// the handshake and the capture command order a peer must speak.
-pub const FEATURE_IDENTITY: &str = "ramet/5";
+pub const FEATURE_IDENTITY: &str = "farplane/20";
 /// Identity of the vmstate this build writes and restores: its layout and the quiesce semantics
 /// it was captured under. It changes only when those do, so a channel change alone leaves every
 /// stored vmstate restorable.
-pub const VMSTATE_IDENTITY: &str = "ramet-vmstate/1";
+pub const VMSTATE_IDENTITY: &str = "farplane-vmstate/1";
 /// Maximum output of an advisory free summary, including per-region word padding.
 pub const MAX_FREE_SUMMARY_BYTES: u64 = 4 * 1024 * 1024;
 /// Maximum cooperative work budget for one advisory free summary.
@@ -1076,6 +1076,6 @@ mod tests {
             let hex: String = datagram.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, fixture.trim(), "{arch:?} hello frame changed");
         }
-        assert_eq!(FEATURE_IDENTITY, "ramet/4");
+        assert_eq!(FEATURE_IDENTITY, "farplane/20");
     }
 }
