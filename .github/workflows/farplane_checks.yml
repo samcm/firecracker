@@ -100,12 +100,15 @@ jobs:
           fi
           echo "the link search follows the supplied path and refuses a directory without one"
 
-      # Directives alone do not prove which file the linker opened: its default search
-      # directories follow every explicit `-L`. Build the real seccompiler binary in an
-      # isolated target directory and require GNU ld's link map to name the supplied
-      # library. Rustc consumes a successful linker's stdout, so `-Wl,-t` never reaches the
-      # cargo log. The map is a durable linker output instead. A single build job prevents
-      # dependency linkers from racing to overwrite it before the final binary is linked.
+      # Directives alone do not prove which file was used: the linker's default search
+      # directories follow every explicit `-L`. Rustc bundles a `static=` library into the
+      # rlib that names it, so the binary's link takes libseccomp's objects from that rlib,
+      # never from the archive itself (and since Rust 1.90 the linker is lld, whose map
+      # names the rlib). So the supplied archive carries a marker member: the rlib must hold
+      # it, which only the supplied copy can give, and the link map of the real seccompiler
+      # binary, built in an isolated target directory, must show libseccomp's objects linked
+      # from that rlib and never the shared-library decoy. A single build job prevents
+      # dependency linkers from racing to overwrite the map before the final binary links.
       #
       # This is a debug GNU host build of one workspace binary, driven by cargo directly.
       # It proves the build script's directives are honoured by a linker; it is not the
@@ -121,6 +124,9 @@ jobs:
             exit 1
           fi
           cp -L "$supplied" "$private/libseccomp.a"
+          marker="$(mktemp -d)/farplane-supplied-marker.o"
+          echo 'const char farplane_supplied_marker[] = "supplied";' | cc -x c -c -o "$marker" -
+          ar q "$private/libseccomp.a" "$marker"
           if [ "$shared" = libseccomp.so ] || [ ! -f "$shared" ]; then
             echo "::error::the installed libseccomp development package exposed no shared-library decoy"
             exit 1
@@ -134,13 +140,21 @@ jobs:
             CARGO_BUILD_JOBS=1 \
             RUSTFLAGS="-C link-arg=-Wl,-Map=$map" \
             cargo build -p seccompiler --bin seccompiler-bin -vv
-          grep -qF "$private/libseccomp.a" "$map"
+          rlib=$(ls "$target"/debug/deps/libseccompiler-*.rlib)
+          if ! ar t "$rlib" | grep -qxF farplane-supplied-marker.o; then
+            echo "::error::the seccompiler rlib bundles a libseccomp other than the supplied archive"
+            exit 1
+          fi
+          if ! grep -qF "$(basename "$rlib")(libseccomp_la-api.o)" "$map"; then
+            echo "::error::the seccompiler binary did not link libseccomp's objects from its rlib"
+            exit 1
+          fi
           if grep -qF "$private/libseccomp.so" "$map"; then
             echo "::error::the linker selected the shared library beside the supplied archive"
             exit 1
           fi
           test -x "$target/debug/seccompiler-bin"
-          echo "the linker opened $private/libseccomp.a"
+          echo "the binary linked libseccomp bundled from $private/libseccomp.a"
 
       # `cargo test <filter>` exits 0 when the filter selects nothing, and a sum taken over
       # several modules stays green when one of them stops existing.
