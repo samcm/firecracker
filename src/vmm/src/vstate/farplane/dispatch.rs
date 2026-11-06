@@ -405,20 +405,31 @@ mod tests {
             return;
         }
         let gate = Arc::new(DispatchGate::new());
-        let (ready_tx, ready_rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = channel();
         let slice_gate = gate.clone();
+        let slice_stop = stop.clone();
         let event_loop = std::thread::spawn(move || {
             let mut event_manager = EventManager::new().unwrap();
             register_kick(&mut event_manager);
-            ready_tx.send(()).unwrap();
-            let _hold = slice_gate.enter();
-            event_manager.run_with_timeout(10_000).unwrap();
+            // KICK is process-wide: another test closing its own gate while that gate holds a
+            // slice writes it too, and can end this slice before the test closes. The loop then
+            // enters a fresh slice for the close to wake, instead of leaving the test waiting
+            // for a hold that is already gone.
+            loop {
+                let _hold = slice_gate.enter();
+                if slice_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let _ = entered_tx.send(());
+                event_manager.run_with_timeout(10_000).unwrap();
+                if slice_gate.is_closed() {
+                    break;
+                }
+            }
         });
-        ready_rx.recv().unwrap();
-        // Wait until the slice holds the gate, then for it to reach epoll_wait.
-        while gate.state.lock().unwrap().dispatching == 0 {
-            std::thread::yield_now();
-        }
+        // The slice holds the gate; give it time to reach epoll_wait.
+        entered_rx.recv().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         let started = std::time::Instant::now();
         gate.close();
@@ -428,6 +439,7 @@ mod tests {
             waited < std::time::Duration::from_secs(1),
             "close waited {waited:?}"
         );
+        stop.store(true, Ordering::SeqCst);
         gate.open();
         event_loop.join().unwrap();
     }
