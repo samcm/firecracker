@@ -156,6 +156,16 @@ jobs:
           test -x "$target/debug/seccompiler-bin"
           echo "the binary linked libseccomp bundled from $private/libseccomp.a"
 
+      # Two capture-channel tests build a VM object, which opens /dev/kvm before any guest
+      # exists. A hosted runner has /dev/kvm but leaves it to the kvm group; the rest of
+      # this lane still needs no guest and no userfaultfd.
+      - name: "Let the runner open /dev/kvm"
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+
       # `cargo test <filter>` exits 0 when the filter selects nothing, and a sum taken over
       # several modules stays green when one of them stops existing.
       # `guarded_cargo_test <min> <cargo args...>` pipes cargo through `tee`, keeps cargo's
@@ -179,6 +189,11 @@ jobs:
       - name: "Filtered Rust suites, guarded by a per-suite floor"
         run: |
           set -euo pipefail
+          # The firecracker crate links seccompiler, whose build script looks in
+          # /usr/local/lib unless told otherwise; the runner's package installs the archive
+          # under the multiarch directory instead.
+          LIBSECCOMP_LIB_PATH=$(dirname "$(cc -print-file-name=libseccomp.a)")
+          export LIBSECCOMP_LIB_PATH
 
           guarded_cargo_test() {
             local min=$1 log passed
