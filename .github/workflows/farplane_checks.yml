@@ -193,7 +193,9 @@ jobs:
           guarded_cargo_test 15 -p vmm --lib devices::virtio::vsock::event_handler
           guarded_cargo_test 12 -p vmm --lib devices::virtio::vsock::persist
           guarded_cargo_test 12 -p vmm --lib snapshot::
-          guarded_cargo_test 25 -p vmm --test farplane_channel
+          # Each handshake asserts the drive slots (fds 4 and 5) are free before it installs
+          # them, which another test's sockets may hold when the tests run in parallel.
+          guarded_cargo_test 25 -p vmm --test farplane_channel -- --test-threads=1
           guarded_cargo_test 1 -p firecracker --bin firecracker api_server_adapter
           # One image-alias test briefly redirects stderr, so the jailer crate runs
           # single-threaded rather than exposing process-global fd 2 to another test.
