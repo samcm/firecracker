@@ -269,6 +269,9 @@ pub enum RecordError {
     NotAnonymous(u64),
 }
 
+/// The hot ranges a scan found: those under Pagemaster's mark first, then the rest.
+type ScannedRanges = (Vec<HotRange>, Vec<HotRange>);
+
 /// The present pages of `regions` in this process, from RESIDENT in steps of at most 1 GiB, as
 /// one-page ranges in guest-physical order: first those `mark` names (sorted guest-physical
 /// addresses of an earlier record), then the rest, of which at most [`MAX_PAGES`] are kept,
@@ -279,7 +282,7 @@ fn scan_regions(
     handle: BorrowedFd<'_>,
     mark: &[u64],
     skipped: &mut Vec<RecordError>,
-) -> Result<Option<(Vec<HotRange>, Vec<HotRange>)>, RecordError> {
+) -> Result<Option<ScannedRanges>, RecordError> {
     let step = super::memversion::MV_RESIDENT_MAX_LEN;
     let words_per_step = usize::try_from(step / PAGE_SIZE / 64).unwrap();
     let mut present = vec![0u64; words_per_step];
@@ -320,7 +323,7 @@ fn scan_regions(
                     };
                     if mark.binary_search(&gpa).is_ok() {
                         marked.push(range);
-                    } else if later.len() < MAX_PAGES as usize {
+                    } else if later.len() < crate::utils::u64_to_usize(MAX_PAGES) {
                         later.push(range);
                     }
                 }

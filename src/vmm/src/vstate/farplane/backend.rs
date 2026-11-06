@@ -250,12 +250,12 @@ impl FarplaneBackend {
         Ok(())
     }
 
-    /// Takes the channel established by the handshake, so it can be driven by the event loop.
     /// Takes the hot set a restore plan carried, if any, for the bring-up prefault.
     pub fn take_hot_set() -> Option<protocol::HotSetTail> {
         HOT_SET.lock().expect("Poisoned lock").take()
     }
 
+    /// Takes the channel established by the handshake, so it can be driven by the event loop.
     pub fn take_channel() -> Option<MemoryChannel> {
         CHANNEL.lock().expect("Poisoned lock").take()
     }

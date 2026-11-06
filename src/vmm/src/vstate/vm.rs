@@ -34,7 +34,7 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    Address, AtomicBitmap, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap,
+    Address, AtomicBitmap, GuestAddress, GuestMemory, GuestMemoryMmap,
     GuestMemoryRegion, GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
@@ -1179,6 +1179,7 @@ pub(crate) mod tests {
     use crate::utils::mib_to_bytes;
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::Bitmap;
+    use crate::vstate::memory::GuestMemoryExtension;
     use crate::vstate::memory::GuestRegionMmap;
 
     // Auxiliary function being used throughout the tests.

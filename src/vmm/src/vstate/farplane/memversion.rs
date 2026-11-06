@@ -890,12 +890,15 @@ pub(crate) fn written_pages(
     Ok(residency(device, regions)?.1)
 }
 
+/// One bitmap per region, shaped like the dirty log.
+pub(crate) type PageMaps = Vec<Vec<u64>>;
+
 /// The pages of each region this process maps (present), and those of them it maps exclusively
 /// (written), as bitmaps shaped like the dirty log.
 pub(crate) fn residency(
     device: BorrowedFd<'_>,
     regions: &[Region],
-) -> io::Result<(Vec<Vec<u64>>, Vec<Vec<u64>>)> {
+) -> io::Result<(PageMaps, PageMaps)> {
     residency_with(regions, |addr, len, present, written| {
         let mut request = Resident {
             addr,
@@ -928,7 +931,7 @@ fn written_pages_with(
 fn residency_with(
     regions: &[Region],
     mut resident: impl FnMut(u64, u64, &mut [u64], &mut [u64]) -> io::Result<()>,
-) -> io::Result<(Vec<Vec<u64>>, Vec<Vec<u64>>)> {
+) -> io::Result<(PageMaps, PageMaps)> {
     let page = crate::arch::host_page_size() as u64;
     let chunk_pages = MV_RESIDENT_MAX_LEN / page;
     // A range then starts on a bitmap word, so its words concatenate into the region's.
