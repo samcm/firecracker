@@ -108,7 +108,7 @@ impl BackendState {
 
 /// Backend observation reported by `GET /`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct RametState {
+pub struct FarplaneState {
     /// Backend lifecycle state.
     pub backend_state: String,
     /// vCPU execution state.
@@ -124,13 +124,13 @@ pub struct RametState {
     pub source_commit: String,
 }
 
-impl Default for RametState {
+impl Default for FarplaneState {
     fn default() -> Self {
         Self::observe()
     }
 }
 
-impl RametState {
+impl FarplaneState {
     /// Samples the process-wide backend and vCPU state.
     pub fn observe() -> Self {
         let vcpus = match VmState::load() {
@@ -190,9 +190,9 @@ pub struct MemoryChannel {
 
 /// Handshake with pagemaster: the only way guest memory comes into existence.
 #[derive(Debug)]
-pub struct RametBackend;
+pub struct FarplaneBackend;
 
-impl RametBackend {
+impl FarplaneBackend {
     /// Records the channel path taken from the command line.
     pub fn set_socket_path(path: PathBuf) {
         *SOCKET_PATH.lock().expect("Poisoned lock") = Some(path);
@@ -380,7 +380,7 @@ fn handshake(
     mode: Mode,
     arch_regions: &[RegionRecord],
 ) -> Result<(Vec<GuestRegionMmap>, Option<MicrovmState>), BackendError> {
-    RametBackend::ensure_drives()?;
+    FarplaneBackend::ensure_drives()?;
     let Connection { sock, peer_pid } = CONNECTION
         .lock()
         .expect("Poisoned lock")
@@ -527,7 +527,7 @@ fn commit_plan(
     })?;
     if hot.is_some() {
         crate::logger::info!(
-            "Ramet mapped the hot set at import: {} B covered, {} B copied, in {} us",
+            "Farplane mapped the hot set at import: {} B covered, {} B copied, in {} us",
             hot_mapped.covered,
             hot_mapped.copied,
             hot_started.elapsed().as_micros()
@@ -830,7 +830,7 @@ mod tests {
 
     fn finalized_vmstate(content: &[u8]) -> OwnedFd {
         let writable = memfd(
-            c"ramet-final-vmstate",
+            c"farplane-final-vmstate",
             libc::off_t::try_from(content.len()).unwrap(),
         );
         if !content.is_empty() {
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn capture_buffer_must_be_sealed_and_large_enough() {
-        let buffer = memfd(c"ramet-capture-buffer", 4096);
+        let buffer = memfd(c"farplane-capture-buffer", 4096);
 
         assert_eq!(
             validate_buffer_fd(buffer, 4096),
@@ -924,7 +924,7 @@ mod tests {
             Err(ErrorCode::VmstateParseFailed)
         );
 
-        let mutable = memfd(c"ramet-mutable-vmstate", 4096);
+        let mutable = memfd(c"farplane-mutable-vmstate", 4096);
         assert_eq!(validate_vmstate_fd(mutable), Err(ErrorCode::FdWritable));
         // SAFETY: `mutable` is owned by this test and no longer used.
         unsafe { libc::close(mutable) };
@@ -977,7 +977,7 @@ mod tests {
     /// link target from.
     #[test]
     fn memfd_identity_is_proven_without_procfs() {
-        let image = memfd(c"ramet-backing", 4096);
+        let image = memfd(c"farplane-backing", 4096);
         assert_eq!(memfd_seals(image), Some(0));
 
         let mut pipe = [-1i32; 2];
@@ -1000,7 +1000,7 @@ mod tests {
         set_source_commit(COMMIT);
         assert_eq!(source_commit(), COMMIT);
 
-        let json = serde_json::to_value(RametState::observe()).unwrap();
+        let json = serde_json::to_value(FarplaneState::observe()).unwrap();
         assert_eq!(
             json.get("source_commit").and_then(|value| value.as_str()),
             Some(COMMIT),
@@ -1015,7 +1015,7 @@ mod tests {
             state: VmState::NotStarted,
             vmm_version: "0.0.0".to_string(),
             app_name: "Firecracker".to_string(),
-            ramet: RametState {
+            farplane: FarplaneState {
                 backend_state: "stale".to_string(),
                 vcpus: "stale".to_string(),
                 capture_buffers_armed: !CAPTURE_BUFFERS_ARMED.load(Ordering::Acquire),
@@ -1026,13 +1026,13 @@ mod tests {
         }
         .publish();
 
-        let observed = InstanceInfo::observe().unwrap().ramet;
+        let observed = InstanceInfo::observe().unwrap().farplane;
         assert_eq!(observed.source_commit, COMMIT);
         assert_eq!(observed.backend_state, BackendState::load().as_str());
         assert_ne!(observed.vcpus, "stale");
         assert_eq!(
             observed.capture_buffers_armed,
-            RametState::observe().capture_buffers_armed
+            FarplaneState::observe().capture_buffers_armed
         );
         assert_eq!(observed.feature_identity, protocol::FEATURE_IDENTITY);
         assert_eq!(observed.vmstate_identity, protocol::VMSTATE_IDENTITY);
@@ -1041,7 +1041,7 @@ mod tests {
     /// The vmstate identity is its own fact: a memory-protocol bump must not change what a
     /// capture records about its vmstate, so the two identities are distinct values.
     #[test]
-    fn test_ramet_vmstate_and_channel_identities_are_distinct() {
+    fn test_farplane_vmstate_and_channel_identities_are_distinct() {
         assert_ne!(protocol::VMSTATE_IDENTITY, protocol::FEATURE_IDENTITY);
         assert_eq!(protocol::VMSTATE_IDENTITY, "farplane-vmstate/1");
         assert_eq!(protocol::FEATURE_IDENTITY, "farplane/20");

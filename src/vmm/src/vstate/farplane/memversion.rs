@@ -16,7 +16,7 @@ pub(crate) const GUEST_RAM_BASE: u64 = 0x3000_0000_0000;
 pub(crate) const MAX_REGIONS: usize = 16;
 const MAX_EXCLUSIONS: usize = 65_536;
 
-/// A lower run limit set once at startup by `--ramet-exclusion-cap`, so a test cell can
+/// A lower run limit set once at startup by `--farplane-exclusion-cap`, so a test cell can
 /// drive a capture over it with an ordinary guest. Unset, the limit is [`MAX_EXCLUSIONS`].
 static EXCLUSION_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
@@ -608,7 +608,7 @@ fn map_with(version: BorrowedFd<'_>, region: u32, addr: u64, flags: u32) -> io::
 }
 
 /// Caller releases only its own reservation immediately before this NOREPLACE operation.
-/// Every import is lazy: the kernel ramet pins supports it, so there is no eager path.
+/// Every import is lazy: the kernel farplane pins supports it, so there is no eager path.
 pub(crate) fn map_private(version: BorrowedFd<'_>, region: u32, addr: u64) -> io::Result<()> {
     map_with(version, region, addr, MV_MAP_PRIVATE | MV_MAP_LAZY)
 }

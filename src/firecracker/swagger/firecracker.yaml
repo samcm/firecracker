@@ -781,7 +781,7 @@ definitions:
       - id
       - state
       - vmm_version
-      - ramet
+      - farplane
     properties:
       app_name:
         description: Application name.
@@ -801,13 +801,13 @@ definitions:
       vmm_version:
         description: MicroVM hypervisor build version.
         type: string
-      ramet:
-        $ref: "#/definitions/RametState"
-        description: Ramet memory-channel observation.
+      farplane:
+        $ref: "#/definitions/FarplaneState"
+        description: Farplane memory-channel observation.
 
-  RametState:
+  FarplaneState:
     type: object
-    description: Ramet memory-channel observation.
+    description: Farplane memory-channel observation.
     required:
       - backend_state
       - vcpus

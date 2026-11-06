@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Serialize, ser};
 
-use crate::vstate::ramet::RametState;
+use crate::vstate::farplane::FarplaneState;
 
 static DESCRIPTION: Mutex<Option<InstanceInfo>> = Mutex::new(None);
 static VCPU_STATE: AtomicU8 = AtomicU8::new(VmState::NotStarted as u8);
@@ -70,8 +70,8 @@ pub struct InstanceInfo {
     pub vmm_version: String,
     /// The name of the application that runs the microVM.
     pub app_name: String,
-    /// Ramet memory-backend observation.
-    pub ramet: RametState,
+    /// Farplane memory-backend observation.
+    pub farplane: FarplaneState,
 }
 
 impl InstanceInfo {
@@ -87,7 +87,7 @@ impl InstanceInfo {
     pub fn observe() -> Option<Self> {
         let mut info = DESCRIPTION.lock().expect("Poisoned lock").clone()?;
         info.state = VmState::load();
-        info.ramet = RametState::observe();
+        info.farplane = FarplaneState::observe();
         Some(info)
     }
 }

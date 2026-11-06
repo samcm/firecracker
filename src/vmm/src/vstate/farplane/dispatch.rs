@@ -109,7 +109,7 @@ impl DispatchGate {
             && let Some(kick) = KICK.get()
             && let Err(err) = kick.write(1)
         {
-            error!("Ramet gate could not wake the event loop: {err}");
+            error!("Farplane gate could not wake the event loop: {err}");
         }
         while state.dispatching > 0 {
             state = self.changed.wait(state).expect("Poisoned lock");
@@ -185,7 +185,7 @@ impl MutEventSubscriber for GateKick {
             return;
         };
         if let Err(err) = ops.add(Events::new(kick, EventSet::IN)) {
-            error!("Ramet gate could not register its wake-up eventfd: {err}");
+            error!("Farplane gate could not register its wake-up eventfd: {err}");
         }
     }
 }
@@ -202,7 +202,7 @@ fn register_kick(event_manager: &mut EventManager) {
                 event_manager.add_subscriber(Arc::new(Mutex::new(GateKick)));
             }
         }
-        Err(err) => error!("Ramet gate could not create its wake-up eventfd: {err}"),
+        Err(err) => error!("Farplane gate could not create its wake-up eventfd: {err}"),
     }
 }
 
@@ -400,7 +400,7 @@ mod tests {
     fn close_wakes_an_idle_slice() {
         // The kick is process-wide and wakes the first event loop that registered it: another
         // test's loop may have taken it, and this one could then never be woken. Run alone
-        // (`-- vstate::ramet::dispatch`) the test owns it.
+        // (`-- vstate::farplane::dispatch`) the test owns it.
         if KICK.get().is_some() {
             return;
         }

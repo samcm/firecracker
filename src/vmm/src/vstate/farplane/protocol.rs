@@ -91,8 +91,8 @@ pub enum MsgType {
     /// Every bitmap word was written; with no descriptors. The body is LE u64 popcount, u64
     /// included pages and u64 standing version id: what the next quiesced CREATE would fold
     /// against the exclusions sampled with the summary, and the version that count is against.
-    /// Included pages is u64::MAX (and the id 0) when there is no count. Since ramet/10; a
-    /// ramet/9 reply is the popcount alone.
+    /// Included pages is u64::MAX (and the id 0) when there is no count. Since farplane/10; a
+    /// farplane/9 reply is the popcount alone.
     FreeSummaryDone = 23,
     /// Pagemaster hands over the drive images: the read-only root image and, for a sandbox with
     /// a disk, its read-write scratch disk. The body is the LE u32 descriptor count.
@@ -885,7 +885,7 @@ mod tests {
         let (tx, rx) = seqpacket_pair();
         set_buffers(&tx);
         set_buffers(&rx);
-        let mut memfd = memfd(b"ramet-test\0");
+        let mut memfd = memfd(b"farplane-test\0");
         memfd.write_all(b"payload").unwrap();
 
         let body = 3u32.to_le_bytes().to_vec();
@@ -903,7 +903,7 @@ mod tests {
         let (tx, rx) = seqpacket_pair();
         set_buffers(&tx);
         set_buffers(&rx);
-        let memfd = memfd(b"ramet-fd-limit\0");
+        let memfd = memfd(b"farplane-fd-limit\0");
         let fds = vec![memfd.as_raw_fd(); MAX_SCM_FDS];
 
         let count = u32::try_from(MAX_SCM_FDS).unwrap();

@@ -37,11 +37,11 @@ pub fn prewarm() {
         Ok(vm) => {
             SKELETON.with(|s| *s.borrow_mut() = Some(vm));
             info!(
-                "Ramet built a warm KVM skeleton in {} us",
+                "Farplane built a warm KVM skeleton in {} us",
                 started.elapsed().as_micros()
             );
         }
-        Err(err) => warn!("Ramet could not build a warm KVM skeleton: {err}"),
+        Err(err) => warn!("Farplane could not build a warm KVM skeleton: {err}"),
     }
 }
 
@@ -63,11 +63,11 @@ pub fn vm_with_vcpus(
             }
             vm.arch_post_create_vcpus(vcpu_count)
                 .map_err(VmError::Arch)?;
-            info!("Ramet builds on the warm KVM skeleton ({vcpu_count} vCPUs)");
+            info!("Farplane builds on the warm KVM skeleton ({vcpu_count} vCPUs)");
             return Ok((vm, vcpus));
         }
         info!(
-            "Ramet dropped the warm KVM skeleton: the VM needs {} capability modifiers",
+            "Farplane dropped the warm KVM skeleton: the VM needs {} capability modifiers",
             kvm_cap_modifiers.len()
         );
     }

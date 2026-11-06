@@ -322,7 +322,7 @@ impl Vmm {
                         entropy = Some(EntropyDeviceConfig::from(e));
                     }
                 }
-                // Free page reporting is part of every ramet machine, not configuration.
+                // Free page reporting is part of every farplane machine, not configuration.
                 VirtioDeviceType::Balloon => {}
             });
 
@@ -349,7 +349,7 @@ impl Vmm {
         self.device_manager.kick_virtio_devices();
         // The bring-up prefault and KVM_RUN take the same vCPU lock: what it did not reach by
         // now faults the ordinary way.
-        crate::vstate::ramet::prefault::Prefaulter::stop();
+        crate::vstate::farplane::prefault::Prefaulter::stop();
         kvm_vm.resume_vcpus()?;
         self.set_vm_state(VmState::Running);
         Ok(())

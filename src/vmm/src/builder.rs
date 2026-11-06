@@ -47,7 +47,7 @@ use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
-use crate::vstate::ramet::{CaptureService, RametBackend};
+use crate::vstate::farplane::{CaptureService, FarplaneBackend};
 use crate::vstate::kvm::KvmError;
 use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
@@ -181,7 +181,7 @@ pub fn build_microvm_for_boot(
         .get_cpu_template()?;
 
     // A boot builds on the warm skeleton too, unless its template modifies KVM capabilities.
-    let (mut vm, mut vcpus) = crate::vstate::ramet::skeleton::vm_with_vcpus(
+    let (mut vm, mut vcpus) = crate::vstate::farplane::skeleton::vm_with_vcpus(
         vm_resources.machine_config.vcpu_count,
         &cpu_template.kvm_capabilities,
     )
@@ -346,7 +346,7 @@ pub fn build_microvm_for_boot(
     // The channel's thread is started before this thread is confined, because it
     // confines itself with the same filter and a filtered thread may not be
     // allowed to create another.
-    let channel = RametBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
+    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
     CaptureService::spawn(
         channel,
         vmm.clone(),
@@ -420,10 +420,10 @@ pub enum BuildMicrovmFromSnapshotError {
     UnsupportedClockRealtime,
 }
 
-fn skeleton_error(err: crate::vstate::ramet::skeleton::SkeletonError) -> StartMicrovmError {
+fn skeleton_error(err: crate::vstate::farplane::skeleton::SkeletonError) -> StartMicrovmError {
     match err {
-        crate::vstate::ramet::skeleton::SkeletonError::Kvm(err) => StartMicrovmError::Kvm(err),
-        crate::vstate::ramet::skeleton::SkeletonError::Vm(err) => StartMicrovmError::KvmVm(err),
+        crate::vstate::farplane::skeleton::SkeletonError::Kvm(err) => StartMicrovmError::Kvm(err),
+        crate::vstate::farplane::skeleton::SkeletonError::Vm(err) => StartMicrovmError::KvmVm(err),
     }
 }
 
@@ -446,7 +446,7 @@ pub fn build_microvm_from_snapshot(
 
     // A warm Firecracker built the VM and its interrupt controller before the claim; the vCPUs
     // are created now, for the snapshot's count.
-    let (mut vm, mut vcpus) = crate::vstate::ramet::skeleton::vm_with_vcpus(
+    let (mut vm, mut vcpus) = crate::vstate::farplane::skeleton::vm_with_vcpus(
         vm_resources.machine_config.vcpu_count,
         &microvm_state.kvm_state.kvm_cap_modifiers,
     )
@@ -530,7 +530,7 @@ pub fn build_microvm_from_snapshot(
 
     // The vCPU state is restored and nothing has run: the stage-2 tables are warmed over the hot
     // set until resume. The worker is prepared here, while a vCPU is at hand, and started last.
-    let prefault = RametBackend::take_hot_set()
+    let prefault = FarplaneBackend::take_hot_set()
         .and_then(|hot_set| prepare_bring_up_prefault(&kvm_vm, &vcpus, hot_set));
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -549,7 +549,7 @@ pub fn build_microvm_from_snapshot(
     // Started before this thread is confined: the channel's thread confines
     // itself with the same filter, and a filtered thread may not be allowed to
     // create another.
-    let channel = RametBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
+    let channel = FarplaneBackend::take_channel().ok_or(StartMicrovmError::MissingMemoryChannel)?;
     CaptureService::spawn(
         channel,
         vmm.clone(),
@@ -588,7 +588,7 @@ pub fn build_microvm_from_snapshot(
 /// pre-copy budget.
 struct BringUpPrefault {
     vcpu_fds: Vec<std::os::fd::OwnedFd>,
-    ranges: Vec<crate::vstate::ramet::prefault::PrefaultRange>,
+    ranges: Vec<crate::vstate::farplane::prefault::PrefaultRange>,
     precow_budget: u64,
 }
 
@@ -598,12 +598,12 @@ struct BringUpPrefault {
 fn prepare_bring_up_prefault(
     kvm_vm: &KvmVm,
     vcpus: &[crate::vstate::vcpu::Vcpu],
-    hot_set: crate::vstate::ramet::protocol::HotSetTail,
+    hot_set: crate::vstate::farplane::protocol::HotSetTail,
 ) -> Option<BringUpPrefault> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     use crate::logger::warn;
-    use crate::vstate::ramet::prefault;
+    use crate::vstate::farplane::prefault;
 
     let Some(entries) = prefault::decode_entries(&hot_set.encoded) else {
         warn!("Bring-up prefault: the hot set does not decode; it is ignored");
@@ -642,7 +642,7 @@ fn prepare_bring_up_prefault(
 /// Starts a prepared bring-up prefault; a worker that cannot start leaves the guest to fault its
 /// pages the ordinary way.
 fn start_bring_up_prefault(prefault: BringUpPrefault, filter: &Arc<crate::seccomp::BpfProgram>) {
-    if let Err(err) = crate::vstate::ramet::prefault::Prefaulter::start(
+    if let Err(err) = crate::vstate::farplane::prefault::Prefaulter::start(
         prefault.vcpu_fds,
         prefault.ranges,
         prefault.precow_budget,

@@ -1,6 +1,6 @@
 # Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Cross-language checks of the ramet memory channel wire format.
+"""Cross-language checks of the farplane memory channel wire format.
 
 The Python pagemaster fake and the Rust implementation carry two copies of the same
 protocol. These tests need no microVM: they compare the fake against the Rust source and
@@ -15,13 +15,13 @@ from types import SimpleNamespace
 
 import pytest
 
-import host_tools.ramet as fp  # pylint:disable=import-error
+import host_tools.farplane as fp  # pylint:disable=import-error
 
 # This test needs no built binary and no test artifacts, so it resolves the workspace itself
 # rather than through the framework, and runs on any Linux with the test requirements.
 WORKSPACE = Path(__file__).resolve().parents[3]
-PROTOCOL_RS = WORKSPACE / "src/vmm/src/vstate/ramet/protocol.rs"
-FIXTURE_DIR = WORKSPACE / "src/vmm/src/vstate/ramet/testdata"
+PROTOCOL_RS = WORKSPACE / "src/vmm/src/vstate/farplane/protocol.rs"
+FIXTURE_DIR = WORKSPACE / "src/vmm/src/vstate/farplane/testdata"
 
 
 def rust_constant(name):

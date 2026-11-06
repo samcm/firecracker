@@ -606,8 +606,8 @@ fn a_retry_is_replayed_after_the_clone_destination_grew() {
 
 #[test]
 fn the_scratch_clone_reproduces_the_disk_and_reports_its_duration() {
-    let Some(dir) = std::env::var_os("RAMET_TEST_XFS_DIR") else {
-        eprintln!("skipping: RAMET_TEST_XFS_DIR must name XFS with reflink=1");
+    let Some(dir) = std::env::var_os("FARPLANE_TEST_XFS_DIR") else {
+        eprintln!("skipping: FARPLANE_TEST_XFS_DIR must name XFS with reflink=1");
         return;
     };
     let dir = std::path::PathBuf::from(dir);
@@ -951,7 +951,7 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         &[file.as_raw_fd()],
     );
     assert_eq!(reply.header.msg(), MsgType::FreeSummaryDone);
-    // ramet/10: the popcount, then no tracked sample (an untracked guest): MAX and id 0.
+    // farplane/10: the popcount, then no tracked sample (an untracked guest): MAX and id 0.
     let untracked = encode_free_summary_done(64, u64::MAX, 0);
     assert_eq!(reply.body, untracked);
     assert!(reply.fds.is_empty());

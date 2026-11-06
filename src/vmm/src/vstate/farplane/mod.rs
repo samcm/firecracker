@@ -20,7 +20,7 @@ pub mod protocol;
 /// The KVM skeleton a warm Firecracker builds before its claim.
 pub mod skeleton;
 
-pub use backend::{BackendError, BackendState, RametBackend, RametState, seal_process, set_source_commit};
+pub use backend::{BackendError, BackendState, FarplaneBackend, FarplaneState, seal_process, set_source_commit};
 pub use capture::CaptureService;
 pub use dispatch::{dispatch_slice, gate, outside_capture_epoch};
 pub use memversion::set_exclusion_cap;

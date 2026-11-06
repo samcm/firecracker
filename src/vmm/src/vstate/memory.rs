@@ -151,7 +151,7 @@ impl NewBitmap for AtomicBitmap {
 #[derive(Debug)]
 pub struct GuestRegionMmap {
     region: vm_memory::GuestRegionMmap<Option<AtomicBitmap>>,
-    _mapping: Option<super::ramet::memversion::Mapping>,
+    _mapping: Option<super::farplane::memversion::Mapping>,
 }
 
 impl GuestRegionMmap {
@@ -165,7 +165,7 @@ impl GuestRegionMmap {
 
     /// Wraps an externally allocated mapping and transfers lifetime ownership to the region.
     pub(crate) fn from_external(
-        mapping: super::ramet::memversion::Mapping,
+        mapping: super::farplane::memversion::Mapping,
         address: GuestAddress,
     ) -> Result<Self, std::io::Error> {
         use vm_memory::bitmap::NewBitmap;
@@ -218,8 +218,8 @@ pub enum MemoryError {
         /// Size in bytes recorded in the snapshot.
         want_size: usize,
     },
-    /// Ramet memory channel failed: {0}
-    Ramet(String),
+    /// Farplane memory channel failed: {0}
+    Farplane(String),
 }
 
 /// An extension to GuestMemoryRegion which records the KVM memory slot the region is

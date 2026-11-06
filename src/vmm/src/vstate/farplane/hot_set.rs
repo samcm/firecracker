@@ -660,7 +660,7 @@ mod tests {
     }
 
     /// Needs a kernel with MV_IOC_RESIDENT and /dev/memversion_v1 (its handle here). Skips
-    /// elsewhere unless RAMET_REQUIRE_RESIDENT is set, which the kernel-qualified run sets.
+    /// elsewhere unless FARPLANE_REQUIRE_RESIDENT is set, which the kernel-qualified run sets.
     #[test]
     fn records_exactly_the_touched_pages_with_written_flags() {
         const A_PAGES: u64 = 2048; // 8 MiB: spans PMD boundaries
@@ -713,7 +713,7 @@ mod tests {
                 len: B_PAGES * PAGE_SIZE,
             },
         ];
-        let required = std::env::var_os("RAMET_REQUIRE_RESIDENT").is_some();
+        let required = std::env::var_os("FARPLANE_REQUIRE_RESIDENT").is_some();
         let Ok(device) = std::fs::File::open("/dev/memversion_v1") else {
             assert!(!required, "no /dev/memversion_v1 on a kernel that must have it");
             eprintln!("skipped: no /dev/memversion_v1");

@@ -129,14 +129,14 @@ impl Background {
         filter: Arc<crate::seccomp::BpfProgram>,
     ) -> std::io::Result<Self> {
         let bg = Self::new(Arc::new(VmmPauser(vmm)))?;
-        for (name, guard) in [("fc_ramet_bg", false), ("fc_ramet_guard", true)] {
+        for (name, guard) in [("fc_farplane_bg", false), ("fc_farplane_guard", true)] {
             let worker = bg.clone();
             let filter = filter.clone();
             std::thread::Builder::new()
                 .name(name.to_string())
                 .spawn(move || {
                     if let Err(err) = crate::seccomp::apply_filter(&filter) {
-                        error!("Ramet {name} could not install its filter: {err}");
+                        error!("Farplane {name} could not install its filter: {err}");
                         return;
                     }
                     if guard {
@@ -178,7 +178,7 @@ impl Background {
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                error!("Ramet standing guard cannot read its eventfd: {err}");
+                error!("Farplane standing guard cannot read its eventfd: {err}");
                 return;
             }
             self.guard_check(true);
@@ -217,7 +217,7 @@ impl Background {
             if let Some(wake) = state.wake.as_mut()
                 && let Err(err) = wake.write_all(&1u64.to_ne_bytes())
             {
-                error!("Ramet could not wake memory plane at the standing bound: {err}");
+                error!("Farplane could not wake memory plane at the standing bound: {err}");
             }
         }
         cvar.notify_all();
@@ -253,7 +253,7 @@ impl Background {
         }
         if !pages.is_empty() {
             info!(
-                "Ramet re-shared {done} of {} refused pages in {} us",
+                "Farplane re-shared {done} of {} refused pages in {} us",
                 pages.len(),
                 started.elapsed().as_micros()
             );
@@ -278,7 +278,7 @@ impl Background {
         let device = unsafe { BorrowedFd::borrow_raw(fd) };
         // A zero count is reached already: the kernel takes 0 as off, so ask for 1 and check.
         if let Err(err) = memversion::track_limit(device, self.limit.as_fd(), at.max(1)) {
-            error!("Ramet could not arm the standing guard at {at} pages: {err}");
+            error!("Farplane could not arm the standing guard at {at} pages: {err}");
         }
         if at == 0 {
             self.guard_check(false);
@@ -303,7 +303,7 @@ impl Background {
             paused.total += at.elapsed();
             paused.waited += refresh_started.saturating_duration_since(at);
             info!(
-                "Ramet paused the guest {} us until the refresh caught up",
+                "Farplane paused the guest {} us until the refresh caught up",
                 at.elapsed().as_micros()
             );
         }
@@ -325,7 +325,7 @@ impl Background {
             // SAFETY: the tracker stays open while the guard is armed.
             let device = unsafe { BorrowedFd::borrow_raw(guard.tracker) };
             if let Err(err) = memversion::track_limit(device, self.limit.as_fd(), 0) {
-                error!("Ramet could not disarm the standing guard: {err}");
+                error!("Farplane could not disarm the standing guard: {err}");
             }
         }
         let mut state = cvar
@@ -417,7 +417,7 @@ impl Pauser for VmmPauser {
             && match vmm.pause_vm() {
                 Ok(()) => true,
                 Err(err) => {
-                    error!("Ramet could not pause the guest at its standing bound: {err}");
+                    error!("Farplane could not pause the guest at its standing bound: {err}");
                     false
                 }
             };
@@ -431,7 +431,7 @@ impl Pauser for VmmPauser {
     fn resume(&self) {
         let mut vmm = self.0.lock().expect("Poisoned lock");
         if let Err(err) = vmm.resume_vm() {
-            error!("Ramet could not resume the guest after its standing bound: {err}");
+            error!("Farplane could not resume the guest after its standing bound: {err}");
         }
         drop(vmm);
         super::dispatch::gate().open();

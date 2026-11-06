@@ -3,8 +3,8 @@
 
 /// Module with the implementation of a Bus that can hold devices.
 pub mod bus;
-/// Ramet memory-channel backend.
-pub mod ramet;
+/// Farplane memory-channel backend.
+pub mod farplane;
 /// VM interrupts implementation.
 pub mod interrupts;
 /// Module with Kvm implementation.

@@ -467,20 +467,20 @@ impl CaptureService {
         filter: Arc<crate::seccomp::BpfProgram>,
     ) {
         std::thread::Builder::new()
-            .name("fc_ramet".to_string())
+            .name("fc_farplane".to_string())
             .spawn(move || {
                 // Started before the filter, which allows no new thread; it installs the same
                 // filter on itself first.
                 let background = match Background::spawn(vmm.clone(), filter.clone()) {
                     Ok(background) => background,
                     Err(err) => {
-                        error!("Ramet channel could not start its background worker: {err}");
+                        error!("Farplane channel could not start its background worker: {err}");
                         BackendState::fail();
                         return;
                     }
                 };
                 if let Err(err) = crate::seccomp::apply_filter(&filter) {
-                    error!("Ramet channel could not install its filter: {err}");
+                    error!("Farplane channel could not install its filter: {err}");
                     BackendState::fail();
                     return;
                 }
@@ -507,13 +507,13 @@ impl CaptureService {
                         return;
                     }
                     if let Err(err) = service.serve_one() {
-                        error!("Ramet memory channel failed: {err}");
+                        error!("Farplane memory channel failed: {err}");
                         BackendState::fail();
                         return;
                     }
                 }
             })
-            .expect("Failed to spawn the ramet memory channel thread");
+            .expect("Failed to spawn the farplane memory channel thread");
     }
 
     fn serve_one(&mut self) -> Result<(), ChannelError> {
@@ -590,7 +590,7 @@ impl CaptureService {
             .and_then(|vmm| vmm.kvm_vm().cloned());
         let Some(vm) = vm else {
             crate::logger::warn!("Bring-up hot set: the VM is busy or gone");
-            METRICS.ramet.hot_set_failures.inc();
+            METRICS.farplane.hot_set_failures.inc();
             return self.reject(request_id, ErrorCode::HotSetFailed, MsgType::RecordHotSet);
         };
         let mut skipped = Vec::new();
@@ -609,11 +609,11 @@ impl CaptureService {
         };
         for err in &skipped {
             crate::logger::warn!("Bring-up hot set skipped a guest region: {err}");
-            METRICS.ramet.hot_set_failures.inc();
+            METRICS.farplane.hot_set_failures.inc();
         }
         match recorded {
             Ok(Some(set)) => {
-                METRICS.ramet.hot_set_pages.add(set.pages());
+                METRICS.farplane.hot_set_pages.add(set.pages());
                 info!(
                     "Bring-up hot set: {} pages in {} entries, {} marked first",
                     set.pages(),
@@ -625,7 +625,7 @@ impl CaptureService {
             Ok(None) => self.reply(request_id, MsgType::HotSetRecorded, &[]),
             Err(err) => {
                 crate::logger::warn!("Bring-up hot set could not be recorded: {err}");
-                METRICS.ramet.hot_set_failures.inc();
+                METRICS.farplane.hot_set_failures.inc();
                 self.reject(request_id, ErrorCode::HotSetFailed, MsgType::RecordHotSet)
             }
         }
@@ -696,7 +696,7 @@ impl CaptureService {
         );
         if sample != NO_TRACKED_SAMPLE {
             info!(
-                "Ramet sampled {} pages for the next CREATE in {} us",
+                "Farplane sampled {} pages for the next CREATE in {} us",
                 sample.0,
                 started.elapsed().as_micros()
             );
@@ -728,11 +728,11 @@ impl CaptureService {
             if let Err(err) = memversion::geometry(&self.channel.regions).and_then(|regions| {
                 memversion::track_guest(device.as_fd(), &regions, base.as_ref().map(AsFd::as_fd))
             }) {
-                error!("Ramet could not track guest memory: {err}");
+                error!("Farplane could not track guest memory: {err}");
                 return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
             }
             info!(
-                "Ramet tracks guest memory (base={}) after {} us",
+                "Farplane tracks guest memory (base={}) after {} us",
                 base.is_some(),
                 started.elapsed().as_micros()
             );
@@ -758,7 +758,7 @@ impl CaptureService {
         let info = match read {
             Ok(info) => info,
             Err(err) => {
-                error!("Ramet could not read the memory tracker: {err}");
+                error!("Farplane could not read the memory tracker: {err}");
                 return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
             }
         };
@@ -772,7 +772,7 @@ impl CaptureService {
                         memversion::Included::Resident(_) => (info, "residency"),
                     };
                     info!(
-                        "Ramet counted {} of {} dirty pages for CREATE by {by} in {} us",
+                        "Farplane counted {} of {} dirty pages for CREATE by {by} in {} us",
                         included.pages(),
                         info.dirty_pages,
                         started.elapsed().as_micros()
@@ -780,7 +780,7 @@ impl CaptureService {
                     (info, included.pages())
                 }
                 Err(err) => {
-                    error!("Ramet could not count the pages CREATE would retain: {err}");
+                    error!("Farplane could not count the pages CREATE would retain: {err}");
                     return self.reject(request_id, ErrorCode::TrackFailed, MsgType::Track);
                 }
             }
@@ -882,7 +882,7 @@ impl CaptureService {
                     memversion::with_hot_runs(&regions, &exclusions, &hot)
                 })
                 .unwrap_or_else(|err| {
-                    error!("Ramet could not find the guest's hot pages: {err}");
+                    error!("Farplane could not find the guest's hot pages: {err}");
                     exclusions
                 })
         } else {
@@ -985,12 +985,12 @@ impl CaptureService {
                         flat
                     }
                     Err(err) => {
-                        error!("Ramet could not flatten the refreshed standing version: {err}");
+                        error!("Farplane could not flatten the refreshed standing version: {err}");
                         folded
                     }
                 };
                 info!(
-                    "Ramet refreshed the standing version in {} us (re-shared {reshared} pages \
+                    "Farplane refreshed the standing version in {} us (re-shared {reshared} pages \
                      in {reshared_us} us, fold {folded_us} us): own={} new={} folded={} depth={} \
                      hot={hot} fold_guard={fold_guard:?} after={after} dirty_now={}",
                     started.elapsed().as_micros(),
@@ -1030,7 +1030,7 @@ impl CaptureService {
                 answered
             }
             Err(err) => {
-                error!("Ramet could not refresh the standing version: {err}");
+                error!("Farplane could not refresh the standing version: {err}");
                 // The guard waited for this refresh: the guest runs again, and the next refresh
                 // reports the pause and arms the guard anew.
                 self.background.disarm();
@@ -1051,7 +1051,7 @@ impl CaptureService {
             // The guard reads this tracker: it goes first.
             self.background.disarm();
             if let Err(err) = memversion::untrack(tracker.as_fd()) {
-                error!("Ramet could not untrack guest memory: {err}");
+                error!("Farplane could not untrack guest memory: {err}");
                 return self.reject(request_id, ErrorCode::UntrackFailed, MsgType::Untrack);
             }
             self.tracker = None;
@@ -1059,7 +1059,7 @@ impl CaptureService {
             self.standing_exclusions.clear();
             self.folded.clear();
             self.hot.clear();
-            info!("Ramet untracked guest memory");
+            info!("Farplane untracked guest memory");
         }
         self.reply(
             request_id,
@@ -1085,10 +1085,10 @@ impl CaptureService {
             return self.reject(request_id, ErrorCode::RearmFailed, MsgType::Rearm);
         }
         if let Err(err) = memversion::rebase(tracker.as_fd(), flat.as_fd()) {
-            error!("Ramet could not rearm the memory tracker: {err}");
+            error!("Farplane could not rearm the memory tracker: {err}");
             return self.reject(request_id, ErrorCode::RearmFailed, MsgType::Rearm);
         }
-        info!("Ramet rearmed the memory tracker on a flat version");
+        info!("Farplane rearmed the memory tracker on a flat version");
         self.standing = Some(Arc::new(flat));
         self.reply(request_id, MsgType::Rearmed, &[])
     }
@@ -1108,7 +1108,7 @@ impl CaptureService {
         if let Some(tracker) = self.tracker.as_ref()
             && let Ok(track) = memversion::track_info(tracker.as_fd())
         {
-            info!("Ramet armed a capture at {} dirty pages", track.dirty_pages);
+            info!("Farplane armed a capture at {} dirty pages", track.dirty_pages);
         }
         let mut fds = incoming.fds;
         let destination = (fds.len() == 2).then(|| fds.remove(1));
@@ -1156,7 +1156,7 @@ impl CaptureService {
         let lock_us = at();
         let were_running = vmm.instance_info.state == VmState::Running;
         if were_running && let Err(err) = vmm.pause_vm() {
-            error!("Ramet quiesce could not pause the vCPUs: {err}");
+            error!("Farplane quiesce could not pause the vCPUs: {err}");
             drop(vmm);
             dispatch::gate().open();
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
@@ -1165,12 +1165,12 @@ impl CaptureService {
         if let Some(tracker) = self.tracker.as_ref()
             && let Ok(track) = memversion::track_info(tracker.as_fd())
         {
-            info!("Ramet quiesced a capture at {} dirty pages", track.dirty_pages);
+            info!("Farplane quiesced a capture at {} dirty pages", track.dirty_pages);
         }
         // The background worker writes guest memory too: no touch runs past here.
         self.background.fence();
         if let Err(err) = vmm.drain_guest_memory_writers() {
-            error!("Ramet quiesce could not stop every guest-memory writer: {err}");
+            error!("Farplane quiesce could not stop every guest-memory writer: {err}");
             hand_back_source(vmm, were_running);
             self.background.unfence();
             return self.reject(request_id, ErrorCode::QuiesceFailed, MsgType::Quiesce);
@@ -1187,13 +1187,13 @@ impl CaptureService {
                 .and_then(|scratch| clone_scratch(destination, scratch))
             {
                 Ok(elapsed_us) => {
-                    info!("Ramet quiesce cloned the scratch disk in {elapsed_us} us");
-                    METRICS.ramet.disk_clones.inc();
-                    METRICS.ramet.disk_clone_agg.record_us(elapsed_us);
+                    info!("Farplane quiesce cloned the scratch disk in {elapsed_us} us");
+                    METRICS.farplane.disk_clones.inc();
+                    METRICS.farplane.disk_clone_agg.record_us(elapsed_us);
                 }
                 Err(err) => {
-                    error!("Ramet quiesce could not clone the scratch disk: {err}");
-                    METRICS.ramet.disk_clone_failures.inc();
+                    error!("Farplane quiesce could not clone the scratch disk: {err}");
+                    METRICS.farplane.disk_clone_failures.inc();
                     hand_back_source(vmm, were_running);
                     self.background.unfence();
             self.background.unfence();
@@ -1206,7 +1206,7 @@ impl CaptureService {
         self.order.open();
         BackendState::Quiesced.store();
         info!(
-            "Ramet quiesce timing gate_close_us={gate_us} vmm_lock_us={lock_us} \
+            "Farplane quiesce timing gate_close_us={gate_us} vmm_lock_us={lock_us} \
              vcpu_pause_us={pause_us} drain_and_clone_us={drain_clone_us} were_running={were_running}"
         );
         self.reply(
@@ -1245,7 +1245,7 @@ impl CaptureService {
             // Keep the lock through device preparation, serialization and CREATE.
             let mut vmm = vmm.lock().expect("Poisoned lock");
             let state = vmm.save_state(vm_info).map_err(|err| {
-                error!("Ramet capture could not save the microVM state: {err}");
+                error!("Farplane capture could not save the microVM state: {err}");
                 VmstateRefusal::failed("save_state", err)
             })?;
             let bytes = serialize_vmstate(&mut buffers.as_mut().unwrap().vmstate, state)?;
@@ -1262,7 +1262,7 @@ impl CaptureService {
                     .map_err(io::Error::other)??;
                 // One line per capture, so how close guests come to the run limit is visible.
                 info!(
-                    "Ramet capture excludes {} of {found} free runs (cap {}); {dropped_pages} \
+                    "Farplane capture excludes {} of {found} free runs (cap {}); {dropped_pages} \
                      free pages in dropped runs are copied",
                     exclusions.len(),
                     memversion::exclusion_cap()
@@ -1281,13 +1281,13 @@ impl CaptureService {
                     memversion::Fold::Quiesced,
                 )
                 .or_else(|err| {
-                    error!("Ramet tracked capture fell back to a whole copy: {err}");
+                    error!("Farplane tracked capture fell back to a whole copy: {err}");
                     memversion::create(device.as_fd(), &regions, &exclusions)
                 })
                 .map(|version| (version, exclusions))
             })()
             .map_err(|err| {
-                error!("Ramet capture could not create the memory version: {err}");
+                error!("Farplane capture could not create the memory version: {err}");
                 VmstateRefusal::failed("memory version", err)
             })?;
             // Deliberately do not clear dirty logs: accumulating evidence is conservative and
@@ -1335,13 +1335,13 @@ impl CaptureService {
         }
         // Logged before any vCPU can run again, so the line's timestamp bounds the guest's resume
         // from below: the lab checks it falls after the plane published the capture.
-        info!("Ramet capture resume began (run_vcpus={run_vcpus})");
+        info!("Farplane capture resume began (run_vcpus={run_vcpus})");
         let mut vmm = self.vmm.lock().expect("Poisoned lock");
         if run_vcpus > 0
             && vmm.instance_info.state != VmState::Running
             && let Err(err) = vmm.resume_vm()
         {
-            error!("Ramet capture could not restart the vCPUs: {err}");
+            error!("Farplane capture could not restart the vCPUs: {err}");
             drop(vmm);
             return self.reject(request_id, ErrorCode::ResumeFailed, MsgType::Resume);
         }
@@ -1510,7 +1510,7 @@ fn accept_clone_destination(destination: RawFd, scratch: Option<RawFd>) -> Resul
 
 fn hand_back_source(mut vmm: MutexGuard<'_, Vmm>, were_running: bool) {
     if were_running && let Err(err) = vmm.resume_vm() {
-        error!("Ramet quiesce could not restart the vCPUs after the failure: {err}");
+        error!("Farplane quiesce could not restart the vCPUs after the failure: {err}");
         BackendState::fail();
     }
     drop(vmm);
@@ -1538,7 +1538,7 @@ fn serialize_vmstate_within(
     capacity: u64,
 ) -> Result<u64, VmstateRefusal> {
     let failed = |step: &str, err: &dyn std::fmt::Display| {
-        error!("Ramet capture could not serialize the microVM state ({step}): {err}");
+        error!("Farplane capture could not serialize the microVM state ({step}): {err}");
         VmstateRefusal::failed(step, err)
     };
     buffer
