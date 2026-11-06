@@ -157,12 +157,14 @@ mod tests {
     #[test]
     fn test_set_resource_limits() {
         let resource = Resource::NoFile;
-        let new_limit = NO_FILE - 1;
         let mut rlim: libc::rlimit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
         unsafe { libc::getrlimit(resource.into(), &mut rlim) };
+        // Below what the process holds: an earlier test may have lowered the hard limit, and
+        // raising it again needs CAP_SYS_RESOURCE.
+        let new_limit = rlim.rlim_max.min(NO_FILE) - 1;
         assert_ne!(rlim.rlim_cur, new_limit);
         assert_ne!(rlim.rlim_max, new_limit);
 
