@@ -1465,6 +1465,41 @@ fn a_refresh_waiting_behind_a_pending_walk_has_it_run_before_it_folds() {
     assert!(service.parked.is_empty());
 }
 
+#[test]
+fn a_pre_copy_refresh_behind_a_pending_walk_drops_it_and_leaves_the_fold_parked() {
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("SKIP: real capture dispatcher requires /dev/kvm");
+        return;
+    }
+    let (sock, peer) = UnixStream::pair().unwrap();
+    let mut service = after_refresh(sock);
+    FAKE_WALK.set(FakeWalk {
+        peer: Some(peer.try_clone().unwrap()),
+        ranges: 4,
+        ..FakeWalk::default()
+    });
+    let mut body = 0u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&4u64.to_le_bytes());
+    protocol::send_frame(&peer, MsgType::Refresh, 9, &body, &[]).unwrap();
+    let previous_state = BackendState::load();
+    // Not running: the pre-copy is refused once it starts, after anything it waits for.
+    BackendState::Quiesced.store();
+    service.serve_one().unwrap();
+    let reply = protocol::recv_frame(&peer).unwrap();
+    previous_state.store();
+    assert_eq!(reply.header.request_id, 9);
+    FAKE_WALK.with_borrow(|f| {
+        // Only the idle walk, which gives way at once to the waiting pre-copy.
+        assert_eq!(f.calls, 1, "the pre-copy had the pending walk run");
+        assert_eq!(f.stopped_at, Some(0));
+        assert!(!f.finished);
+    });
+    assert!(!service.walk_pending, "the walk would run after the pre-copy");
+    assert!(service.folded.is_empty());
+    assert!(!service.release_pending);
+    assert_eq!(service.parked.len(), 1, "the pre-copy released the parked fold");
+}
+
 /// A refresh flattens its fold and answers with the flat copy, of no depth; a capture's
 /// pre-copy answers with the fold itself, over the standing version, since the capture's CREATE
 /// replaces it at once. Skips without the pinned memversion host.

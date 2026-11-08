@@ -602,6 +602,14 @@ impl CaptureService {
                 // The capture's CREATE folds what the walk would re-share, and its set is stale
                 // after it: the next refresh then finds no hot set to leave out.
                 MsgType::CaptureBuffers => self.walk_pending = false,
+                // A capture's pre-copy re-shares what the guest wrote before it folds, and the
+                // capture's CREATE stales the walk's set: it drops the walk as the capture does.
+                MsgType::Refresh
+                    if protocol::parse_refresh(&incoming.body).is_ok_and(|b| b.capture_next) =>
+                {
+                    self.walk_pending = false;
+                    self.folded.clear();
+                }
                 MsgType::Refresh => self.walk_refreshed(false),
                 _ => {}
             }
@@ -884,7 +892,11 @@ impl CaptureService {
             self.background.wake_with(wake);
         }
         self.guard_pages = bound.pages;
-        self.parked.clear();
+        // A capture's pre-copy leaves the parked folds to the capture's resume: their release
+        // takes as long as a fold, and the capture would wait for it.
+        if !bound.capture_next {
+            self.parked.clear();
+        }
         let Some(tracker) = self.tracker.as_ref() else {
             return self.reject(request_id, ErrorCode::RefreshFailed, MsgType::Refresh);
         };
