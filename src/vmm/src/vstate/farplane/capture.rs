@@ -1023,26 +1023,33 @@ impl CaptureService {
                     self.background
                         .guard(tracker, marked + bound.pages.saturating_sub(held));
                 }
-                let flattened = memversion::flatten(folded.as_fd()).and_then(|flat| {
-                    memversion::rebase(tracker.as_fd(), flat.as_fd())?;
-                    Ok(flat)
+                // A capture's pre-copy is followed at once by its CREATE, whose version the
+                // tracker then stands on: a flat copy of this fold would cost as long as the fold
+                // and stand for a moment only. The tracker stays on the fold, one level deeper,
+                // and the next refresh flattens.
+                let flattened = (!bound.capture_next).then(|| {
+                    memversion::flatten(folded.as_fd()).and_then(|flat| {
+                        memversion::rebase(tracker.as_fd(), flat.as_fd())?;
+                        Ok(flat)
+                    })
                 });
                 // What the guest wrote up to the rebase, while the old chain still held it;
                 // pages it writes after are the new standing version's to count.
                 let after = written(tracker.as_fd(), if applied { &exclusions } else { &[] });
-                if bound.pages > 0 && flattened.is_ok() {
+                if bound.pages > 0 && matches!(flattened, Some(Ok(_))) {
                     self.background.guard(tracker, marked + bound.pages);
                 }
                 let paused = self.background.release(started);
                 let version = match flattened {
-                    Ok(flat) => {
+                    Some(Ok(flat)) => {
                         self.parked.push(folded);
                         flat
                     }
-                    Err(err) => {
+                    Some(Err(err)) => {
                         error!("Farplane could not flatten the refreshed standing version: {err}");
                         folded
                     }
+                    None => folded,
                 };
                 info!(
                     "Farplane refreshed the standing version in {} us (re-shared {reshared} pages \

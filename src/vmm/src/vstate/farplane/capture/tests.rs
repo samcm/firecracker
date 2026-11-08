@@ -1464,3 +1464,80 @@ fn a_refresh_waiting_behind_a_pending_walk_has_it_run_before_it_folds() {
     assert!(!service.folded.is_empty(), "the walk's shared pages are not there for the fold");
     assert!(service.parked.is_empty());
 }
+
+/// A refresh flattens its fold and answers with the flat copy, of no depth; a capture's
+/// pre-copy answers with the fold itself, over the standing version, since the capture's CREATE
+/// replaces it at once. Skips without the pinned memversion host.
+#[test]
+fn a_pre_copy_refresh_answers_its_fold_and_a_refresh_its_flat_copy() {
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("SKIP: real capture dispatcher requires /dev/kvm");
+        return;
+    }
+    let Ok(device) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/memversion_v1")
+    else {
+        eprintln!("SKIP: requires the pinned memversion host");
+        return;
+    };
+    let page = crate::arch::host_page_size() as u64;
+    let size = 4096 * page;
+    let records = vec![protocol::RegionRecord { guest_addr: 0, size }];
+    let regions = memversion::geometry(&records).unwrap();
+    let source = memversion::map_regions(&regions, None, None, false).unwrap().0;
+    let write = |tag: u64| {
+        for p in 0..size / page {
+            // SAFETY: every page lies in the live, writable source mapping.
+            unsafe { ((memversion::GUEST_RAM_BASE + p * page) as *mut u64).write(tag << 32 | p) };
+        }
+    };
+    write(1);
+    if let Err(err) = memversion::track(device.as_fd(), &regions, None) {
+        eprintln!("SKIP: this device does not track: {err}");
+        return;
+    }
+    let (sock, peer) = UnixStream::pair().unwrap();
+    let mut service = CaptureService {
+        channel: MemoryChannel { sock, regions: records },
+        vmm: Arc::new(Mutex::new(crate::builder::tests::default_vmm())),
+        vm_info: VmInfo::default(),
+        buffers: None,
+        order: EpochOrder::default(),
+        replies: ReplyCache::default(),
+        pending: None,
+        tracker: Some(OwnedFd::from(device.try_clone().unwrap())),
+        standing: None,
+        guard_pages: 0,
+        background: Background::detached(),
+        standing_exclusions: Vec::new(),
+        hot_set_mark: Vec::new(),
+        folded: Vec::new(),
+        parked: Vec::new(),
+        hot: Vec::new(),
+        walk_pending: false,
+        release_pending: false,
+        walk: memversion::residency_unless,
+    };
+    let previous_state = BackendState::load();
+    BackendState::Ready.store();
+    let mut refresh = |id: u64, capture_next: bool| {
+        let mut body = 0u64.to_le_bytes().to_vec();
+        body.extend_from_slice(&(if capture_next { 4u64 } else { 0 }).to_le_bytes());
+        protocol::send_frame(&peer, MsgType::Refresh, id, &body, &[]).unwrap();
+        service.serve_one().unwrap();
+        let reply = protocol::recv_frame(&peer).unwrap();
+        assert_eq!(reply.header.msg(), MsgType::Refreshed, "refresh {id}");
+        let version = reply.fds.into_iter().next().expect("the refreshed version");
+        memversion::info2(version.as_fd()).unwrap().depth
+    };
+    assert_eq!(refresh(1, false), 0, "a refresh answers its flat copy");
+    write(2);
+    assert_eq!(refresh(2, true), 1, "a pre-copy answers its fold over the standing version");
+    write(3);
+    assert_eq!(refresh(3, false), 0, "the next refresh flattens again");
+    previous_state.store();
+    drop(source);
+    memversion::untrack(device.as_fd()).unwrap();
+}
