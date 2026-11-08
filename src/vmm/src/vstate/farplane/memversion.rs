@@ -905,7 +905,27 @@ pub(crate) fn residency(
     device: BorrowedFd<'_>,
     regions: &[Region],
 ) -> io::Result<(PageMaps, PageMaps)> {
-    residency_with(regions, |addr, len, present, written| {
+    residency_unless(device, regions, &mut || false)
+        .map(|walked| walked.expect("a walk that never stops completes"))
+}
+
+/// The RESIDENT range a walk that may give way reads at a time: a 4 GiB guest's walk then
+/// checks between 32 ranges rather than 4.
+const YIELDING_RANGE_LEN: u64 = 128 << 20;
+
+/// As [`residency`], but `stop` is asked before each range; once it says so the walk gives up
+/// with `None`.
+pub(crate) fn residency_unless(
+    device: BorrowedFd<'_>,
+    regions: &[Region],
+    stop: &mut dyn FnMut() -> bool,
+) -> io::Result<Option<(PageMaps, PageMaps)>> {
+    let mut stopped = false;
+    let walked = residency_with(regions, YIELDING_RANGE_LEN, |addr, len, present, written| {
+        if stop() {
+            stopped = true;
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
         let mut request = Resident {
             addr,
             len,
@@ -919,7 +939,11 @@ pub(crate) fn residency(
             return Err(io::Error::last_os_error());
         }
         Ok(())
-    })
+    });
+    if stopped {
+        return Ok(None);
+    }
+    walked.map(Some)
 }
 
 /// Splits each region into RESIDENT ranges and assembles their `written` bitmaps. `resident`
@@ -929,17 +953,18 @@ fn written_pages_with(
     regions: &[Region],
     resident: impl FnMut(u64, u64, &mut [u64], &mut [u64]) -> io::Result<()>,
 ) -> io::Result<Vec<Vec<u64>>> {
-    Ok(residency_with(regions, resident)?.1)
+    Ok(residency_with(regions, MV_RESIDENT_MAX_LEN, resident)?.1)
 }
 
-/// Splits each region into RESIDENT ranges and assembles their `present` and `written`
-/// bitmaps. `resident` gets a range's address and length and its `present` and `written` words.
+/// Splits each region into RESIDENT ranges of at most `range_len` and assembles their `present`
+/// and `written` bitmaps. `resident` gets a range's address and length and its `present` and `written` words.
 fn residency_with(
     regions: &[Region],
+    range_len: u64,
     mut resident: impl FnMut(u64, u64, &mut [u64], &mut [u64]) -> io::Result<()>,
 ) -> io::Result<(PageMaps, PageMaps)> {
     let page = crate::arch::host_page_size() as u64;
-    let chunk_pages = MV_RESIDENT_MAX_LEN / page;
+    let chunk_pages = range_len.min(MV_RESIDENT_MAX_LEN) / page;
     // A range then starts on a bitmap word, so its words concatenate into the region's.
     if !chunk_pages.is_multiple_of(64) {
         return Err(invalid());

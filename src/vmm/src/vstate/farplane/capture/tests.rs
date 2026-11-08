@@ -933,6 +933,9 @@ fn free_summary_handler_roundtrip_replay_busy_and_capture_priority() {
         folded: Vec::new(),
         parked: Vec::new(),
         hot: Vec::new(),
+        walk_pending: false,
+        release_pending: false,
+        walk: memversion::residency_unless,
     };
     let file = summary_buffer(4096);
     let budget = protocol::MAX_FREE_SUMMARY_MICROS.to_le_bytes();
@@ -1259,6 +1262,9 @@ fn rearm_refuses_without_a_running_tracked_guest_and_changes_nothing() {
         folded: Vec::new(),
         parked: Vec::new(),
         hot: Vec::new(),
+        walk_pending: false,
+        release_pending: false,
+        walk: memversion::residency_unless,
     };
     let previous_state = BackendState::load();
     let flat = memfd(c"flat", 0);
@@ -1309,4 +1315,152 @@ fn hot_pages_are_rewrites_of_what_the_last_fold_shared_or_left_out() {
     assert_eq!(super::rewritten(&written, &folded, &hot), vec![vec![0b0_0101]]);
     // Before any fold was read, nothing is a rewrite.
     assert_eq!(super::rewritten(&written, &[], &[]), vec![vec![0]]);
+}
+
+/// What the stand-in walk saw. A walk reads `ranges` ranges and asks to stop before each; at
+/// range `send_at` it first sends `send` from the memory plane's end, as a command arriving
+/// mid-walk would.
+#[derive(Default)]
+struct FakeWalk {
+    peer: Option<UnixStream>,
+    ranges: usize,
+    send_at: Option<usize>,
+    send: Option<MsgType>,
+    calls: usize,
+    stopped_at: Option<usize>,
+    finished: bool,
+    answered_before_finishing: bool,
+}
+
+thread_local! {
+    static FAKE_WALK: std::cell::RefCell<FakeWalk> = std::cell::RefCell::default();
+}
+
+fn fake_walk(
+    _: BorrowedFd<'_>,
+    regions: &[memversion::Region],
+    stop: &mut dyn FnMut() -> bool,
+) -> io::Result<Option<(memversion::PageMaps, memversion::PageMaps)>> {
+    FAKE_WALK.with_borrow_mut(|f| {
+        f.calls += 1;
+        let peer = f.peer.as_ref().expect("a peer");
+        for range in 0..f.ranges {
+            if f.send_at == Some(range) {
+                let vmstate = memfd(c"vmstate", 0);
+                let msg = f.send.expect("a command");
+                protocol::send_frame(peer, msg, 9, &[], &[vmstate.as_raw_fd()]).unwrap();
+            }
+            if stop() {
+                f.stopped_at = Some(range);
+                return Ok(None);
+            }
+        }
+        // A reply already waiting on the memory plane's end was sent before this walk ended.
+        f.answered_before_finishing = frame_waiting(peer.as_raw_fd());
+        f.finished = true;
+        let words = |r: &memversion::Region| usize::try_from(r.len / 4096 / 64).unwrap();
+        let present = regions.iter().map(|r| vec![u64::MAX; words(r)]).collect();
+        let written = regions.iter().map(|r| vec![0; words(r)]).collect();
+        Ok(Some((present, written)))
+    })
+}
+
+/// A service whose last refresh left its walk and its fold's release pending.
+fn after_refresh(sock: UnixStream) -> CaptureService {
+    CaptureService {
+        channel: MemoryChannel {
+            sock,
+            regions: vec![protocol::RegionRecord {
+                guest_addr: 0,
+                size: 128 * 1024 * 1024,
+            }],
+        },
+        vmm: Arc::new(Mutex::new(crate::builder::tests::default_vmm())),
+        vm_info: VmInfo::default(),
+        buffers: None,
+        order: EpochOrder::default(),
+        replies: ReplyCache::default(),
+        pending: None,
+        tracker: Some(memfd(c"device", 0)),
+        standing: None,
+        guard_pages: 0,
+        background: Background::detached(),
+        standing_exclusions: Vec::new(),
+        hot_set_mark: Vec::new(),
+        folded: Vec::new(),
+        parked: vec![memfd(c"fold", 0)],
+        hot: Vec::new(),
+        walk_pending: true,
+        release_pending: true,
+        walk: fake_walk,
+    }
+}
+
+#[test]
+fn a_capture_arriving_mid_walk_is_served_before_the_walk_ends_and_drops_it() {
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("SKIP: real capture dispatcher requires /dev/kvm");
+        return;
+    }
+    let (sock, peer) = UnixStream::pair().unwrap();
+    let mut service = after_refresh(sock);
+    FAKE_WALK.set(FakeWalk {
+        peer: Some(peer.try_clone().unwrap()),
+        ranges: 4,
+        send_at: Some(1),
+        send: Some(MsgType::CaptureBuffers),
+        ..FakeWalk::default()
+    });
+    let previous_state = BackendState::load();
+    // Not running: the arm itself is refused, which this test does not look at.
+    BackendState::Quiesced.store();
+    service.serve_one().unwrap();
+    let reply = protocol::recv_frame(&peer).unwrap();
+    previous_state.store();
+    assert_eq!(reply.header.request_id, 9);
+    FAKE_WALK.with_borrow(|f| {
+        assert_eq!(f.calls, 1);
+        assert_eq!(f.stopped_at, Some(1), "the walk did not give way to the capture");
+        assert!(!f.finished);
+    });
+    // The capture folds what the walk would re-share: no walk follows it, and the fold stays
+    // parked until the capture resumes.
+    assert!(!service.walk_pending, "the walk would run after the capture");
+    assert!(service.folded.is_empty());
+    assert!(!service.release_pending);
+    assert_eq!(service.parked.len(), 1);
+}
+
+#[test]
+fn a_refresh_waiting_behind_a_pending_walk_has_it_run_before_it_folds() {
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("SKIP: real capture dispatcher requires /dev/kvm");
+        return;
+    }
+    let (sock, peer) = UnixStream::pair().unwrap();
+    let mut service = after_refresh(sock);
+    FAKE_WALK.set(FakeWalk {
+        peer: Some(peer.try_clone().unwrap()),
+        ranges: 4,
+        ..FakeWalk::default()
+    });
+    protocol::send_frame(&peer, MsgType::Refresh, 9, &[], &[]).unwrap();
+    let previous_state = BackendState::load();
+    // Not running: the refresh is refused once it starts, after any walk it needs first.
+    BackendState::Quiesced.store();
+    service.serve_one().unwrap();
+    let reply = protocol::recv_frame(&peer).unwrap();
+    previous_state.store();
+    assert_eq!(reply.header.request_id, 9);
+    FAKE_WALK.with_borrow(|f| {
+        // First the idle walk, which gives way at once to the waiting refresh; then the walk
+        // the refresh has run to its end before it answers.
+        assert_eq!(f.calls, 2, "the refresh did not have the pending walk run");
+        assert_eq!(f.stopped_at, Some(0));
+        assert!(f.finished);
+        assert!(!f.answered_before_finishing, "the walk ran after the refresh");
+    });
+    assert!(!service.walk_pending);
+    assert!(!service.folded.is_empty(), "the walk's shared pages are not there for the fold");
+    assert!(service.parked.is_empty());
 }

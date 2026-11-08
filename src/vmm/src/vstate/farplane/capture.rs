@@ -316,10 +316,44 @@ pub struct CaptureService {
     folded: Vec<Vec<u64>>,
     /// The pages the last refresh left out as hot; empty after any fold that took them.
     hot: Vec<Vec<u64>>,
-    /// Folds a capture's pre-copy replaced with their flat copies, kept open until the capture
-    /// resumes: the last close of a version releases it in the kernel, as long as a fold on a
-    /// large guest, and the capture would wait for it.
+    /// The last refresh's walk of what it shared and left the source mapping alone is still to
+    /// do: the loop runs it between commands, so a capture waiting behind the refresh is
+    /// served first.
+    walk_pending: bool,
+    /// The last refresh's fold is parked, to be released once the channel is idle: its release
+    /// takes as long as a fold, and a capture waiting behind the refresh would wait for it too.
+    release_pending: bool,
+    /// Folds a refresh replaced with their flat copies, kept open until the channel is idle or,
+    /// once a capture arms, until it resumes: the last close of a version releases it in the
+    /// kernel, as long as a fold on a large guest, and the capture would wait for it.
     parked: Vec<OwnedFd>,
+    /// The walk `walk_refreshed` runs.
+    walk: ResidencyWalk,
+}
+
+/// Reads which guest pages the source maps, and which of them it maps alone, giving up with
+/// `None` once `stop` says so: [`memversion::residency_unless`], or a test's stand-in.
+type ResidencyWalk = fn(
+    BorrowedFd<'_>,
+    &[memversion::Region],
+    &mut dyn FnMut() -> bool,
+) -> io::Result<Option<(memversion::PageMaps, memversion::PageMaps)>>;
+
+/// Whether a frame waits on the memory channel, without taking it.
+fn frame_waiting(sock: RawFd) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: a one-byte peek into a live buffer on the channel's socket; nothing is consumed.
+    let n = unsafe {
+        libc::recvfrom(
+            sock,
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    n > 0
 }
 
 /// The 40-byte `tracked` reply body. An untracked reply is zero after `tracked`.
@@ -501,6 +535,9 @@ impl CaptureService {
                     folded: Vec::new(),
                     parked: Vec::new(),
                     hot: Vec::new(),
+                    walk_pending: false,
+                    release_pending: false,
+                    walk: memversion::residency_unless,
                 };
                 loop {
                     if BackendState::load() == BackendState::ChannelFailed {
@@ -517,6 +554,13 @@ impl CaptureService {
     }
 
     fn serve_one(&mut self) -> Result<(), ChannelError> {
+        if self.walk_pending {
+            self.walk_refreshed(true);
+        }
+        if self.release_pending && !self.walk_pending && !frame_waiting(self.channel.sock.as_raw_fd()) {
+            self.parked.clear();
+            self.release_pending = false;
+        }
         let incoming = protocol::recv_frame(&self.channel.sock)?;
         let request_id = incoming.header.request_id;
         if request_id == 0 {
@@ -550,6 +594,18 @@ impl CaptureService {
             }
         }
         self.pending = Some((request_id, command));
+        if matches!(msg, MsgType::CaptureBuffers | MsgType::Refresh) {
+            self.release_pending = false;
+        }
+        if self.walk_pending {
+            match msg {
+                // The capture's CREATE folds what the walk would re-share, and its set is stale
+                // after it: the next refresh then finds no hot set to leave out.
+                MsgType::CaptureBuffers => self.walk_pending = false,
+                MsgType::Refresh => self.walk_refreshed(false),
+                _ => {}
+            }
+        }
         match msg {
             MsgType::CaptureBuffers => self.arm_buffers(incoming),
             MsgType::Quiesce => self.quiesce(request_id),
@@ -739,6 +795,7 @@ impl CaptureService {
             self.tracker = Some(device);
             self.standing_exclusions.clear();
             self.folded.clear();
+            self.walk_pending = false;
             self.hot.clear();
         }
         let tracker = self.tracker.as_ref().expect("tracker set above");
@@ -979,9 +1036,7 @@ impl CaptureService {
                 let paused = self.background.release(started);
                 let version = match flattened {
                     Ok(flat) => {
-                        if bound.capture_next {
-                            self.parked.push(folded);
-                        }
+                        self.parked.push(folded);
                         flat
                     }
                     Err(err) => {
@@ -1009,24 +1064,11 @@ impl CaptureService {
                     encode_refreshed(&info, paused, before, after, excluded, hot),
                     Some(version),
                 );
-                // What the source still maps alone is what the fold refused, what it left out
-                // as hot and what the guest wrote since: re-share it so the next live fold takes
-                // it. What it maps and does not own is what the fold shared.
                 // A capture arming next folds the rest itself, and a walk of the guest's memory
-                // here would hold it up: the next refresh then finds no hot set to leave out.
+                // would hold it up: the next refresh then finds no hot set to leave out.
                 self.folded.clear();
-                if !bound.capture_next
-                    && let Some(tracker) = self.tracker.as_ref()
-                    && let Ok(regions) = memversion::geometry(&self.channel.regions)
-                    && let Ok((present, written)) = memversion::residency(tracker.as_fd(), &regions)
-                {
-                    self.background.reshare(&regions, &without(&written, &self.hot));
-                    self.folded = present
-                        .iter()
-                        .zip(&written)
-                        .map(|(p, w)| p.iter().zip(w).map(|(p, w)| p & !w).collect())
-                        .collect();
-                }
+                self.walk_pending = !bound.capture_next;
+                self.release_pending = !bound.capture_next;
                 answered
             }
             Err(err) => {
@@ -1058,6 +1100,7 @@ impl CaptureService {
             self.standing = None;
             self.standing_exclusions.clear();
             self.folded.clear();
+            self.walk_pending = false;
             self.hot.clear();
             info!("Farplane untracked guest memory");
         }
@@ -1128,6 +1171,35 @@ impl CaptureService {
         });
         set_capture_buffers_armed(true);
         self.reply(request_id, MsgType::CaptureBuffersArmed, &[])
+    }
+
+    /// Walks the guest's memory after a refresh. What the source still maps alone is what the
+    /// fold refused, what it left out as hot and what the guest wrote since: it is re-shared so
+    /// the next live fold takes it. What it maps and does not own is what the fold shared. With
+    /// `yielding`, the walk gives way to a command that waits and stays pending.
+    fn walk_refreshed(&mut self, yielding: bool) {
+        let sock = self.channel.sock.as_raw_fd();
+        let walk = self.walk;
+        let walked = match (self.tracker.as_ref(), memversion::geometry(&self.channel.regions)) {
+            (Some(tracker), Ok(regions)) => {
+                walk(tracker.as_fd(), &regions, &mut || yielding && frame_waiting(sock))
+                    .map(|walked| walked.map(|maps| (regions, maps)))
+            }
+            _ => Ok(None),
+        };
+        match walked {
+            Ok(None) if yielding && self.tracker.is_some() => return,
+            Ok(Some((regions, (present, written)))) => {
+                self.background.reshare(&regions, &without(&written, &self.hot));
+                self.folded = present
+                    .iter()
+                    .zip(&written)
+                    .map(|(p, w)| p.iter().zip(w).map(|(p, w)| p & !w).collect())
+                    .collect();
+            }
+            Ok(None) | Err(_) => {}
+        }
+        self.walk_pending = false;
     }
 
     fn scratch_descriptor(&self) -> Option<RawFd> {
